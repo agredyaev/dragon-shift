@@ -27,8 +27,10 @@ pub struct Phase2TransitionResult {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionDragon {
     pub id: String,
+    pub name: String,
     pub original_owner_id: String,
     pub current_owner_id: String,
+    pub creator_instructions: String,
     pub active_time: ActiveTime,
     pub day_food: FoodType,
     pub night_food: FoodType,
@@ -38,6 +40,7 @@ pub struct SessionDragon {
     pub hunger: i32,
     pub energy: i32,
     pub happiness: i32,
+    pub discovery_observations: Vec<String>,
     pub handover_tags: Vec<String>,
     pub last_action: DragonAction,
     pub last_emotion: DragonEmotion,
@@ -77,6 +80,7 @@ pub enum ActionBlockReason {
 pub struct SessionPlayer {
     pub id: String,
     pub name: String,
+    pub pet_description: Option<String>,
     pub is_host: bool,
     pub is_connected: bool,
     pub is_ready: bool,
@@ -190,13 +194,19 @@ impl WorkshopSession {
 
         for assignment in assignments {
             if let Some(player) = self.players.get_mut(&assignment.player_id) {
+                let creator_instructions = player
+                    .pet_description
+                    .clone()
+                    .unwrap_or_else(|| default_pet_description(&player.name));
                 player.current_dragon_id = Some(assignment.dragon_id.clone());
                 self.dragons.insert(
                     assignment.dragon_id.clone(),
                     SessionDragon {
                         id: assignment.dragon_id.clone(),
+                        name: default_dragon_name(&player.name),
                         original_owner_id: assignment.player_id.clone(),
                         current_owner_id: assignment.player_id.clone(),
+                        creator_instructions,
                         active_time: ActiveTime::Day,
                         day_food: FoodType::Meat,
                         night_food: FoodType::Fruit,
@@ -206,6 +216,7 @@ impl WorkshopSession {
                         hunger: 100,
                         energy: 100,
                         happiness: 100,
+                        discovery_observations: Vec::new(),
                         handover_tags: Vec::new(),
                         last_action: DragonAction::Idle,
                         last_emotion: DragonEmotion::Neutral,
@@ -658,6 +669,30 @@ impl WorkshopSession {
     fn touch(&mut self) {
         self.updated_at = Utc::now();
     }
+
+    pub fn record_discovery_observation(&mut self, player_id: &str, text: impl Into<String>) {
+        let Some(dragon_id) = self
+            .players
+            .get(player_id)
+            .and_then(|player| player.current_dragon_id.clone())
+        else {
+            return;
+        };
+        if let Some(dragon) = self.dragons.get_mut(&dragon_id) {
+            dragon.discovery_observations.push(text.into());
+            dragon.discovery_observations = dragon
+                .discovery_observations
+                .iter()
+                .rev()
+                .take(6)
+                .cloned()
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
+        }
+        self.touch();
+    }
 }
 
 pub fn can_transition(current: Phase, next: Phase) -> bool {
@@ -684,6 +719,14 @@ fn is_daytime(hour: i32) -> bool {
     hour >= 6 && hour < 18
 }
 
+fn default_pet_description(player_name: &str) -> String {
+    format!("{player_name}'s workshop dragon")
+}
+
+fn default_dragon_name(player_name: &str) -> String {
+    format!("{player_name}'s dragon")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -696,6 +739,7 @@ mod tests {
         SessionPlayer {
             id: id.to_string(),
             name: format!("player-{id}"),
+            pet_description: None,
             is_host: false,
             is_connected: connected,
             is_ready: false,
@@ -769,6 +813,7 @@ mod tests {
     fn begin_phase1_assigns_dragons_and_resets_player_progress() {
         let mut session = WorkshopSession::new(Uuid::new_v4(), SessionCode("123456".into()), ts(1));
         let mut p1 = player("p1", true, 10);
+        p1.pet_description = Some("Curious cave dragon".into());
         p1.score = 90;
         p1.achievements = vec!["master_chef".into()];
         p1.current_dragon_id = Some("old-dragon".into());
@@ -796,6 +841,33 @@ mod tests {
         assert_eq!(session.players.get("p2").and_then(|p| p.current_dragon_id.as_deref()), Some("dragon-b"));
         assert_eq!(session.players.get("p1").map(|p| p.score), Some(0));
         assert!(session.players.get("p1").expect("player p1").achievements.is_empty());
+        let dragon_a = session.dragons.get("dragon-a").expect("dragon a");
+        assert_eq!(dragon_a.name, "player-p1's dragon");
+        assert_eq!(dragon_a.creator_instructions, "Curious cave dragon");
+        assert!(dragon_a.discovery_observations.is_empty());
+        let dragon_b = session.dragons.get("dragon-b").expect("dragon b");
+        assert_eq!(dragon_b.creator_instructions, "player-p2's workshop dragon");
+    }
+
+    #[test]
+    fn record_discovery_observation_keeps_last_six_entries() {
+        let mut session = WorkshopSession::new(Uuid::new_v4(), SessionCode("123456".into()), ts(1));
+        session.add_player(player("p1", true, 10));
+        session
+            .begin_phase1(&[Phase1Assignment {
+                player_id: "p1".into(),
+                dragon_id: "dragon-a".into(),
+            }])
+            .expect("start phase1");
+
+        for index in 1..=7 {
+            session.record_discovery_observation("p1", format!("note-{index}"));
+        }
+
+        let dragon = session.dragons.get("dragon-a").expect("dragon-a");
+        assert_eq!(dragon.discovery_observations.len(), 6);
+        assert_eq!(dragon.discovery_observations.first().map(String::as_str), Some("note-2"));
+        assert_eq!(dragon.discovery_observations.last().map(String::as_str), Some("note-7"));
     }
 
     #[test]

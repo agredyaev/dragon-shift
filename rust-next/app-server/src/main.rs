@@ -162,6 +162,7 @@ async fn create_workshop(
     let host_player = SessionPlayer {
         id: player_id.clone(),
         name: normalized_name.to_string(),
+        pet_description: Some(format!("{}'s workshop dragon", normalized_name)),
         is_host: true,
         is_connected: true,
         is_ready: false,
@@ -260,6 +261,7 @@ async fn join_workshop(
     let player = SessionPlayer {
         id: player_id.clone(),
         name: normalized_name.clone(),
+        pet_description: Some(format!("{}'s workshop dragon", normalized_name)),
         is_host: false,
         is_connected: true,
         is_ready: false,
@@ -756,7 +758,7 @@ async fn workshop_command(
                      achievements: player.achievements.clone(),
                      is_ready: player.is_ready,
                      is_connected: player.is_connected,
-                     pet_description: None,
+                     pet_description: player.pet_description.clone(),
                  },
              )
          })
@@ -923,6 +925,8 @@ async fn workshop_command(
                  assert_eq!(success.coordinator_type, CoordinatorType::Rust);
                  assert_eq!(success.state.current_player_id.as_deref(), Some(success.player_id.as_str()));
                  assert_eq!(success.state.players.len(), 1);
+                 let host = success.state.players.get(&success.player_id).expect("host player in state");
+                 assert_eq!(host.pet_description.as_deref(), Some("Alice's workshop dragon"));
              }
              WorkshopJoinResult::Error(error) => panic!("expected success, got error: {}", error.error),
          }
@@ -1115,6 +1119,8 @@ async fn workshop_command(
                  assert_eq!(success.coordinator_type, CoordinatorType::Rust);
                  assert_eq!(success.state.players.len(), 2);
                  assert_eq!(success.state.current_player_id.as_deref(), Some(success.player_id.as_str()));
+                 let joined = success.state.players.get(&success.player_id).expect("joined player in state");
+                 assert_eq!(joined.pet_description.as_deref(), Some("Bob's workshop dragon"));
              }
              WorkshopJoinResult::Error(error) => panic!("expected success, got error: {}", error.error),
          }
