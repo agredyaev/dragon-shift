@@ -1,12 +1,20 @@
 use dioxus::prelude::*;
 use protocol::{
     create_default_session_settings, ClientGameState, ClientSessionSnapshot, CoordinatorType,
-    CreateWorkshopRequest, JoinWorkshopRequest, Phase, Player, SessionCommand, SessionMeta,
+    CreateWorkshopRequest, JoinWorkshopRequest, NoticeLevel, Phase, Player, ServerWsMessage,
+    SessionCommand, SessionEnvelope, SessionMeta, SessionNotice as ProtocolSessionNotice,
     WorkshopCommandRequest, WorkshopCommandResult, WorkshopJoinResult, WorkshopJoinSuccess,
 };
 use std::collections::BTreeMap;
 
-#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+#[cfg(target_arch = "wasm32")]
+use protocol::ClientWsMessage;
+#[cfg(target_arch = "wasm32")]
+use std::cell::RefCell;
+#[cfg(target_arch = "wasm32")]
+use wasm_bindgen::{closure::Closure, JsCast};
+
+#[allow(dead_code)]
 const SESSION_SNAPSHOT_STORAGE_KEY: &str = "dragon-switch/rust-next/session-snapshot";
 const APP_STYLE: &str = r#"
     :root {
@@ -228,6 +236,7 @@ struct ShellState {
     pending_flow: Option<PendingFlow>,
     pending_command: Option<SessionCommand>,
     handover_tags_input: String,
+    realtime_bootstrap_attempted: bool,
     notice: Option<ShellNotice>,
 }
 
@@ -331,6 +340,7 @@ fn restore_shell_state(snapshot: Option<ClientSessionSnapshot>) -> ShellState {
         pending_flow: None,
         pending_command: None,
         handover_tags_input: String::new(),
+        realtime_bootstrap_attempted: false,
         notice: None,
     };
 
@@ -449,6 +459,28 @@ fn build_command_request(
     }
 }
 
+fn build_session_envelope(snapshot: &ClientSessionSnapshot) -> SessionEnvelope {
+    SessionEnvelope {
+        session_code: snapshot.session_code.clone(),
+        player_id: snapshot.player_id.clone(),
+        reconnect_token: snapshot.reconnect_token.clone(),
+        coordinator_type: Some(snapshot.coordinator_type),
+    }
+}
+
+fn build_ws_url(base_url: &str) -> String {
+    let normalized = normalize_api_base_url(base_url);
+    let ws_base = if let Some(rest) = normalized.strip_prefix("https://") {
+        format!("wss://{rest}")
+    } else if let Some(rest) = normalized.strip_prefix("http://") {
+        format!("ws://{rest}")
+    } else {
+        normalized
+    };
+
+    format!("{ws_base}/api/workshops/ws")
+}
+
 fn parse_tags_input(input: &str) -> Vec<String> {
     input
         .split(',')
@@ -481,6 +513,14 @@ fn error_notice(message: &str) -> ShellNotice {
     ShellNotice {
         tone: NoticeTone::Error,
         message: message.to_string(),
+    }
+}
+
+fn map_notice_tone(level: NoticeLevel) -> NoticeTone {
+    match level {
+        NoticeLevel::Info => NoticeTone::Info,
+        NoticeLevel::Success => NoticeTone::Success,
+        NoticeLevel::Warning | NoticeLevel::Error => NoticeTone::Error,
     }
 }
 
@@ -552,6 +592,147 @@ fn apply_successful_command(state: &mut ShellState, command: SessionCommand) {
 fn apply_command_error(state: &mut ShellState, error: String) {
     state.pending_command = None;
     state.notice = Some(error_notice(&error));
+}
+
+#[allow(dead_code)]
+fn apply_realtime_bootstrap_error(state: &mut ShellState, error: String) {
+    state.connection_status = ConnectionStatus::Offline;
+    state.notice = Some(error_notice(&error));
+}
+
+#[allow(dead_code)]
+fn apply_realtime_connecting(state: &mut ShellState) {
+    state.realtime_bootstrap_attempted = true;
+    state.connection_status = ConnectionStatus::Connecting;
+    state.notice = Some(info_notice("Attaching realtime session…"));
+}
+
+fn apply_server_ws_message(state: &mut ShellState, message: ServerWsMessage) {
+    match message {
+        ServerWsMessage::StateUpdate(client_state) => {
+            let first_attach = state.connection_status != ConnectionStatus::Connected;
+            state.screen = ShellScreen::Session;
+            state.session_state = Some(client_state);
+            state.connection_status = ConnectionStatus::Connected;
+            state.pending_command = None;
+            if first_attach {
+                state.notice = Some(info_notice("Realtime session attached."));
+            }
+        }
+        ServerWsMessage::Notice(ProtocolSessionNotice { level, title, message }) => {
+            let tone = map_notice_tone(level);
+            let combined = if title.trim().is_empty() {
+                message
+            } else {
+                format!("{title}: {message}")
+            };
+            state.notice = Some(ShellNotice { tone, message: combined });
+        }
+        ServerWsMessage::Error { message } => {
+            state.connection_status = ConnectionStatus::Offline;
+            state.notice = Some(error_notice(&message));
+        }
+        ServerWsMessage::Pong => {
+            state.connection_status = ConnectionStatus::Connected;
+            state.notice = Some(info_notice("Realtime connection confirmed."));
+        }
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+struct RealtimeClientHandle {
+    socket: web_sys::WebSocket,
+    onopen: Closure<dyn FnMut(web_sys::Event)>,
+    onmessage: Closure<dyn FnMut(web_sys::MessageEvent)>,
+    onerror: Closure<dyn FnMut(web_sys::ErrorEvent)>,
+    onclose: Closure<dyn FnMut(web_sys::Event)>,
+}
+
+#[cfg(target_arch = "wasm32")]
+std::thread_local! {
+    static REALTIME_CLIENT: RefCell<Option<RealtimeClientHandle>> = const { RefCell::new(None) };
+}
+
+#[cfg(target_arch = "wasm32")]
+fn bootstrap_realtime(mut shell_state: Signal<ShellState>) -> Result<(), String> {
+    let (base_url, snapshot) = {
+        let state = shell_state.read();
+        (state.api_base_url.clone(), state.session_snapshot.clone())
+    };
+    let snapshot = snapshot.ok_or_else(|| "Connect to a workshop before attaching realtime.".to_string())?;
+    let envelope_json = serde_json::to_string(&ClientWsMessage::AttachSession(build_session_envelope(&snapshot)))
+        .map_err(|error| format!("failed to encode attach payload: {error}"))?;
+    let socket = web_sys::WebSocket::new(&build_ws_url(&base_url))
+        .map_err(|_| "failed to open realtime socket".to_string())?;
+
+    shell_state.with_mut(apply_realtime_connecting);
+
+    let open_socket = socket.clone();
+    let open_state = shell_state;
+    let onopen = Closure::wrap(Box::new(move |_event: web_sys::Event| {
+        if open_socket.send_with_str(&envelope_json).is_err() {
+            open_state.with_mut(|state| {
+                state.connection_status = ConnectionStatus::Offline;
+                state.notice = Some(error_notice("Failed to attach realtime session."));
+            });
+        }
+    }) as Box<dyn FnMut(_)>);
+    socket.set_onopen(Some(onopen.as_ref().unchecked_ref()));
+
+    let message_state = shell_state;
+    let onmessage = Closure::wrap(Box::new(move |event: web_sys::MessageEvent| {
+        if let Some(text) = event.data().as_string() {
+            match serde_json::from_str::<ServerWsMessage>(&text) {
+                Ok(message) => message_state.with_mut(|state| apply_server_ws_message(state, message)),
+                Err(_) => message_state.with_mut(|state| {
+                    state.connection_status = ConnectionStatus::Offline;
+                    state.notice = Some(error_notice("Received invalid realtime payload."));
+                }),
+            }
+        }
+    }) as Box<dyn FnMut(_)>);
+    socket.set_onmessage(Some(onmessage.as_ref().unchecked_ref()));
+
+    let error_state = shell_state;
+    let onerror = Closure::wrap(Box::new(move |_event: web_sys::ErrorEvent| {
+        error_state.with_mut(|state| {
+            state.connection_status = ConnectionStatus::Offline;
+            state.notice = Some(error_notice("Realtime connection failed."));
+        });
+    }) as Box<dyn FnMut(_)>);
+    socket.set_onerror(Some(onerror.as_ref().unchecked_ref()));
+
+    let close_state = shell_state;
+    let onclose = Closure::wrap(Box::new(move |_event: web_sys::Event| {
+        close_state.with_mut(|state| {
+            state.connection_status = ConnectionStatus::Offline;
+            state.notice = Some(info_notice("Realtime connection closed."));
+        });
+    }) as Box<dyn FnMut(_)>);
+    socket.set_onclose(Some(onclose.as_ref().unchecked_ref()));
+
+    REALTIME_CLIENT.with(|client| {
+        if let Some(existing) = client.borrow_mut().take() {
+            let _ = existing.socket.close();
+        }
+        client.borrow_mut().replace(RealtimeClientHandle {
+            socket,
+            onopen,
+            onmessage,
+            onerror,
+            onclose,
+        });
+    });
+
+    Ok(())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn bootstrap_realtime(mut shell_state: Signal<ShellState>) -> Result<(), String> {
+    shell_state.with_mut(|state| {
+        state.realtime_bootstrap_attempted = true;
+    });
+    Ok(())
 }
 
 fn encode_session_snapshot(snapshot: &ClientSessionSnapshot) -> Result<String, String> {
@@ -649,6 +830,9 @@ async fn submit_create_flow(mut shell_state: Signal<ShellState>) {
                         state.notice = Some(error_notice(&format!("Workshop created, but session persistence failed: {error}")))
                     });
                 }
+            }
+            if let Err(error) = bootstrap_realtime(shell_state) {
+                shell_state.with_mut(|state| apply_realtime_bootstrap_error(state, error));
             }
         }
         Err(error) => shell_state.with_mut(|state| apply_request_error(state, error)),
@@ -791,6 +975,8 @@ fn App() -> Element {
     let mut join_state = state;
     let mut reconnect_state = state;
     let mut tags_state = state;
+    let mut realtime_state = state;
+    let mut realtime_effect_state = state;
     let start_phase1_state = state;
     let start_handover_state = state;
     let start_phase2_state = state;
@@ -803,6 +989,12 @@ fn App() -> Element {
     let pending_flow_status = shell.pending_flow.map(pending_flow_label).unwrap_or("Idle");
     let pending_command_status = shell.pending_command.map(pending_command_label).unwrap_or("Idle");
     let commands_disabled = shell.pending_flow.is_some() || shell.pending_command.is_some() || shell.session_snapshot.is_none();
+    let realtime_button_label = if shell.realtime_bootstrap_attempted {
+        "Retry realtime attach"
+    } else {
+        "Attach realtime"
+    };
+    let should_bootstrap_realtime = shell.session_snapshot.is_some() && !shell.realtime_bootstrap_attempted;
     let active_player_label = shell
         .session_state
         .as_ref()
@@ -823,6 +1015,14 @@ fn App() -> Element {
         .as_ref()
         .map(|session| session.players.len().to_string())
         .unwrap_or_else(|| "0".to_string());
+
+    use_effect(move || {
+        if should_bootstrap_realtime {
+            if let Err(error) = bootstrap_realtime(realtime_effect_state) {
+                realtime_effect_state.with_mut(|state| apply_realtime_bootstrap_error(state, error));
+            }
+        }
+    });
 
     rsx! {
         style {
@@ -941,6 +1141,18 @@ fn App() -> Element {
                             p { class: "panel__body", "Active player: " {active_player_label} }
                             p { class: "panel__body", "Current phase: " {session_phase_label} }
                             p { class: "panel__body", "Visible players: " {players_count_label} }
+                        }
+                        div { class: "button-row",
+                            button {
+                                class: "button button--secondary",
+                                disabled: shell.session_snapshot.is_none() || shell.pending_flow.is_some(),
+                                onclick: move |_| {
+                                    if let Err(error) = bootstrap_realtime(realtime_state) {
+                                        realtime_state.with_mut(|state| apply_realtime_bootstrap_error(state, error));
+                                    }
+                                },
+                                {realtime_button_label}
+                            }
                         }
                         p { class: "meta", "Browser session persistence now restores the reconnect snapshot on boot so the shell can attempt reconnect without retyping credentials." }
                     }
@@ -1176,6 +1388,29 @@ mod tests {
     }
 
     #[test]
+    fn build_session_envelope_uses_snapshot_identity() {
+        let snapshot = ClientSessionSnapshot {
+            session_code: "123456".to_string(),
+            reconnect_token: "reconnect-1".to_string(),
+            player_id: "player-1".to_string(),
+            coordinator_type: CoordinatorType::Rust,
+        };
+
+        let envelope = build_session_envelope(&snapshot);
+
+        assert_eq!(envelope.session_code, "123456");
+        assert_eq!(envelope.player_id, "player-1");
+        assert_eq!(envelope.reconnect_token, "reconnect-1");
+        assert_eq!(envelope.coordinator_type, Some(CoordinatorType::Rust));
+    }
+
+    #[test]
+    fn build_ws_url_maps_http_scheme_to_ws_endpoint() {
+        assert_eq!(build_ws_url("http://127.0.0.1:4100/"), "ws://127.0.0.1:4100/api/workshops/ws");
+        assert_eq!(build_ws_url("https://dragon-switch.dev"), "wss://dragon-switch.dev/api/workshops/ws");
+    }
+
+    #[test]
     fn parse_tags_input_trims_and_filters_empty_segments() {
         let tags = parse_tags_input(" one, two ,, three , ");
 
@@ -1223,5 +1458,39 @@ mod tests {
         assert_eq!(state.pending_command, None);
         assert!(state.handover_tags_input.is_empty());
         assert_eq!(state.notice.as_ref().map(|notice| notice.message.as_str()), Some("Handover tags saved."));
+    }
+
+    #[test]
+    fn server_ws_state_update_promotes_shell_to_connected_realtime_session() {
+        let mut state = default_shell_state();
+        apply_join_success(&mut state, mock_join_success(), PendingFlow::Join);
+        state.connection_status = ConnectionStatus::Connecting;
+        state.pending_command = Some(SessionCommand::StartPhase1);
+
+        apply_server_ws_message(
+            &mut state,
+            ServerWsMessage::StateUpdate(mock_join_success().state),
+        );
+
+        assert_eq!(state.connection_status, ConnectionStatus::Connected);
+        assert_eq!(state.pending_command, None);
+        assert_eq!(state.notice.as_ref().map(|notice| notice.message.as_str()), Some("Realtime session attached."));
+    }
+
+    #[test]
+    fn server_ws_notice_maps_protocol_notice_to_shell_notice() {
+        let mut state = default_shell_state();
+
+        apply_server_ws_message(
+            &mut state,
+            ServerWsMessage::Notice(ProtocolSessionNotice {
+                level: NoticeLevel::Success,
+                title: "Saved".to_string(),
+                message: "Workshop updated".to_string(),
+            }),
+        );
+
+        assert_eq!(state.notice.as_ref().map(|notice| notice.message.as_str()), Some("Saved: Workshop updated"));
+        assert_eq!(state.notice.as_ref().map(|notice| notice.tone), Some(NoticeTone::Success));
     }
 }
