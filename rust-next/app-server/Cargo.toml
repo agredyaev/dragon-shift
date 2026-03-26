@@ -6,7 +6,7 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
-axum.workspace = true
+axum = { workspace = true, features = ["ws"] }
 chrono.workspace = true
 tokio.workspace = true
 tracing.workspace = true
@@ -21,3 +21,7 @@ persistence.workspace = true
 security.workspace = true
 realtime.workspace = true
 uuid.workspace = true
+
+[dev-dependencies]
+futures-util = "0.3"
+tokio-tungstenite = "0.24"

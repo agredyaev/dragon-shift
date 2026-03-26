@@ -1,7 +1,9 @@
 use axum::{
+    extract::ws::{Message, WebSocket, WebSocketUpgrade},
     extract::State,
     http::HeaderMap,
     http::StatusCode,
+    response::IntoResponse,
     routing::post,
     routing::get,
     Json, Router,
@@ -10,11 +12,11 @@ use chrono::Utc;
 use domain::{DomainError, Phase1Assignment, SessionCode, SessionPlayer, WorkshopSession};
 use persistence::{InMemorySessionStore, SessionStore};
 use protocol::{
-    create_default_session_settings, ClientGameState, CoordinatorType, CreateWorkshopRequest,
+    create_default_session_settings, ClientGameState, ClientWsMessage, CoordinatorType, CreateWorkshopRequest,
     DragonStats, JudgeActionTrace, JudgeBundle, JudgeDragonBundle, JudgeHandoverChain,
     JudgePlayerSummary, JoinWorkshopRequest, Player, SessionArtifactKind, SessionArtifactRecord, SessionMeta,
-    SessionCommand, VotePayload, WorkshopCommandRequest, WorkshopCommandResult, WorkshopCommandSuccess,
-    WorkshopError, WorkshopJoinResult, WorkshopJoinSuccess, WorkshopJudgeBundleRequest,
+    ServerWsMessage, SessionCommand, SessionEnvelope, VotePayload, WorkshopCommandRequest,
+    WorkshopCommandResult, WorkshopCommandSuccess, WorkshopError, WorkshopJoinResult, WorkshopJoinSuccess, WorkshopJudgeBundleRequest,
     WorkshopJudgeBundleResult, WorkshopJudgeBundleSuccess,
 };
 use realtime::SessionRegistry;
@@ -95,6 +97,7 @@ fn build_app(state: AppState) -> Router {
         .route("/api/workshops", post(create_workshop))
         .route("/api/workshops/join", post(join_workshop))
         .route("/api/workshops/command", post(workshop_command))
+        .route("/api/workshops/ws", get(workshop_ws))
         .route("/api/workshops/judge-bundle", post(workshop_judge_bundle))
         .route("/api/live", get(live))
         .route("/api/ready", get(ready))
@@ -129,6 +132,132 @@ fn load_config() -> Result<AppConfig, String> {
         rust_session_code_prefix,
         origin_policy,
     })
+}
+
+async fn workshop_ws(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    ws: WebSocketUpgrade,
+) -> impl IntoResponse {
+    if !security::is_origin_allowed(
+        headers.get("origin").and_then(|value| value.to_str().ok()),
+        &state.config.origin_policy,
+    ) {
+        return (StatusCode::FORBIDDEN, "Origin is not allowed.").into_response();
+    }
+
+    ws.on_upgrade(move |socket| handle_workshop_ws(state, socket))
+        .into_response()
+}
+
+async fn handle_workshop_ws(state: AppState, mut socket: WebSocket) {
+    let mut attached_connection_id: Option<String> = None;
+
+    while let Some(message_result) = socket.recv().await {
+        let Ok(message) = message_result else {
+            break;
+        };
+
+        match message {
+            Message::Text(text) => match serde_json::from_str::<ClientWsMessage>(&text) {
+                Ok(ClientWsMessage::AttachSession(envelope)) => {
+                    let connection_id = attached_connection_id
+                        .clone()
+                        .unwrap_or_else(|| random_prefixed_id("conn"));
+                    match attach_ws_session(&state, &mut socket, &envelope, &connection_id).await {
+                        Ok(()) => attached_connection_id = Some(connection_id),
+                        Err(error_message) => {
+                            if send_ws_message(&mut socket, &ServerWsMessage::Error { message: error_message })
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                    }
+                }
+                Ok(ClientWsMessage::Ping) => {
+                    if send_ws_message(&mut socket, &ServerWsMessage::Pong).await.is_err() {
+                        break;
+                    }
+                }
+                Err(_) => {
+                    if send_ws_message(
+                        &mut socket,
+                        &ServerWsMessage::Error {
+                            message: "Invalid WebSocket payload.".to_string(),
+                        },
+                    )
+                    .await
+                    .is_err()
+                    {
+                        break;
+                    }
+                }
+            },
+            Message::Ping(payload) => {
+                if socket.send(Message::Pong(payload)).await.is_err() {
+                    break;
+                }
+            }
+            Message::Close(_) => break,
+            _ => {}
+        }
+    }
+
+    if let Some(connection_id) = attached_connection_id {
+        state.realtime.lock().await.detach(&connection_id);
+    }
+}
+
+async fn attach_ws_session(
+    state: &AppState,
+    socket: &mut WebSocket,
+    envelope: &SessionEnvelope,
+    connection_id: &str,
+) -> Result<(), String> {
+    let session_code = envelope.session_code.trim();
+    let reconnect_token = envelope.reconnect_token.trim();
+    let player_id = envelope.player_id.trim();
+    if session_code.is_empty()
+        || reconnect_token.is_empty()
+        || player_id.is_empty()
+        || validate_session_code(session_code).is_err()
+    {
+        return Err("Missing workshop credentials.".to_string());
+    }
+
+    let identity = state
+        .store
+        .find_player_identity(session_code, reconnect_token)
+        .map_err(|error| format!("failed to lookup identity: {error}"))?
+        .ok_or_else(|| "Session identity is invalid or expired.".to_string())?;
+    if identity.player_id != player_id {
+        return Err("Session identity is invalid or expired.".to_string());
+    }
+
+    let client_state = {
+        let sessions = state.sessions.lock().await;
+        let session = sessions
+            .get(session_code)
+            .ok_or_else(|| "Workshop not found.".to_string())?;
+        to_client_game_state(session, &identity.player_id)
+    };
+
+    state
+        .realtime
+        .lock()
+        .await
+        .attach(session_code, &identity.player_id, connection_id);
+
+    send_ws_message(socket, &ServerWsMessage::StateUpdate(client_state))
+        .await
+        .map_err(|_| "connection is closed".to_string())
+}
+
+async fn send_ws_message(socket: &mut WebSocket, message: &ServerWsMessage) -> Result<(), ()> {
+    let encoded = serde_json::to_string(message).map_err(|_| ())?;
+    socket.send(Message::Text(encoded.into())).await.map_err(|_| ())
 }
 
 async fn live() -> Json<serde_json::Value> {
@@ -1079,7 +1208,12 @@ async fn workshop_judge_bundle(
      use super::*;
      use axum::{
          body::{to_bytes, Body},
-         http::{Request, StatusCode},
+         http::{HeaderValue, Request, StatusCode},
+     };
+     use futures_util::{SinkExt, StreamExt};
+     use tokio_tungstenite::{
+         connect_async,
+         tungstenite::{client::IntoClientRequest, Message as WsMessage},
      };
      use tower::util::ServiceExt;
 
@@ -1125,6 +1259,27 @@ async fn workshop_judge_bundle(
          }
      }
 
+     async fn spawn_test_server(app: Router) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+         let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+             .await
+             .expect("bind test listener");
+         let addr = listener.local_addr().expect("listener addr");
+         let handle = tokio::spawn(async move {
+             axum::serve(listener, app).await.expect("serve test app");
+         });
+         (addr, handle)
+     }
+
+     fn ws_request(addr: SocketAddr) -> tokio_tungstenite::tungstenite::handshake::client::Request {
+         let mut request = format!("ws://{addr}/api/workshops/ws")
+             .into_client_request()
+             .expect("ws client request");
+         request
+             .headers_mut()
+             .insert("origin", HeaderValue::from_static("http://localhost:5173"));
+         request
+     }
+
      #[tokio::test]
      async fn live_endpoint_returns_ok() {
          let app = build_app(test_state());
@@ -1139,6 +1294,117 @@ async fn workshop_judge_bundle(
          let json: serde_json::Value = serde_json::from_slice(&body).expect("parse live json");
          assert_eq!(json["status"], "live");
          assert_eq!(json["ok"], true);
+     }
+
+     #[tokio::test]
+     async fn workshop_ws_attach_sends_current_state_for_valid_identity() {
+         let state = test_state();
+         let app = build_app(state.clone());
+
+         let create_response = app
+             .clone()
+             .oneshot(
+                 Request::builder()
+                     .method("POST")
+                     .uri("/api/workshops")
+                     .header("content-type", "application/json")
+                     .body(Body::from(r#"{"name":"Alice"}"#))
+                     .expect("build create request"),
+             )
+             .await
+             .expect("call create workshop");
+         let create_body = to_bytes(create_response.into_body(), usize::MAX).await.expect("read create body");
+         let create_result: WorkshopJoinResult = serde_json::from_slice(&create_body).expect("parse create result");
+         let create_success = match create_result {
+             WorkshopJoinResult::Success(success) => success,
+             WorkshopJoinResult::Error(error) => panic!("expected create success, got error: {}", error.error),
+         };
+
+         let (addr, server_handle) = spawn_test_server(app).await;
+         let (mut socket, _) = connect_async(ws_request(addr)).await.expect("connect ws");
+         let attach_message = ClientWsMessage::AttachSession(SessionEnvelope {
+             session_code: create_success.session_code.clone(),
+             player_id: create_success.player_id.clone(),
+             reconnect_token: create_success.reconnect_token.clone(),
+             coordinator_type: Some(CoordinatorType::Rust),
+         });
+         socket
+             .send(WsMessage::Text(serde_json::to_string(&attach_message).expect("encode attach").into()))
+             .await
+             .expect("send attach");
+
+         let message = socket.next().await.expect("state update frame").expect("state update message");
+         let payload = match message {
+             WsMessage::Text(payload) => payload,
+             other => panic!("expected text frame, got {other:?}"),
+         };
+         let server_message: ServerWsMessage = serde_json::from_str(&payload).expect("parse server ws message");
+         match server_message {
+             ServerWsMessage::StateUpdate(client_state) => {
+                 assert_eq!(client_state.session.code, create_success.session_code);
+                 assert_eq!(client_state.current_player_id.as_deref(), Some(create_success.player_id.as_str()));
+             }
+             other => panic!("expected state update, got {other:?}"),
+         }
+         assert_eq!(state.realtime.lock().await.session_connection_count(&create_success.session_code), 1);
+
+         let _ = socket.close(None).await;
+         server_handle.abort();
+     }
+
+     #[tokio::test]
+     async fn workshop_ws_rejects_invalid_identity() {
+         let app = build_app(test_state());
+         let (addr, server_handle) = spawn_test_server(app).await;
+         let (mut socket, _) = connect_async(ws_request(addr)).await.expect("connect ws");
+         let attach_message = ClientWsMessage::AttachSession(SessionEnvelope {
+             session_code: "123456".to_string(),
+             player_id: "player-1".to_string(),
+             reconnect_token: "missing".to_string(),
+             coordinator_type: Some(CoordinatorType::Rust),
+         });
+         socket
+             .send(WsMessage::Text(serde_json::to_string(&attach_message).expect("encode attach").into()))
+             .await
+             .expect("send attach");
+
+         let message = socket.next().await.expect("error frame").expect("error message");
+         let payload = match message {
+             WsMessage::Text(payload) => payload,
+             other => panic!("expected text frame, got {other:?}"),
+         };
+         let server_message: ServerWsMessage = serde_json::from_str(&payload).expect("parse server ws message");
+         match server_message {
+             ServerWsMessage::Error { message } => {
+                 assert_eq!(message, "Session identity is invalid or expired.");
+             }
+             other => panic!("expected error message, got {other:?}"),
+         }
+
+         let _ = socket.close(None).await;
+         server_handle.abort();
+     }
+
+     #[tokio::test]
+     async fn workshop_ws_replies_with_pong_for_ping_message() {
+         let app = build_app(test_state());
+         let (addr, server_handle) = spawn_test_server(app).await;
+         let (mut socket, _) = connect_async(ws_request(addr)).await.expect("connect ws");
+         socket
+             .send(WsMessage::Text(serde_json::to_string(&ClientWsMessage::Ping).expect("encode ping").into()))
+             .await
+             .expect("send ping message");
+
+         let message = socket.next().await.expect("pong frame").expect("pong message");
+         let payload = match message {
+             WsMessage::Text(payload) => payload,
+             other => panic!("expected text frame, got {other:?}"),
+         };
+         let server_message: ServerWsMessage = serde_json::from_str(&payload).expect("parse server ws message");
+         assert_eq!(server_message, ServerWsMessage::Pong);
+
+         let _ = socket.close(None).await;
+         server_handle.abort();
      }
 
      #[test]
