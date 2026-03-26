@@ -690,6 +690,53 @@ fn handover_status_copy(state: &ClientGameState) -> String {
     }
 }
 
+fn player_name_by_id(state: &ClientGameState, player_id: Option<&str>) -> String {
+    player_id
+        .and_then(|player_id| state.players.get(player_id))
+        .map(|player| player.name.clone())
+        .unwrap_or_else(|| "Unknown".to_string())
+}
+
+fn phase2_focus_title(state: &ClientGameState) -> String {
+    current_dragon(state)
+        .map(|dragon| format!("Phase 2 care for {}", dragon.name))
+        .unwrap_or_else(|| "Awaiting Phase 2 dragon".to_string())
+}
+
+fn phase2_creator_label(state: &ClientGameState) -> String {
+    let Some(dragon) = current_dragon(state) else {
+        return "Creator: Unknown".to_string();
+    };
+
+    format!("Creator: {}", player_name_by_id(state, dragon.original_owner_id.as_deref()))
+}
+
+fn phase2_handover_summary(state: &ClientGameState) -> String {
+    let Some(dragon) = current_dragon(state) else {
+        return "No handover notes yet.".to_string();
+    };
+
+    if dragon.handover_tags.is_empty() {
+        "No handover notes yet.".to_string()
+    } else {
+        format!("{} handover note(s) available from the previous caretaker.", dragon.handover_tags.len())
+    }
+}
+
+fn phase2_care_copy(state: &ClientGameState) -> String {
+    let Some(dragon) = current_dragon(state) else {
+        return "Phase 2 will begin once a dragon is assigned.".to_string();
+    };
+
+    let condition = dragon
+        .condition_hint
+        .as_deref()
+        .filter(|hint| !hint.trim().is_empty())
+        .unwrap_or("Expect faster decay in Phase 2 and react before the bars collapse.");
+
+    format!("{condition} Phase 2 decay is stronger, so adjust faster than in discovery.")
+}
+
 fn info_notice(message: &str) -> ShellNotice {
     ShellNotice {
         tone: NoticeTone::Info,
@@ -1295,6 +1342,30 @@ fn App() -> Element {
         .map(handover_saved_tags)
         .unwrap_or_default();
     let handover_draft_count = parse_tags_input(&shell.handover_tags_input).len();
+    let phase2_title = shell
+        .session_state
+        .as_ref()
+        .filter(|session| session.phase == Phase::Phase2)
+        .map(phase2_focus_title)
+        .unwrap_or_default();
+    let phase2_creator = shell
+        .session_state
+        .as_ref()
+        .filter(|session| session.phase == Phase::Phase2)
+        .map(phase2_creator_label)
+        .unwrap_or_default();
+    let phase2_handover = shell
+        .session_state
+        .as_ref()
+        .filter(|session| session.phase == Phase::Phase2)
+        .map(phase2_handover_summary)
+        .unwrap_or_default();
+    let phase2_care = shell
+        .session_state
+        .as_ref()
+        .filter(|session| session.phase == Phase::Phase2)
+        .map(phase2_care_copy)
+        .unwrap_or_default();
 
     use_effect(move || {
         if should_bootstrap_realtime {
@@ -1477,6 +1548,17 @@ fn App() -> Element {
                                     }
                                 }
                             }
+                        }
+                        if !phase2_title.is_empty() {
+                            article { class: "roster__item",
+                                div {
+                                    p { class: "roster__name", {phase2_title} }
+                                    p { class: "roster__meta", {phase2_creator.clone()} }
+                                }
+                                span { class: "roster__status status-connected", "Care" }
+                            }
+                            p { class: "panel__body", {phase2_care.clone()} }
+                            p { class: "meta", "Handover notes from previous caretaker: " {phase2_handover.clone()} }
                         }
                         div { class: "button-row",
                             button {
@@ -1889,6 +1971,31 @@ mod tests {
 
         assert_eq!(handover_saved_summary(&state), "0 / 3 handover rules saved");
         assert!(handover_status_copy(&state).contains("Write three concrete care rules"));
+    }
+
+    fn mock_phase2_state() -> ClientGameState {
+        let mut state = mock_handover_state();
+        state.phase = Phase::Phase2;
+        state
+    }
+
+    #[test]
+    fn phase2_helpers_expose_creator_and_handover_context() {
+        let state = mock_phase2_state();
+
+        assert_eq!(phase2_focus_title(&state), "Phase 2 care for Comet");
+        assert_eq!(phase2_creator_label(&state), "Creator: Alice");
+        assert_eq!(phase2_handover_summary(&state), "2 handover note(s) available from the previous caretaker.");
+        assert!(phase2_care_copy(&state).contains("Phase 2 decay is stronger"));
+    }
+
+    #[test]
+    fn phase2_helpers_fall_back_without_handover_notes() {
+        let mut state = mock_phase1_state();
+        state.phase = Phase::Phase2;
+
+        assert_eq!(phase2_handover_summary(&state), "No handover notes yet.");
+        assert_eq!(phase2_creator_label(&state), "Creator: Alice");
     }
 
     #[test]
