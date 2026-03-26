@@ -1,8 +1,8 @@
 use dioxus::prelude::*;
 use protocol::{
     create_default_session_settings, ClientGameState, ClientSessionSnapshot, CoordinatorType,
-    CreateWorkshopRequest, JoinWorkshopRequest, Phase, Player, SessionMeta, WorkshopJoinResult,
-    WorkshopJoinSuccess,
+    CreateWorkshopRequest, JoinWorkshopRequest, Phase, Player, SessionCommand, SessionMeta,
+    WorkshopCommandRequest, WorkshopCommandResult, WorkshopJoinResult, WorkshopJoinSuccess,
 };
 use std::collections::BTreeMap;
 
@@ -226,6 +226,8 @@ struct ShellState {
     reconnect_session_code: String,
     reconnect_token: String,
     pending_flow: Option<PendingFlow>,
+    pending_command: Option<SessionCommand>,
+    handover_tags_input: String,
     notice: Option<ShellNotice>,
 }
 
@@ -275,6 +277,26 @@ impl AppWebApi {
         self.join_workshop(build_reconnect_request(&session_code, &reconnect_token)).await
     }
 
+    async fn send_command(&self, request: WorkshopCommandRequest) -> Result<(), String> {
+        let response = self
+            .client
+            .post(format!("{}/api/workshops/command", self.base_url))
+            .json(&request)
+            .send()
+            .await
+            .map_err(|error| format!("failed to reach backend: {error}"))?;
+
+        let payload = response
+            .json::<WorkshopCommandResult>()
+            .await
+            .map_err(|error| format!("failed to parse backend response: {error}"))?;
+
+        match payload {
+            WorkshopCommandResult::Success(_) => Ok(()),
+            WorkshopCommandResult::Error(error) => Err(error.error),
+        }
+    }
+
     async fn parse_join_response(response: reqwest::Response) -> Result<WorkshopJoinSuccess, String> {
         let payload = response
             .json::<WorkshopJoinResult>()
@@ -307,6 +329,8 @@ fn restore_shell_state(snapshot: Option<ClientSessionSnapshot>) -> ShellState {
         reconnect_session_code: String::new(),
         reconnect_token: String::new(),
         pending_flow: None,
+        pending_command: None,
+        handover_tags_input: String::new(),
         notice: None,
     };
 
@@ -372,6 +396,19 @@ fn pending_flow_label(flow: PendingFlow) -> &'static str {
     }
 }
 
+fn pending_command_label(command: SessionCommand) -> &'static str {
+    match command {
+        SessionCommand::StartPhase1 => "Starting Phase 1…",
+        SessionCommand::StartHandover => "Starting handover…",
+        SessionCommand::SubmitTags => "Saving handover tags…",
+        SessionCommand::StartPhase2 => "Starting Phase 2…",
+        SessionCommand::EndGame => "Ending workshop…",
+        SessionCommand::RevealVotingResults => "Revealing results…",
+        SessionCommand::ResetGame => "Resetting workshop…",
+        _ => "Sending command…",
+    }
+}
+
 fn normalize_api_base_url(base_url: &str) -> String {
     let trimmed = base_url.trim().trim_end_matches('/');
     if trimmed.is_empty() {
@@ -396,6 +433,29 @@ fn build_client_session_snapshot(success: &WorkshopJoinSuccess) -> ClientSession
         player_id: success.player_id.clone(),
         coordinator_type: success.coordinator_type,
     }
+}
+
+fn build_command_request(
+    snapshot: &ClientSessionSnapshot,
+    command: SessionCommand,
+    payload: Option<serde_json::Value>,
+) -> WorkshopCommandRequest {
+    WorkshopCommandRequest {
+        session_code: snapshot.session_code.clone(),
+        reconnect_token: snapshot.reconnect_token.clone(),
+        coordinator_type: Some(snapshot.coordinator_type),
+        command,
+        payload,
+    }
+}
+
+fn parse_tags_input(input: &str) -> Vec<String> {
+    input
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 fn active_player_name(state: &ClientGameState) -> Option<String> {
@@ -452,6 +512,45 @@ fn apply_join_success(state: &mut ShellState, success: WorkshopJoinSuccess, flow
 fn apply_request_error(state: &mut ShellState, error: String) {
     state.connection_status = ConnectionStatus::Offline;
     state.pending_flow = None;
+    state.notice = Some(error_notice(&error));
+}
+
+fn command_success_message(command: SessionCommand) -> &'static str {
+    match command {
+        SessionCommand::StartPhase1 => "Phase 1 started.",
+        SessionCommand::StartHandover => "Handover started.",
+        SessionCommand::SubmitTags => "Handover tags saved.",
+        SessionCommand::StartPhase2 => "Phase 2 started.",
+        SessionCommand::EndGame => "Voting started.",
+        SessionCommand::RevealVotingResults => "Voting results revealed.",
+        SessionCommand::ResetGame => "Workshop reset.",
+        _ => "Command sent.",
+    }
+}
+
+fn apply_successful_command(state: &mut ShellState, command: SessionCommand) {
+    state.pending_command = None;
+    state.connection_status = ConnectionStatus::Connected;
+    if let Some(session) = state.session_state.as_mut() {
+        match command {
+            SessionCommand::StartPhase1 => session.phase = Phase::Phase1,
+            SessionCommand::StartHandover => session.phase = Phase::Handover,
+            SessionCommand::StartPhase2 => session.phase = Phase::Phase2,
+            SessionCommand::EndGame => session.phase = Phase::Voting,
+            SessionCommand::RevealVotingResults => session.phase = Phase::End,
+            SessionCommand::ResetGame => session.phase = Phase::Lobby,
+            SessionCommand::SubmitTags => {}
+            _ => {}
+        }
+    }
+    if command == SessionCommand::SubmitTags {
+        state.handover_tags_input.clear();
+    }
+    state.notice = Some(success_notice(command_success_message(command)));
+}
+
+fn apply_command_error(state: &mut ShellState, error: String) {
+    state.pending_command = None;
     state.notice = Some(error_notice(&error));
 }
 
@@ -643,6 +742,47 @@ async fn submit_reconnect_flow(mut shell_state: Signal<ShellState>) {
     }
 }
 
+async fn submit_workshop_command(
+    mut shell_state: Signal<ShellState>,
+    command: SessionCommand,
+    payload: Option<serde_json::Value>,
+) {
+    let (base_url, snapshot) = {
+        let state = shell_state.read();
+        (state.api_base_url.clone(), state.session_snapshot.clone())
+    };
+
+    let Some(snapshot) = snapshot else {
+        shell_state.with_mut(|state| state.notice = Some(error_notice("Connect to a workshop before sending commands.")));
+        return;
+    };
+
+    shell_state.with_mut(|state| {
+        state.pending_command = Some(command);
+        state.notice = Some(info_notice(pending_command_label(command)));
+    });
+
+    let api = AppWebApi::new(base_url);
+    match api.send_command(build_command_request(&snapshot, command, payload)).await {
+        Ok(()) => shell_state.with_mut(|state| apply_successful_command(state, command)),
+        Err(error) => shell_state.with_mut(|state| apply_command_error(state, error)),
+    }
+}
+
+async fn submit_handover_tags_command(mut shell_state: Signal<ShellState>) {
+    let tags = {
+        let state = shell_state.read();
+        parse_tags_input(&state.handover_tags_input)
+    };
+
+    if tags.is_empty() {
+        shell_state.with_mut(|state| state.notice = Some(error_notice("Enter at least one handover tag.")));
+        return;
+    }
+
+    submit_workshop_command(shell_state, SessionCommand::SubmitTags, Some(serde_json::json!(tags))).await;
+}
+
 #[component]
 fn App() -> Element {
     let mut state = use_signal(bootstrap_shell_state);
@@ -650,9 +790,19 @@ fn App() -> Element {
     let mut create_state = state;
     let mut join_state = state;
     let mut reconnect_state = state;
+    let mut tags_state = state;
+    let start_phase1_state = state;
+    let start_handover_state = state;
+    let start_phase2_state = state;
+    let end_game_state = state;
+    let reveal_results_state = state;
+    let reset_game_state = state;
+    let submit_tags_state = state;
     let connection_badge_class = format!("badge {}", connection_status_class(&shell.connection_status));
     let identity_label = if shell.identity.is_some() { "present" } else { "empty" };
-    let pending_label = shell.pending_flow.map(pending_flow_label).unwrap_or("Idle");
+    let pending_flow_status = shell.pending_flow.map(pending_flow_label).unwrap_or("Idle");
+    let pending_command_status = shell.pending_command.map(pending_command_label).unwrap_or("Idle");
+    let commands_disabled = shell.pending_flow.is_some() || shell.pending_command.is_some() || shell.session_snapshot.is_none();
     let active_player_label = shell
         .session_state
         .as_ref()
@@ -684,12 +834,13 @@ fn App() -> Element {
                     p { class: "hero__eyebrow", "Rust-only migration / Sprint 6" }
                     h1 { class: "hero__title", "Dragon Switch Rust Next" }
                     p { class: "hero__body", {screen_title(&shell.screen)} }
-                    p { class: "meta", "The Dioxus shell is now wired to the Rust HTTP API for create, join, and reconnect flows, while browser persistence remains the next isolated slice." }
+                    p { class: "meta", "The Dioxus shell now covers session bootstrap, browser persistence, and shell-level HTTP command transport against the Rust Axum backend." }
                     div { class: "hero__meta",
                         span { class: "badge", "Coordinator: Rust" }
                         span { class: connection_badge_class, "Connection: " {connection_status_label(&shell.connection_status)} }
                         span { class: "badge", "Reconnect identity: " {identity_label} }
-                        span { class: "badge", "Pending flow: " {pending_label} }
+                        span { class: "badge", "Pending flow: " {pending_flow_status} }
+                        span { class: "badge", "Pending command: " {pending_command_status} }
                     }
                 }
                 if let Some(notice) = shell.notice.clone() {
@@ -700,7 +851,7 @@ fn App() -> Element {
                 section { class: "grid",
                     article { class: "panel",
                         h2 { class: "panel__title", "Backend target" }
-                        p { class: "panel__body", "Point the shell at the Rust Axum backend before running create, join, or reconnect flows." }
+                        p { class: "panel__body", "Point the shell at the Rust Axum backend before running session bootstrap or workshop commands." }
                         div { class: "panel__stack",
                             input {
                                 class: "input",
@@ -708,7 +859,7 @@ fn App() -> Element {
                                 placeholder: "http://127.0.0.1:4100",
                                 oninput: move |event| state.with_mut(|shell| shell.api_base_url = event.value())
                             }
-                            p { class: "meta", "The HTTP command channel remains authoritative. WebSocket attach/state streaming comes in the next Sprint 6 slices." }
+                            p { class: "meta", "HTTP is authoritative for create, join, reconnect, and workshop commands. WebSocket attach/state streaming comes next." }
                         }
                     }
                     article { class: "panel",
@@ -794,12 +945,86 @@ fn App() -> Element {
                         p { class: "meta", "Browser session persistence now restores the reconnect snapshot on boot so the shell can attempt reconnect without retyping credentials." }
                     }
                     article { class: "panel",
+                        h2 { class: "panel__title", "Workshop controls" }
+                        p { class: "panel__body", "Host lifecycle controls are now available through the Rust command endpoint. The shell applies lightweight optimistic phase updates until WebSocket state sync lands." }
+                        div { class: "panel__stack",
+                            div { class: "button-row",
+                                button {
+                                    class: "button button--primary",
+                                    disabled: commands_disabled,
+                                    onclick: move |_| {
+                                        spawn(submit_workshop_command(start_phase1_state, SessionCommand::StartPhase1, None));
+                                    },
+                                    "Start Phase 1"
+                                }
+                                button {
+                                    class: "button button--secondary",
+                                    disabled: commands_disabled,
+                                    onclick: move |_| {
+                                        spawn(submit_workshop_command(start_handover_state, SessionCommand::StartHandover, None));
+                                    },
+                                    "Start handover"
+                                }
+                            }
+                            input {
+                                class: "input",
+                                value: shell.handover_tags_input,
+                                placeholder: "Handover tags, comma separated",
+                                oninput: move |event| tags_state.with_mut(|shell| shell.handover_tags_input = event.value())
+                            }
+                            div { class: "button-row",
+                                button {
+                                    class: "button button--secondary",
+                                    disabled: commands_disabled,
+                                    onclick: move |_| {
+                                        spawn(submit_handover_tags_command(submit_tags_state));
+                                    },
+                                    "Save handover tags"
+                                }
+                                button {
+                                    class: "button button--secondary",
+                                    disabled: commands_disabled,
+                                    onclick: move |_| {
+                                        spawn(submit_workshop_command(start_phase2_state, SessionCommand::StartPhase2, None));
+                                    },
+                                    "Start Phase 2"
+                                }
+                            }
+                            div { class: "button-row",
+                                button {
+                                    class: "button button--secondary",
+                                    disabled: commands_disabled,
+                                    onclick: move |_| {
+                                        spawn(submit_workshop_command(end_game_state, SessionCommand::EndGame, None));
+                                    },
+                                    "End game"
+                                }
+                                button {
+                                    class: "button button--secondary",
+                                    disabled: commands_disabled,
+                                    onclick: move |_| {
+                                        spawn(submit_workshop_command(reveal_results_state, SessionCommand::RevealVotingResults, None));
+                                    },
+                                    "Reveal results"
+                                }
+                                button {
+                                    class: "button button--secondary",
+                                    disabled: commands_disabled,
+                                    onclick: move |_| {
+                                        spawn(submit_workshop_command(reset_game_state, SessionCommand::ResetGame, None));
+                                    },
+                                    "Reset workshop"
+                                }
+                            }
+                        }
+                    }
+                    article { class: "panel",
                         h2 { class: "panel__title", "Transport plan" }
-                        p { class: "panel__body", "HTTP and browser session persistence are active inside the shell. The next step is to attach WebSocket runtime state streaming on top of this bootstrap path." }
+                        p { class: "panel__body", "HTTP bootstrap, browser persistence, and shell-level commands are active. The next step is to attach WebSocket runtime state streaming on top of this path." }
                         ul { class: "panel__list",
                             li { "Reuse restored reconnect snapshot after reload" }
                             li { "Auto-attach session over WebSocket" }
-                            li { "Attach WebSocket client after HTTP bootstrap" }
+                            li { "Replace optimistic local command updates with pushed session state" }
                         }
                     }
                 }
@@ -933,6 +1158,31 @@ mod tests {
     }
 
     #[test]
+    fn build_command_request_uses_snapshot_credentials() {
+        let snapshot = ClientSessionSnapshot {
+            session_code: "123456".to_string(),
+            reconnect_token: "reconnect-1".to_string(),
+            player_id: "player-1".to_string(),
+            coordinator_type: CoordinatorType::Rust,
+        };
+
+        let request = build_command_request(&snapshot, SessionCommand::StartPhase1, None);
+
+        assert_eq!(request.session_code, "123456");
+        assert_eq!(request.reconnect_token, "reconnect-1");
+        assert_eq!(request.coordinator_type, Some(CoordinatorType::Rust));
+        assert_eq!(request.command, SessionCommand::StartPhase1);
+        assert_eq!(request.payload, None);
+    }
+
+    #[test]
+    fn parse_tags_input_trims_and_filters_empty_segments() {
+        let tags = parse_tags_input(" one, two ,, three , ");
+
+        assert_eq!(tags, vec!["one", "two", "three"]);
+    }
+
+    #[test]
     fn apply_join_success_promotes_shell_to_connected_session() {
         let mut state = default_shell_state();
         apply_join_success(&mut state, mock_join_success(), PendingFlow::Join);
@@ -946,5 +1196,32 @@ mod tests {
         assert_eq!(state.reconnect_token, "reconnect-1");
         assert_eq!(active_player_name(state.session_state.as_ref().expect("session state")).as_deref(), Some("Alice"));
         assert_eq!(state.notice.as_ref().map(|notice| notice.message.as_str()), Some("Joined workshop."));
+    }
+
+    #[test]
+    fn apply_successful_command_updates_phase_and_clears_pending_command() {
+        let mut state = default_shell_state();
+        apply_join_success(&mut state, mock_join_success(), PendingFlow::Join);
+        state.pending_command = Some(SessionCommand::StartPhase1);
+
+        apply_successful_command(&mut state, SessionCommand::StartPhase1);
+
+        assert_eq!(state.pending_command, None);
+        assert_eq!(state.session_state.as_ref().map(|session| session.phase), Some(Phase::Phase1));
+        assert_eq!(state.notice.as_ref().map(|notice| notice.message.as_str()), Some("Phase 1 started."));
+    }
+
+    #[test]
+    fn submit_tags_success_clears_handover_input() {
+        let mut state = default_shell_state();
+        apply_join_success(&mut state, mock_join_success(), PendingFlow::Join);
+        state.handover_tags_input = "one, two".to_string();
+        state.pending_command = Some(SessionCommand::SubmitTags);
+
+        apply_successful_command(&mut state, SessionCommand::SubmitTags);
+
+        assert_eq!(state.pending_command, None);
+        assert!(state.handover_tags_input.is_empty());
+        assert_eq!(state.notice.as_ref().map(|notice| notice.message.as_str()), Some("Handover tags saved."));
     }
 }
