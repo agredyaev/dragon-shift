@@ -1,0 +1,11 @@
+[package]
+name = "security"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+base64 = "0.22"
+thiserror.workspace = true
+url = "2"
