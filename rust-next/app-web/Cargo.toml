@@ -10,3 +10,5 @@ dioxus.workspace = true
 dioxus-web.workspace = true
 protocol.workspace = true
 reqwest = { version = "0.12", default-features = false, features = ["json"] }
+serde_json.workspace = true
+web-sys = { version = "0.3", features = ["Storage", "Window"] }

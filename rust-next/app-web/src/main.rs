@@ -6,6 +6,8 @@ use protocol::{
 };
 use std::collections::BTreeMap;
 
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+const SESSION_SNAPSHOT_STORAGE_KEY: &str = "dragon-switch/rust-next/session-snapshot";
 const APP_STYLE: &str = r#"
     :root {
         color-scheme: dark;
@@ -290,8 +292,8 @@ fn default_api_base_url() -> String {
     "http://127.0.0.1:4100".to_string()
 }
 
-fn default_shell_state() -> ShellState {
-    ShellState {
+fn restore_shell_state(snapshot: Option<ClientSessionSnapshot>) -> ShellState {
+    let mut state = ShellState {
         screen: ShellScreen::Home,
         connection_status: ConnectionStatus::Offline,
         coordinator: CoordinatorType::Rust,
@@ -306,6 +308,28 @@ fn default_shell_state() -> ShellState {
         reconnect_token: String::new(),
         pending_flow: None,
         notice: None,
+    };
+
+    if let Some(snapshot) = snapshot {
+        hydrate_shell_from_snapshot(&mut state, &snapshot);
+        state.notice = Some(info_notice("Restored reconnect session from browser storage."));
+    }
+
+    state
+}
+
+fn default_shell_state() -> ShellState {
+    restore_shell_state(None)
+}
+
+fn bootstrap_shell_state() -> ShellState {
+    match load_browser_session_snapshot() {
+        Ok(snapshot) => restore_shell_state(snapshot),
+        Err(error) => {
+            let mut state = default_shell_state();
+            state.notice = Some(error_notice(&format!("Failed to restore browser session: {error}")));
+            state
+        }
     }
 }
 
@@ -431,6 +455,73 @@ fn apply_request_error(state: &mut ShellState, error: String) {
     state.notice = Some(error_notice(&error));
 }
 
+fn encode_session_snapshot(snapshot: &ClientSessionSnapshot) -> Result<String, String> {
+    serde_json::to_string(snapshot).map_err(|error| format!("failed to encode session snapshot: {error}"))
+}
+
+fn decode_session_snapshot(value: &str) -> Result<ClientSessionSnapshot, String> {
+    serde_json::from_str(value).map_err(|error| format!("failed to decode session snapshot: {error}"))
+}
+
+fn hydrate_shell_from_snapshot(state: &mut ShellState, snapshot: &ClientSessionSnapshot) {
+    state.coordinator = snapshot.coordinator_type;
+    state.identity = Some(SessionIdentity {
+        session_code: snapshot.session_code.clone(),
+        player_id: snapshot.player_id.clone(),
+        reconnect_token: snapshot.reconnect_token.clone(),
+    });
+    state.session_snapshot = Some(snapshot.clone());
+    state.join_session_code = snapshot.session_code.clone();
+    state.reconnect_session_code = snapshot.session_code.clone();
+    state.reconnect_token = snapshot.reconnect_token.clone();
+}
+
+#[cfg(target_arch = "wasm32")]
+fn load_browser_session_snapshot() -> Result<Option<ClientSessionSnapshot>, String> {
+    let Some(window) = web_sys::window() else {
+        return Err("window is unavailable".to_string());
+    };
+    let storage = window
+        .local_storage()
+        .map_err(|_| "failed to access browser storage".to_string())?
+        .ok_or_else(|| "browser storage is unavailable".to_string())?;
+
+    let Some(encoded) = storage
+        .get_item(SESSION_SNAPSHOT_STORAGE_KEY)
+        .map_err(|_| "failed to read browser storage".to_string())?
+    else {
+        return Ok(None);
+    };
+
+    decode_session_snapshot(&encoded).map(Some)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn load_browser_session_snapshot() -> Result<Option<ClientSessionSnapshot>, String> {
+    Ok(None)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn persist_browser_session_snapshot(snapshot: &ClientSessionSnapshot) -> Result<(), String> {
+    let Some(window) = web_sys::window() else {
+        return Err("window is unavailable".to_string());
+    };
+    let storage = window
+        .local_storage()
+        .map_err(|_| "failed to access browser storage".to_string())?
+        .ok_or_else(|| "browser storage is unavailable".to_string())?;
+    let encoded = encode_session_snapshot(snapshot)?;
+    storage
+        .set_item(SESSION_SNAPSHOT_STORAGE_KEY, &encoded)
+        .map_err(|_| "failed to persist browser session".to_string())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn persist_browser_session_snapshot(snapshot: &ClientSessionSnapshot) -> Result<(), String> {
+    let _ = snapshot;
+    Ok(())
+}
+
 async fn submit_create_flow(mut shell_state: Signal<ShellState>) {
     let (base_url, name) = {
         let state = shell_state.read();
@@ -450,7 +541,17 @@ async fn submit_create_flow(mut shell_state: Signal<ShellState>) {
 
     let api = AppWebApi::new(base_url);
     match api.create_workshop(name).await {
-        Ok(success) => shell_state.with_mut(|state| apply_join_success(state, success, PendingFlow::Create)),
+        Ok(success) => {
+            shell_state.with_mut(|state| apply_join_success(state, success, PendingFlow::Create));
+            let persisted_snapshot = { shell_state.read().session_snapshot.clone() };
+            if let Some(snapshot) = persisted_snapshot {
+                if let Err(error) = persist_browser_session_snapshot(&snapshot) {
+                    shell_state.with_mut(|state| {
+                        state.notice = Some(error_notice(&format!("Workshop created, but session persistence failed: {error}")))
+                    });
+                }
+            }
+        }
         Err(error) => shell_state.with_mut(|state| apply_request_error(state, error)),
     }
 }
@@ -487,7 +588,17 @@ async fn submit_join_flow(mut shell_state: Signal<ShellState>) {
         reconnect_token: None,
     };
     match api.join_workshop(request).await {
-        Ok(success) => shell_state.with_mut(|state| apply_join_success(state, success, PendingFlow::Join)),
+        Ok(success) => {
+            shell_state.with_mut(|state| apply_join_success(state, success, PendingFlow::Join));
+            let persisted_snapshot = { shell_state.read().session_snapshot.clone() };
+            if let Some(snapshot) = persisted_snapshot {
+                if let Err(error) = persist_browser_session_snapshot(&snapshot) {
+                    shell_state.with_mut(|state| {
+                        state.notice = Some(error_notice(&format!("Joined workshop, but session persistence failed: {error}")))
+                    });
+                }
+            }
+        }
         Err(error) => shell_state.with_mut(|state| apply_request_error(state, error)),
     }
 }
@@ -517,14 +628,24 @@ async fn submit_reconnect_flow(mut shell_state: Signal<ShellState>) {
 
     let api = AppWebApi::new(base_url);
     match api.reconnect_workshop(session_code, reconnect_token).await {
-        Ok(success) => shell_state.with_mut(|state| apply_join_success(state, success, PendingFlow::Reconnect)),
+        Ok(success) => {
+            shell_state.with_mut(|state| apply_join_success(state, success, PendingFlow::Reconnect));
+            let persisted_snapshot = { shell_state.read().session_snapshot.clone() };
+            if let Some(snapshot) = persisted_snapshot {
+                if let Err(error) = persist_browser_session_snapshot(&snapshot) {
+                    shell_state.with_mut(|state| {
+                        state.notice = Some(error_notice(&format!("Reconnected, but session persistence failed: {error}")))
+                    });
+                }
+            }
+        }
         Err(error) => shell_state.with_mut(|state| apply_request_error(state, error)),
     }
 }
 
 #[component]
 fn App() -> Element {
-    let mut state = use_signal(default_shell_state);
+    let mut state = use_signal(bootstrap_shell_state);
     let shell = state.read().clone();
     let mut create_state = state;
     let mut join_state = state;
@@ -614,7 +735,7 @@ fn App() -> Element {
                     }
                     article { class: "panel",
                         h2 { class: "panel__title", "Join or reconnect" }
-                        p { class: "panel__body", "Use the same Rust endpoints for new joins and reconnects; browser persistence will wrap these fields in the next slice." }
+                        p { class: "panel__body", "Use the same Rust endpoints for new joins and reconnects. Browser persistence now rehydrates the reconnect fields on boot." }
                         div { class: "panel__stack",
                             input {
                                 class: "input",
@@ -670,14 +791,14 @@ fn App() -> Element {
                             p { class: "panel__body", "Current phase: " {session_phase_label} }
                             p { class: "panel__body", "Visible players: " {players_count_label} }
                         }
-                        p { class: "meta", "Once browser session persistence lands, this shell state will rehydrate automatically before reconnect is attempted." }
+                        p { class: "meta", "Browser session persistence now restores the reconnect snapshot on boot so the shell can attempt reconnect without retyping credentials." }
                     }
                     article { class: "panel",
                         h2 { class: "panel__title", "Transport plan" }
-                        p { class: "panel__body", "HTTP is now active inside the shell. The next step is to layer browser persistence on top, then attach WebSocket runtime state streaming." }
+                        p { class: "panel__body", "HTTP and browser session persistence are active inside the shell. The next step is to attach WebSocket runtime state streaming on top of this bootstrap path." }
                         ul { class: "panel__list",
-                            li { "Persist reconnect snapshot in browser storage" }
-                            li { "Auto-reconnect on reload" }
+                            li { "Reuse restored reconnect snapshot after reload" }
+                            li { "Auto-attach session over WebSocket" }
                             li { "Attach WebSocket client after HTTP bootstrap" }
                         }
                     }
@@ -774,6 +895,41 @@ mod tests {
         assert_eq!(request.session_code, "123456");
         assert_eq!(request.name, None);
         assert_eq!(request.reconnect_token.as_deref(), Some("reconnect-1"));
+    }
+
+    #[test]
+    fn session_snapshot_round_trips_through_json_encoding() {
+        let snapshot = ClientSessionSnapshot {
+            session_code: "123456".to_string(),
+            reconnect_token: "reconnect-1".to_string(),
+            player_id: "player-1".to_string(),
+            coordinator_type: CoordinatorType::Rust,
+        };
+
+        let encoded = encode_session_snapshot(&snapshot).expect("encode snapshot");
+        let decoded = decode_session_snapshot(&encoded).expect("decode snapshot");
+
+        assert_eq!(decoded, snapshot);
+    }
+
+    #[test]
+    fn restore_shell_state_rehydrates_reconnect_fields_from_snapshot() {
+        let snapshot = ClientSessionSnapshot {
+            session_code: "654321".to_string(),
+            reconnect_token: "reconnect-9".to_string(),
+            player_id: "player-9".to_string(),
+            coordinator_type: CoordinatorType::Rust,
+        };
+
+        let state = restore_shell_state(Some(snapshot.clone()));
+
+        assert_eq!(state.screen, ShellScreen::Home);
+        assert_eq!(state.connection_status, ConnectionStatus::Offline);
+        assert_eq!(state.identity.as_ref().map(|identity| identity.player_id.as_str()), Some("player-9"));
+        assert_eq!(state.reconnect_session_code, "654321");
+        assert_eq!(state.reconnect_token, "reconnect-9");
+        assert_eq!(state.session_snapshot, Some(snapshot));
+        assert_eq!(state.notice.as_ref().map(|notice| notice.message.as_str()), Some("Restored reconnect session from browser storage."));
     }
 
     #[test]
