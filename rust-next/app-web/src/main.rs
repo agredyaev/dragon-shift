@@ -1,8 +1,9 @@
 use dioxus::prelude::*;
 use protocol::{
-    create_default_session_settings, ClientGameState, ClientSessionSnapshot, CoordinatorType,
-    CreateWorkshopRequest, JoinWorkshopRequest, NoticeLevel, Phase, Player, ServerWsMessage,
-    SessionCommand, SessionEnvelope, SessionMeta, SessionNotice as ProtocolSessionNotice,
+    create_default_session_settings, ClientDragon, ClientGameState, ClientSessionSnapshot,
+    CoordinatorType, CreateWorkshopRequest, DragonAction, DragonEmotion, JoinWorkshopRequest,
+    NoticeLevel, Phase, Player, ServerWsMessage, SessionCommand, SessionEnvelope, SessionMeta,
+    SessionNotice as ProtocolSessionNotice,
     WorkshopCommandRequest, WorkshopCommandResult, WorkshopJoinResult, WorkshopJoinSuccess,
 };
 use std::collections::BTreeMap;
@@ -155,7 +156,6 @@ const APP_STYLE: &str = r#"
         padding: 14px 16px;
         border: 1px solid rgba(166, 185, 255, 0.16);
         font-size: 14px;
-        line-height: 1.5;
     }
     .notice-info {
         background: rgba(139, 176, 255, 0.12);
@@ -594,6 +594,73 @@ fn lobby_status_copy(state: &ClientGameState) -> String {
         "All players are online. The host can start once the lobby is ready.".to_string()
     } else {
         format!("{offline_players} player(s) are currently offline and may need to reconnect before start.")
+    }
+}
+
+fn current_player(state: &ClientGameState) -> Option<&Player> {
+    let player_id = state.current_player_id.as_ref()?;
+    state.players.get(player_id)
+}
+
+fn current_dragon(state: &ClientGameState) -> Option<&ClientDragon> {
+    let player = current_player(state)?;
+    let dragon_id = player.current_dragon_id.as_ref()?;
+    state.dragons.get(dragon_id)
+}
+
+fn dragon_action_label(action: DragonAction) -> &'static str {
+    match action {
+        DragonAction::Feed => "Feed",
+        DragonAction::Play => "Play",
+        DragonAction::Sleep => "Sleep",
+        DragonAction::Idle => "Idle",
+    }
+}
+
+fn dragon_emotion_label(emotion: DragonEmotion) -> &'static str {
+    match emotion {
+        DragonEmotion::Happy => "Happy",
+        DragonEmotion::Angry => "Angry",
+        DragonEmotion::Sleepy => "Sleepy",
+        DragonEmotion::Neutral => "Neutral",
+    }
+}
+
+fn phase1_focus_title(state: &ClientGameState) -> String {
+    current_dragon(state)
+        .map(|dragon| format!("Meet {}", dragon.name))
+        .unwrap_or_else(|| "Awaiting assigned dragon".to_string())
+}
+
+fn phase1_focus_body(state: &ClientGameState) -> String {
+    let Some(dragon) = current_dragon(state) else {
+        return "Phase 1 will unlock once the session assigns you a dragon to observe.".to_string();
+    };
+
+    let speech = dragon
+        .speech
+        .as_deref()
+        .filter(|speech| !speech.trim().is_empty())
+        .unwrap_or("No direct speech hint yet.");
+    let condition = dragon
+        .condition_hint
+        .as_deref()
+        .filter(|hint| !hint.trim().is_empty())
+        .unwrap_or("Watch for timing changes between food, play, and sleep.");
+
+    format!("{speech} {condition}")
+}
+
+fn phase1_observation_summary(state: &ClientGameState) -> String {
+    let Some(dragon) = current_dragon(state) else {
+        return "No discovery notes saved yet.".to_string();
+    };
+
+    let count = dragon.discovery_observations.len();
+    if count == 0 {
+        "No discovery notes saved yet.".to_string()
+    } else {
+        format!("{count} discovery note(s) captured for handover.")
     }
 }
 
@@ -1145,6 +1212,38 @@ fn App() -> Element {
         .filter(|session| session.phase == Phase::Lobby)
         .map(lobby_status_copy)
         .unwrap_or_default();
+    let phase1_title = shell
+        .session_state
+        .as_ref()
+        .filter(|session| session.phase == Phase::Phase1)
+        .map(phase1_focus_title)
+        .unwrap_or_default();
+    let phase1_body = shell
+        .session_state
+        .as_ref()
+        .filter(|session| session.phase == Phase::Phase1)
+        .map(phase1_focus_body)
+        .unwrap_or_default();
+    let phase1_observations = shell
+        .session_state
+        .as_ref()
+        .filter(|session| session.phase == Phase::Phase1)
+        .map(phase1_observation_summary)
+        .unwrap_or_default();
+    let phase1_emotion = shell
+        .session_state
+        .as_ref()
+        .filter(|session| session.phase == Phase::Phase1)
+        .and_then(current_dragon)
+        .map(|dragon| dragon_emotion_label(dragon.last_emotion))
+        .unwrap_or("");
+    let phase1_last_action = shell
+        .session_state
+        .as_ref()
+        .filter(|session| session.phase == Phase::Phase1)
+        .and_then(current_dragon)
+        .map(|dragon| dragon_action_label(dragon.last_action))
+        .unwrap_or("");
 
     use_effect(move || {
         if should_bootstrap_realtime {
@@ -1291,6 +1390,18 @@ fn App() -> Element {
                                     }
                                 }
                             }
+                        }
+                        if !phase1_title.is_empty() {
+                            p { class: "meta", "Current dragon mood: " {phase1_emotion} }
+                            p { class: "meta", "Last action: " {phase1_last_action} }
+                            article { class: "roster__item",
+                                div {
+                                    p { class: "roster__name", {phase1_title} }
+                                    p { class: "roster__meta", {phase1_observations.clone()} }
+                                }
+                                span { class: "roster__status status-connecting", "Discovery" }
+                            }
+                            p { class: "panel__body", {phase1_body} }
                         }
                         div { class: "button-row",
                             button {
@@ -1620,6 +1731,61 @@ mod tests {
         assert_eq!(lobby_ready_summary(&single_player_state), "0 / 1 ready");
     }
 
+    fn mock_phase1_state() -> ClientGameState {
+        let mut state = mock_join_success().state;
+        state.phase = Phase::Phase1;
+        state.players.get_mut("player-1").expect("player-1").current_dragon_id = Some("dragon-1".to_string());
+        state.dragons.insert(
+            "dragon-1".to_string(),
+            ClientDragon {
+                id: "dragon-1".to_string(),
+                name: "Comet".to_string(),
+                visuals: protocol::DragonVisuals {
+                    base: 1,
+                    color_p: "#88ccff".to_string(),
+                    color_s: "#4466aa".to_string(),
+                    color_a: "#ffee88".to_string(),
+                },
+                original_owner_id: Some("player-1".to_string()),
+                current_owner_id: Some("player-1".to_string()),
+                stats: protocol::DragonStats {
+                    hunger: 72,
+                    energy: 55,
+                    happiness: 81,
+                },
+                condition_hint: Some("Gets restless after long idle stretches.".to_string()),
+                discovery_observations: vec!["Loves food at dusk".to_string()],
+                handover_tags: Vec::new(),
+                last_action: DragonAction::Feed,
+                last_emotion: DragonEmotion::Happy,
+                speech: Some("The snack worked.".to_string()),
+                speech_timer: 2,
+                action_cooldown: 0,
+                custom_sprites: None,
+            },
+        );
+        state
+    }
+
+    #[test]
+    fn phase1_focus_helpers_use_current_dragon_context() {
+        let state = mock_phase1_state();
+
+        assert_eq!(phase1_focus_title(&state), "Meet Comet");
+        assert_eq!(phase1_observation_summary(&state), "1 discovery note(s) captured for handover.");
+        assert_eq!(dragon_emotion_label(current_dragon(&state).expect("dragon").last_emotion), "Happy");
+        assert_eq!(dragon_action_label(current_dragon(&state).expect("dragon").last_action), "Feed");
+        assert!(phase1_focus_body(&state).contains("The snack worked."));
+    }
+
+    #[test]
+    fn phase1_focus_helpers_fall_back_when_player_has_no_dragon() {
+        let state = mock_join_success().state;
+
+        assert_eq!(phase1_focus_title(&state), "Awaiting assigned dragon");
+        assert_eq!(phase1_observation_summary(&state), "No discovery notes saved yet.");
+    }
+
     #[test]
     fn apply_join_success_promotes_shell_to_connected_session() {
         let mut state = default_shell_state();
@@ -1629,7 +1795,12 @@ mod tests {
         assert_eq!(state.connection_status, ConnectionStatus::Connected);
         assert_eq!(state.pending_flow, None);
         assert_eq!(state.identity.as_ref().map(|identity| identity.session_code.as_str()), Some("123456"));
-        assert_eq!(state.session_snapshot.as_ref().map(|snapshot| snapshot.player_id.as_str()), Some("player-1"));
+        assert_eq!(state.session_snapshot, Some(ClientSessionSnapshot {
+            session_code: "123456".to_string(),
+            reconnect_token: "reconnect-1".to_string(),
+            player_id: "player-1".to_string(),
+            coordinator_type: CoordinatorType::Rust,
+        }));
         assert_eq!(state.join_session_code, "123456");
         assert_eq!(state.reconnect_token, "reconnect-1");
         assert_eq!(active_player_name(state.session_state.as_ref().expect("session state")).as_deref(), Some("Alice"));
