@@ -11,7 +11,7 @@ use domain::{DomainError, Phase1Assignment, SessionCode, SessionPlayer, Workshop
 use persistence::{InMemorySessionStore, SessionStore};
 use protocol::{
     create_default_session_settings, ClientGameState, CoordinatorType, CreateWorkshopRequest,
-    JoinWorkshopRequest, Player, SessionArtifactKind, SessionArtifactRecord, SessionMeta,
+    DragonStats, JudgeActionTrace, JoinWorkshopRequest, Player, SessionArtifactKind, SessionArtifactRecord, SessionMeta,
     SessionCommand, VotePayload, WorkshopCommandRequest, WorkshopCommandResult, WorkshopCommandSuccess,
     WorkshopError, WorkshopJoinResult, WorkshopJoinSuccess,
 };
@@ -782,6 +782,69 @@ async fn workshop_command(
      }
  }
 
+ fn build_judge_action_traces(
+     session: &WorkshopSession,
+     artifacts: &[SessionArtifactRecord],
+ ) -> BTreeMap<String, Vec<JudgeActionTrace>> {
+     let mut traces_by_dragon_id = BTreeMap::new();
+
+     for artifact in artifacts {
+         if artifact.kind != SessionArtifactKind::ActionProcessed {
+             continue;
+         }
+
+         let Some(dragon_id) = artifact.payload.get("dragonId").and_then(|value| value.as_str()) else {
+             continue;
+         };
+
+         let player = artifact
+             .player_id
+             .as_ref()
+             .and_then(|player_id| session.players.get(player_id));
+
+         let resulting_stats = match (
+             artifact.payload.get("hunger").and_then(|value| value.as_i64()),
+             artifact.payload.get("energy").and_then(|value| value.as_i64()),
+             artifact.payload.get("happiness").and_then(|value| value.as_i64()),
+         ) {
+             (Some(hunger), Some(energy), Some(happiness)) => Some(DragonStats {
+                 hunger: hunger as i32,
+                 energy: energy as i32,
+                 happiness: happiness as i32,
+             }),
+             _ => None,
+         };
+
+         let trace = JudgeActionTrace {
+             player_id: artifact.player_id.clone().unwrap_or_else(|| "unknown".to_string()),
+             player_name: player
+                 .map(|player| player.name.clone())
+                 .unwrap_or_else(|| "Unknown".to_string()),
+             phase: artifact.phase,
+             action_type: artifact
+                 .payload
+                 .get("actionType")
+                 .and_then(|value| value.as_str())
+                 .unwrap_or("unknown")
+                 .to_string(),
+             action_value: artifact
+                 .payload
+                 .get("actionValue")
+                 .and_then(|value| value.as_str())
+                 .map(str::to_string),
+             created_at: artifact.created_at.clone(),
+             resulting_stats,
+         };
+
+         traces_by_dragon_id
+             .entry(dragon_id.to_string())
+             .or_insert_with(Vec::new)
+             .push(trace);
+     }
+
+     traces_by_dragon_id
+ }
+
  fn reject_disallowed_origin(
      headers: &HeaderMap,
      policy: &OriginPolicy,
@@ -857,6 +920,21 @@ async fn workshop_command(
      };
      use tower::util::ServiceExt;
 
+     fn session_player(id: &str, name: &str, joined_at_seconds: i64) -> SessionPlayer {
+         SessionPlayer {
+             id: id.to_string(),
+             name: name.to_string(),
+             pet_description: Some(format!("{name}'s workshop dragon")),
+             is_host: false,
+             is_connected: true,
+             is_ready: false,
+             score: 0,
+             current_dragon_id: None,
+             achievements: Vec::new(),
+             joined_at: chrono::DateTime::from_timestamp(joined_at_seconds, 0).expect("valid timestamp"),
+         }
+     }
+
      fn test_state() -> AppState {
          test_state_with_limits(20, 40)
      }
@@ -898,6 +976,100 @@ async fn workshop_command(
          let json: serde_json::Value = serde_json::from_slice(&body).expect("parse live json");
          assert_eq!(json["status"], "live");
          assert_eq!(json["ok"], true);
+     }
+
+     #[test]
+     fn build_judge_action_traces_groups_action_artifacts_by_dragon() {
+         let mut session = WorkshopSession::new(
+             Uuid::new_v4(),
+             SessionCode("123456".into()),
+             chrono::DateTime::from_timestamp(1, 0).expect("valid timestamp"),
+         );
+         session.add_player(session_player("p1", "Alice", 10));
+
+         let artifacts = vec![
+             SessionArtifactRecord {
+                 id: "artifact-1".into(),
+                 session_id: session.id.to_string(),
+                 phase: protocol::Phase::Phase2,
+                 step: 2,
+                 kind: SessionArtifactKind::ActionProcessed,
+                 player_id: Some("p1".into()),
+                 created_at: "2026-01-01T00:00:00Z".into(),
+                 payload: serde_json::json!({
+                     "dragonId": "dragon-a",
+                     "actionType": "feed",
+                     "actionValue": "meat",
+                     "hunger": 90,
+                     "energy": 100,
+                     "happiness": 95
+                 }),
+             },
+             SessionArtifactRecord {
+                 id: "artifact-2".into(),
+                 session_id: session.id.to_string(),
+                 phase: protocol::Phase::Phase2,
+                 step: 2,
+                 kind: SessionArtifactKind::ActionProcessed,
+                 player_id: Some("p1".into()),
+                 created_at: "2026-01-01T00:00:01Z".into(),
+                 payload: serde_json::json!({
+                     "dragonId": "dragon-a",
+                     "actionType": "play",
+                     "actionValue": "fetch"
+                 }),
+             },
+             SessionArtifactRecord {
+                 id: "artifact-3".into(),
+                 session_id: session.id.to_string(),
+                 phase: protocol::Phase::Phase2,
+                 step: 2,
+                 kind: SessionArtifactKind::PhaseChanged,
+                 player_id: Some("p1".into()),
+                 created_at: "2026-01-01T00:00:02Z".into(),
+                 payload: serde_json::json!({ "toPhase": "voting" }),
+             },
+         ];
+
+         let traces = build_judge_action_traces(&session, &artifacts);
+
+         let dragon_traces = traces.get("dragon-a").expect("dragon-a traces");
+         assert_eq!(dragon_traces.len(), 2);
+         assert_eq!(dragon_traces[0].player_name, "Alice");
+         assert_eq!(dragon_traces[0].action_type, "feed");
+         assert_eq!(dragon_traces[0].action_value.as_deref(), Some("meat"));
+         assert_eq!(dragon_traces[0].resulting_stats, Some(DragonStats { hunger: 90, energy: 100, happiness: 95 }));
+         assert_eq!(dragon_traces[1].action_type, "play");
+         assert_eq!(dragon_traces[1].resulting_stats, None);
+     }
+
+     #[test]
+     fn build_judge_action_traces_uses_unknown_fallbacks_for_missing_player_or_payload() {
+         let session = WorkshopSession::new(
+             Uuid::new_v4(),
+             SessionCode("123456".into()),
+             chrono::DateTime::from_timestamp(1, 0).expect("valid timestamp"),
+         );
+         let artifacts = vec![SessionArtifactRecord {
+             id: "artifact-1".into(),
+             session_id: session.id.to_string(),
+             phase: protocol::Phase::Phase2,
+             step: 2,
+             kind: SessionArtifactKind::ActionProcessed,
+             player_id: None,
+             created_at: "2026-01-01T00:00:00Z".into(),
+             payload: serde_json::json!({ "dragonId": "dragon-a" }),
+         }];
+
+         let traces = build_judge_action_traces(&session, &artifacts);
+
+         let dragon_traces = traces.get("dragon-a").expect("dragon-a traces");
+         assert_eq!(dragon_traces.len(), 1);
+         assert_eq!(dragon_traces[0].player_id, "unknown");
+         assert_eq!(dragon_traces[0].player_name, "Unknown");
+         assert_eq!(dragon_traces[0].action_type, "unknown");
+         assert_eq!(dragon_traces[0].action_value, None);
+         assert_eq!(dragon_traces[0].resulting_stats, None);
      }
 
      #[tokio::test]
