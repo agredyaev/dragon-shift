@@ -11,9 +11,11 @@ use domain::{DomainError, Phase1Assignment, SessionCode, SessionPlayer, Workshop
 use persistence::{InMemorySessionStore, SessionStore};
 use protocol::{
     create_default_session_settings, ClientGameState, CoordinatorType, CreateWorkshopRequest,
-    DragonStats, JudgeActionTrace, JoinWorkshopRequest, Player, SessionArtifactKind, SessionArtifactRecord, SessionMeta,
+    DragonStats, JudgeActionTrace, JudgeBundle, JudgeDragonBundle, JudgeHandoverChain,
+    JudgePlayerSummary, JoinWorkshopRequest, Player, SessionArtifactKind, SessionArtifactRecord, SessionMeta,
     SessionCommand, VotePayload, WorkshopCommandRequest, WorkshopCommandResult, WorkshopCommandSuccess,
-    WorkshopError, WorkshopJoinResult, WorkshopJoinSuccess,
+    WorkshopError, WorkshopJoinResult, WorkshopJoinSuccess, WorkshopJudgeBundleRequest,
+    WorkshopJudgeBundleResult, WorkshopJudgeBundleSuccess,
 };
 use realtime::SessionRegistry;
 use security::{
@@ -93,6 +95,7 @@ fn build_app(state: AppState) -> Router {
         .route("/api/workshops", post(create_workshop))
         .route("/api/workshops/join", post(join_workshop))
         .route("/api/workshops/command", post(workshop_command))
+        .route("/api/workshops/judge-bundle", post(workshop_judge_bundle))
         .route("/api/live", get(live))
         .route("/api/ready", get(ready))
         .route("/api/runtime", get(runtime_snapshot))
@@ -644,6 +647,67 @@ async fn workshop_command(
     }
 }
 
+async fn workshop_judge_bundle(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<WorkshopJudgeBundleRequest>,
+) -> (StatusCode, Json<WorkshopJudgeBundleResult>) {
+    if let Some(response) = reject_disallowed_judge_bundle_origin(&headers, &state.config.origin_policy) {
+        return response;
+    }
+
+    let session_code = request.session_code.trim();
+    let reconnect_token = request.reconnect_token.trim();
+    if session_code.is_empty() || reconnect_token.is_empty() || validate_session_code(session_code).is_err() {
+        return bad_judge_bundle_request("Missing workshop credentials.");
+    }
+
+    let session = {
+        let sessions = state.sessions.lock().await;
+        let Some(session) = sessions.get(session_code) else {
+            return bad_judge_bundle_request("Workshop not found.");
+        };
+        session.clone()
+    };
+
+    let identity = match state.store.find_player_identity(session_code, reconnect_token) {
+        Ok(Some(identity)) => identity,
+        Ok(None) => return bad_judge_bundle_request("Session identity is invalid or expired."),
+        Err(error) => return internal_judge_bundle_error(format!("failed to lookup identity: {error}")),
+    };
+
+    let artifacts = match state.store.list_session_artifacts(&session.id.to_string()) {
+        Ok(artifacts) => artifacts,
+        Err(error) => return internal_judge_bundle_error(format!("failed to list session artifacts: {error}")),
+    };
+
+    let bundle = build_judge_bundle(&session, &artifacts);
+
+    if let Err(error) = state.store.append_session_artifact(&SessionArtifactRecord {
+        id: random_prefixed_id("artifact"),
+        session_id: session.id.to_string(),
+        phase: session.phase,
+        step: 4,
+        kind: SessionArtifactKind::JudgeBundleGenerated,
+        player_id: Some(identity.player_id.clone()),
+        created_at: Utc::now().to_rfc3339(),
+        payload: json!({
+            "dragonCount": bundle.dragons.len(),
+            "artifactCount": bundle.artifact_count,
+        }),
+    }) {
+        return internal_judge_bundle_error(format!("failed to append session artifact: {error}"));
+    }
+
+    (
+        StatusCode::OK,
+        Json(WorkshopJudgeBundleResult::Success(WorkshopJudgeBundleSuccess {
+            ok: true,
+            bundle,
+        })),
+    )
+}
+
  async fn ready(State(state): State<AppState>) -> Json<serde_json::Value> {
      let store_healthy = state.store.health_check().unwrap_or(false);
 
@@ -686,6 +750,26 @@ async fn workshop_command(
      (
          StatusCode::INTERNAL_SERVER_ERROR,
          Json(WorkshopJoinResult::Error(WorkshopError {
+             ok: false,
+             error: message,
+         })),
+     )
+ }
+
+ fn bad_judge_bundle_request(message: &str) -> (StatusCode, Json<WorkshopJudgeBundleResult>) {
+     (
+         StatusCode::BAD_REQUEST,
+         Json(WorkshopJudgeBundleResult::Error(WorkshopError {
+             ok: false,
+             error: message.to_string(),
+         })),
+     )
+ }
+
+ fn internal_judge_bundle_error(message: String) -> (StatusCode, Json<WorkshopJudgeBundleResult>) {
+     (
+         StatusCode::INTERNAL_SERVER_ERROR,
+         Json(WorkshopJudgeBundleResult::Error(WorkshopError {
              ok: false,
              error: message,
          })),
@@ -845,6 +929,67 @@ async fn workshop_command(
      traces_by_dragon_id
  }
 
+ fn build_judge_bundle(session: &WorkshopSession, artifacts: &[SessionArtifactRecord]) -> JudgeBundle {
+     let mut vote_counts = BTreeMap::new();
+     if let Some(voting) = session.voting.as_ref() {
+         for dragon_id in voting.votes_by_player_id.values() {
+             *vote_counts.entry(dragon_id.clone()).or_insert(0) += 1;
+         }
+     }
+
+     let phase2_actions = build_judge_action_traces(session, artifacts);
+
+     JudgeBundle {
+         session_id: session.id.to_string(),
+         session_code: session.code.0.clone(),
+         current_phase: session.phase,
+         generated_at: Utc::now().to_rfc3339(),
+         artifact_count: artifacts.len() as i32,
+         players: session
+             .players
+             .values()
+             .map(|player| JudgePlayerSummary {
+                 player_id: player.id.clone(),
+                 name: player.name.clone(),
+                 score: player.score,
+                 achievements: player.achievements.clone(),
+             })
+             .collect(),
+         dragons: session
+             .dragons
+             .values()
+             .map(|dragon| JudgeDragonBundle {
+                 dragon_id: dragon.id.clone(),
+                 dragon_name: dragon.name.clone(),
+                 creator_player_id: dragon.original_owner_id.clone(),
+                 creator_name: session
+                     .players
+                     .get(&dragon.original_owner_id)
+                     .map(|player| player.name.clone())
+                     .unwrap_or_else(|| "Unknown".to_string()),
+                 current_owner_id: dragon.current_owner_id.clone(),
+                 current_owner_name: session
+                     .players
+                     .get(&dragon.current_owner_id)
+                     .map(|player| player.name.clone())
+                     .unwrap_or_else(|| "Unknown".to_string()),
+                 creative_vote_count: vote_counts.get(&dragon.id).copied().unwrap_or(0),
+                 final_stats: DragonStats {
+                     hunger: dragon.hunger,
+                     energy: dragon.energy,
+                     happiness: dragon.happiness,
+                 },
+                 handover_chain: JudgeHandoverChain {
+                     creator_instructions: dragon.creator_instructions.clone(),
+                     discovery_observations: dragon.discovery_observations.clone(),
+                     handover_tags: dragon.handover_tags.clone(),
+                 },
+                 phase2_actions: phase2_actions.get(&dragon.id).cloned().unwrap_or_default(),
+             })
+             .collect(),
+     }
+ }
+
  fn reject_disallowed_origin(
      headers: &HeaderMap,
      policy: &OriginPolicy,
@@ -874,6 +1019,24 @@ async fn workshop_command(
          Some((
              StatusCode::FORBIDDEN,
              Json(WorkshopCommandResult::Error(WorkshopError {
+                 ok: false,
+                 error: "Origin is not allowed.".to_string(),
+             })),
+         ))
+     }
+ }
+
+ fn reject_disallowed_judge_bundle_origin(
+     headers: &HeaderMap,
+     policy: &OriginPolicy,
+ ) -> Option<(StatusCode, Json<WorkshopJudgeBundleResult>)> {
+     let origin = headers.get("origin").and_then(|value| value.to_str().ok());
+     if security::is_origin_allowed(origin, policy) {
+         None
+     } else {
+         Some((
+             StatusCode::FORBIDDEN,
+             Json(WorkshopJudgeBundleResult::Error(WorkshopError {
                  ok: false,
                  error: "Origin is not allowed.".to_string(),
              })),
@@ -1070,6 +1233,223 @@ async fn workshop_command(
          assert_eq!(dragon_traces[0].action_type, "unknown");
          assert_eq!(dragon_traces[0].action_value, None);
          assert_eq!(dragon_traces[0].resulting_stats, None);
+     }
+
+     #[tokio::test]
+     async fn workshop_judge_bundle_rejects_invalid_credentials() {
+         let state = test_state();
+         let app = build_app(state.clone());
+         let create_response = app
+             .clone()
+             .oneshot(
+                 Request::builder()
+                     .method("POST")
+                     .uri("/api/workshops")
+                     .header("content-type", "application/json")
+                     .body(Body::from(r#"{"name":"Alice"}"#))
+                     .expect("build create request"),
+             )
+             .await
+             .expect("call create workshop");
+         let create_body = to_bytes(create_response.into_body(), usize::MAX).await.expect("read create body");
+         let create_result: WorkshopJoinResult = serde_json::from_slice(&create_body).expect("parse create result");
+         let session_code = match create_result {
+             WorkshopJoinResult::Success(success) => success.session_code,
+             WorkshopJoinResult::Error(error) => panic!("expected create success, got error: {}", error.error),
+         };
+
+         let response = app
+             .oneshot(
+                 Request::builder()
+                     .method("POST")
+                     .uri("/api/workshops/judge-bundle")
+                     .header("content-type", "application/json")
+                     .body(Body::from(format!(r#"{{"sessionCode":"{}","reconnectToken":"missing"}}"#, session_code)))
+                     .expect("build request"),
+             )
+             .await
+             .expect("call judge bundle endpoint");
+
+         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+         let body = to_bytes(response.into_body(), usize::MAX).await.expect("read judge bundle body");
+         let result: WorkshopJudgeBundleResult = serde_json::from_slice(&body).expect("parse judge bundle result");
+         match result {
+             WorkshopJudgeBundleResult::Error(error) => {
+                 assert_eq!(error.error, "Session identity is invalid or expired.");
+             }
+             WorkshopJudgeBundleResult::Success(_) => panic!("expected error response"),
+         }
+     }
+
+     #[tokio::test]
+     async fn workshop_judge_bundle_returns_bundle_for_completed_session() {
+         let state = test_state();
+         let app = build_app(state.clone());
+
+         let create_response = app
+             .clone()
+             .oneshot(
+                 Request::builder()
+                     .method("POST")
+                     .uri("/api/workshops")
+                     .header("content-type", "application/json")
+                     .body(Body::from(r#"{"name":"Alice"}"#))
+                     .expect("build create request"),
+             )
+             .await
+             .expect("call create workshop");
+         let create_body = to_bytes(create_response.into_body(), usize::MAX).await.expect("read create body");
+         let create_result: WorkshopJoinResult = serde_json::from_slice(&create_body).expect("parse create result");
+         let create_success = match create_result {
+             WorkshopJoinResult::Success(success) => success,
+             WorkshopJoinResult::Error(error) => panic!("expected create success, got error: {}", error.error),
+         };
+         let session_code = create_success.session_code.clone();
+
+         let join_response = app
+             .clone()
+             .oneshot(
+                 Request::builder()
+                     .method("POST")
+                     .uri("/api/workshops/join")
+                     .header("content-type", "application/json")
+                     .body(Body::from(format!(r#"{{"sessionCode":"{}","name":"Bob"}}"#, session_code)))
+                     .expect("build join request"),
+             )
+             .await
+             .expect("call join workshop");
+         let join_body = to_bytes(join_response.into_body(), usize::MAX).await.expect("read join body");
+         let join_result: WorkshopJoinResult = serde_json::from_slice(&join_body).expect("parse join result");
+         let join_success = match join_result {
+             WorkshopJoinResult::Success(success) => success,
+             WorkshopJoinResult::Error(error) => panic!("expected join success, got error: {}", error.error),
+         };
+
+         for request_body in [
+             format!(r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"startPhase1"}}"#, session_code, create_success.reconnect_token),
+             format!(r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"startHandover"}}"#, session_code, create_success.reconnect_token),
+             format!(r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"submitTags","payload":["one","two","three"]}}"#, session_code, create_success.reconnect_token),
+             format!(r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"submitTags","payload":["four","five","six"]}}"#, session_code, join_success.reconnect_token),
+             format!(r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"startPhase2"}}"#, session_code, create_success.reconnect_token),
+             format!(r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"endGame"}}"#, session_code, create_success.reconnect_token),
+         ] {
+             let response = app
+                 .clone()
+                 .oneshot(
+                     Request::builder()
+                         .method("POST")
+                         .uri("/api/workshops/command")
+                         .header("content-type", "application/json")
+                         .body(Body::from(request_body))
+                         .expect("build setup request"),
+                 )
+                 .await
+                 .expect("call setup command");
+             assert_eq!(response.status(), StatusCode::OK);
+         }
+
+         let sessions = state.sessions.lock().await;
+         let session = sessions.get(&session_code).expect("session exists");
+         let alice_dragon_id = session
+             .players
+             .get(&create_success.player_id)
+             .and_then(|player| player.current_dragon_id.clone())
+             .expect("alice dragon id");
+         let bob_dragon_id = session
+             .players
+             .get(&join_success.player_id)
+             .and_then(|player| player.current_dragon_id.clone())
+             .expect("bob dragon id");
+         let session_id = session.id.to_string();
+         drop(sessions);
+
+         for request_body in [
+             format!(r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"submitVote","payload":{{"dragonId":"{}"}}}}"#, session_code, create_success.reconnect_token, bob_dragon_id),
+             format!(r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"submitVote","payload":{{"dragonId":"{}"}}}}"#, session_code, join_success.reconnect_token, alice_dragon_id),
+         ] {
+             let response = app
+                 .clone()
+                 .oneshot(
+                     Request::builder()
+                         .method("POST")
+                         .uri("/api/workshops/command")
+                         .header("content-type", "application/json")
+                         .body(Body::from(request_body))
+                         .expect("build vote request"),
+                 )
+                 .await
+                 .expect("call submitVote command");
+             assert_eq!(response.status(), StatusCode::OK);
+         }
+
+         let reveal_response = app
+             .clone()
+             .oneshot(
+                 Request::builder()
+                     .method("POST")
+                     .uri("/api/workshops/command")
+                     .header("content-type", "application/json")
+                     .body(Body::from(format!(r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"revealVotingResults"}}"#, session_code, create_success.reconnect_token)))
+                     .expect("build reveal results request"),
+             )
+             .await
+             .expect("call revealVotingResults command");
+         assert_eq!(reveal_response.status(), StatusCode::OK);
+
+         state.store.append_session_artifact(&SessionArtifactRecord {
+             id: "artifact-action-1".into(),
+             session_id: session_id.clone(),
+             phase: protocol::Phase::Phase2,
+             step: 2,
+             kind: SessionArtifactKind::ActionProcessed,
+             player_id: Some(join_success.player_id.clone()),
+             created_at: "2026-01-01T00:00:00Z".into(),
+             payload: serde_json::json!({
+                 "dragonId": alice_dragon_id,
+                 "actionType": "feed",
+                 "actionValue": "meat",
+                 "hunger": 88,
+                 "energy": 100,
+                 "happiness": 97
+             }),
+         }).expect("append action artifact");
+
+         let response = app
+             .oneshot(
+                 Request::builder()
+                     .method("POST")
+                     .uri("/api/workshops/judge-bundle")
+                     .header("content-type", "application/json")
+                     .body(Body::from(format!(r#"{{"sessionCode":"{}","reconnectToken":"{}"}}"#, session_code, create_success.reconnect_token)))
+                     .expect("build judge bundle request"),
+             )
+             .await
+             .expect("call judge bundle endpoint");
+
+         assert_eq!(response.status(), StatusCode::OK);
+         let body = to_bytes(response.into_body(), usize::MAX).await.expect("read judge bundle body");
+         let result: WorkshopJudgeBundleResult = serde_json::from_slice(&body).expect("parse judge bundle result");
+         let success = match result {
+             WorkshopJudgeBundleResult::Success(success) => success,
+             WorkshopJudgeBundleResult::Error(error) => panic!("expected success, got error: {}", error.error),
+         };
+
+         assert!(success.ok);
+         assert_eq!(success.bundle.session_code, session_code);
+         assert_eq!(success.bundle.current_phase, protocol::Phase::End);
+         assert_eq!(success.bundle.players.len(), 2);
+         assert_eq!(success.bundle.dragons.len(), 2);
+         let judged_dragon = success
+             .bundle
+             .dragons
+             .iter()
+             .find(|dragon| dragon.dragon_id == alice_dragon_id)
+             .expect("judged dragon bundle");
+         assert_eq!(judged_dragon.creative_vote_count, 1);
+         assert_eq!(judged_dragon.handover_chain.discovery_observations, Vec::<String>::new());
+         assert_eq!(judged_dragon.phase2_actions.len(), 1);
+         assert_eq!(judged_dragon.phase2_actions[0].player_name, "Bob");
+         assert_eq!(judged_dragon.phase2_actions[0].action_type, "feed");
      }
 
      #[tokio::test]
