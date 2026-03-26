@@ -173,6 +173,37 @@ const APP_STYLE: &str = r#"
         display: grid;
         gap: 10px;
     }
+    .roster {
+        display: grid;
+        gap: 10px;
+    }
+    .roster__item {
+        border: 1px solid rgba(166, 185, 255, 0.16);
+        border-radius: 16px;
+        background: rgba(255, 255, 255, 0.04);
+        padding: 14px 16px;
+        display: flex;
+        justify-content: space-between;
+        gap: 12px;
+        align-items: center;
+    }
+    .roster__name {
+        margin: 0;
+        font-size: 14px;
+        font-weight: 700;
+    }
+    .roster__meta {
+        margin: 4px 0 0;
+        color: #9fb5df;
+        font-size: 12px;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+    }
+    .roster__status {
+        font-size: 12px;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+    }
 "#;
 
 fn main() {
@@ -217,6 +248,14 @@ struct SessionIdentity {
     session_code: String,
     player_id: String,
     reconnect_token: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LobbyPlayerRow {
+    name: String,
+    role_label: &'static str,
+    readiness_label: &'static str,
+    connectivity_label: &'static str,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -493,6 +532,69 @@ fn parse_tags_input(input: &str) -> Vec<String> {
 fn active_player_name(state: &ClientGameState) -> Option<String> {
     let player_id = state.current_player_id.as_ref()?;
     state.players.get(player_id).map(|player| player.name.clone())
+}
+
+fn phase_screen_title(phase: Phase) -> &'static str {
+    match phase {
+        Phase::Lobby => "Lobby setup",
+        Phase::Phase1 => "Phase 1 - Discovery",
+        Phase::Handover => "Handover",
+        Phase::Phase2 => "Phase 2 - Care loop",
+        Phase::Voting => "Voting",
+        Phase::End => "Workshop results",
+    }
+}
+
+fn phase_screen_body(phase: Phase) -> &'static str {
+    match phase {
+        Phase::Lobby => "Check the player roster, confirm reconnect status, and start when the workshop is ready.",
+        Phase::Phase1 => "Discovery controls and dragon observation screens are the next Sprint 7 slices.",
+        Phase::Handover => "Handover writing UX will move into a dedicated Dioxus screen in the next slices.",
+        Phase::Phase2 => "Phase 2 action panels will replace the generic shell once the gameplay screens land.",
+        Phase::Voting => "Voting UI will move from shell controls into a dedicated gameplay screen in Sprint 7.",
+        Phase::End => "Final results and judge bundle presentation will be expanded after the core gameplay screens.",
+    }
+}
+
+fn lobby_player_rows(state: &ClientGameState) -> Vec<LobbyPlayerRow> {
+    let mut players = state.players.values().collect::<Vec<_>>();
+    players.sort_by(|left, right| {
+        right
+            .is_host
+            .cmp(&left.is_host)
+            .then_with(|| left.name.to_ascii_lowercase().cmp(&right.name.to_ascii_lowercase()))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+
+    players
+        .into_iter()
+        .map(|player| LobbyPlayerRow {
+            name: player.name.clone(),
+            role_label: if player.is_host { "Host" } else { "Player" },
+            readiness_label: if player.is_ready { "Ready" } else { "Setting up" },
+            connectivity_label: if player.is_connected { "Online" } else { "Offline" },
+        })
+        .collect()
+}
+
+fn lobby_ready_summary(state: &ClientGameState) -> String {
+    let ready_count = state.players.values().filter(|player| player.is_ready).count();
+    format!("{ready_count} / {} ready", state.players.len())
+}
+
+fn lobby_status_copy(state: &ClientGameState) -> String {
+    let total_players = state.players.len();
+    let offline_players = state.players.values().filter(|player| !player.is_connected).count();
+
+    if total_players == 0 {
+        "No players have joined the workshop yet.".to_string()
+    } else if total_players == 1 {
+        "Single-player workshops can start as soon as the host is ready.".to_string()
+    } else if offline_players == 0 {
+        "All players are online. The host can start once the lobby is ready.".to_string()
+    } else {
+        format!("{offline_players} player(s) are currently offline and may need to reconnect before start.")
+    }
 }
 
 fn info_notice(message: &str) -> ShellNotice {
@@ -1015,6 +1117,34 @@ fn App() -> Element {
         .as_ref()
         .map(|session| session.players.len().to_string())
         .unwrap_or_else(|| "0".to_string());
+    let session_phase_title = shell
+        .session_state
+        .as_ref()
+        .map(|session| phase_screen_title(session.phase))
+        .unwrap_or("Awaiting session");
+    let session_phase_body = shell
+        .session_state
+        .as_ref()
+        .map(|session| phase_screen_body(session.phase))
+        .unwrap_or("Connect to a workshop to see the active gameplay screen.");
+    let lobby_rows = shell
+        .session_state
+        .as_ref()
+        .filter(|session| session.phase == Phase::Lobby)
+        .map(lobby_player_rows)
+        .unwrap_or_default();
+    let lobby_ready_label = shell
+        .session_state
+        .as_ref()
+        .filter(|session| session.phase == Phase::Lobby)
+        .map(lobby_ready_summary)
+        .unwrap_or_else(|| "—".to_string());
+    let lobby_status_label = shell
+        .session_state
+        .as_ref()
+        .filter(|session| session.phase == Phase::Lobby)
+        .map(lobby_status_copy)
+        .unwrap_or_default();
 
     use_effect(move || {
         if should_bootstrap_realtime {
@@ -1141,6 +1271,26 @@ fn App() -> Element {
                             p { class: "panel__body", "Active player: " {active_player_label} }
                             p { class: "panel__body", "Current phase: " {session_phase_label} }
                             p { class: "panel__body", "Visible players: " {players_count_label} }
+                        }
+                        h3 { class: "panel__title", {session_phase_title} }
+                        p { class: "panel__body", {session_phase_body} }
+                        if !lobby_rows.is_empty() {
+                            p { class: "meta", "Lobby readiness: " {lobby_ready_label} }
+                            p { class: "meta", {lobby_status_label.clone()} }
+                            div { class: "roster",
+                                for row in lobby_rows {
+                                    article { class: "roster__item",
+                                        div {
+                                            p { class: "roster__name", {row.name} }
+                                            p { class: "roster__meta", {row.role_label} " - " {row.readiness_label} }
+                                        }
+                                        span {
+                                            class: format!("roster__status {}", if row.connectivity_label == "Online" { "status-connected" } else { "status-offline" }),
+                                            {row.connectivity_label}
+                                        }
+                                    }
+                                }
+                            }
                         }
                         div { class: "button-row",
                             button {
@@ -1415,6 +1565,59 @@ mod tests {
         let tags = parse_tags_input(" one, two ,, three , ");
 
         assert_eq!(tags, vec!["one", "two", "three"]);
+    }
+
+    #[test]
+    fn phase_screen_copy_matches_lobby_and_voting_states() {
+        assert_eq!(phase_screen_title(Phase::Lobby), "Lobby setup");
+        assert_eq!(phase_screen_title(Phase::Voting), "Voting");
+        assert_eq!(
+            phase_screen_body(Phase::Lobby),
+            "Check the player roster, confirm reconnect status, and start when the workshop is ready."
+        );
+    }
+
+    #[test]
+    fn lobby_player_rows_prioritize_host_and_map_labels() {
+        let mut state = mock_join_success().state;
+        state.players.insert(
+            "player-2".to_string(),
+            Player {
+                id: "player-2".to_string(),
+                name: "Bob".to_string(),
+                is_host: false,
+                score: 0,
+                current_dragon_id: None,
+                achievements: Vec::new(),
+                is_ready: true,
+                is_connected: false,
+                pet_description: Some("Bob's workshop dragon".to_string()),
+            },
+        );
+
+        let rows = lobby_player_rows(&state);
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].name, "Alice");
+        assert_eq!(rows[0].role_label, "Host");
+        assert_eq!(rows[0].readiness_label, "Setting up");
+        assert_eq!(rows[1].name, "Bob");
+        assert_eq!(rows[1].connectivity_label, "Offline");
+        assert_eq!(rows[1].readiness_label, "Ready");
+    }
+
+    #[test]
+    fn lobby_status_copy_handles_empty_and_single_player_states() {
+        let mut empty_state = mock_join_success().state;
+        empty_state.players.clear();
+        assert_eq!(lobby_status_copy(&empty_state), "No players have joined the workshop yet.");
+
+        let single_player_state = mock_join_success().state;
+        assert_eq!(
+            lobby_status_copy(&single_player_state),
+            "Single-player workshops can start as soon as the host is ready."
+        );
+        assert_eq!(lobby_ready_summary(&single_player_state), "0 / 1 ready");
     }
 
     #[test]
