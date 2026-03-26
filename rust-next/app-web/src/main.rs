@@ -664,6 +664,32 @@ fn phase1_observation_summary(state: &ClientGameState) -> String {
     }
 }
 
+fn handover_focus_title(state: &ClientGameState) -> String {
+    current_dragon(state)
+        .map(|dragon| format!("Handover for {}", dragon.name))
+        .unwrap_or_else(|| "Awaiting dragon handover".to_string())
+}
+
+fn handover_saved_tags(state: &ClientGameState) -> Vec<String> {
+    current_dragon(state)
+        .map(|dragon| dragon.handover_tags.clone())
+        .unwrap_or_default()
+}
+
+fn handover_saved_summary(state: &ClientGameState) -> String {
+    let saved_count = handover_saved_tags(state).len();
+    format!("{saved_count} / 3 handover rules saved")
+}
+
+fn handover_status_copy(state: &ClientGameState) -> String {
+    let saved_count = handover_saved_tags(state).len();
+    match saved_count {
+        0 => "Write three concrete care rules so the next player can continue without re-discovering everything.".to_string(),
+        1 | 2 => format!("Add {} more rule(s) to complete the handover bundle.", 3 - saved_count),
+        _ => "Handover bundle is complete. Host can move the workshop into Phase 2 once everyone finishes.".to_string(),
+    }
+}
+
 fn info_notice(message: &str) -> ShellNotice {
     ShellNotice {
         tone: NoticeTone::Info,
@@ -1244,6 +1270,31 @@ fn App() -> Element {
         .and_then(current_dragon)
         .map(|dragon| dragon_action_label(dragon.last_action))
         .unwrap_or("");
+    let handover_title = shell
+        .session_state
+        .as_ref()
+        .filter(|session| session.phase == Phase::Handover)
+        .map(handover_focus_title)
+        .unwrap_or_default();
+    let handover_summary = shell
+        .session_state
+        .as_ref()
+        .filter(|session| session.phase == Phase::Handover)
+        .map(handover_saved_summary)
+        .unwrap_or_default();
+    let handover_status = shell
+        .session_state
+        .as_ref()
+        .filter(|session| session.phase == Phase::Handover)
+        .map(handover_status_copy)
+        .unwrap_or_default();
+    let handover_saved = shell
+        .session_state
+        .as_ref()
+        .filter(|session| session.phase == Phase::Handover)
+        .map(handover_saved_tags)
+        .unwrap_or_default();
+    let handover_draft_count = parse_tags_input(&shell.handover_tags_input).len();
 
     use_effect(move || {
         if should_bootstrap_realtime {
@@ -1402,6 +1453,30 @@ fn App() -> Element {
                                 span { class: "roster__status status-connecting", "Discovery" }
                             }
                             p { class: "panel__body", {phase1_body} }
+                        }
+                        if !handover_title.is_empty() {
+                            article { class: "roster__item",
+                                div {
+                                    p { class: "roster__name", {handover_title} }
+                                    p { class: "roster__meta", {handover_summary.clone()} }
+                                }
+                                span { class: "roster__status status-connecting", "Handover" }
+                            }
+                            p { class: "panel__body", {handover_status.clone()} }
+                            p { class: "meta", "Draft rules parsed from input: " {handover_draft_count.to_string()} }
+                            if !handover_saved.is_empty() {
+                                div { class: "roster",
+                                    for tag in handover_saved {
+                                        article { class: "roster__item",
+                                            div {
+                                                p { class: "roster__name", {tag} }
+                                                p { class: "roster__meta", "Saved handover rule" }
+                                            }
+                                            span { class: "roster__status status-connected", "Saved" }
+                                        }
+                                    }
+                                }
+                            }
                         }
                         div { class: "button-row",
                             button {
@@ -1784,6 +1859,36 @@ mod tests {
 
         assert_eq!(phase1_focus_title(&state), "Awaiting assigned dragon");
         assert_eq!(phase1_observation_summary(&state), "No discovery notes saved yet.");
+    }
+
+    fn mock_handover_state() -> ClientGameState {
+        let mut state = mock_phase1_state();
+        state.phase = Phase::Handover;
+        state
+            .dragons
+            .get_mut("dragon-1")
+            .expect("dragon-1")
+            .handover_tags = vec!["Feed at dusk".to_string(), "Avoid long idle gaps".to_string()];
+        state
+    }
+
+    #[test]
+    fn handover_helpers_report_saved_rules_and_remaining_work() {
+        let state = mock_handover_state();
+
+        assert_eq!(handover_focus_title(&state), "Handover for Comet");
+        assert_eq!(handover_saved_summary(&state), "2 / 3 handover rules saved");
+        assert_eq!(handover_saved_tags(&state).len(), 2);
+        assert_eq!(handover_status_copy(&state), "Add 1 more rule(s) to complete the handover bundle.");
+    }
+
+    #[test]
+    fn handover_helpers_handle_empty_bundle() {
+        let mut state = mock_phase1_state();
+        state.phase = Phase::Handover;
+
+        assert_eq!(handover_saved_summary(&state), "0 / 3 handover rules saved");
+        assert!(handover_status_copy(&state).contains("Write three concrete care rules"));
     }
 
     #[test]
