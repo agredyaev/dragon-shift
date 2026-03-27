@@ -288,6 +288,37 @@
 - staging проходит полный сценарий без Node/TS path
 - production готов к cutover
 
+### Current Status
+
+- `host failover` и `offline behavior` теперь подтверждаются не только доменом, но и runtime-путём `WebSocket detach -> session player is_connected = false -> host reassignment`
+- `app-server` синхронизирует `WS`-disconnect в session state, пишет `PlayerLeft` artifact и поднимает игрока обратно в `is_connected = true` при повторном attach/reconnect
+- `app-server` теперь пушит персонализированные `ServerWsMessage::StateUpdate` после `join`, `reconnect`, успешных `workshop_command` и `WS`-disconnect/failover, то есть realtime path стал authoritative для runtime state
+- `app-web` больше не двигает phase locally через optimistic mutation: shell ждёт pushed `WebSocket` state и использует его как authoritative source of truth
+- Dioxus shell получил расширенный pixel-style visual слой для `Current session`, `Workshop controls`, `Judge bundle` и runtime readiness экранов, что закрывает первый критичный visual parity gap без возврата к legacy path
+- в `xtask` добавлен live smoke `smoke-offline-failover` для сценария `attach -> disconnect -> failover -> reconnect -> reset`
+- оформлены Sprint 9 артефакты:
+  - `rust-next/SPRINT9_SMOKE_CHECKLIST.md`
+  - `rust-next/SPRINT9_ROLLBACK_PLAN.md`
+
+### Validated Now
+
+- `cargo test --manifest-path /Users/fingerbib/Project/dragon-switch/rust-next/Cargo.toml --workspace`
+- `cargo test --manifest-path /Users/fingerbib/Project/dragon-switch/rust-next/Cargo.toml -p app-server`
+- `cargo test --manifest-path /Users/fingerbib/Project/dragon-switch/rust-next/Cargo.toml -p app-web`
+- `cargo test --manifest-path /Users/fingerbib/Project/dragon-switch/rust-next/Cargo.toml -p xtask`
+- `cargo run --manifest-path /Users/fingerbib/Project/dragon-switch/rust-next/Cargo.toml -p xtask -- smoke-phase1 --base-url http://127.0.0.1:4100`
+- `cargo run --manifest-path /Users/fingerbib/Project/dragon-switch/rust-next/Cargo.toml -p xtask -- smoke-judge-bundle --base-url http://127.0.0.1:4100`
+- `cargo run --manifest-path /Users/fingerbib/Project/dragon-switch/rust-next/Cargo.toml -p xtask -- smoke-offline-failover --base-url http://127.0.0.1:4100`
+
+### Remaining Sprint 9 Blockers
+
+- core realtime/session-state drift gap закрыт, но browser-level confirmation этого пути всё ещё не автоматизировано
+- critical shell/style parity gap существенно сокращён локально, но всё ещё не подтверждён отдельным browser/staging walkthrough
+- automated browser E2E всё ещё отсутствует
+- staging deployment не выполнен и не подтверждён отдельным staging прогоном
+- следовательно, формальное `Definition of Done` Sprint 9 ещё не достигнуто
+- production cutover и Sprint 10 `Legacy Purge` остаются заблокированными до staging и browser-level подтверждения
+
 ## Sprint 10 - Legacy Purge
 
 ### Goals

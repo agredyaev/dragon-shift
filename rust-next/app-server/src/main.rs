@@ -9,15 +9,16 @@ use axum::{
     Json, Router,
 };
 use chrono::Utc;
-use domain::{DomainError, Phase1Assignment, SessionCode, SessionPlayer, WorkshopSession};
+use domain::{DomainError, Phase1Assignment, PlayerAction, SessionCode, SessionPlayer, WorkshopSession};
 use persistence::{InMemorySessionStore, SessionStore};
 use protocol::{
-    create_default_session_settings, ClientGameState, ClientWsMessage, CoordinatorType, CreateWorkshopRequest,
-    DragonStats, JudgeActionTrace, JudgeBundle, JudgeDragonBundle, JudgeHandoverChain,
-    JudgePlayerSummary, JoinWorkshopRequest, Player, SessionArtifactKind, SessionArtifactRecord, SessionMeta,
-    ServerWsMessage, SessionCommand, SessionEnvelope, VotePayload, WorkshopCommandRequest,
-    WorkshopCommandResult, WorkshopCommandSuccess, WorkshopError, WorkshopJoinResult, WorkshopJoinSuccess, WorkshopJudgeBundleRequest,
-    WorkshopJudgeBundleResult, WorkshopJudgeBundleSuccess,
+    create_default_session_settings, ActionPayload, ClientGameState, ClientWsMessage, CoordinatorType,
+    CreateWorkshopRequest, DiscoveryObservationRequest, DragonStats, FoodType, JudgeActionTrace,
+    JudgeBundle, JudgeDragonBundle, JudgeHandoverChain, JudgePlayerSummary, JoinWorkshopRequest,
+    PlayType, Player, SessionArtifactKind, SessionArtifactRecord, SessionMeta, ServerWsMessage,
+    SessionCommand, SessionEnvelope, VotePayload, WorkshopCommandRequest, WorkshopCommandResult,
+    WorkshopCommandSuccess, WorkshopError, WorkshopJoinResult, WorkshopJoinSuccess,
+    WorkshopJudgeBundleRequest, WorkshopJudgeBundleResult, WorkshopJudgeBundleSuccess,
 };
 use realtime::SessionRegistry;
 use security::{
@@ -29,7 +30,7 @@ use serde_json::json;
 use std::{
     collections::BTreeMap, env, net::SocketAddr, str::FromStr, sync::Arc,
 };
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, Mutex};
 use tower_http::trace::TraceLayer;
 use tracing::info;
 use uuid::Uuid;
@@ -50,6 +51,7 @@ struct AppState {
     create_limiter: Arc<Mutex<FixedWindowRateLimiter>>,
     join_limiter: Arc<Mutex<FixedWindowRateLimiter>>,
     realtime: Arc<Mutex<SessionRegistry>>,
+    realtime_senders: Arc<Mutex<BTreeMap<String, mpsc::UnboundedSender<ServerWsMessage>>>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -61,6 +63,13 @@ struct RuntimeSnapshot {
     require_origin: bool,
     allowed_origins: Vec<String>,
     active_realtime_sessions: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WsAttachOutcome {
+    session_code: String,
+    replaced_connection_id: Option<String>,
+    state_changed: bool,
 }
 
 #[tokio::main]
@@ -80,6 +89,7 @@ async fn main() {
         create_limiter: Arc::new(Mutex::new(FixedWindowRateLimiter::new(20, 60_000))),
         join_limiter: Arc::new(Mutex::new(FixedWindowRateLimiter::new(40, 60_000))),
         realtime: Arc::new(Mutex::new(SessionRegistry::new())),
+        realtime_senders: Arc::new(Mutex::new(BTreeMap::new())),
     };
 
     let app = build_app(state);
@@ -151,63 +161,216 @@ async fn workshop_ws(
 }
 
 async fn handle_workshop_ws(state: AppState, mut socket: WebSocket) {
+    let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel();
     let mut attached_connection_id: Option<String> = None;
 
-    while let Some(message_result) = socket.recv().await {
-        let Ok(message) = message_result else {
-            break;
-        };
+    loop {
+        tokio::select! {
+            outbound_message = outbound_rx.recv() => {
+                let Some(outbound_message) = outbound_message else {
+                    break;
+                };
+                if send_ws_message(&mut socket, &outbound_message).await.is_err() {
+                    break;
+                }
+            }
+            message_result = socket.recv() => {
+                let Some(message_result) = message_result else {
+                    break;
+                };
+                let Ok(message) = message_result else {
+                    break;
+                };
 
-        match message {
-            Message::Text(text) => match serde_json::from_str::<ClientWsMessage>(&text) {
-                Ok(ClientWsMessage::AttachSession(envelope)) => {
-                    let connection_id = attached_connection_id
-                        .clone()
-                        .unwrap_or_else(|| random_prefixed_id("conn"));
-                    match attach_ws_session(&state, &mut socket, &envelope, &connection_id).await {
-                        Ok(()) => attached_connection_id = Some(connection_id),
-                        Err(error_message) => {
-                            if send_ws_message(&mut socket, &ServerWsMessage::Error { message: error_message })
-                                .await
-                                .is_err()
+                match message {
+                    Message::Text(text) => match serde_json::from_str::<ClientWsMessage>(&text) {
+                        Ok(ClientWsMessage::AttachSession(envelope)) => {
+                            let connection_id = attached_connection_id
+                                .clone()
+                                .unwrap_or_else(|| random_prefixed_id("conn"));
+                            match attach_ws_session(&state, &mut socket, &envelope, &connection_id).await {
+                                Ok(outcome) => {
+                                    register_ws_sender(&state, &connection_id, outbound_tx.clone()).await;
+                                    if let Some(replaced_connection_id) = outcome.replaced_connection_id.as_deref() {
+                                        if replaced_connection_id != connection_id.as_str() {
+                                            unregister_ws_sender(&state, replaced_connection_id).await;
+                                        }
+                                    }
+                                    if outcome.state_changed {
+                                        broadcast_session_state(&state, &outcome.session_code, Some(connection_id.as_str())).await;
+                                    }
+                                    attached_connection_id = Some(connection_id);
+                                }
+                                Err(error_message) => {
+                                    if send_ws_message(&mut socket, &ServerWsMessage::Error { message: error_message })
+                                        .await
+                                        .is_err()
+                                    {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        Ok(ClientWsMessage::Ping) => {
+                            if send_ws_message(&mut socket, &ServerWsMessage::Pong).await.is_err() {
+                                break;
+                            }
+                        }
+                        Err(_) => {
+                            if send_ws_message(
+                                &mut socket,
+                                &ServerWsMessage::Error {
+                                    message: "Invalid WebSocket payload.".to_string(),
+                                },
+                            )
+                            .await
+                            .is_err()
                             {
                                 break;
                             }
                         }
+                    },
+                    Message::Ping(payload) => {
+                        if socket.send(Message::Pong(payload)).await.is_err() {
+                            break;
+                        }
                     }
-                }
-                Ok(ClientWsMessage::Ping) => {
-                    if send_ws_message(&mut socket, &ServerWsMessage::Pong).await.is_err() {
-                        break;
-                    }
-                }
-                Err(_) => {
-                    if send_ws_message(
-                        &mut socket,
-                        &ServerWsMessage::Error {
-                            message: "Invalid WebSocket payload.".to_string(),
-                        },
-                    )
-                    .await
-                    .is_err()
-                    {
-                        break;
-                    }
-                }
-            },
-            Message::Ping(payload) => {
-                if socket.send(Message::Pong(payload)).await.is_err() {
-                    break;
+                    Message::Close(_) => break,
+                    _ => {}
                 }
             }
-            Message::Close(_) => break,
-            _ => {}
         }
     }
 
     if let Some(connection_id) = attached_connection_id {
-        state.realtime.lock().await.detach(&connection_id);
+        unregister_ws_sender(&state, &connection_id).await;
+        sync_ws_disconnect(&state, &connection_id).await;
     }
+}
+
+async fn register_ws_sender(
+    state: &AppState,
+    connection_id: &str,
+    sender: mpsc::UnboundedSender<ServerWsMessage>,
+) {
+    state
+        .realtime_senders
+        .lock()
+        .await
+        .insert(connection_id.to_string(), sender);
+}
+
+async fn unregister_ws_sender(state: &AppState, connection_id: &str) {
+    state.realtime_senders.lock().await.remove(connection_id);
+}
+
+async fn broadcast_session_state(
+    state: &AppState,
+    session_code: &str,
+    excluded_connection_id: Option<&str>,
+) {
+    let registrations = state.realtime.lock().await.session_registrations(session_code);
+    if registrations.is_empty() {
+        return;
+    }
+
+    let messages = {
+        let sessions = state.sessions.lock().await;
+        let Some(session) = sessions.get(session_code) else {
+            return;
+        };
+
+        registrations
+            .into_iter()
+            .filter(|registration| Some(registration.connection_id.as_str()) != excluded_connection_id)
+            .map(|registration| {
+                (
+                    registration.connection_id,
+                    ServerWsMessage::StateUpdate(to_client_game_state(session, &registration.player_id)),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+
+    if messages.is_empty() {
+        return;
+    }
+
+    let failed_connection_ids = {
+        let senders = state.realtime_senders.lock().await;
+        messages
+            .into_iter()
+            .filter_map(|(connection_id, message)| match senders.get(&connection_id) {
+                Some(sender) => sender.send(message).err().map(|_| connection_id),
+                None => None,
+            })
+            .collect::<Vec<_>>()
+    };
+
+    if !failed_connection_ids.is_empty() {
+        let mut senders = state.realtime_senders.lock().await;
+        for connection_id in failed_connection_ids {
+            senders.remove(&connection_id);
+        }
+    }
+}
+
+async fn sync_ws_disconnect(state: &AppState, connection_id: &str) {
+    let Some(registration) = state.realtime.lock().await.detach(connection_id) else {
+        return;
+    };
+
+    let timestamp = Utc::now();
+    let session_code = registration.session_code;
+    let player_id = registration.player_id;
+    let disconnect_payload = json!({
+        "sessionCode": session_code.clone(),
+        "playerId": player_id.clone(),
+    });
+
+    let disconnect_state = {
+        let mut sessions = state.sessions.lock().await;
+        match sessions.get_mut(session_code.as_str()) {
+            Some(session) => match session.players.get_mut(player_id.as_str()) {
+                Some(player) if player.is_connected => {
+                    player.is_connected = false;
+                    session.ensure_host_assigned(true);
+                    session.updated_at = timestamp;
+                    Some((
+                        session.summary(),
+                        session.id.to_string(),
+                        session.phase,
+                        phase_step(session.phase),
+                    ))
+                }
+                _ => None,
+            },
+            None => None,
+        }
+    };
+
+    let Some((summary, session_id, phase, step)) = disconnect_state else {
+        return;
+    };
+
+    if let Err(error) = state.store.save_session(&summary) {
+        info!(session_code = %summary.code.0, player_id = %player_id, error = %error, "failed to persist websocket disconnect session state");
+    }
+
+    if let Err(error) = state.store.append_session_artifact(&SessionArtifactRecord {
+        id: random_prefixed_id("artifact"),
+        session_id,
+        phase,
+        step,
+        kind: SessionArtifactKind::PlayerLeft,
+        player_id: Some(player_id.clone()),
+        created_at: timestamp.to_rfc3339(),
+        payload: disconnect_payload,
+    }) {
+        info!(session_code = %summary.code.0, player_id = %player_id, error = %error, "failed to append websocket disconnect artifact");
+    }
+
+    broadcast_session_state(state, &summary.code.0, None).await;
 }
 
 async fn attach_ws_session(
@@ -215,7 +378,7 @@ async fn attach_ws_session(
     socket: &mut WebSocket,
     envelope: &SessionEnvelope,
     connection_id: &str,
-) -> Result<(), String> {
+) -> Result<WsAttachOutcome, String> {
     let session_code = envelope.session_code.trim();
     let reconnect_token = envelope.reconnect_token.trim();
     let player_id = envelope.player_id.trim();
@@ -236,15 +399,59 @@ async fn attach_ws_session(
         return Err("Session identity is invalid or expired.".to_string());
     }
 
+    let mut reconnect_artifact: Option<SessionArtifactRecord> = None;
+
     let client_state = {
-        let sessions = state.sessions.lock().await;
+        let mut sessions = state.sessions.lock().await;
         let session = sessions
-            .get(session_code)
+            .get_mut(session_code)
             .ok_or_else(|| "Workshop not found.".to_string())?;
-        to_client_game_state(session, &identity.player_id)
+        let player = session
+            .players
+            .get(&identity.player_id)
+            .ok_or_else(|| "Session identity is invalid or expired.".to_string())?;
+        if !player.is_connected {
+            session
+                .players
+                .get_mut(&identity.player_id)
+                .expect("player checked above")
+                .is_connected = true;
+            session.ensure_host_assigned(true);
+            session.updated_at = Utc::now();
+            reconnect_artifact = Some(SessionArtifactRecord {
+                id: random_prefixed_id("artifact"),
+                session_id: session.id.to_string(),
+                phase: session.phase,
+                step: phase_step(session.phase),
+                kind: SessionArtifactKind::PlayerReconnected,
+                player_id: Some(identity.player_id.clone()),
+                created_at: session.updated_at.to_rfc3339(),
+                payload: json!({
+                    "sessionCode": session_code,
+                    "playerId": identity.player_id.clone(),
+                    "transport": "websocket",
+                }),
+            });
+        }
+        let client_state = to_client_game_state(session, &identity.player_id);
+        if reconnect_artifact.is_some() {
+            if let Err(error) = state.store.save_session(&session.summary()) {
+                return Err(format!("failed to save session: {error}"));
+            }
+        }
+        client_state
     };
 
-    state
+    let state_changed = reconnect_artifact.is_some();
+
+    if let Some(artifact) = reconnect_artifact {
+        state
+            .store
+            .append_session_artifact(&artifact)
+            .map_err(|error| format!("failed to append reconnect artifact: {error}"))?;
+    }
+
+    let attach_result = state
         .realtime
         .lock()
         .await
@@ -252,7 +459,13 @@ async fn attach_ws_session(
 
     send_ws_message(socket, &ServerWsMessage::StateUpdate(client_state))
         .await
-        .map_err(|_| "connection is closed".to_string())
+        .map_err(|_| "connection is closed".to_string())?;
+
+    Ok(WsAttachOutcome {
+        session_code: session_code.to_string(),
+        replaced_connection_id: attach_result.replaced_connection_id,
+        state_changed,
+    })
 }
 
 async fn send_ws_message(socket: &mut WebSocket, message: &ServerWsMessage) -> Result<(), ()> {
@@ -367,6 +580,70 @@ async fn join_workshop(
         return bad_join_request("Workshop codes must be 6 digits.");
     }
 
+    if let Some(reconnect_token) = payload
+        .reconnect_token
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        let identity = match state.store.find_player_identity(session_code, reconnect_token) {
+            Ok(Some(identity)) => identity,
+            Ok(None) => return bad_join_request("Session identity is invalid or expired."),
+            Err(error) => return internal_join_error(format!("failed to lookup player identity: {error}")),
+        };
+
+        let timestamp = Utc::now();
+        let mut sessions = state.sessions.lock().await;
+        let Some(session) = sessions.get_mut(session_code) else {
+            return bad_join_request("Workshop not found.");
+        };
+        let Some(player) = session.players.get_mut(&identity.player_id) else {
+            return bad_join_request("Session identity is invalid or expired.");
+        };
+        player.is_connected = true;
+        session.ensure_host_assigned(true);
+        session.updated_at = timestamp;
+
+        if let Err(error) = state.store.save_session(&session.summary()) {
+            return internal_join_error(format!("failed to save session: {error}"));
+        }
+        if let Err(error) = state.store.touch_player_identity(reconnect_token, &timestamp.to_rfc3339()) {
+            return internal_join_error(format!("failed to touch player identity: {error}"));
+        }
+        if let Err(error) = state.store.append_session_artifact(&SessionArtifactRecord {
+            id: random_prefixed_id("artifact"),
+            session_id: session.id.to_string(),
+            phase: session.phase,
+            step: match session.phase {
+                protocol::Phase::Lobby => 0,
+                protocol::Phase::Phase1 => 1,
+                protocol::Phase::Handover => 2,
+                protocol::Phase::Phase2 | protocol::Phase::Voting => 3,
+                protocol::Phase::End => 4,
+            },
+            kind: SessionArtifactKind::PlayerReconnected,
+            player_id: Some(identity.player_id.clone()),
+            created_at: timestamp.to_rfc3339(),
+            payload: json!({ "sessionCode": session_code, "playerId": identity.player_id.clone() }),
+        }) {
+            return internal_join_error(format!("failed to append session artifact: {error}"));
+        }
+
+        let response = WorkshopJoinSuccess {
+            ok: true,
+            session_code: session.code.0.clone(),
+            player_id: identity.player_id.clone(),
+            reconnect_token: reconnect_token.to_string(),
+            coordinator_type: CoordinatorType::Rust,
+            state: to_client_game_state(session, &identity.player_id),
+        };
+
+        let response = (StatusCode::OK, Json(WorkshopJoinResult::Success(response)));
+        drop(sessions);
+        broadcast_session_state(&state, session_code, None).await;
+        return response;
+    }
+
     let normalized_name = payload.name.unwrap_or_default().trim().to_string();
     if normalized_name.is_empty() {
         return bad_join_request("Please enter a player name.");
@@ -438,7 +715,10 @@ async fn join_workshop(
         state: to_client_game_state(session, &player_id),
     };
 
-    (StatusCode::OK, Json(WorkshopJoinResult::Success(response)))
+    let response = (StatusCode::OK, Json(WorkshopJoinResult::Success(response)));
+    drop(sessions);
+    broadcast_session_state(&state, session_code, None).await;
+    response
 }
 
 async fn workshop_command(
@@ -462,12 +742,14 @@ async fn workshop_command(
         Err(error) => return internal_command_error(format!("failed to lookup identity: {error}")),
     };
 
-    let mut sessions = state.sessions.lock().await;
-    let Some(session) = sessions.get_mut(session_code) else {
-        return bad_command_request("Workshop not found.");
-    };
+    let (response, should_broadcast) = {
+        let mut sessions = state.sessions.lock().await;
+        let Some(session) = sessions.get_mut(session_code) else {
+            return bad_command_request("Workshop not found.");
+        };
+        let mut should_broadcast = false;
 
-    match request.command {
+        let response = match request.command {
         SessionCommand::StartPhase1 => {
             if session.host_player_id.as_deref() != Some(identity.player_id.as_str()) {
                 return bad_command_request("Only the host can start the workshop.");
@@ -504,10 +786,129 @@ async fn workshop_command(
                 return internal_command_error(format!("failed to append session artifact: {error}"));
             }
 
-            (
-                StatusCode::OK,
-                Json(WorkshopCommandResult::Success(WorkshopCommandSuccess { ok: true })),
-            )
+            successful_workshop_command(&mut should_broadcast)
+        }
+        SessionCommand::SubmitObservation => {
+            if session.phase != protocol::Phase::Phase1 {
+                return bad_command_request("Observations can only be saved during Phase 1.");
+            }
+            let payload = match request.payload.clone() {
+                Some(value) => serde_json::from_value::<DiscoveryObservationRequest>(value).ok(),
+                None => None,
+            };
+            let Some(payload) = payload else {
+                return bad_command_request("Observation payload is invalid.");
+            };
+            let text = payload.text.trim();
+            if text.is_empty() {
+                return bad_command_request("Observation text is required.");
+            }
+            let dragon_id = session
+                .players
+                .get(&identity.player_id)
+                .and_then(|player| player.current_dragon_id.clone())
+                .ok_or_else(|| bad_command_request("Player is not assigned to a dragon."));
+            let Ok(dragon_id) = dragon_id else {
+                return dragon_id.err().expect("dragon assignment error");
+            };
+
+            session.record_discovery_observation(&identity.player_id, text.to_string());
+            if let Err(error) = state.store.save_session(&session.summary()) {
+                return internal_command_error(format!("failed to save session: {error}"));
+            }
+            if let Err(error) = state.store.append_session_artifact(&SessionArtifactRecord {
+                id: random_prefixed_id("artifact"),
+                session_id: session.id.to_string(),
+                phase: session.phase,
+                step: phase_step(session.phase),
+                kind: SessionArtifactKind::DiscoveryObservationSaved,
+                player_id: Some(identity.player_id.clone()),
+                created_at: Utc::now().to_rfc3339(),
+                payload: json!({ "dragonId": dragon_id, "text": text }),
+            }) {
+                return internal_command_error(format!("failed to append session artifact: {error}"));
+            }
+
+            successful_workshop_command(&mut should_broadcast)
+        }
+        SessionCommand::Action => {
+            let payload = match request.payload.clone() {
+                Some(value) => serde_json::from_value::<ActionPayload>(value).ok(),
+                None => None,
+            };
+            let Some(payload) = payload else {
+                return bad_command_request("Action payload is invalid.");
+            };
+            let Some(action) = parse_player_action(&payload) else {
+                return bad_command_request("Action payload is invalid.");
+            };
+            let dragon_id = match session
+                .players
+                .get(&identity.player_id)
+                .and_then(|player| player.current_dragon_id.clone())
+            {
+                Some(dragon_id) => dragon_id,
+                None => return bad_command_request("Player is not assigned to a dragon."),
+            };
+            let action_type = payload.action_type.trim().to_ascii_lowercase();
+            let action_value = payload.value.as_deref().map(str::trim).filter(|value| !value.is_empty()).map(str::to_ascii_lowercase);
+            let outcome = match session.apply_action(&identity.player_id, action) {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    let message = match error {
+                        DomainError::ActionNotAllowed => "Action is not allowed right now.".to_string(),
+                        DomainError::DragonNotAssigned => "Player is not assigned to a dragon.".to_string(),
+                        _ => error.to_string(),
+                    };
+                    return bad_command_request(&message);
+                }
+            };
+            if let Err(error) = state.store.save_session(&session.summary()) {
+                return internal_command_error(format!("failed to save session: {error}"));
+            }
+
+            let mut artifact_payload = json!({
+                "dragonId": dragon_id,
+                "actionType": action_type,
+                "actionValue": action_value,
+            });
+            if let Some(dragon) = session.dragons.get(&dragon_id) {
+                if let Some(payload_map) = artifact_payload.as_object_mut() {
+                    match outcome {
+                        domain::ActionOutcome::Applied { .. } => {
+                            payload_map.insert("hunger".to_string(), json!(dragon.hunger));
+                            payload_map.insert("energy".to_string(), json!(dragon.energy));
+                            payload_map.insert("happiness".to_string(), json!(dragon.happiness));
+                        }
+                        domain::ActionOutcome::Blocked { reason } => {
+                            payload_map.insert(
+                                "blockedReason".to_string(),
+                                json!(match reason {
+                                    domain::ActionBlockReason::AlreadyFull => "already_full",
+                                    domain::ActionBlockReason::TooHungryToPlay => "too_hungry_to_play",
+                                    domain::ActionBlockReason::TooTiredToPlay => "too_tired_to_play",
+                                    domain::ActionBlockReason::TooAwakeToSleep => "too_awake_to_sleep",
+                                }),
+                            );
+                        }
+                    }
+                }
+            }
+
+            if let Err(error) = state.store.append_session_artifact(&SessionArtifactRecord {
+                id: random_prefixed_id("artifact"),
+                session_id: session.id.to_string(),
+                phase: session.phase,
+                step: phase_step(session.phase),
+                kind: SessionArtifactKind::ActionProcessed,
+                player_id: Some(identity.player_id.clone()),
+                created_at: Utc::now().to_rfc3339(),
+                payload: artifact_payload,
+            }) {
+                return internal_command_error(format!("failed to append session artifact: {error}"));
+            }
+
+            successful_workshop_command(&mut should_broadcast)
         }
         SessionCommand::StartHandover => {
             if session.host_player_id.as_deref() != Some(identity.player_id.as_str()) {
@@ -535,10 +936,7 @@ async fn workshop_command(
                 return internal_command_error(format!("failed to append session artifact: {error}"));
             }
 
-            (
-                StatusCode::OK,
-                Json(WorkshopCommandResult::Success(WorkshopCommandSuccess { ok: true })),
-            )
+            successful_workshop_command(&mut should_broadcast)
         }
         SessionCommand::SubmitTags => {
             if session.phase != protocol::Phase::Handover {
@@ -581,10 +979,7 @@ async fn workshop_command(
                 return internal_command_error(format!("failed to append session artifact: {error}"));
             }
 
-            (
-                StatusCode::OK,
-                Json(WorkshopCommandResult::Success(WorkshopCommandSuccess { ok: true })),
-            )
+            successful_workshop_command(&mut should_broadcast)
         }
         SessionCommand::StartPhase2 => {
             if session.host_player_id.as_deref() != Some(identity.player_id.as_str()) {
@@ -617,10 +1012,7 @@ async fn workshop_command(
                 return internal_command_error(format!("failed to append session artifact: {error}"));
             }
 
-            (
-                StatusCode::OK,
-                Json(WorkshopCommandResult::Success(WorkshopCommandSuccess { ok: true })),
-            )
+            successful_workshop_command(&mut should_broadcast)
         }
         SessionCommand::EndGame => {
             if session.host_player_id.as_deref() != Some(identity.player_id.as_str()) {
@@ -654,10 +1046,7 @@ async fn workshop_command(
                 return internal_command_error(format!("failed to append session artifact: {error}"));
             }
 
-            (
-                StatusCode::OK,
-                Json(WorkshopCommandResult::Success(WorkshopCommandSuccess { ok: true })),
-            )
+            successful_workshop_command(&mut should_broadcast)
         }
         SessionCommand::SubmitVote => {
             if session.phase != protocol::Phase::Voting {
@@ -696,10 +1085,7 @@ async fn workshop_command(
                 return internal_command_error(format!("failed to append session artifact: {error}"));
             }
 
-            (
-                StatusCode::OK,
-                Json(WorkshopCommandResult::Success(WorkshopCommandSuccess { ok: true })),
-            )
+            successful_workshop_command(&mut should_broadcast)
         }
         SessionCommand::RevealVotingResults => {
             if session.host_player_id.as_deref() != Some(identity.player_id.as_str()) {
@@ -739,10 +1125,7 @@ async fn workshop_command(
                 return internal_command_error(format!("failed to append session artifact: {error}"));
             }
 
-            (
-                StatusCode::OK,
-                Json(WorkshopCommandResult::Success(WorkshopCommandSuccess { ok: true })),
-            )
+            successful_workshop_command(&mut should_broadcast)
         }
         SessionCommand::ResetGame => {
             if session.host_player_id.as_deref() != Some(identity.player_id.as_str()) {
@@ -767,13 +1150,19 @@ async fn workshop_command(
                 return internal_command_error(format!("failed to append session artifact: {error}"));
             }
 
-            (
-                StatusCode::OK,
-                Json(WorkshopCommandResult::Success(WorkshopCommandSuccess { ok: true })),
-            )
+            successful_workshop_command(&mut should_broadcast)
         }
         _ => bad_command_request("Unsupported workshop command."),
+        };
+
+        (response, should_broadcast)
+    };
+
+    if should_broadcast {
+        broadcast_session_state(&state, session_code, None).await;
     }
+
+    response
 }
 
 async fn workshop_judge_bundle(
@@ -995,7 +1384,38 @@ async fn workshop_judge_bundle(
      }
  }
 
- fn build_judge_action_traces(
+ fn phase_step(phase: protocol::Phase) -> u8 {
+    match phase {
+        protocol::Phase::Lobby => 0,
+        protocol::Phase::Phase1 => 1,
+        protocol::Phase::Handover => 2,
+        protocol::Phase::Phase2 => 2,
+        protocol::Phase::Voting => 3,
+        protocol::Phase::End => 4,
+    }
+}
+
+fn parse_player_action(payload: &ActionPayload) -> Option<PlayerAction> {
+    let action_type = payload.action_type.trim().to_ascii_lowercase();
+    match action_type.as_str() {
+        "sleep" => Some(PlayerAction::Sleep),
+        "feed" => match payload.value.as_deref().map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+            Some("meat") => Some(PlayerAction::Feed(FoodType::Meat)),
+            Some("fruit") => Some(PlayerAction::Feed(FoodType::Fruit)),
+            Some("fish") => Some(PlayerAction::Feed(FoodType::Fish)),
+            _ => None,
+        },
+        "play" => match payload.value.as_deref().map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+            Some("fetch") => Some(PlayerAction::Play(PlayType::Fetch)),
+            Some("puzzle") => Some(PlayerAction::Play(PlayType::Puzzle)),
+            Some("music") => Some(PlayerAction::Play(PlayType::Music)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn build_judge_action_traces(
      session: &WorkshopSession,
      artifacts: &[SessionArtifactRecord],
  ) -> BTreeMap<String, Vec<JudgeActionTrace>> {
@@ -1203,6 +1623,14 @@ async fn workshop_judge_bundle(
          .to_string()
  }
 
+fn successful_workshop_command(should_broadcast: &mut bool) -> (StatusCode, Json<WorkshopCommandResult>) {
+    *should_broadcast = true;
+    (
+        StatusCode::OK,
+        Json(WorkshopCommandResult::Success(WorkshopCommandSuccess { ok: true })),
+    )
+}
+
  #[cfg(test)]
  mod tests {
      use super::*;
@@ -1250,14 +1678,15 @@ async fn workshop_judge_bundle(
          });
 
          AppState {
-             config,
-             store: Arc::new(InMemorySessionStore::new()),
-             sessions: Arc::new(Mutex::new(BTreeMap::new())),
-             create_limiter: Arc::new(Mutex::new(FixedWindowRateLimiter::new(create_limit, 60_000))),
-             join_limiter: Arc::new(Mutex::new(FixedWindowRateLimiter::new(join_limit, 60_000))),
-             realtime: Arc::new(Mutex::new(SessionRegistry::new())),
-         }
-     }
+            config,
+            store: Arc::new(InMemorySessionStore::new()),
+            sessions: Arc::new(Mutex::new(BTreeMap::new())),
+            create_limiter: Arc::new(Mutex::new(FixedWindowRateLimiter::new(create_limit, 60_000))),
+            join_limiter: Arc::new(Mutex::new(FixedWindowRateLimiter::new(join_limit, 60_000))),
+            realtime: Arc::new(Mutex::new(SessionRegistry::new())),
+            realtime_senders: Arc::new(Mutex::new(BTreeMap::new())),
+        }
+    }
 
      async fn spawn_test_server(app: Router) -> (SocketAddr, tokio::task::JoinHandle<()>) {
          let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
@@ -1349,6 +1778,194 @@ async fn workshop_judge_bundle(
          assert_eq!(state.realtime.lock().await.session_connection_count(&create_success.session_code), 1);
 
          let _ = socket.close(None).await;
+         server_handle.abort();
+     }
+
+     #[tokio::test]
+     async fn workshop_command_pushes_state_update_to_attached_websocket() {
+         let state = test_state();
+         let app = build_app(state.clone());
+
+         let create_response = app
+             .clone()
+             .oneshot(
+                 Request::builder()
+                     .method("POST")
+                     .uri("/api/workshops")
+                     .header("content-type", "application/json")
+                     .body(Body::from(r#"{"name":"Alice"}"#))
+                     .expect("build create request"),
+             )
+             .await
+             .expect("call create workshop");
+         let create_body = to_bytes(create_response.into_body(), usize::MAX).await.expect("read create body");
+         let create_result: WorkshopJoinResult = serde_json::from_slice(&create_body).expect("parse create result");
+         let create_success = match create_result {
+             WorkshopJoinResult::Success(success) => success,
+             WorkshopJoinResult::Error(error) => panic!("expected create success, got error: {}", error.error),
+         };
+
+         let (addr, server_handle) = spawn_test_server(app.clone()).await;
+         let (mut socket, _) = connect_async(ws_request(addr)).await.expect("connect ws");
+         let attach_message = ClientWsMessage::AttachSession(SessionEnvelope {
+             session_code: create_success.session_code.clone(),
+             player_id: create_success.player_id.clone(),
+             reconnect_token: create_success.reconnect_token.clone(),
+             coordinator_type: Some(CoordinatorType::Rust),
+         });
+         socket
+             .send(WsMessage::Text(serde_json::to_string(&attach_message).expect("encode attach").into()))
+             .await
+             .expect("send attach");
+
+         let _ = socket.next().await.expect("initial state update frame").expect("initial state update message");
+
+         let command_response = app
+             .clone()
+             .oneshot(
+                 Request::builder()
+                     .method("POST")
+                     .uri("/api/workshops/command")
+                     .header("origin", "http://localhost:5173")
+                     .header("content-type", "application/json")
+                     .body(Body::from(
+                         serde_json::to_vec(&WorkshopCommandRequest {
+                             session_code: create_success.session_code.clone(),
+                             reconnect_token: create_success.reconnect_token.clone(),
+                             coordinator_type: Some(CoordinatorType::Rust),
+                             command: SessionCommand::StartPhase1,
+                             payload: None,
+                         })
+                         .expect("encode command request"),
+                     ))
+                     .expect("build command request"),
+             )
+             .await
+             .expect("call command endpoint");
+         assert_eq!(command_response.status(), StatusCode::OK);
+
+         let message = socket.next().await.expect("broadcast state update frame").expect("broadcast state update message");
+         let payload = match message {
+             WsMessage::Text(payload) => payload,
+             other => panic!("expected text frame, got {other:?}"),
+         };
+         let server_message: ServerWsMessage = serde_json::from_str(&payload).expect("parse server ws message");
+         match server_message {
+             ServerWsMessage::StateUpdate(client_state) => {
+                 assert_eq!(client_state.phase, protocol::Phase::Phase1);
+                 assert_eq!(client_state.session.code, create_success.session_code);
+             }
+             other => panic!("expected state update, got {other:?}"),
+         }
+
+         let _ = socket.close(None).await;
+         server_handle.abort();
+     }
+
+     #[tokio::test]
+     async fn workshop_ws_close_marks_player_offline_and_reassigns_host() {
+         let state = test_state();
+         let app = build_app(state.clone());
+
+         let create_response = app
+             .clone()
+             .oneshot(
+                 Request::builder()
+                     .method("POST")
+                     .uri("/api/workshops")
+                     .header("content-type", "application/json")
+                     .body(Body::from(r#"{"name":"Alice"}"#))
+                     .expect("build create request"),
+             )
+             .await
+             .expect("call create workshop");
+         let create_body = to_bytes(create_response.into_body(), usize::MAX).await.expect("read create body");
+         let create_result: WorkshopJoinResult = serde_json::from_slice(&create_body).expect("parse create result");
+         let create_success = match create_result {
+             WorkshopJoinResult::Success(success) => success,
+             WorkshopJoinResult::Error(error) => panic!("expected create success, got error: {}", error.error),
+         };
+
+         let join_response = app
+             .clone()
+             .oneshot(
+                 Request::builder()
+                     .method("POST")
+                     .uri("/api/workshops/join")
+                     .header("content-type", "application/json")
+                     .body(Body::from(format!(r#"{{"sessionCode":"{}","name":"Bob"}}"#, create_success.session_code)))
+                     .expect("build join request"),
+             )
+             .await
+             .expect("call join workshop");
+         let join_body = to_bytes(join_response.into_body(), usize::MAX).await.expect("read join body");
+         let join_result: WorkshopJoinResult = serde_json::from_slice(&join_body).expect("parse join result");
+         let join_success = match join_result {
+             WorkshopJoinResult::Success(success) => success,
+             WorkshopJoinResult::Error(error) => panic!("expected join success, got error: {}", error.error),
+         };
+
+         let (addr, server_handle) = spawn_test_server(app).await;
+         let (mut socket, _) = connect_async(ws_request(addr)).await.expect("connect ws");
+         let attach_message = ClientWsMessage::AttachSession(SessionEnvelope {
+             session_code: create_success.session_code.clone(),
+             player_id: create_success.player_id.clone(),
+             reconnect_token: create_success.reconnect_token.clone(),
+             coordinator_type: Some(CoordinatorType::Rust),
+         });
+         socket
+             .send(WsMessage::Text(serde_json::to_string(&attach_message).expect("encode attach").into()))
+             .await
+             .expect("send attach");
+
+         let _ = socket.next().await.expect("state update frame").expect("state update message");
+         assert_eq!(state.realtime.lock().await.session_connection_count(&create_success.session_code), 1);
+
+         let _ = socket.close(None).await;
+         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+         assert_eq!(state.realtime.lock().await.session_connection_count(&create_success.session_code), 0);
+
+         let (session_id, host_player, guest_player) = {
+             let sessions = state.sessions.lock().await;
+             let session = sessions
+                 .get(&create_success.session_code)
+                 .expect("session exists after disconnect");
+             (
+                 session.id.to_string(),
+                 session
+                     .players
+                     .get(&create_success.player_id)
+                     .expect("host player exists")
+                     .clone(),
+                 session
+                     .players
+                     .get(&join_success.player_id)
+                     .expect("guest player exists")
+                     .clone(),
+             )
+         };
+
+         assert!(!host_player.is_connected);
+         assert!(!host_player.is_host);
+         assert!(guest_player.is_host);
+         assert!(guest_player.is_connected);
+
+         let artifacts = state
+             .store
+             .list_session_artifacts(&session_id)
+             .expect("list session artifacts");
+         let disconnect_artifact = artifacts
+             .iter()
+             .rev()
+             .find(|artifact| artifact.kind == SessionArtifactKind::PlayerLeft)
+             .expect("player left artifact");
+         assert_eq!(disconnect_artifact.player_id.as_deref(), Some(create_success.player_id.as_str()));
+         assert_eq!(
+             disconnect_artifact.payload.get("sessionCode").and_then(|value| value.as_str()),
+             Some(create_success.session_code.as_str())
+         );
+
          server_handle.abort();
      }
 
@@ -1945,6 +2562,319 @@ async fn workshop_judge_bundle(
      }
 
      #[tokio::test]
+    async fn join_workshop_endpoint_reconnects_existing_player_without_name() {
+        let state = test_state();
+        let app = build_app(state.clone());
+        let create_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/workshops")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"name":"Alice"}"#))
+                    .expect("build create request"),
+            )
+            .await
+            .expect("call create workshop");
+        let create_body = to_bytes(create_response.into_body(), usize::MAX).await.expect("read create body");
+        let create_result: WorkshopJoinResult = serde_json::from_slice(&create_body).expect("parse create result");
+        let create_success = match create_result {
+            WorkshopJoinResult::Success(success) => success,
+            WorkshopJoinResult::Error(error) => panic!("expected create success, got error: {}", error.error),
+        };
+
+        let start_phase1_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/workshops/command")
+                    .header("content-type", "application/json")
+                    .body(Body::from(format!(
+                        r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"startPhase1"}}"#,
+                        create_success.session_code, create_success.reconnect_token
+                    )))
+                    .expect("build start phase1 request"),
+            )
+            .await
+            .expect("call start phase1 command");
+        assert_eq!(start_phase1_response.status(), StatusCode::OK);
+
+        {
+            let mut sessions = state.sessions.lock().await;
+            let session = sessions
+                .get_mut(&create_success.session_code)
+                .expect("session exists");
+            let player = session
+                .players
+                .get_mut(&create_success.player_id)
+                .expect("player exists");
+            player.is_connected = false;
+        }
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/workshops/join")
+                    .header("content-type", "application/json")
+                    .body(Body::from(format!(
+                        r#"{{"sessionCode":"{}","reconnectToken":"{}"}}"#,
+                        create_success.session_code, create_success.reconnect_token
+                    )))
+                    .expect("build reconnect request"),
+            )
+            .await
+            .expect("call reconnect join workshop");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.expect("read reconnect body");
+        let result: WorkshopJoinResult = serde_json::from_slice(&body).expect("parse reconnect result");
+        match result {
+            WorkshopJoinResult::Success(success) => {
+                assert!(success.ok);
+                assert_eq!(success.player_id, create_success.player_id);
+                assert_eq!(success.reconnect_token, create_success.reconnect_token);
+                assert_eq!(success.state.phase, protocol::Phase::Phase1);
+                assert_eq!(success.state.current_player_id.as_deref(), Some(create_success.player_id.as_str()));
+                let player = success
+                    .state
+                    .players
+                    .get(&create_success.player_id)
+                    .expect("reconnected player in state");
+                assert!(player.is_connected);
+                assert!(player.current_dragon_id.is_some());
+            }
+            WorkshopJoinResult::Error(error) => panic!("expected reconnect success, got error: {}", error.error),
+        }
+    }
+
+    #[tokio::test]
+    async fn join_workshop_endpoint_rejects_invalid_reconnect_token() {
+        let app = build_app(test_state());
+        let create_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/workshops")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"name":"Alice"}"#))
+                    .expect("build create request"),
+            )
+            .await
+            .expect("call create workshop");
+        let create_body = to_bytes(create_response.into_body(), usize::MAX).await.expect("read create body");
+        let create_result: WorkshopJoinResult = serde_json::from_slice(&create_body).expect("parse create result");
+        let session_code = match create_result {
+            WorkshopJoinResult::Success(success) => success.session_code,
+            WorkshopJoinResult::Error(error) => panic!("expected create success, got error: {}", error.error),
+        };
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/workshops/join")
+                    .header("content-type", "application/json")
+                    .body(Body::from(format!(
+                        r#"{{"sessionCode":"{}","reconnectToken":"missing"}}"#,
+                        session_code
+                    )))
+                    .expect("build reconnect request"),
+            )
+            .await
+            .expect("call reconnect join workshop");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), usize::MAX).await.expect("read reconnect body");
+        let result: WorkshopJoinResult = serde_json::from_slice(&body).expect("parse reconnect result");
+        match result {
+            WorkshopJoinResult::Error(error) => {
+                assert_eq!(error.error, "Session identity is invalid or expired.");
+            }
+            WorkshopJoinResult::Success(_) => panic!("expected reconnect error response"),
+        }
+    }
+
+    #[tokio::test]
+    async fn workshop_command_saves_observation_during_phase1() {
+        let state = test_state();
+        let app = build_app(state.clone());
+        let create_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/workshops")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"name":"Alice"}"#))
+                    .expect("build create request"),
+            )
+            .await
+            .expect("call create workshop");
+        let create_body = to_bytes(create_response.into_body(), usize::MAX).await.expect("read create body");
+        let create_result: WorkshopJoinResult = serde_json::from_slice(&create_body).expect("parse create result");
+        let create_success = match create_result {
+            WorkshopJoinResult::Success(success) => success,
+            WorkshopJoinResult::Error(error) => panic!("expected create success, got error: {}", error.error),
+        };
+
+        let start_phase1_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/workshops/command")
+                    .header("content-type", "application/json")
+                    .body(Body::from(format!(
+                        r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"startPhase1"}}"#,
+                        create_success.session_code, create_success.reconnect_token
+                    )))
+                    .expect("build start phase1 request"),
+            )
+            .await
+            .expect("call start phase1 command");
+        assert_eq!(start_phase1_response.status(), StatusCode::OK);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/workshops/command")
+                    .header("content-type", "application/json")
+                    .body(Body::from(format!(
+                        r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"submitObservation","payload":{{"text":"Calms down at dusk"}}}}"#,
+                        create_success.session_code, create_success.reconnect_token
+                    )))
+                    .expect("build observation request"),
+            )
+            .await
+            .expect("call observation command");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.expect("read observation body");
+        let result: WorkshopCommandResult = serde_json::from_slice(&body).expect("parse observation result");
+        match result {
+            WorkshopCommandResult::Success(success) => assert!(success.ok),
+            WorkshopCommandResult::Error(error) => panic!("expected observation success, got error: {}", error.error),
+        }
+
+        let sessions = state.sessions.lock().await;
+        let session = sessions
+            .get(&create_success.session_code)
+            .expect("session exists");
+        let dragon_id = session
+            .players
+            .get(&create_success.player_id)
+            .and_then(|player| player.current_dragon_id.as_ref())
+            .expect("current dragon id");
+        let dragon = session.dragons.get(dragon_id).expect("dragon exists");
+        assert_eq!(dragon.discovery_observations, vec!["Calms down at dusk".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn workshop_command_records_action_artifact_during_phase2() {
+        let state = test_state();
+        let app = build_app(state.clone());
+        let create_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/workshops")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"name":"Alice"}"#))
+                    .expect("build create request"),
+            )
+            .await
+            .expect("call create workshop");
+        let create_body = to_bytes(create_response.into_body(), usize::MAX).await.expect("read create body");
+        let create_result: WorkshopJoinResult = serde_json::from_slice(&create_body).expect("parse create result");
+        let create_success = match create_result {
+            WorkshopJoinResult::Success(success) => success,
+            WorkshopJoinResult::Error(error) => panic!("expected create success, got error: {}", error.error),
+        };
+        let join_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/workshops/join")
+                    .header("content-type", "application/json")
+                    .body(Body::from(format!(r#"{{"sessionCode":"{}","name":"Bob"}}"#, create_success.session_code)))
+                    .expect("build join request"),
+            )
+            .await
+            .expect("call join workshop");
+        let join_body = to_bytes(join_response.into_body(), usize::MAX).await.expect("read join body");
+        let join_result: WorkshopJoinResult = serde_json::from_slice(&join_body).expect("parse join result");
+        let join_success = match join_result {
+            WorkshopJoinResult::Success(success) => success,
+            WorkshopJoinResult::Error(error) => panic!("expected join success, got error: {}", error.error),
+        };
+
+        for request_body in [
+            format!(r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"startPhase1"}}"#, create_success.session_code, create_success.reconnect_token),
+            format!(r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"startHandover"}}"#, create_success.session_code, create_success.reconnect_token),
+            format!(r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"submitTags","payload":["Rule 1","Rule 2","Rule 3"]}}"#, create_success.session_code, create_success.reconnect_token),
+            format!(r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"submitTags","payload":["Rule A","Rule B","Rule C"]}}"#, create_success.session_code, join_success.reconnect_token),
+            format!(r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"startPhase2"}}"#, create_success.session_code, create_success.reconnect_token),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/workshops/command")
+                        .header("content-type", "application/json")
+                        .body(Body::from(request_body))
+                        .expect("build setup request"),
+                )
+                .await
+                .expect("call setup command");
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/workshops/command")
+                    .header("content-type", "application/json")
+                    .body(Body::from(format!(
+                        r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"action","payload":{{"type":"sleep"}}}}"#,
+                        create_success.session_code, create_success.reconnect_token
+                    )))
+                    .expect("build action request"),
+            )
+            .await
+            .expect("call action command");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.expect("read action body");
+        let result: WorkshopCommandResult = serde_json::from_slice(&body).expect("parse action result");
+        match result {
+            WorkshopCommandResult::Success(success) => assert!(success.ok),
+            WorkshopCommandResult::Error(error) => panic!("expected action success, got error: {}", error.error),
+        }
+
+        let artifacts = state
+            .store
+            .list_session_artifacts(&create_success.state.session.id)
+            .expect("list artifacts");
+        let action_artifact = artifacts
+            .iter()
+            .rev()
+            .find(|artifact| artifact.kind == SessionArtifactKind::ActionProcessed)
+            .expect("action artifact exists");
+        assert_eq!(action_artifact.phase, protocol::Phase::Phase2);
+        assert_eq!(action_artifact.payload.get("actionType").and_then(|value| value.as_str()), Some("sleep"));
+        assert!(action_artifact.payload.get("dragonId").and_then(|value| value.as_str()).is_some());
+    }
+
+    #[tokio::test]
      async fn workshop_command_rejects_invalid_credentials() {
          let app = build_app(test_state());
 

@@ -64,14 +64,12 @@ impl SessionRegistry {
         }
     }
 
-    pub fn detach(&mut self, connection_id: &str) -> bool {
-        let Some(registration) = self.connections_by_id.remove(connection_id) else {
-            return false;
-        };
+    pub fn detach(&mut self, connection_id: &str) -> Option<ConnectionRegistration> {
+        let registration = self.connections_by_id.remove(connection_id)?;
 
-        let key = (registration.session_code, registration.player_id);
+        let key = (registration.session_code.clone(), registration.player_id.clone());
         self.connection_by_session_player.remove(&key);
-        true
+        Some(registration)
     }
 
     pub fn broadcast_to_session(
@@ -86,6 +84,14 @@ impl SessionRegistry {
                 connection_id: registration.connection_id.clone(),
                 message: message.clone(),
             })
+            .collect()
+    }
+
+    pub fn session_registrations(&self, session_code: &str) -> Vec<ConnectionRegistration> {
+        self.connections_by_id
+            .values()
+            .filter(|registration| registration.session_code == session_code)
+            .cloned()
             .collect()
     }
 
@@ -127,12 +133,30 @@ mod tests {
     }
 
     #[test]
-    fn detach_returns_false_for_missing_connection() {
+    fn detach_returns_registration_for_existing_connection() {
+        let mut registry = SessionRegistry::new();
+        registry.attach("123456", "player-1", "conn-1");
+
+        let removed = registry.detach("conn-1");
+
+        assert_eq!(
+            removed,
+            Some(ConnectionRegistration {
+                session_code: "123456".to_string(),
+                player_id: "player-1".to_string(),
+                connection_id: "conn-1".to_string(),
+            })
+        );
+        assert_eq!(registry.session_connection_count("123456"), 0);
+    }
+
+    #[test]
+    fn detach_returns_none_for_missing_connection() {
         let mut registry = SessionRegistry::new();
 
         let removed = registry.detach("missing-connection");
 
-        assert!(!removed);
+        assert_eq!(removed, None);
     }
 
     #[test]
@@ -148,5 +172,20 @@ mod tests {
         assert!(events.iter().any(|event| event.connection_id == "conn-1"));
         assert!(events.iter().any(|event| event.connection_id == "conn-2"));
         assert!(!events.iter().any(|event| event.connection_id == "conn-3"));
+    }
+
+    #[test]
+    fn session_registrations_return_player_specific_connections() {
+        let mut registry = SessionRegistry::new();
+        registry.attach("123456", "player-1", "conn-1");
+        registry.attach("123456", "player-2", "conn-2");
+        registry.attach("654321", "player-3", "conn-3");
+
+        let registrations = registry.session_registrations("123456");
+
+        assert_eq!(registrations.len(), 2);
+        assert!(registrations.iter().any(|registration| registration.player_id == "player-1"));
+        assert!(registrations.iter().any(|registration| registration.player_id == "player-2"));
+        assert!(!registrations.iter().any(|registration| registration.player_id == "player-3"));
     }
 }
