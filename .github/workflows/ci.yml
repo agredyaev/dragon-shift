@@ -1,0 +1,104 @@
+name: CI
+
+on:
+  pull_request:
+    paths:
+      - "platform/**"
+      - "helm/**"
+      - "Dockerfile"
+      - ".github/workflows/**"
+      - "README.md"
+  push:
+    branches:
+      - main
+    paths:
+      - "platform/**"
+      - "helm/**"
+      - "Dockerfile"
+      - ".github/workflows/**"
+      - "README.md"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    name: Rust workspace
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: platform
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy,rustfmt
+          targets: wasm32-unknown-unknown
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            platform -> target
+
+      - name: Cargo check
+        run: cargo check --workspace --all-targets
+
+      - name: Cargo test
+        run: cargo test --workspace
+
+      - name: Install wasm-bindgen-cli
+        run: cargo install wasm-bindgen-cli --version 0.2.114 --locked
+
+      - name: Build web bundle
+        run: cargo run --locked -p xtask -- build-web --out-dir /tmp/app-web-dist
+
+  helm:
+    name: Helm chart
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+
+      - name: Helm lint
+        run: >-
+          helm lint ./helm/dragon-shift
+          --set image.repository=ghcr.io/example/dragon-shift
+          --set image.tag=ci
+          --set app.allowedOrigins=https://dragon-shift.example.com
+          --set app.viteAppUrl=https://dragon-shift.example.com
+          --set database.existingSecretName=dragon-shift-app
+          --set database.existingSecretKey=DATABASE_URL
+
+      - name: Helm template
+        run: >-
+          helm template dragon-shift ./helm/dragon-shift
+          --set image.repository=ghcr.io/example/dragon-shift
+          --set image.tag=ci
+          --set app.allowedOrigins=https://dragon-shift.example.com
+          --set app.viteAppUrl=https://dragon-shift.example.com
+          --set database.existingSecretName=dragon-shift-app
+          --set database.existingSecretKey=DATABASE_URL
+          > /tmp/dragon-shift-rendered.yaml
+
+  docker:
+    name: Docker image build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build production image
+        env:
+          DOCKER_BUILDKIT: "1"
+        run: docker build --tag dragon-shift:ci .
