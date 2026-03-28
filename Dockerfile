@@ -10,19 +10,28 @@ RUN cargo run --locked -p xtask -- build-web --out-dir /tmp/app-web-dist
 RUN cargo build --release -p app-server --locked
 
 FROM debian:bookworm-slim AS runtime
-WORKDIR /app
+ARG APP_UID=10001
+ARG APP_GID=10001
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
+    && groupadd --gid "${APP_GID}" app \
+    && useradd --uid "${APP_UID}" --gid "${APP_GID}" --create-home --home-dir /app --shell /usr/sbin/nologin app \
+    && mkdir -p /app/static /tmp \
+    && chown -R "${APP_UID}:${APP_GID}" /app /tmp \
     && rm -rf /var/lib/apt/lists/*
 
-ENV NODE_ENV=production
-ENV APP_SERVER_BIND_ADDR=0.0.0.0:3000
-ENV APP_SERVER_STATIC_DIR=/app/static
+WORKDIR /app
 
-COPY --from=builder /workspace/platform/target/release/app-server /app/app-server
-COPY --from=builder /tmp/app-web-dist /app/static
+ENV NODE_ENV=production \
+    APP_SERVER_BIND_ADDR=0.0.0.0:3000 \
+    APP_SERVER_STATIC_DIR=/app/static
+
+COPY --from=builder --chown=10001:10001 /workspace/platform/target/release/app-server /app/app-server
+COPY --from=builder --chown=10001:10001 /tmp/app-web-dist /app/static
+
+USER 10001:10001
 
 EXPOSE 3000
 
-CMD ["/app/app-server"]
+ENTRYPOINT ["/app/app-server"]
