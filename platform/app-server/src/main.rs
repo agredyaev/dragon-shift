@@ -10,7 +10,7 @@ use axum::{
 };
 use chrono::Utc;
 use domain::{DomainError, Phase1Assignment, PlayerAction, SessionCode, SessionPlayer, WorkshopSession};
-use persistence::{InMemorySessionStore, SessionStore};
+use persistence::{InMemorySessionStore, PostgresSessionStore, SessionStore};
 use protocol::{
     create_default_session_settings, ActionPayload, ClientGameState, ClientWsMessage, CoordinatorType,
     CreateWorkshopRequest, DiscoveryObservationRequest, DragonStats, FoodType, JudgeActionTrace,
@@ -28,9 +28,10 @@ use security::{
 use serde::Serialize;
 use serde_json::json;
 use std::{
-    collections::BTreeMap, env, net::SocketAddr, str::FromStr, sync::Arc,
+    collections::BTreeMap, env, net::SocketAddr, path::PathBuf, str::FromStr, sync::Arc,
 };
 use tokio::sync::{mpsc, Mutex};
+use tower_http::services::{ServeDir, ServeFile};
 use tower_http::trace::TraceLayer;
 use tracing::info;
 use uuid::Uuid;
@@ -41,12 +42,15 @@ struct AppConfig {
     is_production: bool,
     rust_session_code_prefix: String,
     origin_policy: OriginPolicy,
+    static_assets_dir: PathBuf,
+    database_url: Option<String>,
+    persistence_backend: String,
 }
 
 #[derive(Clone)]
 struct AppState {
     config: Arc<AppConfig>,
-    store: Arc<InMemorySessionStore>,
+    store: Arc<dyn SessionStore>,
     sessions: Arc<Mutex<BTreeMap<String, WorkshopSession>>>,
     create_limiter: Arc<Mutex<FixedWindowRateLimiter>>,
     join_limiter: Arc<Mutex<FixedWindowRateLimiter>>,
@@ -59,6 +63,7 @@ struct RuntimeSnapshot {
     bind_addr: String,
     is_production: bool,
     rust_session_code_prefix: String,
+    persistence_backend: String,
     allow_any_origin: bool,
     require_origin: bool,
     allowed_origins: Vec<String>,
@@ -72,14 +77,13 @@ struct WsAttachOutcome {
     state_changed: bool,
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 
     let config = Arc::new(load_config().expect("load app config"));
-    let store = Arc::new(InMemorySessionStore::new());
+    let store = build_session_store(&config).expect("build session store");
     store.init().expect("init session store");
 
     let state = AppState {
@@ -94,15 +98,25 @@ async fn main() {
 
     let app = build_app(state);
 
-    info!(bind_addr = %config.bind_addr, "starting rust-next app-server");
+    info!(bind_addr = %config.bind_addr, "starting platform app-server");
 
-    let listener = tokio::net::TcpListener::bind(config.bind_addr)
-        .await
-        .expect("bind listener");
-    axum::serve(listener, app).await.expect("serve app");
+    let bind_addr = config.bind_addr;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("build tokio runtime");
+    runtime.block_on(async move {
+        let listener = tokio::net::TcpListener::bind(bind_addr)
+            .await
+            .expect("bind listener");
+        axum::serve(listener, app).await.expect("serve app");
+    });
 }
 
 fn build_app(state: AppState) -> Router {
+    let static_assets_dir = state.config.static_assets_dir.clone();
+    let index_file = static_assets_dir.join("index.html");
+
     Router::new()
         .route("/api/workshops", post(create_workshop))
         .route("/api/workshops/join", post(join_workshop))
@@ -112,8 +126,19 @@ fn build_app(state: AppState) -> Router {
         .route("/api/live", get(live))
         .route("/api/ready", get(ready))
         .route("/api/runtime", get(runtime_snapshot))
+        .fallback_service(ServeDir::new(static_assets_dir).not_found_service(ServeFile::new(index_file)))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
+}
+
+fn build_session_store(config: &AppConfig) -> Result<Arc<dyn SessionStore>, String> {
+    if let Some(database_url) = config.database_url.as_deref() {
+        let store = PostgresSessionStore::connect(database_url)
+            .map_err(|error| format!("connect postgres session store: {error}"))?;
+        Ok(Arc::new(store))
+    } else {
+        Ok(Arc::new(InMemorySessionStore::new()))
+    }
 }
 
 fn load_config() -> Result<AppConfig, String> {
@@ -135,13 +160,57 @@ fn load_config() -> Result<AppConfig, String> {
         is_production,
     })
     .map_err(|error| error.to_string())?;
+    let static_assets_dir = env::var("APP_SERVER_STATIC_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .expect("workspace root")
+                .join("app-web/dist")
+        });
+    let database_url = env::var("DATABASE_URL")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    if is_production && database_url.is_none() {
+        return Err("DATABASE_URL is required when NODE_ENV=production".to_string());
+    }
+    let persistence_backend = if database_url.is_some() {
+        "postgres".to_string()
+    } else {
+        "memory".to_string()
+    };
 
     Ok(AppConfig {
         bind_addr,
         is_production,
         rust_session_code_prefix,
         origin_policy,
+        static_assets_dir,
+        database_url,
+        persistence_backend,
     })
+}
+
+async fn ensure_session_cached(state: &AppState, session_code: &str) -> Result<bool, String> {
+    {
+        let sessions = state.sessions.lock().await;
+        if sessions.contains_key(session_code) {
+            return Ok(true);
+        }
+    }
+
+    let Some(session) = state
+        .store
+        .load_session_by_code(session_code)
+        .map_err(|error| format!("failed to load session: {error}"))?
+    else {
+        return Ok(false);
+    };
+
+    let mut sessions = state.sessions.lock().await;
+    sessions.entry(session.code.0.clone()).or_insert(session);
+    Ok(true)
 }
 
 async fn workshop_ws(
@@ -269,6 +338,13 @@ async fn broadcast_session_state(
     session_code: &str,
     excluded_connection_id: Option<&str>,
 ) {
+    let Ok(is_cached) = ensure_session_cached(state, session_code).await else {
+        return;
+    };
+    if !is_cached {
+        return;
+    }
+
     let registrations = state.realtime.lock().await.session_registrations(session_code);
     if registrations.is_empty() {
         return;
@@ -336,12 +412,7 @@ async fn sync_ws_disconnect(state: &AppState, connection_id: &str) {
                     player.is_connected = false;
                     session.ensure_host_assigned(true);
                     session.updated_at = timestamp;
-                    Some((
-                        session.summary(),
-                        session.id.to_string(),
-                        session.phase,
-                        phase_step(session.phase),
-                    ))
+                    Some((session.clone(), phase_step(session.phase)))
                 }
                 _ => None,
             },
@@ -349,28 +420,28 @@ async fn sync_ws_disconnect(state: &AppState, connection_id: &str) {
         }
     };
 
-    let Some((summary, session_id, phase, step)) = disconnect_state else {
+    let Some((session, step)) = disconnect_state else {
         return;
     };
 
-    if let Err(error) = state.store.save_session(&summary) {
-        info!(session_code = %summary.code.0, player_id = %player_id, error = %error, "failed to persist websocket disconnect session state");
+    if let Err(error) = state.store.save_session(&session) {
+        info!(session_code = %session.code.0, player_id = %player_id, error = %error, "failed to persist websocket disconnect session state");
     }
 
     if let Err(error) = state.store.append_session_artifact(&SessionArtifactRecord {
         id: random_prefixed_id("artifact"),
-        session_id,
-        phase,
+        session_id: session.id.to_string(),
+        phase: session.phase,
         step,
         kind: SessionArtifactKind::PlayerLeft,
         player_id: Some(player_id.clone()),
         created_at: timestamp.to_rfc3339(),
         payload: disconnect_payload,
     }) {
-        info!(session_code = %summary.code.0, player_id = %player_id, error = %error, "failed to append websocket disconnect artifact");
+        info!(session_code = %session.code.0, player_id = %player_id, error = %error, "failed to append websocket disconnect artifact");
     }
 
-    broadcast_session_state(state, &summary.code.0, None).await;
+    broadcast_session_state(state, &session.code.0, None).await;
 }
 
 async fn attach_ws_session(
@@ -398,6 +469,9 @@ async fn attach_ws_session(
     if identity.player_id != player_id {
         return Err("Session identity is invalid or expired.".to_string());
     }
+    if !ensure_session_cached(state, session_code).await? {
+        return Err("Workshop not found.".to_string());
+    }
 
     let mut reconnect_artifact: Option<SessionArtifactRecord> = None;
 
@@ -408,7 +482,7 @@ async fn attach_ws_session(
             .ok_or_else(|| "Workshop not found.".to_string())?;
         let player = session
             .players
-            .get(&identity.player_id)
+            .get_mut(&identity.player_id)
             .ok_or_else(|| "Session identity is invalid or expired.".to_string())?;
         if !player.is_connected {
             session
@@ -435,7 +509,7 @@ async fn attach_ws_session(
         }
         let client_state = to_client_game_state(session, &identity.player_id);
         if reconnect_artifact.is_some() {
-            if let Err(error) = state.store.save_session(&session.summary()) {
+            if let Err(error) = state.store.save_session(session) {
                 return Err(format!("failed to save session: {error}"));
             }
         }
@@ -518,7 +592,7 @@ async fn create_workshop(
     };
     session.add_player(host_player.clone());
 
-    if let Err(error) = state.store.save_session(&session.summary()) {
+    if let Err(error) = state.store.save_session(&session) {
         return internal_join_error(format!("failed to save session: {error}"));
     }
     if let Err(error) = state.store.create_player_identity(&persistence::PlayerIdentity {
@@ -592,6 +666,10 @@ async fn join_workshop(
             Err(error) => return internal_join_error(format!("failed to lookup player identity: {error}")),
         };
 
+        if !ensure_session_cached(&state, session_code).await.unwrap_or(false) {
+            return bad_join_request("Workshop not found.");
+        }
+
         let timestamp = Utc::now();
         let mut sessions = state.sessions.lock().await;
         let Some(session) = sessions.get_mut(session_code) else {
@@ -604,7 +682,7 @@ async fn join_workshop(
         session.ensure_host_assigned(true);
         session.updated_at = timestamp;
 
-        if let Err(error) = state.store.save_session(&session.summary()) {
+        if let Err(error) = state.store.save_session(session) {
             return internal_join_error(format!("failed to save session: {error}"));
         }
         if let Err(error) = state.store.touch_player_identity(reconnect_token, &timestamp.to_rfc3339()) {
@@ -649,6 +727,10 @@ async fn join_workshop(
         return bad_join_request("Please enter a player name.");
     }
 
+    if !ensure_session_cached(&state, session_code).await.unwrap_or(false) {
+        return bad_join_request("Workshop not found.");
+    }
+
     let mut sessions = state.sessions.lock().await;
     let Some(session) = sessions.get_mut(session_code) else {
         return bad_join_request("Workshop not found.");
@@ -681,7 +763,7 @@ async fn join_workshop(
     };
     session.add_player(player.clone());
 
-    if let Err(error) = state.store.save_session(&session.summary()) {
+    if let Err(error) = state.store.save_session(session) {
         return internal_join_error(format!("failed to save session: {error}"));
     }
     if let Err(error) = state.store.create_player_identity(&persistence::PlayerIdentity {
@@ -742,6 +824,10 @@ async fn workshop_command(
         Err(error) => return internal_command_error(format!("failed to lookup identity: {error}")),
     };
 
+    if !ensure_session_cached(&state, session_code).await.unwrap_or(false) {
+        return bad_command_request("Workshop not found.");
+    }
+
     let (response, should_broadcast) = {
         let mut sessions = state.sessions.lock().await;
         let Some(session) = sessions.get_mut(session_code) else {
@@ -770,7 +856,7 @@ async fn workshop_command(
             if let Err(error) = session.begin_phase1(&assignments) {
                 return bad_command_request(&error.to_string());
             }
-            if let Err(error) = state.store.save_session(&session.summary()) {
+            if let Err(error) = state.store.save_session(session) {
                 return internal_command_error(format!("failed to save session: {error}"));
             }
             if let Err(error) = state.store.append_session_artifact(&SessionArtifactRecord {
@@ -813,7 +899,7 @@ async fn workshop_command(
             };
 
             session.record_discovery_observation(&identity.player_id, text.to_string());
-            if let Err(error) = state.store.save_session(&session.summary()) {
+            if let Err(error) = state.store.save_session(session) {
                 return internal_command_error(format!("failed to save session: {error}"));
             }
             if let Err(error) = state.store.append_session_artifact(&SessionArtifactRecord {
@@ -863,7 +949,7 @@ async fn workshop_command(
                     return bad_command_request(&message);
                 }
             };
-            if let Err(error) = state.store.save_session(&session.summary()) {
+            if let Err(error) = state.store.save_session(session) {
                 return internal_command_error(format!("failed to save session: {error}"));
             }
 
@@ -920,7 +1006,7 @@ async fn workshop_command(
             if let Err(error) = session.transition_to(protocol::Phase::Handover) {
                 return bad_command_request(&error.to_string());
             }
-            if let Err(error) = state.store.save_session(&session.summary()) {
+            if let Err(error) = state.store.save_session(session) {
                 return internal_command_error(format!("failed to save session: {error}"));
             }
             if let Err(error) = state.store.append_session_artifact(&SessionArtifactRecord {
@@ -954,7 +1040,7 @@ async fn workshop_command(
             };
 
             session.save_handover_tags(&identity.player_id, tags);
-            if let Err(error) = state.store.save_session(&session.summary()) {
+            if let Err(error) = state.store.save_session(session) {
                 return internal_command_error(format!("failed to save session: {error}"));
             }
 
@@ -996,7 +1082,7 @@ async fn workshop_command(
                     _ => bad_command_request(&error.to_string()),
                 };
             }
-            if let Err(error) = state.store.save_session(&session.summary()) {
+            if let Err(error) = state.store.save_session(session) {
                 return internal_command_error(format!("failed to save session: {error}"));
             }
             if let Err(error) = state.store.append_session_artifact(&SessionArtifactRecord {
@@ -1030,7 +1116,7 @@ async fn workshop_command(
                     return bad_command_request(&error.to_string());
                 }
             }
-            if let Err(error) = state.store.save_session(&session.summary()) {
+            if let Err(error) = state.store.save_session(session) {
                 return internal_command_error(format!("failed to save session: {error}"));
             }
             if let Err(error) = state.store.append_session_artifact(&SessionArtifactRecord {
@@ -1069,7 +1155,7 @@ async fn workshop_command(
                 };
                 return bad_command_request(&message);
             }
-            if let Err(error) = state.store.save_session(&session.summary()) {
+            if let Err(error) = state.store.save_session(session) {
                 return internal_command_error(format!("failed to save session: {error}"));
             }
             if let Err(error) = state.store.append_session_artifact(&SessionArtifactRecord {
@@ -1102,7 +1188,7 @@ async fn workshop_command(
             if let Err(error) = session.finalize_voting() {
                 return bad_command_request(&error.to_string());
             }
-            if let Err(error) = state.store.save_session(&session.summary()) {
+            if let Err(error) = state.store.save_session(session) {
                 return internal_command_error(format!("failed to save session: {error}"));
             }
             if let Err(error) = state.store.append_session_artifact(&SessionArtifactRecord {
@@ -1134,7 +1220,7 @@ async fn workshop_command(
             if let Err(error) = session.reset_to_lobby() {
                 return bad_command_request(&error.to_string());
             }
-            if let Err(error) = state.store.save_session(&session.summary()) {
+            if let Err(error) = state.store.save_session(session) {
                 return internal_command_error(format!("failed to save session: {error}"));
             }
             if let Err(error) = state.store.append_session_artifact(&SessionArtifactRecord {
@@ -1181,6 +1267,9 @@ async fn workshop_judge_bundle(
     }
 
     let session = {
+        if !ensure_session_cached(&state, session_code).await.unwrap_or(false) {
+            return bad_judge_bundle_request("Workshop not found.");
+        }
         let sessions = state.sessions.lock().await;
         let Some(session) = sessions.get(session_code) else {
             return bad_judge_bundle_request("Workshop not found.");
@@ -1257,6 +1346,7 @@ async fn workshop_judge_bundle(
          bind_addr: state.config.bind_addr.to_string(),
          is_production: state.config.is_production,
          rust_session_code_prefix: state.config.rust_session_code_prefix.clone(),
+         persistence_backend: state.config.persistence_backend.clone(),
          allow_any_origin: state.config.origin_policy.allow_any_origin,
          require_origin: state.config.origin_policy.require_origin,
          allowed_origins,
@@ -1338,7 +1428,9 @@ async fn workshop_judge_bundle(
              .map(|ch| (((ch as u8) % 10) + b'0') as char)
              .collect::<String>();
          let candidate = format!("{}{}", state.config.rust_session_code_prefix, suffix);
-         if !state.sessions.lock().await.contains_key(&candidate) {
+         if !state.sessions.lock().await.contains_key(&candidate)
+             && state.store.load_session_by_code(&candidate).ok().flatten().is_none()
+         {
              return candidate;
          }
      }
@@ -1675,6 +1767,9 @@ fn successful_workshop_command(should_broadcast: &mut bool) -> (StatusCode, Json
                  is_production: false,
              })
              .expect("create origin policy"),
+             static_assets_dir: std::env::temp_dir().join("dragon-shift-test-static-missing"),
+             database_url: None,
+             persistence_backend: "memory".to_string(),
          });
 
          AppState {
@@ -1709,6 +1804,23 @@ fn successful_workshop_command(should_broadcast: &mut bool) -> (StatusCode, Json
          request
      }
 
+     fn test_state_with_static_assets() -> AppState {
+         let static_assets_dir = std::env::temp_dir().join(format!("dragon-shift-test-static-{}", Uuid::new_v4()));
+         std::fs::create_dir_all(&static_assets_dir).expect("create static assets dir");
+         std::fs::write(
+             static_assets_dir.join("index.html"),
+             "<!doctype html><html><body><div id=\"root\">dragon shift</div></body></html>",
+         )
+         .expect("write static index");
+
+         let mut state = test_state();
+         state.config = Arc::new(AppConfig {
+             static_assets_dir,
+             ..state.config.as_ref().clone()
+         });
+         state
+     }
+
      #[tokio::test]
      async fn live_endpoint_returns_ok() {
          let app = build_app(test_state());
@@ -1723,6 +1835,21 @@ fn successful_workshop_command(should_broadcast: &mut bool) -> (StatusCode, Json
          let json: serde_json::Value = serde_json::from_slice(&body).expect("parse live json");
          assert_eq!(json["status"], "live");
          assert_eq!(json["ok"], true);
+     }
+
+     #[tokio::test]
+     async fn root_path_serves_static_index_when_bundle_exists() {
+         let app = build_app(test_state_with_static_assets());
+
+         let response = app
+             .oneshot(Request::builder().uri("/").body(Body::empty()).expect("build request"))
+             .await
+             .expect("call root path");
+
+         assert_eq!(response.status(), StatusCode::OK);
+         let body = to_bytes(response.into_body(), usize::MAX).await.expect("read root body");
+         let html = String::from_utf8(body.to_vec()).expect("decode html");
+         assert!(html.contains("dragon shift"));
      }
 
      #[tokio::test]

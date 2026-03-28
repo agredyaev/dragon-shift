@@ -1,0 +1,11 @@
+node_modules/
+build/
+dist/
+rust-coordinator/target/
+coverage/
+.DS_Store
+*.log
+.env*
+!.env.example
+target/
+*/.tmp/

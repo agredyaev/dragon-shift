@@ -1,5 +1,5 @@
 [package]
-name = "persistence"
+name = "domain"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -7,8 +7,7 @@ authors.workspace = true
 
 [dependencies]
 chrono.workspace = true
+serde.workspace = true
 thiserror.workspace = true
-domain.workspace = true
-protocol.workspace = true
-serde_json.workspace = true
 uuid.workspace = true
+protocol.workspace = true

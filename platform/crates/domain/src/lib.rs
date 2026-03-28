@@ -1,30 +1,31 @@
 use chrono::{DateTime, Utc};
 use protocol::{ActiveTime, DragonAction, DragonEmotion, FoodType, Phase, PlayType};
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use thiserror::Error;
 use uuid::Uuid;
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SessionCode(pub String);
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VotingState {
     pub eligible_player_ids: Vec<String>,
     pub votes_by_player_id: BTreeMap<String, String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Phase1Assignment {
     pub player_id: String,
     pub dragon_id: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Phase2TransitionResult {
     pub auto_filled_players: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionDragon {
     pub id: String,
     pub name: String,
@@ -55,20 +56,20 @@ pub struct SessionDragon {
     pub phase2_lowest_happiness: i32,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PlayerAction {
     Feed(FoodType),
     Play(PlayType),
     Sleep,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ActionOutcome {
     Applied { awarded_achievement: Option<&'static str> },
     Blocked { reason: ActionBlockReason },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ActionBlockReason {
     AlreadyFull,
     TooHungryToPlay,
@@ -76,7 +77,7 @@ pub enum ActionBlockReason {
     TooAwakeToSleep,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionPlayer {
     pub id: String,
     pub name: String,
@@ -90,7 +91,7 @@ pub struct SessionPlayer {
     pub joined_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionSummary {
     pub id: Uuid,
     pub code: SessionCode,
@@ -98,7 +99,7 @@ pub struct SessionSummary {
     pub updated_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkshopSession {
     pub id: Uuid,
     pub code: SessionCode,

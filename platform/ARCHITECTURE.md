@@ -326,7 +326,7 @@ Frontend composition root:
 Пока не наступил cutover:
 
 - legacy код не редактируется без крайней необходимости;
-- все новые фичи Rust-only мира реализуются в `rust-next/`;
+- все новые фичи Rust-only мира реализуются в `platform/`;
 - parity подтверждается тестами, а не ощущением;
 - удаление legacy только после зелёного staging и cutover checklist.
 

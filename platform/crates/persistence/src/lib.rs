@@ -1,13 +1,20 @@
-use domain::SessionSummary;
+use domain::WorkshopSession;
+use postgres::{Client, NoTls};
 use protocol::SessionArtifactRecord;
 use std::collections::HashMap;
-use std::sync::RwLock;
+use std::sync::{Mutex, RwLock};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum PersistenceError {
     #[error("session store lock poisoned")]
     LockPoisoned,
+    #[error("postgres worker thread panicked")]
+    WorkerThreadPanicked,
+    #[error("postgres error: {0}")]
+    Postgres(#[from] postgres::Error),
+    #[error("json error: {0}")]
+    Json(#[from] serde_json::Error),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -28,8 +35,8 @@ pub struct PlayerIdentityMatch {
 pub trait SessionStore: Send + Sync {
     fn init(&self) -> Result<(), PersistenceError>;
     fn health_check(&self) -> Result<bool, PersistenceError>;
-    fn load_session_by_code(&self, session_code: &str) -> Result<Option<SessionSummary>, PersistenceError>;
-    fn save_session(&self, session: &SessionSummary) -> Result<(), PersistenceError>;
+    fn load_session_by_code(&self, session_code: &str) -> Result<Option<WorkshopSession>, PersistenceError>;
+    fn save_session(&self, session: &WorkshopSession) -> Result<(), PersistenceError>;
     fn append_session_artifact(&self, artifact: &SessionArtifactRecord) -> Result<(), PersistenceError>;
     fn list_session_artifacts(&self, session_id: &str) -> Result<Vec<SessionArtifactRecord>, PersistenceError>;
     fn create_player_identity(&self, identity: &PlayerIdentity) -> Result<(), PersistenceError>;
@@ -44,8 +51,8 @@ pub trait SessionStore: Send + Sync {
 
 #[derive(Debug, Default)]
 pub struct InMemorySessionStore {
-    sessions_by_code: RwLock<HashMap<String, SessionSummary>>,
-    sessions_by_id: RwLock<HashMap<String, SessionSummary>>,
+    sessions_by_code: RwLock<HashMap<String, WorkshopSession>>,
+    sessions_by_id: RwLock<HashMap<String, WorkshopSession>>,
     artifacts_by_session_id: RwLock<HashMap<String, Vec<SessionArtifactRecord>>>,
     identities_by_token: RwLock<HashMap<String, PlayerIdentity>>,
 }
@@ -53,6 +60,218 @@ pub struct InMemorySessionStore {
 impl InMemorySessionStore {
     pub fn new() -> Self {
         Self::default()
+    }
+}
+
+pub struct PostgresSessionStore {
+    client: Mutex<Client>,
+}
+
+impl PostgresSessionStore {
+    pub fn connect(database_url: &str) -> Result<Self, PersistenceError> {
+        let client = Client::connect(database_url, NoTls)?;
+        Ok(Self {
+            client: Mutex::new(client),
+        })
+    }
+
+    fn with_client<T>(
+        &self,
+        operation: impl FnOnce(&mut Client) -> Result<T, PersistenceError> + Send,
+    ) -> Result<T, PersistenceError>
+    where
+        T: Send,
+    {
+        std::thread::scope(|scope| {
+            let handle = scope.spawn(|| {
+                let mut client = self.client.lock().map_err(|_| PersistenceError::LockPoisoned)?;
+                operation(&mut client)
+            });
+            handle
+                .join()
+                .map_err(|_| PersistenceError::WorkerThreadPanicked)?
+        })
+    }
+}
+
+impl SessionStore for PostgresSessionStore {
+    fn init(&self) -> Result<(), PersistenceError> {
+        self.with_client(|client| {
+            client.batch_execute(
+                "
+                CREATE TABLE IF NOT EXISTS workshop_sessions (
+                    session_id TEXT PRIMARY KEY,
+                    session_code TEXT UNIQUE NOT NULL,
+                    payload JSONB NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_workshop_sessions_code ON workshop_sessions(session_code);
+
+                CREATE TABLE IF NOT EXISTS session_artifacts (
+                    id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    payload JSONB NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_session_artifacts_session_created
+                    ON session_artifacts(session_id, created_at, id);
+
+                CREATE TABLE IF NOT EXISTS player_identities (
+                    reconnect_token TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    player_id TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    last_seen_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_player_identities_session_id ON player_identities(session_id);
+                ",
+            )?;
+            Ok(())
+        })
+    }
+
+    fn health_check(&self) -> Result<bool, PersistenceError> {
+        self.with_client(|client| {
+            client.query_one("SELECT 1", &[])?;
+            Ok(true)
+        })
+    }
+
+    fn load_session_by_code(&self, session_code: &str) -> Result<Option<WorkshopSession>, PersistenceError> {
+        self.with_client(|client| {
+            let row = client.query_opt(
+                "SELECT payload FROM workshop_sessions WHERE session_code = $1",
+                &[&session_code],
+            )?;
+            let Some(row) = row else {
+                return Ok(None);
+            };
+            let payload: serde_json::Value = row.get(0);
+            let session = serde_json::from_value(payload)?;
+            Ok(Some(session))
+        })
+    }
+
+    fn save_session(&self, session: &WorkshopSession) -> Result<(), PersistenceError> {
+        self.with_client(|client| {
+            let payload = serde_json::to_value(session)?;
+            client.execute(
+                "
+                INSERT INTO workshop_sessions (session_id, session_code, payload, updated_at)
+                VALUES ($1, $2, $3, $4)
+                ON CONFLICT (session_id) DO UPDATE SET
+                    session_code = EXCLUDED.session_code,
+                    payload = EXCLUDED.payload,
+                    updated_at = EXCLUDED.updated_at
+                ",
+                &[
+                    &session.id.to_string(),
+                    &session.code.0,
+                    &payload,
+                    &session.updated_at.to_rfc3339(),
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    fn append_session_artifact(&self, artifact: &SessionArtifactRecord) -> Result<(), PersistenceError> {
+        self.with_client(|client| {
+            let payload = serde_json::to_value(artifact)?;
+            client.execute(
+                "
+                INSERT INTO session_artifacts (id, session_id, created_at, payload)
+                VALUES ($1, $2, $3, $4)
+                ON CONFLICT (id) DO UPDATE SET
+                    session_id = EXCLUDED.session_id,
+                    created_at = EXCLUDED.created_at,
+                    payload = EXCLUDED.payload
+                ",
+                &[&artifact.id, &artifact.session_id, &artifact.created_at, &payload],
+            )?;
+            Ok(())
+        })
+    }
+
+    fn list_session_artifacts(&self, session_id: &str) -> Result<Vec<SessionArtifactRecord>, PersistenceError> {
+        self.with_client(|client| {
+            let rows = client.query(
+                "SELECT payload FROM session_artifacts WHERE session_id = $1 ORDER BY created_at ASC, id ASC",
+                &[&session_id],
+            )?;
+            rows.into_iter()
+                .map(|row| {
+                    let payload: serde_json::Value = row.get(0);
+                    serde_json::from_value(payload).map_err(PersistenceError::from)
+                })
+                .collect()
+        })
+    }
+
+    fn create_player_identity(&self, identity: &PlayerIdentity) -> Result<(), PersistenceError> {
+        self.with_client(|client| {
+            client.execute(
+                "
+                INSERT INTO player_identities (reconnect_token, session_id, player_id, created_at, last_seen_at)
+                VALUES ($1, $2, $3, $4, $5)
+                ON CONFLICT (reconnect_token) DO UPDATE SET
+                    session_id = EXCLUDED.session_id,
+                    player_id = EXCLUDED.player_id,
+                    created_at = EXCLUDED.created_at,
+                    last_seen_at = EXCLUDED.last_seen_at
+                ",
+                &[
+                    &identity.reconnect_token,
+                    &identity.session_id,
+                    &identity.player_id,
+                    &identity.created_at,
+                    &identity.last_seen_at,
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    fn find_player_identity(
+        &self,
+        session_code: &str,
+        reconnect_token: &str,
+    ) -> Result<Option<PlayerIdentityMatch>, PersistenceError> {
+        self.with_client(|client| {
+            let row = client.query_opt(
+                "
+                SELECT identities.session_id, identities.player_id
+                FROM player_identities identities
+                INNER JOIN workshop_sessions sessions ON sessions.session_id = identities.session_id
+                WHERE identities.reconnect_token = $1 AND sessions.session_code = $2
+                ",
+                &[&reconnect_token, &session_code],
+            )?;
+            Ok(row.map(|row| PlayerIdentityMatch {
+                session_id: row.get(0),
+                player_id: row.get(1),
+            }))
+        })
+    }
+
+    fn touch_player_identity(&self, reconnect_token: &str, last_seen_at: &str) -> Result<(), PersistenceError> {
+        self.with_client(|client| {
+            client.execute(
+                "UPDATE player_identities SET last_seen_at = $2 WHERE reconnect_token = $1",
+                &[&reconnect_token, &last_seen_at],
+            )?;
+            Ok(())
+        })
+    }
+
+    fn revoke_player_identity(&self, reconnect_token: &str) -> Result<(), PersistenceError> {
+        self.with_client(|client| {
+            client.execute(
+                "DELETE FROM player_identities WHERE reconnect_token = $1",
+                &[&reconnect_token],
+            )?;
+            Ok(())
+        })
     }
 }
 
@@ -65,7 +284,7 @@ impl SessionStore for InMemorySessionStore {
         Ok(true)
     }
 
-    fn load_session_by_code(&self, session_code: &str) -> Result<Option<SessionSummary>, PersistenceError> {
+    fn load_session_by_code(&self, session_code: &str) -> Result<Option<WorkshopSession>, PersistenceError> {
         let guard = self
             .sessions_by_code
             .read()
@@ -73,7 +292,7 @@ impl SessionStore for InMemorySessionStore {
         Ok(guard.get(session_code).cloned())
     }
 
-    fn save_session(&self, session: &SessionSummary) -> Result<(), PersistenceError> {
+    fn save_session(&self, session: &WorkshopSession) -> Result<(), PersistenceError> {
         {
             let mut sessions_by_code = self
                 .sessions_by_code
@@ -184,7 +403,7 @@ impl SessionStore for InMemorySessionStore {
 mod tests {
     use super::*;
     use chrono::{DateTime, Utc};
-    use domain::SessionCode;
+    use domain::{SessionCode, WorkshopSession};
     use protocol::{Phase, SessionArtifactKind};
     use serde_json::json;
     use uuid::Uuid;
@@ -193,13 +412,11 @@ mod tests {
         DateTime::from_timestamp(seconds, 0).expect("valid timestamp")
     }
 
-    fn summary(code: &str, phase: Phase, updated_at_seconds: i64) -> SessionSummary {
-        SessionSummary {
-            id: Uuid::new_v4(),
-            code: SessionCode(code.to_string()),
-            phase,
-            updated_at: ts(updated_at_seconds),
-        }
+    fn session(code: &str, phase: Phase, updated_at_seconds: i64) -> WorkshopSession {
+        let mut session = WorkshopSession::new(Uuid::new_v4(), SessionCode(code.to_string()), ts(updated_at_seconds));
+        session.phase = phase;
+        session.updated_at = ts(updated_at_seconds);
+        session
     }
 
     fn artifact(session_id: &str, id: &str, created_at: &str) -> SessionArtifactRecord {
@@ -237,7 +454,7 @@ mod tests {
     #[test]
     fn save_and_load_session_roundtrip() {
         let store = InMemorySessionStore::new();
-        let saved = summary("123456", Phase::Lobby, 1);
+        let saved = session("123456", Phase::Lobby, 1);
 
         store.save_session(&saved).expect("save session");
         let loaded = store
@@ -251,8 +468,8 @@ mod tests {
     #[test]
     fn save_session_overwrites_existing_session_by_code() {
         let store = InMemorySessionStore::new();
-        let first = summary("123456", Phase::Lobby, 1);
-        let second = summary("123456", Phase::Phase1, 2);
+        let first = session("123456", Phase::Lobby, 1);
+        let second = session("123456", Phase::Phase1, 2);
 
         store.save_session(&first).expect("save first session");
         store.save_session(&second).expect("save second session");
@@ -296,7 +513,7 @@ mod tests {
     #[test]
     fn find_player_identity_returns_none_for_missing_token() {
         let store = InMemorySessionStore::new();
-        let session = summary("123456", Phase::Lobby, 1);
+        let session = session("123456", Phase::Lobby, 1);
         store.save_session(&session).expect("save session");
 
         let found = store
@@ -309,7 +526,7 @@ mod tests {
     #[test]
     fn revoke_player_identity_removes_existing_identity() {
         let store = InMemorySessionStore::new();
-        let session = summary("123456", Phase::Lobby, 1);
+        let session = session("123456", Phase::Lobby, 1);
         store.save_session(&session).expect("save session");
         store
             .create_player_identity(&identity(&session.id.to_string(), "player-1", "token-1"))
@@ -328,7 +545,7 @@ mod tests {
     #[test]
     fn touch_player_identity_updates_last_seen_without_changing_match() {
         let store = InMemorySessionStore::new();
-        let session = summary("123456", Phase::Lobby, 1);
+        let session = session("123456", Phase::Lobby, 1);
         store.save_session(&session).expect("save session");
         store
             .create_player_identity(&identity(&session.id.to_string(), "player-1", "token-1"))
