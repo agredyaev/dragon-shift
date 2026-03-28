@@ -13,5 +13,4 @@ Important:
 - The default chart path deploys the Rust-only app-server image with the bundled Dioxus web client.
 - HTTP API, WebSocket endpoint, and browser UI share the same origin through one service.
 - Keep replicaCount=1 until persistence and distributed realtime coordination are added to the Rust runtime.
-- Legacy gateway/coordinator resources only render when legacy.enabled=true.
 - Ensure ALLOWED_ORIGINS and VITE_APP_URL match the public application origin.

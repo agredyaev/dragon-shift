@@ -3,33 +3,11 @@ image:
   tag: minikube
   pullPolicy: IfNotPresent
 
-gatewayImage:
-  repository: dragon-shift-axum-gateway
-  tag: minikube
-  pullPolicy: IfNotPresent
-
-rustCoordinatorImage:
-  repository: dragon-shift-rust-coordinator
-  tag: minikube
-  pullPolicy: IfNotPresent
-
-legacy:
-  enabled: false
-
 service:
   type: NodePort
   port: 3000
   targetPort: 3000
-
-gatewayService:
-  type: NodePort
-  port: 4000
-  targetPort: 4000
-
-rustCoordinatorService:
-  type: ClusterIP
-  port: 3100
-  targetPort: 3100
+  nodePort: 39000
 
 ingress:
   enabled: false
@@ -48,16 +26,8 @@ app:
   socketRateLimitMax: 300
   socketRateLimitWindowMs: 60000
 
-gatewayApp:
-  port: 4000
-  publicBaseUrl: ""
-
-rustCoordinatorApp:
-  port: 3100
-  sessionCodePrefix: "9"
-
 database:
-  url: "postgres://dragon_shift:dragon-shift-local@postgres.default.svc.cluster.local:5432/dragon_shift"
+  url: ""
   existingSecretName: ""
   existingSecretKey: DATABASE_URL
 
@@ -69,25 +39,7 @@ resources:
     cpu: 1000m
     memory: 1Gi
 
-gatewayResources:
-  requests:
-    cpu: 100m
-    memory: 128Mi
-  limits:
-    cpu: 500m
-    memory: 256Mi
-
-rustCoordinatorResources:
-  requests:
-    cpu: 100m
-    memory: 128Mi
-  limits:
-    cpu: 500m
-    memory: 256Mi
-
 podDisruptionBudget:
   enabled: false
 
 replicaCount: 1
-gatewayReplicaCount: 1
-rustCoordinatorReplicaCount: 1

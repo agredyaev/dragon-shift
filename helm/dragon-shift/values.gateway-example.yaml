@@ -3,9 +3,6 @@ service:
   port: 80
   targetPort: 3000
 
-legacy:
-  enabled: false
-
 ingress:
   enabled: true
   className: nginx
@@ -33,5 +30,3 @@ database:
   existingSecretKey: DATABASE_URL
 
 replicaCount: 1
-gatewayReplicaCount: 1
-rustCoordinatorReplicaCount: 1

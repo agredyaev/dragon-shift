@@ -21,9 +21,9 @@ spec:
             pathType: Prefix
             backend:
               service:
-                name: {{ if .Values.legacy.enabled }}{{ include "dragon-shift.gateway.fullname" . }}{{ else }}{{ include "dragon-shift.app.fullname" . }}{{ end }}
+                name: {{ include "dragon-shift.app.fullname" . }}
                 port:
-                  number: {{ if .Values.legacy.enabled }}{{ .Values.gatewayService.port }}{{ else }}{{ .Values.service.port }}{{ end }}
+                  number: {{ .Values.service.port }}
   {{- if .Values.ingress.tls.enabled }}
   tls:
     - hosts:

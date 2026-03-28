@@ -1,4 +1,3 @@
-{{- if not .Values.legacy.enabled }}
 apiVersion: v1
 kind: Service
 metadata:
@@ -13,5 +12,7 @@ spec:
     - name: http
       port: {{ .Values.service.port }}
       targetPort: {{ .Values.service.targetPort }}
+      {{- with .Values.service.nodePort }}
+      nodePort: {{ . }}
+      {{- end }}
       protocol: TCP
-{{- end }}

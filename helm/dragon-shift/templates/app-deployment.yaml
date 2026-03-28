@@ -1,12 +1,19 @@
-{{- if not .Values.legacy.enabled }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: {{ include "dragon-shift.app.fullname" . }}
   labels:
     {{- include "dragon-shift.app.labels" . | nindent 4 }}
+  {{- with .Values.deploymentAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
 spec:
   replicas: {{ .Values.replicaCount }}
+  revisionHistoryLimit: {{ .Values.revisionHistoryLimit }}
+  minReadySeconds: {{ .Values.minReadySeconds }}
+  strategy:
+    {{- toYaml .Values.deploymentStrategy | nindent 4 }}
   selector:
     matchLabels:
       {{- include "dragon-shift.app.selectorLabels" . | nindent 6 }}
@@ -14,12 +21,18 @@ spec:
     metadata:
       labels:
         {{- include "dragon-shift.app.labels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
       {{- with .Values.podAnnotations }}
       annotations:
         {{- toYaml . | nindent 8 }}
       {{- end }}
     spec:
       serviceAccountName: {{ include "dragon-shift.serviceAccountName" . }}
+      automountServiceAccountToken: {{ .Values.serviceAccount.automountServiceAccountToken }}
+      enableServiceLinks: false
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
@@ -30,7 +43,7 @@ spec:
       {{- end }}
       containers:
         - name: app-server
-          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          image: {{ include "dragon-shift.app.image" . | quote }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           {{- with .Values.securityContext }}
           securityContext:
@@ -62,7 +75,18 @@ spec:
                 secretKeyRef:
                   name: {{ .Values.database.existingSecretName | quote }}
                   key: {{ .Values.database.existingSecretKey | quote }}
+            {{- else if .Values.postgresql.enabled }}
+            - name: DATABASE_URL
+              value: {{ include "dragon-shift.databaseUrl" . | quote }}
             {{- end }}
+          {{- if .Values.startupProbe.enabled }}
+          startupProbe:
+            httpGet:
+              path: {{ .Values.startupProbe.path }}
+              port: http
+            failureThreshold: {{ .Values.startupProbe.failureThreshold }}
+            periodSeconds: {{ .Values.startupProbe.periodSeconds }}
+          {{- end }}
           readinessProbe:
             httpGet:
               path: /api/ready
@@ -75,8 +99,14 @@ spec:
               port: http
             initialDelaySeconds: 10
             periodSeconds: 20
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
+      volumes:
+        - name: tmp
+          emptyDir: {}
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
@@ -89,4 +119,3 @@ spec:
       tolerations:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-{{- end }}

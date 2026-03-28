@@ -3,4 +3,11 @@ name: dragon-shift
 description: Dragon Shift workshop deployment chart
 type: application
 version: 0.1.0
-appVersion: "0.0.0"
+kubeVersion: ">=1.29.0-0"
+appVersion: "0.1.0"
+
+dependencies:
+  - name: postgresql
+    version: 18.5.14
+    repository: https://charts.bitnami.com/bitnami
+    condition: postgresql.enabled
