@@ -1,0 +1,6 @@
+apiVersion: v2
+name: dragon-shift
+description: Dragon Shift workshop deployment chart
+type: application
+version: 0.1.0
+appVersion: "0.0.0"

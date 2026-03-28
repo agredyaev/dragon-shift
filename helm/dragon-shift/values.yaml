@@ -1,0 +1,139 @@
+image:
+  repository: ghcr.io/your-org/dragon-shift-rust
+  tag: latest
+  pullPolicy: IfNotPresent
+
+gatewayImage:
+  repository: ghcr.io/your-org/dragon-shift-axum-gateway
+  tag: latest
+  pullPolicy: IfNotPresent
+
+rustCoordinatorImage:
+  repository: ghcr.io/your-org/dragon-shift-rust-coordinator
+  tag: latest
+  pullPolicy: IfNotPresent
+
+nameOverride: ""
+fullnameOverride: ""
+
+legacy:
+  enabled: false
+
+service:
+  type: ClusterIP
+  port: 80
+  targetPort: 3000
+
+gatewayService:
+  type: ClusterIP
+  port: 80
+  targetPort: 4000
+
+rustCoordinatorService:
+  type: ClusterIP
+  port: 80
+  targetPort: 3100
+
+ingress:
+  enabled: false
+  className: ""
+  host: dragon-shift.example.com
+  annotations: {}
+  tls:
+    enabled: false
+    secretName: ""
+
+gateway:
+  enabled: false
+  name: ""
+  namespace: ""
+  sectionName: ""
+  hostnames: []
+  pathPrefix: /
+  annotations: {}
+  tls:
+    enabled: false
+    secretName: ""
+
+app:
+  port: 3000
+  allowedOrigins: https://dragon-shift.example.com
+  viteAppUrl: https://dragon-shift.example.com
+  staticDir: /app/static
+  rustSessionCodePrefix: "9"
+  databasePoolSize: 10
+  geminiApiKey: ""
+  trustProxyHeaders: true
+  joinRateLimitMax: 120
+  joinRateLimitWindowMs: 60000
+  socketRateLimitMax: 300
+  socketRateLimitWindowMs: 60000
+
+gatewayApp:
+  port: 4000
+  publicBaseUrl: ""
+
+rustCoordinatorApp:
+  port: 3100
+  sessionCodePrefix: "9"
+
+database:
+  url: ""
+  existingSecretName: ""
+  existingSecretKey: DATABASE_URL
+
+resources:
+  requests:
+    cpu: 250m
+    memory: 512Mi
+  limits:
+    cpu: 1000m
+    memory: 1Gi
+
+gatewayResources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
+
+rustCoordinatorResources:
+  requests:
+    cpu: 150m
+    memory: 256Mi
+  limits:
+    cpu: 750m
+    memory: 768Mi
+
+autoscaling:
+  enabled: false
+
+imagePullSecrets: []
+
+serviceAccount:
+  create: true
+  annotations: {}
+  name: ""
+
+podAnnotations: {}
+
+podSecurityContext: {}
+
+securityContext: {}
+
+nodeSelector: {}
+
+tolerations: []
+
+affinity: {}
+
+replicaCount: 1
+
+gatewayReplicaCount: 2
+
+rustCoordinatorReplicaCount: 1
+
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1

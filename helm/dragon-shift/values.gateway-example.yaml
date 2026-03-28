@@ -1,0 +1,37 @@
+service:
+  type: ClusterIP
+  port: 80
+  targetPort: 3000
+
+legacy:
+  enabled: false
+
+ingress:
+  enabled: true
+  className: nginx
+  host: dragon-shift.example.com
+  annotations: {}
+  tls:
+    enabled: false
+    secretName: ""
+
+app:
+  port: 3000
+  allowedOrigins: https://dragon-shift.example.com
+  viteAppUrl: https://dragon-shift.example.com
+  staticDir: /app/static
+  rustSessionCodePrefix: "9"
+  trustProxyHeaders: true
+  joinRateLimitMax: 180
+  joinRateLimitWindowMs: 60000
+  socketRateLimitMax: 500
+  socketRateLimitWindowMs: 60000
+
+database:
+  url: ""
+  existingSecretName: dragon-shift-app
+  existingSecretKey: DATABASE_URL
+
+replicaCount: 1
+gatewayReplicaCount: 1
+rustCoordinatorReplicaCount: 1
