@@ -32,6 +32,12 @@ struct WebBuildConfig {
     out_dir: PathBuf,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct JoinLoadConfig {
+    base_url: String,
+    clients: usize,
+}
+
 fn main() {
     if let Err(error) = run(env::args().skip(1).collect()) {
         eprintln!("{error}");
@@ -61,6 +67,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
         "build-web" => build_web_bundle(build_web_config(&forwarded)?),
         "server" | "dev-server" => run_tool_owned("cargo", cargo_run_package_args("app-server", &forwarded)),
         "smoke-phase1" => run_async(smoke_phase1(smoke_base_url(&forwarded)?)),
+        "smoke-join-load" => run_async(smoke_join_load(join_load_config(&forwarded)?)),
         "smoke-judge-bundle" => run_async(smoke_judge_bundle(smoke_base_url(&forwarded)?)),
         "smoke-offline-failover" => run_async(smoke_offline_failover(smoke_base_url(&forwarded)?)),
         "smoke-persistence" => run_async(smoke_persistence(persistence_smoke_config(&forwarded)?)),
@@ -119,6 +126,42 @@ fn smoke_base_url(forwarded: &[String]) -> Result<String, String> {
     }
 
     Ok(normalize_base_url(&base_url))
+}
+
+fn join_load_config(forwarded: &[String]) -> Result<JoinLoadConfig, String> {
+    let mut base_url = env::var("XTASK_SMOKE_BASE_URL")
+        .or_else(|_| env::var("SMOKE_TEST_BASE_URL"))
+        .unwrap_or_else(|_| "http://127.0.0.1:4100".to_string());
+    let mut clients = 30usize;
+    let mut args = forwarded.iter();
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--base-url" => {
+                base_url = args
+                    .next()
+                    .ok_or_else(|| "missing value for --base-url".to_string())?
+                    .clone();
+            }
+            "--clients" => {
+                clients = args
+                    .next()
+                    .ok_or_else(|| "missing value for --clients".to_string())?
+                    .parse::<usize>()
+                    .map_err(|error| format!("invalid value for --clients: {error}"))?;
+            }
+            unknown => return Err(format!("unknown join-load arg: {unknown}")),
+        }
+    }
+
+    if clients == 0 {
+        return Err("--clients must be greater than 0".to_string());
+    }
+
+    Ok(JoinLoadConfig {
+        base_url: normalize_base_url(&base_url),
+        clients,
+    })
 }
 
 fn persistence_smoke_config(forwarded: &[String]) -> Result<PersistenceSmokeConfig, String> {
@@ -346,6 +389,56 @@ async fn smoke_phase1(base_url: String) -> Result<(), String> {
         "baseUrl": base_url,
         "sessionCode": host.session_code,
         "phase": "phase1",
+    }))
+}
+
+async fn smoke_join_load(config: JoinLoadConfig) -> Result<(), String> {
+    let client = reqwest::Client::new();
+    let host = create_workshop(&client, &config.base_url, "XtaskLoadHost").await?;
+    let requested_clients = config.clients;
+    let join_results = futures_util::future::join_all((0..requested_clients).map(|index| {
+        let client = client.clone();
+        let base_url = config.base_url.clone();
+        let session_code = host.session_code.clone();
+        let player_name = format!("LoadPlayer{:02}", index + 1);
+
+        async move { join_workshop(&client, &base_url, &session_code, &player_name).await }
+    }))
+    .await;
+
+    for join_result in join_results {
+        join_result?;
+    }
+
+    let host_after_load = reconnect_workshop(&client, &config.base_url, &host).await?;
+    let total_players = host_after_load.state.players.len();
+    let connected_players = host_after_load
+        .state
+        .players
+        .values()
+        .filter(|player| player.is_connected)
+        .count();
+    let expected_total_players = requested_clients + 1;
+
+    if total_players != expected_total_players {
+        return Err(format!(
+            "expected {expected_total_players} total players after load join, got {total_players}"
+        ));
+    }
+    if connected_players != expected_total_players {
+        return Err(format!(
+            "expected {expected_total_players} connected players after load join, got {connected_players}"
+        ));
+    }
+
+    print_json(json!({
+        "ok": true,
+        "baseUrl": config.base_url,
+        "sessionCode": host.session_code,
+        "hostPlayerId": host.player_id,
+        "joinedClients": requested_clients,
+        "totalPlayers": total_players,
+        "connectedPlayers": connected_players,
     }))
 }
 
@@ -801,6 +894,7 @@ fn print_help() {
   cargo xtask build-web -- [--out-dir app-web/dist]
   cargo xtask server -- [app-server args]
   cargo xtask smoke-phase1 -- [--base-url http://127.0.0.1:4100]
+  cargo xtask smoke-join-load -- [--base-url http://127.0.0.1:4100] [--clients 30]
   cargo xtask smoke-judge-bundle -- [--base-url http://127.0.0.1:4100]
   cargo xtask smoke-offline-failover -- [--base-url http://127.0.0.1:4100]
   cargo xtask smoke-persistence -- [--base-url http://127.0.0.1:4100] [--database-url postgres://...]"
@@ -831,6 +925,26 @@ mod tests {
             smoke_base_url(&["--base-url".to_string(), "http://localhost:4200/".to_string()]).expect("base url"),
             "http://localhost:4200"
         );
+    }
+
+    #[test]
+    fn join_load_config_defaults_to_thirty_clients() {
+        let config = join_load_config(&[]).expect("join load config");
+        assert_eq!(config.base_url, "http://127.0.0.1:4100");
+        assert_eq!(config.clients, 30);
+    }
+
+    #[test]
+    fn join_load_config_uses_forwarded_flags() {
+        let config = join_load_config(&[
+            "--base-url".to_string(),
+            "http://localhost:4300/".to_string(),
+            "--clients".to_string(),
+            "12".to_string(),
+        ])
+        .expect("join load config with flags");
+        assert_eq!(config.base_url, "http://localhost:4300");
+        assert_eq!(config.clients, 12);
     }
 
     #[test]
