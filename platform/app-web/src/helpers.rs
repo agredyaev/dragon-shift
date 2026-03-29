@@ -140,12 +140,24 @@ pub fn phase_screen_title(phase: Phase) -> &'static str {
 
 pub fn phase_screen_body(phase: Phase) -> &'static str {
     match phase {
-        Phase::Lobby => "Review the roster, make sure everyone is here, and start when the workshop is ready.",
-        Phase::Phase1 => "Observe your dragon, capture what stands out, and get ready for the handover.",
-        Phase::Handover => "Write the handover notes your teammate will need for the next care round.",
-        Phase::Phase2 => "Use the handover notes to guide care actions and keep the dragon thriving.",
-        Phase::Voting => "Cast a creative vote, track submission progress, and wait for the host to reveal the standings.",
-        Phase::End => "Review creative awards and final standings, then let the host reset when the workshop is complete.",
+        Phase::Lobby => {
+            "Review the roster, make sure everyone is here, and start when the workshop is ready."
+        }
+        Phase::Phase1 => {
+            "Observe your dragon, capture what stands out, and get ready for the handover."
+        }
+        Phase::Handover => {
+            "Write the handover notes your teammate will need for the next care round."
+        }
+        Phase::Phase2 => {
+            "Use the handover notes to guide care actions and keep the dragon thriving."
+        }
+        Phase::Voting => {
+            "Cast a creative vote, track submission progress, and wait for the host to reveal the standings."
+        }
+        Phase::End => {
+            "Review creative awards and final standings, then let the host reset when the workshop is complete."
+        }
     }
 }
 
@@ -646,8 +658,8 @@ pub fn judge_bundle_dragon_rows(bundle: &JudgeBundle) -> Vec<JudgeBundleDragonRo
 pub mod tests {
     use super::*;
     use protocol::{
-        create_default_session_settings, ClientDragon, ClientGameState, CoordinatorType,
-        DragonAction, DragonEmotion, Phase, Player, SessionMeta, WorkshopJoinSuccess,
+        ClientDragon, ClientGameState, CoordinatorType, DragonAction, DragonEmotion, Phase, Player,
+        SessionMeta, WorkshopJoinSuccess, create_default_session_settings,
     };
     use std::collections::BTreeMap;
 
@@ -1104,12 +1116,14 @@ pub mod tests {
         );
         assert!(!voting_reveal_ready(&state));
         assert_eq!(rows.len(), 2);
-        assert!(rows
-            .iter()
-            .any(|row| row.dragon_name == "Comet" && row.is_current_players_dragon));
-        assert!(rows
-            .iter()
-            .any(|row| row.dragon_name == "Nova" && row.is_selected));
+        assert!(
+            rows.iter()
+                .any(|row| row.dragon_name == "Comet" && row.is_current_players_dragon)
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.dragon_name == "Nova" && row.is_selected)
+        );
     }
 
     #[test]

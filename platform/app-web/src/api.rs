@@ -135,10 +135,7 @@ pub fn normalize_api_base_url(base_url: &str) -> String {
     }
 }
 
-pub fn build_reconnect_request(
-    session_code: &str,
-    reconnect_token: &str,
-) -> JoinWorkshopRequest {
+pub fn build_reconnect_request(session_code: &str, reconnect_token: &str) -> JoinWorkshopRequest {
     JoinWorkshopRequest {
         session_code: session_code.trim().to_string(),
         name: None,
@@ -146,9 +143,7 @@ pub fn build_reconnect_request(
     }
 }
 
-pub fn build_client_session_snapshot(
-    success: &WorkshopJoinSuccess,
-) -> ClientSessionSnapshot {
+pub fn build_client_session_snapshot(success: &WorkshopJoinSuccess) -> ClientSessionSnapshot {
     ClientSessionSnapshot {
         session_code: success.session_code.clone(),
         reconnect_token: success.reconnect_token.clone(),
@@ -171,9 +166,7 @@ pub fn build_command_request(
     }
 }
 
-pub fn build_judge_bundle_request(
-    snapshot: &ClientSessionSnapshot,
-) -> WorkshopJudgeBundleRequest {
+pub fn build_judge_bundle_request(snapshot: &ClientSessionSnapshot) -> WorkshopJudgeBundleRequest {
     WorkshopJudgeBundleRequest {
         session_code: snapshot.session_code.clone(),
         reconnect_token: snapshot.reconnect_token.clone(),
@@ -182,9 +175,7 @@ pub fn build_judge_bundle_request(
 }
 
 #[allow(dead_code)]
-pub fn build_session_envelope(
-    snapshot: &ClientSessionSnapshot,
-) -> SessionEnvelope {
+pub fn build_session_envelope(snapshot: &ClientSessionSnapshot) -> SessionEnvelope {
     SessionEnvelope {
         session_code: snapshot.session_code.clone(),
         player_id: snapshot.player_id.clone(),

@@ -1,14 +1,14 @@
 use dioxus::prelude::*;
 use protocol::{ClientGameState, JoinWorkshopRequest, JudgeBundle, SessionCommand};
 
-use crate::api::{build_command_request, build_judge_bundle_request, AppWebApi};
+use crate::api::{AppWebApi, build_command_request, build_judge_bundle_request};
 use crate::helpers::{parse_tags_input, pending_command_label};
 use crate::realtime::bootstrap_realtime;
 use crate::state::{
-    apply_command_error, apply_join_success, apply_judge_bundle_error, apply_judge_bundle_success,
+    ConnectionStatus, IdentityState, OperationState, PendingFlow, apply_command_error,
+    apply_join_success, apply_judge_bundle_error, apply_judge_bundle_success,
     apply_realtime_bootstrap_error, apply_request_error, apply_successful_command, error_notice,
-    info_notice, persist_browser_session_snapshot, ConnectionStatus, IdentityState, OperationState,
-    PendingFlow,
+    info_notice, persist_browser_session_snapshot,
 };
 use protocol::WorkshopCreateConfig;
 
@@ -47,10 +47,26 @@ pub async fn submit_create_flow(
             phase0_minutes: phase0,
             phase1_minutes: phase1,
             phase2_minutes: phase2,
-            image_generator_token: if image_token.is_empty() { None } else { Some(image_token) },
-            image_generator_model: if image_model.is_empty() { None } else { Some(image_model) },
-            judge_token: if judge_token.is_empty() { None } else { Some(judge_token) },
-            judge_model: if judge_model.is_empty() { None } else { Some(judge_model) },
+            image_generator_token: if image_token.is_empty() {
+                None
+            } else {
+                Some(image_token)
+            },
+            image_generator_model: if image_model.is_empty() {
+                None
+            } else {
+                Some(image_model)
+            },
+            judge_token: if judge_token.is_empty() {
+                None
+            } else {
+                Some(judge_token)
+            },
+            judge_model: if judge_model.is_empty() {
+                None
+            } else {
+                Some(judge_model)
+            },
         }
     };
 
@@ -204,6 +220,13 @@ pub async fn submit_join_flow(
                     });
                 }
             }
+            if let Err(error) = bootstrap_realtime(identity, game_state, ops, judge_bundle) {
+                identity.with_mut(|id| {
+                    ops.with_mut(|o| {
+                        apply_realtime_bootstrap_error(id, o, error);
+                    });
+                });
+            }
         }
         Err(error) => {
             identity.with_mut(|id| {
@@ -253,10 +276,7 @@ pub async fn submit_reconnect_flow(
     });
 
     let api = AppWebApi::new(base_url);
-    match api
-        .reconnect_workshop(session_code, reconnect_token)
-        .await
-    {
+    match api.reconnect_workshop(session_code, reconnect_token).await {
         Ok(success) => {
             identity.with_mut(|id| {
                 game_state.with_mut(|gs| {

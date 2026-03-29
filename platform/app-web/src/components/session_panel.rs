@@ -9,7 +9,7 @@ use wasm_bindgen::JsCast;
 
 use crate::helpers::*;
 use crate::realtime::bootstrap_realtime;
-use crate::state::{apply_realtime_bootstrap_error, IdentityState, OperationState};
+use crate::state::{IdentityState, OperationState, apply_realtime_bootstrap_error};
 
 use super::end_view::EndView;
 use super::handover_view::HandoverView;
@@ -111,7 +111,7 @@ pub fn SessionPanel(
     let mut rt_ops = ops;
 
     rsx! {
-        article { class: "panel panel--session",
+        article { class: "panel panel--session", "data-testid": "session-panel",
             h2 { class: "panel__title", "Shift board" }
             div { class: "session-summary",
                 p { class: "summary-chip", "Workshop code: " {session_code_label} }
@@ -155,6 +155,7 @@ pub fn SessionPanel(
             div { class: "button-row",
                 button {
                     class: "button button--secondary",
+                    "data-testid": "sync-session-button",
                     disabled: !has_snapshot || pending_flow,
                     onclick: move |_| {
                         if let Err(error) = bootstrap_realtime(identity, game_state, ops, judge_bundle) {

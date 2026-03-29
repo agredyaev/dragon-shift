@@ -7,15 +7,15 @@ service:
   type: NodePort
   port: 3000
   targetPort: 3000
-  nodePort: 39000
+  nodePort: 32000
 
 ingress:
   enabled: false
 
 app:
   port: 3000
-  allowedOrigins: http://127.0.0.1:39000
-  viteAppUrl: http://127.0.0.1:39000
+  allowedOrigins: http://127.0.0.1:32000
+  viteAppUrl: http://127.0.0.1:32000
   staticDir: /app/static
   rustSessionCodePrefix: "9"
   databasePoolSize: 5

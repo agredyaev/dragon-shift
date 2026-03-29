@@ -7,9 +7,6 @@ mod state;
 
 use dioxus::prelude::*;
 
-#[cfg(target_arch = "wasm32")]
-use wasm_bindgen::{closure::Closure, JsCast};
-
 use components::advanced_panel::AdvancedPanel;
 use components::archive_panel::ArchivePanel;
 use components::controls_panel::ControlsPanel;
@@ -55,8 +52,6 @@ fn App() -> Element {
     let handover_tags_input = use_signal(|| bootstrap.handover_tags_input);
     let ops = use_signal(|| bootstrap.ops);
     let judge_bundle = use_signal(|| bootstrap.judge_bundle);
-    let show_session_panels = use_signal(|| false);
-
     let should_bootstrap_realtime = {
         let id = identity.read();
         id.session_snapshot.is_some() && !id.realtime_bootstrap_attempted
@@ -71,36 +66,6 @@ fn App() -> Element {
     let mut effect_ops = ops;
 
     use_effect(move || {
-        if has_session_snapshot {
-            let should_show = { !*show_session_panels.read() };
-            if should_show {
-                #[cfg(target_arch = "wasm32")]
-                {
-                    if let Some(window) = web_sys::window() {
-                        let callback = Closure::wrap(Box::new(move || {
-                            let mut show_session_panels = show_session_panels;
-                            *show_session_panels.write() = true;
-                        }) as Box<dyn FnMut()>);
-                        let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(
-                            callback.as_ref().unchecked_ref(),
-                            0,
-                        );
-                        callback.forget();
-                    } else {
-                        let mut show_session_panels = show_session_panels;
-                        *show_session_panels.write() = true;
-                    }
-                }
-                #[cfg(not(target_arch = "wasm32"))]
-                {
-                    let mut show_session_panels = show_session_panels;
-                    *show_session_panels.write() = true;
-                }
-            }
-        }
-    });
-
-    use_effect(move || {
         if should_bootstrap_realtime {
             if let Err(error) = bootstrap_realtime(identity, game_state, ops, judge_bundle) {
                 effect_identity.with_mut(|id| {
@@ -112,7 +77,7 @@ fn App() -> Element {
         }
     });
 
-    let render_session_panels = has_session_snapshot && *show_session_panels.read();
+    let render_session_panels = has_session_snapshot;
 
     rsx! {
         main { class: "shell",

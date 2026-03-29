@@ -28,18 +28,20 @@ pub fn JoinPanel(
     let mut reconnect_token_w = reconnect_token;
 
     rsx! {
-        article { class: "panel",
+        article { class: "panel", "data-testid": "join-panel",
             h2 { class: "panel__title", "Join workshop" }
             p { class: "panel__body", "Join with a workshop code or reopen the last saved session from this browser." }
             div { class: "panel__stack",
                 input {
                     class: "input",
+                    "data-testid": "join-session-code-input",
                     value: join_session_code_value,
                     placeholder: "Workshop code",
                     oninput: move |event| join_session_code_w.set(event.value())
                 }
                 input {
                     class: "input",
+                    "data-testid": "join-name-input",
                     value: join_name_value,
                     placeholder: "Player name",
                     oninput: move |event| join_name_w.set(event.value())
@@ -47,6 +49,7 @@ pub fn JoinPanel(
                 div { class: "button-row",
                     button {
                         class: "button button--primary",
+                        "data-testid": "join-workshop-button",
                         disabled: pending,
                         onclick: move |_| {
                             spawn(submit_join_flow(
@@ -65,12 +68,14 @@ pub fn JoinPanel(
                 }
                 input {
                     class: "input",
+                    "data-testid": "reconnect-session-code-input",
                     value: reconnect_session_code_value,
                     placeholder: "Reconnect session code",
                     oninput: move |event| reconnect_session_code_w.set(event.value())
                 }
                 input {
                     class: "input",
+                    "data-testid": "reconnect-token-input",
                     value: reconnect_token_value,
                     placeholder: "Reconnect token",
                     oninput: move |event| reconnect_token_w.set(event.value())
@@ -78,6 +83,7 @@ pub fn JoinPanel(
                 div { class: "button-row",
                     button {
                         class: "button button--secondary",
+                        "data-testid": "reconnect-button",
                         disabled: pending,
                         onclick: move |_| {
                             spawn(submit_reconnect_flow(

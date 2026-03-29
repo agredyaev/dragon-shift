@@ -64,6 +64,7 @@ pub fn VotingView(
                     } else {
                         button {
                             class: "button button--secondary",
+                            "data-testid": format!("vote-button-{}", row.dragon_id),
                             disabled: commands_disabled,
                             onclick: {
                                 let vote_target = row.dragon_id.clone();

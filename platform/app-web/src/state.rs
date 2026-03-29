@@ -490,8 +490,8 @@ pub fn apply_server_ws_message(
 mod tests {
     use super::*;
     use protocol::{
-        create_default_session_settings, ClientGameState, CoordinatorType, Phase, Player,
-        SessionMeta, WorkshopJoinSuccess,
+        ClientGameState, CoordinatorType, Phase, Player, SessionMeta, WorkshopJoinSuccess,
+        create_default_session_settings,
     };
     use std::collections::BTreeMap;
 

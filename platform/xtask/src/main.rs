@@ -277,36 +277,42 @@ fn build_web_bundle(config: WebBuildConfig) -> Result<(), String> {
         )
     })?;
 
-    // ── wasm-opt -Oz ───────────────────────────────────────────────────
     let wasm_bg = config.out_dir.join("app-web_bg.wasm");
     let pre_opt_bytes = fs::metadata(&wasm_bg).map(|m| m.len()).unwrap_or(0);
-    run_tool_owned(
-        "wasm-opt",
-        vec![
-            "-Oz".to_string(),
-            "--enable-bulk-memory".to_string(),
-            "-o".to_string(),
-            wasm_bg.to_string_lossy().into_owned(),
-            wasm_bg.to_string_lossy().into_owned(),
-        ],
-    )
-    .map_err(|error| {
-        format!(
-            "{error}. Install binaryen with `brew install binaryen` (or your system package manager) to enable wasm-opt."
-        )
-    })?;
-    let post_opt_bytes = fs::metadata(&wasm_bg).map(|m| m.len()).unwrap_or(0);
-    let saved_pct = if pre_opt_bytes > 0 {
-        ((pre_opt_bytes as f64 - post_opt_bytes as f64) / pre_opt_bytes as f64 * 100.0) as u64
+    let skip_wasm_opt = env_flag_enabled("XTASK_SKIP_WASM_OPT");
+    let (_post_opt_bytes, saved_pct) = if skip_wasm_opt {
+        eprintln!("wasm-opt skipped because XTASK_SKIP_WASM_OPT is set");
+        (pre_opt_bytes, 0)
     } else {
-        0
+        run_tool_owned(
+            "wasm-opt",
+            vec![
+                "-Oz".to_string(),
+                "--enable-bulk-memory".to_string(),
+                "-o".to_string(),
+                wasm_bg.to_string_lossy().into_owned(),
+                wasm_bg.to_string_lossy().into_owned(),
+            ],
+        )
+        .map_err(|error| {
+            format!(
+                "{error}. Install binaryen with `brew install binaryen` (or your system package manager) to enable wasm-opt, or set XTASK_SKIP_WASM_OPT=1 to skip the optimization step."
+            )
+        })?;
+        let post_opt_bytes = fs::metadata(&wasm_bg).map(|m| m.len()).unwrap_or(0);
+        let saved_pct = if pre_opt_bytes > 0 {
+            ((pre_opt_bytes as f64 - post_opt_bytes as f64) / pre_opt_bytes as f64 * 100.0) as u64
+        } else {
+            0
+        };
+        eprintln!(
+            "wasm-opt: {} KB -> {} KB (-{}%)",
+            pre_opt_bytes / 1024,
+            post_opt_bytes / 1024,
+            saved_pct
+        );
+        (post_opt_bytes, saved_pct)
     };
-    eprintln!(
-        "wasm-opt: {} KB -> {} KB (-{}%)",
-        pre_opt_bytes / 1024,
-        post_opt_bytes / 1024,
-        saved_pct
-    );
 
     write_app_web_index_html(&config.out_dir)?;
 
@@ -343,6 +349,7 @@ fn build_web_bundle(config: WebBuildConfig) -> Result<(), String> {
         "wasmSizeKb": wasm_size_kb,
         "wasmPreOptKb": pre_opt_bytes / 1024,
         "wasmOptSavedPct": saved_pct,
+        "wasmOptSkipped": skip_wasm_opt,
         "jsSizeKb": js_size_bytes / 1024,
     });
     if let Some(warning) = wasm_size_warning {
@@ -350,6 +357,13 @@ fn build_web_bundle(config: WebBuildConfig) -> Result<(), String> {
     }
 
     print_json(result)
+}
+
+fn env_flag_enabled(name: &str) -> bool {
+    env::var(name)
+        .ok()
+        .map(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
 }
 
 fn write_app_web_index_html(out_dir: &Path) -> Result<(), String> {

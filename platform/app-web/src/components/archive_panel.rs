@@ -29,7 +29,7 @@ pub fn ArchivePanel(
         .unwrap_or_default();
 
     rsx! {
-        article { class: "panel panel--judge",
+        article { class: "panel panel--judge", "data-testid": "archive-panel",
             h2 { class: "panel__title", "Workshop archive" }
             p { class: "panel__body", {summary_label.clone()} }
             if !player_rows.is_empty() {

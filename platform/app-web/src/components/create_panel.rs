@@ -42,12 +42,13 @@ pub fn CreatePanel(
     let mut judge_model_w = judge_model;
 
     rsx! {
-        article { class: "panel",
+        article { class: "panel", "data-testid": "create-panel",
             h2 { class: "panel__title", "Create workshop" }
             p { class: "panel__body", "Start a new workshop and share the code with your group." }
             div { class: "panel__stack",
                 input {
                     class: "input",
+                    "data-testid": "create-name-input",
                     value: name,
                     placeholder: "Host name",
                     oninput: move |event| create_name_w.set(event.value())
@@ -99,6 +100,7 @@ pub fn CreatePanel(
                 div { class: "button-row",
                     button {
                         class: "button button--primary",
+                        "data-testid": "create-workshop-button",
                         disabled: pending,
                         onclick: move |_| {
                             spawn(submit_create_flow(

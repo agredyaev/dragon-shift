@@ -1,12 +1,16 @@
 FROM rust:1.94.1-slim-bookworm AS builder
 WORKDIR /workspace/platform
 
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends binaryen \
+    && rm -rf /var/lib/apt/lists/*
+
 RUN rustup target add wasm32-unknown-unknown
 RUN cargo install wasm-bindgen-cli --version 0.2.115 --locked
 
 COPY platform ./
 
-RUN cargo run --locked -p xtask -- build-web --out-dir /tmp/app-web-dist
+RUN XTASK_SKIP_WASM_OPT=1 cargo run --locked -p xtask -- build-web --out-dir /tmp/app-web-dist
 RUN cargo build --release -p app-server --locked
 
 FROM debian:bookworm-slim AS runtime

@@ -28,14 +28,14 @@ pub fn Hero(
         .unwrap_or_else(|| "Not attached yet".to_string());
 
     rsx! {
-        section { class: "hero",
+        section { class: "hero", "data-testid": "hero-panel",
             h1 { class: "hero__title", "Dragon Shift" }
             p { class: "hero__body", {screen_title(&id.screen)} }
             p { class: "meta", "Raise a dragon for one short shift, pass along practical care notes, and keep the whole room aligned from lobby to final results." }
             div { class: "hero__meta",
-                span { class: connection_badge_class, "Connection: " {connection_status_label(&id.connection_status)} }
+                span { class: connection_badge_class, "data-testid": "connection-badge", "Connection: " {connection_status_label(&id.connection_status)} }
                 if has_session_snapshot {
-                    span { class: "badge", "Workshop: " {session_code_label} }
+                    span { class: "badge", "data-testid": "workshop-code-badge", "Workshop: " {session_code_label} }
                     span { class: "badge", "Player: " {active_player_label} }
                 }
             }

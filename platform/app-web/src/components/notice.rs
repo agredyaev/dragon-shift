@@ -11,7 +11,7 @@ pub fn NoticeBar(ops: Signal<OperationState>) -> Element {
     };
 
     rsx! {
-        article { class: format!("notice {}", notice_class(notice.tone)),
+        article { class: format!("notice {}", notice_class(notice.tone)), "data-testid": "notice-bar",
             {notice.message}
         }
     }

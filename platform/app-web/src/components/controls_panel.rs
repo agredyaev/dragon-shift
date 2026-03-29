@@ -40,13 +40,14 @@ pub fn ControlsPanel(
     let mut handover_tags_input_w = handover_tags_input;
 
     rsx! {
-        article { class: "panel panel--controls",
+        article { class: "panel panel--controls", "data-testid": "controls-panel",
             h2 { class: "panel__title", "Session controls" }
             p { class: "panel__body", "Use these controls to move the workshop from setup through discovery, handover, care, voting, and the final reset." }
             div { class: "panel__stack",
                 div { class: "button-row",
                     button {
                         class: "button button--primary",
+                        "data-testid": "start-phase1-button",
                         disabled: commands_disabled,
                         onclick: move |_| {
                             spawn(submit_workshop_command(identity, ops, handover_tags_input, judge_bundle, SessionCommand::StartPhase1, None));
@@ -55,6 +56,7 @@ pub fn ControlsPanel(
                     }
                     button {
                         class: "button button--secondary",
+                        "data-testid": "start-handover-button",
                         disabled: commands_disabled,
                         onclick: move |_| {
                             spawn(submit_workshop_command(identity, ops, handover_tags_input, judge_bundle, SessionCommand::StartHandover, None));
@@ -64,6 +66,7 @@ pub fn ControlsPanel(
                 }
                 input {
                     class: "input",
+                    "data-testid": "handover-tags-input",
                     value: handover_tags_value,
                     placeholder: "Handover tags, comma separated",
                     oninput: move |event| handover_tags_input_w.set(event.value())
@@ -71,6 +74,7 @@ pub fn ControlsPanel(
                 div { class: "button-row",
                     button {
                         class: "button button--secondary",
+                        "data-testid": "save-handover-tags-button",
                         disabled: commands_disabled,
                         onclick: move |_| {
                             spawn(submit_handover_tags_command(identity, ops, handover_tags_input, judge_bundle));
@@ -79,6 +83,7 @@ pub fn ControlsPanel(
                     }
                     button {
                         class: "button button--secondary",
+                        "data-testid": "start-phase2-button",
                         disabled: commands_disabled,
                         onclick: move |_| {
                             spawn(submit_workshop_command(identity, ops, handover_tags_input, judge_bundle, SessionCommand::StartPhase2, None));
@@ -89,6 +94,7 @@ pub fn ControlsPanel(
                 div { class: "button-row",
                     button {
                         class: "button button--secondary",
+                        "data-testid": "end-game-button",
                         disabled: commands_disabled,
                         onclick: move |_| {
                             spawn(submit_workshop_command(identity, ops, handover_tags_input, judge_bundle, SessionCommand::EndGame, None));
@@ -97,6 +103,7 @@ pub fn ControlsPanel(
                     }
                     button {
                         class: "button button--secondary",
+                        "data-testid": "reveal-results-button",
                         disabled: commands_disabled,
                         onclick: move |_| {
                             spawn(submit_workshop_command(identity, ops, handover_tags_input, judge_bundle, SessionCommand::RevealVotingResults, None));
@@ -105,6 +112,7 @@ pub fn ControlsPanel(
                     }
                     button {
                         class: "button button--secondary",
+                        "data-testid": "reset-workshop-button",
                         disabled: commands_disabled,
                         onclick: move |_| {
                             spawn(submit_workshop_command(identity, ops, handover_tags_input, judge_bundle, SessionCommand::ResetGame, None));
@@ -116,6 +124,7 @@ pub fn ControlsPanel(
                     div { class: "button-row",
                         button {
                             class: "button button--secondary",
+                            "data-testid": "build-archive-button",
                             disabled: judge_bundle_disabled,
                             onclick: move |_| {
                                 spawn(submit_judge_bundle_request(identity, game_state, ops, judge_bundle));
