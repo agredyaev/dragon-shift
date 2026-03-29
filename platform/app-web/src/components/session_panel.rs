@@ -1,0 +1,141 @@
+use dioxus::prelude::*;
+use protocol::ClientGameState;
+use protocol::JudgeBundle;
+use protocol::Phase;
+
+use crate::helpers::*;
+use crate::realtime::bootstrap_realtime;
+use crate::state::{apply_realtime_bootstrap_error, IdentityState, OperationState};
+
+use super::end_view::EndView;
+use super::handover_view::HandoverView;
+use super::lobby_view::LobbyView;
+use super::phase1_view::Phase1View;
+use super::phase2_view::Phase2View;
+use super::voting_view::VotingView;
+
+#[component]
+pub fn SessionPanel(
+    identity: Signal<IdentityState>,
+    game_state: Signal<Option<ClientGameState>>,
+    ops: Signal<OperationState>,
+    handover_tags_input: Signal<String>,
+    judge_bundle: Signal<Option<JudgeBundle>>,
+) -> Element {
+    // Summary chip data — cheap string computations
+    let session_code_label = {
+        let id = identity.read();
+        id.session_snapshot
+            .as_ref()
+            .map(|s| s.session_code.clone())
+            .unwrap_or_else(|| "\u{2014}".to_string())
+    };
+    let (
+        active_player_label,
+        session_phase_label,
+        players_count_label,
+        session_phase_title,
+        session_phase_body,
+        current_phase,
+    ) = {
+        let gs = game_state.read();
+        let active = gs
+            .as_ref()
+            .and_then(active_player_name)
+            .unwrap_or_else(|| "Not attached yet".to_string());
+        let phase_label = gs
+            .as_ref()
+            .map(|s| format!("{:?}", s.phase))
+            .unwrap_or_else(|| "Not connected".to_string());
+        let count = gs
+            .as_ref()
+            .map(|s| s.players.len().to_string())
+            .unwrap_or_else(|| "0".to_string());
+        let title = gs
+            .as_ref()
+            .map(|s| phase_screen_title(s.phase))
+            .unwrap_or("Awaiting session");
+        let body = gs
+            .as_ref()
+            .map(|s| phase_screen_body(s.phase))
+            .unwrap_or("Connect to a workshop to see the active gameplay screen.");
+        let phase = gs.as_ref().map(|s| s.phase);
+        (active, phase_label, count, title, body, phase)
+    };
+
+    // Realtime button state
+    let (has_snapshot, realtime_button_label, pending_flow) = {
+        let id = identity.read();
+        let o = ops.read();
+        let has = id.session_snapshot.is_some();
+        let label = if id.realtime_bootstrap_attempted {
+            "Reconnect session"
+        } else {
+            "Sync session"
+        };
+        let pending = o.pending_flow.is_some();
+        (has, label, pending)
+    };
+
+    let mut rt_identity = identity;
+    let mut rt_ops = ops;
+
+    rsx! {
+        article { class: "panel panel--session",
+            h2 { class: "panel__title", "Shift board" }
+            div { class: "session-summary",
+                p { class: "summary-chip", "Workshop code: " {session_code_label} }
+                p { class: "summary-chip", "Current caretaker: " {active_player_label} }
+                p { class: "summary-chip", "Current round: " {session_phase_label} }
+                p { class: "summary-chip", "Players in view: " {players_count_label} }
+            }
+            h2 { class: "panel__title", "Current round" }
+            h3 { class: "panel__title", {session_phase_title} }
+            p { class: "panel__body", {session_phase_body} }
+
+            match current_phase {
+                Some(Phase::Lobby) => rsx! {
+                    LobbyView { game_state: game_state }
+                },
+                Some(Phase::Phase1) => rsx! {
+                    Phase1View { game_state: game_state }
+                },
+                Some(Phase::Handover) => rsx! {
+                    HandoverView { game_state: game_state, handover_tags_input: handover_tags_input }
+                },
+                Some(Phase::Phase2) => rsx! {
+                    Phase2View { game_state: game_state }
+                },
+                Some(Phase::Voting) => rsx! {
+                    VotingView {
+                        identity: identity, game_state: game_state, ops: ops,
+                        handover_tags_input: handover_tags_input, judge_bundle: judge_bundle,
+                    }
+                },
+                Some(Phase::End) => rsx! {
+                    EndView { game_state: game_state }
+                },
+                None => rsx! {},
+            }
+
+            // Realtime sync button
+            div { class: "button-row",
+                button {
+                    class: "button button--secondary",
+                    disabled: !has_snapshot || pending_flow,
+                    onclick: move |_| {
+                        if let Err(error) = bootstrap_realtime(identity, game_state, ops, judge_bundle) {
+                            rt_identity.with_mut(|id| {
+                                rt_ops.with_mut(|o| {
+                                    apply_realtime_bootstrap_error(id, o, error);
+                                });
+                            });
+                        }
+                    },
+                    {realtime_button_label}
+                }
+            }
+            p { class: "meta", "This browser remembers your last workshop so you can reconnect without retyping everything." }
+        }
+    }
+}
