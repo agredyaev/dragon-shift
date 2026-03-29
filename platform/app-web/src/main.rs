@@ -186,6 +186,7 @@ const APP_STYLE: &str = r#"
         padding: 30px 22px 22px;
         display: grid;
         gap: 12px;
+        overflow: hidden;
         background:
             linear-gradient(180deg, rgba(255,255,255,0.96) 0%, rgba(241,245,249,0.96) 100%);
     }
@@ -215,10 +216,11 @@ const APP_STYLE: &str = r#"
     .panel--runtime::after,
     .panel--advanced::after {
         content: "";
-        position: fixed;
-        inset: 0;
+        position: absolute;
+        inset: 0 0 auto 0;
+        height: 12px;
         pointer-events: none;
-        z-index: 4;
+        border-bottom: 3px solid rgba(15, 23, 42, 0.18);
     }
     .panel--session::after { background: #ca8a04; }
     .panel--controls::after { background: #34d399; }
@@ -482,6 +484,13 @@ const APP_STYLE: &str = r#"
     }
 "#;
 
+#[cfg(target_arch = "wasm32")]
+fn main() {
+    console_error_panic_hook::set_once();
+    dioxus_web::launch::launch_cfg(App, dioxus_web::Config::default());
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn main() {
     launch(App);
 }

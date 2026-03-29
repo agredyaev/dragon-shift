@@ -301,6 +301,7 @@ fn write_app_web_index_html(out_dir: &Path) -> Result<(), String> {
     <link rel="icon" href="data:," />
   </head>
   <body>
+    <main id="main"></main>
     <script type="module">
       import init from "./app-web.js";
       init();

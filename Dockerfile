@@ -2,7 +2,7 @@ FROM rust:1.94.1-slim-bookworm AS builder
 WORKDIR /workspace/platform
 
 RUN rustup target add wasm32-unknown-unknown
-RUN cargo install wasm-bindgen-cli --version 0.2.114 --locked
+RUN cargo install wasm-bindgen-cli --version 0.2.115 --locked
 
 COPY platform ./
 
