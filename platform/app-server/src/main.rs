@@ -77,14 +77,15 @@ struct WsAttachOutcome {
     state_changed: bool,
 }
 
-fn main() {
+#[tokio::main]
+async fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 
     let config = Arc::new(load_config().expect("load app config"));
-    let store = build_session_store(&config).expect("build session store");
-    store.init().expect("init session store");
+    let store = build_session_store(&config).await.expect("build session store");
+    store.init().await.expect("init session store");
 
     let state = AppState {
         config: config.clone(),
@@ -96,21 +97,50 @@ fn main() {
         realtime_senders: Arc::new(Mutex::new(BTreeMap::new())),
     };
 
+    if let Some(database_url) = state.config.database_url.as_deref() {
+        let listener_state = state.clone();
+        let database_url = database_url.to_string();
+        tokio::spawn(async move {
+            loop {
+                match sqlx::postgres::PgListener::connect(&database_url).await {
+                    Ok(mut listener) => {
+                        if let Err(error) = listener.listen("session_updates").await {
+                            tracing::warn!(%error, "PgListener failed to subscribe, retrying in 5s");
+                            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                            continue;
+                        }
+                        loop {
+                            match listener.recv().await {
+                                Ok(notification) => {
+                                    let session_code = notification.payload();
+                                    listener_state.sessions.lock().await.remove(session_code);
+                                    broadcast_session_state(&listener_state, session_code, None).await;
+                                }
+                                Err(error) => {
+                                    tracing::warn!(%error, "PgListener recv error, reconnecting in 5s");
+                                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "PgListener connect failed, retrying in 5s");
+                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    }
+                }
+            }
+        });
+    }
+
     let app = build_app(state);
 
     info!(bind_addr = %config.bind_addr, "starting platform app-server");
 
-    let bind_addr = config.bind_addr;
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .expect("build tokio runtime");
-    runtime.block_on(async move {
-        let listener = tokio::net::TcpListener::bind(bind_addr)
-            .await
-            .expect("bind listener");
-        axum::serve(listener, app).await.expect("serve app");
-    });
+    let listener = tokio::net::TcpListener::bind(config.bind_addr)
+        .await
+        .expect("bind listener");
+    axum::serve(listener, app).await.expect("serve app");
 }
 
 fn build_app(state: AppState) -> Router {
@@ -131,9 +161,10 @@ fn build_app(state: AppState) -> Router {
         .with_state(state)
 }
 
-fn build_session_store(config: &AppConfig) -> Result<Arc<dyn SessionStore>, String> {
+async fn build_session_store(config: &AppConfig) -> Result<Arc<dyn SessionStore>, String> {
     if let Some(database_url) = config.database_url.as_deref() {
         let store = PostgresSessionStore::connect(database_url)
+            .await
             .map_err(|error| format!("connect postgres session store: {error}"))?;
         Ok(Arc::new(store))
     } else {
@@ -203,6 +234,7 @@ async fn ensure_session_cached(state: &AppState, session_code: &str) -> Result<b
     let Some(session) = state
         .store
         .load_session_by_code(session_code)
+        .await
         .map_err(|error| format!("failed to load session: {error}"))?
     else {
         return Ok(false);
@@ -424,7 +456,7 @@ async fn sync_ws_disconnect(state: &AppState, connection_id: &str) {
         return;
     };
 
-    if let Err(error) = state.store.save_session(&session) {
+    if let Err(error) = state.store.save_session(&session).await {
         info!(session_code = %session.code.0, player_id = %player_id, error = %error, "failed to persist websocket disconnect session state");
     }
 
@@ -437,7 +469,7 @@ async fn sync_ws_disconnect(state: &AppState, connection_id: &str) {
         player_id: Some(player_id.clone()),
         created_at: timestamp.to_rfc3339(),
         payload: disconnect_payload,
-    }) {
+    }).await {
         info!(session_code = %session.code.0, player_id = %player_id, error = %error, "failed to append websocket disconnect artifact");
     }
 
@@ -464,6 +496,7 @@ async fn attach_ws_session(
     let identity = state
         .store
         .find_player_identity(session_code, reconnect_token)
+        .await
         .map_err(|error| format!("failed to lookup identity: {error}"))?
         .ok_or_else(|| "Session identity is invalid or expired.".to_string())?;
     if identity.player_id != player_id {
@@ -475,7 +508,7 @@ async fn attach_ws_session(
 
     let mut reconnect_artifact: Option<SessionArtifactRecord> = None;
 
-    let client_state = {
+    let (client_state, session_clone) = {
         let mut sessions = state.sessions.lock().await;
         let session = sessions
             .get_mut(session_code)
@@ -508,13 +541,19 @@ async fn attach_ws_session(
             });
         }
         let client_state = to_client_game_state(session, &identity.player_id);
-        if reconnect_artifact.is_some() {
-            if let Err(error) = state.store.save_session(session) {
-                return Err(format!("failed to save session: {error}"));
-            }
-        }
-        client_state
+        let session_clone = if reconnect_artifact.is_some() {
+            Some(session.clone())
+        } else {
+            None
+        };
+        (client_state, session_clone)
     };
+
+    if let Some(ref session_clone) = session_clone {
+        if let Err(error) = state.store.save_session(session_clone).await {
+            return Err(format!("failed to save session: {error}"));
+        }
+    }
 
     let state_changed = reconnect_artifact.is_some();
 
@@ -522,6 +561,7 @@ async fn attach_ws_session(
         state
             .store
             .append_session_artifact(&artifact)
+            .await
             .map_err(|error| format!("failed to append reconnect artifact: {error}"))?;
     }
 
@@ -592,7 +632,7 @@ async fn create_workshop(
     };
     session.add_player(host_player.clone());
 
-    if let Err(error) = state.store.save_session(&session) {
+    if let Err(error) = state.store.save_session(&session).await {
         return internal_join_error(format!("failed to save session: {error}"));
     }
     if let Err(error) = state.store.create_player_identity(&persistence::PlayerIdentity {
@@ -601,7 +641,7 @@ async fn create_workshop(
         reconnect_token: reconnect_token.clone(),
         created_at: timestamp.to_rfc3339(),
         last_seen_at: timestamp.to_rfc3339(),
-    }) {
+    }).await {
         return internal_join_error(format!("failed to save player identity: {error}"));
     }
     if let Err(error) = state.store.append_session_artifact(&SessionArtifactRecord {
@@ -613,7 +653,7 @@ async fn create_workshop(
         player_id: Some(player_id.clone()),
         created_at: timestamp.to_rfc3339(),
         payload: json!({ "sessionCode": session_code, "hostName": normalized_name }),
-    }) {
+    }).await {
         return internal_join_error(format!("failed to append session artifact: {error}"));
     }
 
@@ -660,7 +700,7 @@ async fn join_workshop(
         .map(str::trim)
         .filter(|value| !value.is_empty())
     {
-        let identity = match state.store.find_player_identity(session_code, reconnect_token) {
+        let identity = match state.store.find_player_identity(session_code, reconnect_token).await {
             Ok(Some(identity)) => identity,
             Ok(None) => return bad_join_request("Session identity is invalid or expired."),
             Err(error) => return internal_join_error(format!("failed to lookup player identity: {error}")),
@@ -671,28 +711,31 @@ async fn join_workshop(
         }
 
         let timestamp = Utc::now();
-        let mut sessions = state.sessions.lock().await;
-        let Some(session) = sessions.get_mut(session_code) else {
-            return bad_join_request("Workshop not found.");
+        let session_clone = {
+            let mut sessions = state.sessions.lock().await;
+            let Some(session) = sessions.get_mut(session_code) else {
+                return bad_join_request("Workshop not found.");
+            };
+            let Some(player) = session.players.get_mut(&identity.player_id) else {
+                return bad_join_request("Session identity is invalid or expired.");
+            };
+            player.is_connected = true;
+            session.ensure_host_assigned(true);
+            session.updated_at = timestamp;
+            session.clone()
         };
-        let Some(player) = session.players.get_mut(&identity.player_id) else {
-            return bad_join_request("Session identity is invalid or expired.");
-        };
-        player.is_connected = true;
-        session.ensure_host_assigned(true);
-        session.updated_at = timestamp;
 
-        if let Err(error) = state.store.save_session(session) {
+        if let Err(error) = state.store.save_session(&session_clone).await {
             return internal_join_error(format!("failed to save session: {error}"));
         }
-        if let Err(error) = state.store.touch_player_identity(reconnect_token, &timestamp.to_rfc3339()) {
+        if let Err(error) = state.store.touch_player_identity(reconnect_token, &timestamp.to_rfc3339()).await {
             return internal_join_error(format!("failed to touch player identity: {error}"));
         }
         if let Err(error) = state.store.append_session_artifact(&SessionArtifactRecord {
             id: random_prefixed_id("artifact"),
-            session_id: session.id.to_string(),
-            phase: session.phase,
-            step: match session.phase {
+            session_id: session_clone.id.to_string(),
+            phase: session_clone.phase,
+            step: match session_clone.phase {
                 protocol::Phase::Lobby => 0,
                 protocol::Phase::Phase1 => 1,
                 protocol::Phase::Handover => 2,
@@ -703,21 +746,20 @@ async fn join_workshop(
             player_id: Some(identity.player_id.clone()),
             created_at: timestamp.to_rfc3339(),
             payload: json!({ "sessionCode": session_code, "playerId": identity.player_id.clone() }),
-        }) {
+        }).await {
             return internal_join_error(format!("failed to append session artifact: {error}"));
         }
 
         let response = WorkshopJoinSuccess {
             ok: true,
-            session_code: session.code.0.clone(),
+            session_code: session_clone.code.0.clone(),
             player_id: identity.player_id.clone(),
             reconnect_token: reconnect_token.to_string(),
             coordinator_type: CoordinatorType::Rust,
-            state: to_client_game_state(session, &identity.player_id),
+            state: to_client_game_state(&session_clone, &identity.player_id),
         };
 
         let response = (StatusCode::OK, Json(WorkshopJoinResult::Success(response)));
-        drop(sessions);
         broadcast_session_state(&state, session_code, None).await;
         return response;
     }
@@ -731,74 +773,77 @@ async fn join_workshop(
         return bad_join_request("Workshop not found.");
     }
 
-    let mut sessions = state.sessions.lock().await;
-    let Some(session) = sessions.get_mut(session_code) else {
-        return bad_join_request("Workshop not found.");
+    let (session_clone, player_id, reconnect_token) = {
+        let mut sessions = state.sessions.lock().await;
+        let Some(session) = sessions.get_mut(session_code) else {
+            return bad_join_request("Workshop not found.");
+        };
+        if session.phase != protocol::Phase::Lobby {
+            return bad_join_request("This workshop has already started. New players can only join in the lobby.");
+        }
+        let duplicate_name = session
+            .players
+            .values()
+            .any(|player| player.name.eq_ignore_ascii_case(&normalized_name));
+        if duplicate_name {
+            return bad_join_request("That player name is already taken in this workshop.");
+        }
+
+        let timestamp = Utc::now();
+        let player_id = random_prefixed_id("player");
+        let reconnect_token = random_prefixed_id("reconnect");
+        let player = SessionPlayer {
+            id: player_id.clone(),
+            name: normalized_name.clone(),
+            pet_description: Some(format!("{}'s workshop dragon", normalized_name)),
+            is_host: false,
+            is_connected: true,
+            is_ready: false,
+            score: 0,
+            current_dragon_id: None,
+            achievements: Vec::new(),
+            joined_at: timestamp,
+        };
+        session.add_player(player.clone());
+        (session.clone(), player_id, reconnect_token)
     };
-    if session.phase != protocol::Phase::Lobby {
-        return bad_join_request("This workshop has already started. New players can only join in the lobby.");
-    }
-    let duplicate_name = session
-        .players
-        .values()
-        .any(|player| player.name.eq_ignore_ascii_case(&normalized_name));
-    if duplicate_name {
-        return bad_join_request("That player name is already taken in this workshop.");
-    }
 
     let timestamp = Utc::now();
-    let player_id = random_prefixed_id("player");
-    let reconnect_token = random_prefixed_id("reconnect");
-    let player = SessionPlayer {
-        id: player_id.clone(),
-        name: normalized_name.clone(),
-        pet_description: Some(format!("{}'s workshop dragon", normalized_name)),
-        is_host: false,
-        is_connected: true,
-        is_ready: false,
-        score: 0,
-        current_dragon_id: None,
-        achievements: Vec::new(),
-        joined_at: timestamp,
-    };
-    session.add_player(player.clone());
-
-    if let Err(error) = state.store.save_session(session) {
+    if let Err(error) = state.store.save_session(&session_clone).await {
         return internal_join_error(format!("failed to save session: {error}"));
     }
     if let Err(error) = state.store.create_player_identity(&persistence::PlayerIdentity {
-        session_id: session.id.to_string(),
+        session_id: session_clone.id.to_string(),
         player_id: player_id.clone(),
         reconnect_token: reconnect_token.clone(),
         created_at: timestamp.to_rfc3339(),
         last_seen_at: timestamp.to_rfc3339(),
-    }) {
+    }).await {
         return internal_join_error(format!("failed to save player identity: {error}"));
     }
     if let Err(error) = state.store.append_session_artifact(&SessionArtifactRecord {
         id: random_prefixed_id("artifact"),
-        session_id: session.id.to_string(),
+        session_id: session_clone.id.to_string(),
         phase: protocol::Phase::Lobby,
         step: 0,
         kind: SessionArtifactKind::PlayerJoined,
         player_id: Some(player_id.clone()),
         created_at: timestamp.to_rfc3339(),
         payload: json!({ "sessionCode": session_code, "playerName": normalized_name }),
-    }) {
+    }).await {
         return internal_join_error(format!("failed to append session artifact: {error}"));
     }
 
     let response = WorkshopJoinSuccess {
         ok: true,
-        session_code: session.code.0.clone(),
+        session_code: session_clone.code.0.clone(),
         player_id: player_id.clone(),
         reconnect_token,
         coordinator_type: CoordinatorType::Rust,
-        state: to_client_game_state(session, &player_id),
+        state: to_client_game_state(&session_clone, &player_id),
     };
 
     let response = (StatusCode::OK, Json(WorkshopJoinResult::Success(response)));
-    drop(sessions);
     broadcast_session_state(&state, session_code, None).await;
     response
 }
@@ -818,7 +863,7 @@ async fn workshop_command(
         return bad_command_request("Missing workshop credentials.");
     }
 
-    let identity = match state.store.find_player_identity(session_code, reconnect_token) {
+    let identity = match state.store.find_player_identity(session_code, reconnect_token).await {
         Ok(Some(identity)) => identity,
         Ok(None) => return bad_command_request("Session identity is invalid or expired."),
         Err(error) => return internal_command_error(format!("failed to lookup identity: {error}")),
@@ -856,7 +901,7 @@ async fn workshop_command(
             if let Err(error) = session.begin_phase1(&assignments) {
                 return bad_command_request(&error.to_string());
             }
-            if let Err(error) = state.store.save_session(session) {
+            if let Err(error) = state.store.save_session(session).await {
                 return internal_command_error(format!("failed to save session: {error}"));
             }
             if let Err(error) = state.store.append_session_artifact(&SessionArtifactRecord {
@@ -868,7 +913,7 @@ async fn workshop_command(
                 player_id: Some(identity.player_id.clone()),
                 created_at: Utc::now().to_rfc3339(),
                 payload: json!({ "toPhase": "phase1" }),
-            }) {
+            }).await {
                 return internal_command_error(format!("failed to append session artifact: {error}"));
             }
 
@@ -899,7 +944,7 @@ async fn workshop_command(
             };
 
             session.record_discovery_observation(&identity.player_id, text.to_string());
-            if let Err(error) = state.store.save_session(session) {
+            if let Err(error) = state.store.save_session(session).await {
                 return internal_command_error(format!("failed to save session: {error}"));
             }
             if let Err(error) = state.store.append_session_artifact(&SessionArtifactRecord {
@@ -911,7 +956,7 @@ async fn workshop_command(
                 player_id: Some(identity.player_id.clone()),
                 created_at: Utc::now().to_rfc3339(),
                 payload: json!({ "dragonId": dragon_id, "text": text }),
-            }) {
+            }).await {
                 return internal_command_error(format!("failed to append session artifact: {error}"));
             }
 
@@ -949,7 +994,7 @@ async fn workshop_command(
                     return bad_command_request(&message);
                 }
             };
-            if let Err(error) = state.store.save_session(session) {
+            if let Err(error) = state.store.save_session(session).await {
                 return internal_command_error(format!("failed to save session: {error}"));
             }
 
@@ -990,7 +1035,7 @@ async fn workshop_command(
                 player_id: Some(identity.player_id.clone()),
                 created_at: Utc::now().to_rfc3339(),
                 payload: artifact_payload,
-            }) {
+            }).await {
                 return internal_command_error(format!("failed to append session artifact: {error}"));
             }
 
@@ -1006,7 +1051,7 @@ async fn workshop_command(
             if let Err(error) = session.transition_to(protocol::Phase::Handover) {
                 return bad_command_request(&error.to_string());
             }
-            if let Err(error) = state.store.save_session(session) {
+            if let Err(error) = state.store.save_session(session).await {
                 return internal_command_error(format!("failed to save session: {error}"));
             }
             if let Err(error) = state.store.append_session_artifact(&SessionArtifactRecord {
@@ -1018,7 +1063,7 @@ async fn workshop_command(
                 player_id: Some(identity.player_id.clone()),
                 created_at: Utc::now().to_rfc3339(),
                 payload: json!({ "toPhase": "handover" }),
-            }) {
+            }).await {
                 return internal_command_error(format!("failed to append session artifact: {error}"));
             }
 
@@ -1040,7 +1085,7 @@ async fn workshop_command(
             };
 
             session.save_handover_tags(&identity.player_id, tags);
-            if let Err(error) = state.store.save_session(session) {
+            if let Err(error) = state.store.save_session(session).await {
                 return internal_command_error(format!("failed to save session: {error}"));
             }
 
@@ -1061,7 +1106,7 @@ async fn workshop_command(
                 player_id: Some(identity.player_id.clone()),
                 created_at: Utc::now().to_rfc3339(),
                 payload: json!({ "tagCount": saved_tags.len(), "tags": saved_tags }),
-            }) {
+            }).await {
                 return internal_command_error(format!("failed to append session artifact: {error}"));
             }
 
@@ -1082,7 +1127,7 @@ async fn workshop_command(
                     _ => bad_command_request(&error.to_string()),
                 };
             }
-            if let Err(error) = state.store.save_session(session) {
+            if let Err(error) = state.store.save_session(session).await {
                 return internal_command_error(format!("failed to save session: {error}"));
             }
             if let Err(error) = state.store.append_session_artifact(&SessionArtifactRecord {
@@ -1094,7 +1139,7 @@ async fn workshop_command(
                 player_id: Some(identity.player_id.clone()),
                 created_at: Utc::now().to_rfc3339(),
                 payload: json!({ "toPhase": "phase2" }),
-            }) {
+            }).await {
                 return internal_command_error(format!("failed to append session artifact: {error}"));
             }
 
@@ -1116,7 +1161,7 @@ async fn workshop_command(
                     return bad_command_request(&error.to_string());
                 }
             }
-            if let Err(error) = state.store.save_session(session) {
+            if let Err(error) = state.store.save_session(session).await {
                 return internal_command_error(format!("failed to save session: {error}"));
             }
             if let Err(error) = state.store.append_session_artifact(&SessionArtifactRecord {
@@ -1128,7 +1173,7 @@ async fn workshop_command(
                 player_id: Some(identity.player_id.clone()),
                 created_at: Utc::now().to_rfc3339(),
                 payload: json!({ "toPhase": if immediate_finalize { "end" } else { "voting" } }),
-            }) {
+            }).await {
                 return internal_command_error(format!("failed to append session artifact: {error}"));
             }
 
@@ -1155,7 +1200,7 @@ async fn workshop_command(
                 };
                 return bad_command_request(&message);
             }
-            if let Err(error) = state.store.save_session(session) {
+            if let Err(error) = state.store.save_session(session).await {
                 return internal_command_error(format!("failed to save session: {error}"));
             }
             if let Err(error) = state.store.append_session_artifact(&SessionArtifactRecord {
@@ -1167,7 +1212,7 @@ async fn workshop_command(
                 player_id: Some(identity.player_id.clone()),
                 created_at: Utc::now().to_rfc3339(),
                 payload: json!({ "dragonId": payload.dragon_id }),
-            }) {
+            }).await {
                 return internal_command_error(format!("failed to append session artifact: {error}"));
             }
 
@@ -1188,7 +1233,7 @@ async fn workshop_command(
             if let Err(error) = session.finalize_voting() {
                 return bad_command_request(&error.to_string());
             }
-            if let Err(error) = state.store.save_session(session) {
+            if let Err(error) = state.store.save_session(session).await {
                 return internal_command_error(format!("failed to save session: {error}"));
             }
             if let Err(error) = state.store.append_session_artifact(&SessionArtifactRecord {
@@ -1207,7 +1252,7 @@ async fn workshop_command(
                         .map(|(player_id, player)| (player_id.clone(), player.score))
                         .collect::<BTreeMap<_, _>>()
                 }),
-            }) {
+            }).await {
                 return internal_command_error(format!("failed to append session artifact: {error}"));
             }
 
@@ -1220,7 +1265,7 @@ async fn workshop_command(
             if let Err(error) = session.reset_to_lobby() {
                 return bad_command_request(&error.to_string());
             }
-            if let Err(error) = state.store.save_session(session) {
+            if let Err(error) = state.store.save_session(session).await {
                 return internal_command_error(format!("failed to save session: {error}"));
             }
             if let Err(error) = state.store.append_session_artifact(&SessionArtifactRecord {
@@ -1232,7 +1277,7 @@ async fn workshop_command(
                 player_id: Some(identity.player_id.clone()),
                 created_at: Utc::now().to_rfc3339(),
                 payload: json!({ "toPhase": "lobby" }),
-            }) {
+            }).await {
                 return internal_command_error(format!("failed to append session artifact: {error}"));
             }
 
@@ -1277,13 +1322,13 @@ async fn workshop_judge_bundle(
         session.clone()
     };
 
-    let identity = match state.store.find_player_identity(session_code, reconnect_token) {
+    let identity = match state.store.find_player_identity(session_code, reconnect_token).await {
         Ok(Some(identity)) => identity,
         Ok(None) => return bad_judge_bundle_request("Session identity is invalid or expired."),
         Err(error) => return internal_judge_bundle_error(format!("failed to lookup identity: {error}")),
     };
 
-    let artifacts = match state.store.list_session_artifacts(&session.id.to_string()) {
+    let artifacts = match state.store.list_session_artifacts(&session.id.to_string()).await {
         Ok(artifacts) => artifacts,
         Err(error) => return internal_judge_bundle_error(format!("failed to list session artifacts: {error}")),
     };
@@ -1302,7 +1347,7 @@ async fn workshop_judge_bundle(
             "dragonCount": bundle.dragons.len(),
             "artifactCount": bundle.artifact_count,
         }),
-    }) {
+    }).await {
         return internal_judge_bundle_error(format!("failed to append session artifact: {error}"));
     }
 
@@ -1316,7 +1361,7 @@ async fn workshop_judge_bundle(
 }
 
  async fn ready(State(state): State<AppState>) -> Json<serde_json::Value> {
-     let store_healthy = state.store.health_check().unwrap_or(false);
+     let store_healthy = state.store.health_check().await.unwrap_or(false);
 
      Json(json!({
          "ok": store_healthy,
@@ -1429,7 +1474,7 @@ async fn workshop_judge_bundle(
              .collect::<String>();
          let candidate = format!("{}{}", state.config.rust_session_code_prefix, suffix);
          if !state.sessions.lock().await.contains_key(&candidate)
-             && state.store.load_session_by_code(&candidate).ok().flatten().is_none()
+              && state.store.load_session_by_code(&candidate).await.ok().flatten().is_none()
          {
              return candidate;
          }
@@ -2081,6 +2126,7 @@ fn successful_workshop_command(should_broadcast: &mut bool) -> (StatusCode, Json
          let artifacts = state
              .store
              .list_session_artifacts(&session_id)
+             .await
              .expect("list session artifacts");
          let disconnect_artifact = artifacts
              .iter()
@@ -2089,7 +2135,7 @@ fn successful_workshop_command(should_broadcast: &mut bool) -> (StatusCode, Json
              .expect("player left artifact");
          assert_eq!(disconnect_artifact.player_id.as_deref(), Some(create_success.player_id.as_str()));
          assert_eq!(
-             disconnect_artifact.payload.get("sessionCode").and_then(|value| value.as_str()),
+             disconnect_artifact.payload.get("sessionCode").and_then(|value: &serde_json::Value| value.as_str()),
              Some(create_success.session_code.as_str())
          );
 
@@ -2422,7 +2468,7 @@ fn successful_workshop_command(should_broadcast: &mut bool) -> (StatusCode, Json
                  "energy": 100,
                  "happiness": 97
              }),
-         }).expect("append action artifact");
+         }).await.expect("append action artifact");
 
          let response = app
              .oneshot(
@@ -2990,6 +3036,7 @@ fn successful_workshop_command(should_broadcast: &mut bool) -> (StatusCode, Json
         let artifacts = state
             .store
             .list_session_artifacts(&create_success.state.session.id)
+            .await
             .expect("list artifacts");
         let action_artifact = artifacts
             .iter()
@@ -2997,8 +3044,8 @@ fn successful_workshop_command(should_broadcast: &mut bool) -> (StatusCode, Json
             .find(|artifact| artifact.kind == SessionArtifactKind::ActionProcessed)
             .expect("action artifact exists");
         assert_eq!(action_artifact.phase, protocol::Phase::Phase2);
-        assert_eq!(action_artifact.payload.get("actionType").and_then(|value| value.as_str()), Some("sleep"));
-        assert!(action_artifact.payload.get("dragonId").and_then(|value| value.as_str()).is_some());
+        assert_eq!(action_artifact.payload.get("actionType").and_then(|value: &serde_json::Value| value.as_str()), Some("sleep"));
+        assert!(action_artifact.payload.get("dragonId").and_then(|value: &serde_json::Value| value.as_str()).is_some());
     }
 
     #[tokio::test]

@@ -1,5 +1,5 @@
 use futures_util::{SinkExt, StreamExt};
-use postgres::{Client as PgClient, NoTls};
+use sqlx::PgPool;
 use protocol::{
     ClientWsMessage, CreateWorkshopRequest, JudgeBundle, JoinWorkshopRequest, Phase,
     ServerWsMessage, SessionCommand, SessionEnvelope, WorkshopCommandRequest,
@@ -628,14 +628,8 @@ async fn smoke_persistence(config: PersistenceSmokeConfig) -> Result<(), String>
     )
     .await?;
 
-    let database_url = config.database_url.clone();
-    let session_code = host.session_code.clone();
-    let reconnect_token = host.reconnect_token.clone();
-    let report = tokio::task::spawn_blocking(move || {
-        query_persistence_report(&database_url, &session_code, &reconnect_token)
-    })
-    .await
-    .map_err(|error| format!("failed to join persistence smoke worker: {error}"))??;
+    let report = query_persistence_report(&config.database_url, &host.session_code, &host.reconnect_token)
+        .await?;
     if report.persisted_phase != "phase1" {
         return Err(format!(
             "expected persisted workshop phase to be phase1, got {}",
@@ -672,45 +666,46 @@ struct PersistenceReport {
     identity_player_id: String,
 }
 
-fn query_persistence_report(
+async fn query_persistence_report(
     database_url: &str,
     session_code: &str,
     reconnect_token: &str,
 ) -> Result<PersistenceReport, String> {
-    let mut client = PgClient::connect(database_url, NoTls)
+    let pool = PgPool::connect(database_url)
+        .await
         .map_err(|error| format!("failed to connect to persistence database: {error}"))?;
 
-    let session_row = client
-        .query_opt(
+    let (session_id, payload): (String, serde_json::Value) = sqlx::query_as(
             "SELECT session_id, payload FROM workshop_sessions WHERE session_code = $1",
-            &[&session_code],
         )
+        .bind(session_code)
+        .fetch_optional(&pool)
+        .await
         .map_err(|error| format!("failed to query workshop_sessions: {error}"))?
         .ok_or_else(|| format!("no persisted workshop_sessions row found for session code {session_code}"))?;
-    let session_id: String = session_row.get(0);
-    let payload: serde_json::Value = session_row.get(1);
     let persisted_phase = payload
         .get("phase")
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| format!("persisted workshop payload is missing string phase: {payload}"))?
         .to_string();
 
-    let artifact_row = client
-        .query_one(
+    let (artifact_count,): (i64,) = sqlx::query_as(
             "SELECT COUNT(*) FROM session_artifacts WHERE session_id = $1",
-            &[&session_id],
         )
+        .bind(&session_id)
+        .fetch_one(&pool)
+        .await
         .map_err(|error| format!("failed to query session_artifacts: {error}"))?;
-    let artifact_count: i64 = artifact_row.get(0);
 
-    let identity_row = client
-        .query_opt(
+    let (identity_player_id,): (String,) = sqlx::query_as(
             "SELECT player_id FROM player_identities WHERE reconnect_token = $1 AND session_id = $2",
-            &[&reconnect_token, &session_id],
         )
+        .bind(reconnect_token)
+        .bind(&session_id)
+        .fetch_optional(&pool)
+        .await
         .map_err(|error| format!("failed to query player_identities: {error}"))?
         .ok_or_else(|| format!("no persisted player_identities row found for reconnect token {reconnect_token}"))?;
-    let identity_player_id: String = identity_row.get(0);
 
     Ok(PersistenceReport {
         persisted_phase,
