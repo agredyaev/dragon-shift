@@ -41,6 +41,13 @@ fn App() -> Element {
     let identity = use_signal(|| bootstrap.identity);
     let game_state = use_signal(|| bootstrap.game_state);
     let create_name = use_signal(|| bootstrap.create_name);
+    let phase0_minutes = use_signal(|| "8".to_string());
+    let phase1_minutes = use_signal(|| "8".to_string());
+    let phase2_minutes = use_signal(|| "8".to_string());
+    let image_generator_token = use_signal(String::new);
+    let image_generator_model = use_signal(String::new);
+    let judge_token = use_signal(String::new);
+    let judge_model = use_signal(String::new);
     let join_session_code = use_signal(|| bootstrap.join_session_code);
     let join_name = use_signal(|| bootstrap.join_name);
     let reconnect_session_code = use_signal(|| bootstrap.reconnect_session_code);
@@ -119,6 +126,13 @@ fn App() -> Element {
                         game_state,
                         ops,
                         create_name,
+                        phase0_minutes,
+                        phase1_minutes,
+                        phase2_minutes,
+                        image_generator_token,
+                        image_generator_model,
+                        judge_token,
+                        judge_model,
                         join_session_code,
                         reconnect_session_code,
                         reconnect_token,

@@ -10,12 +10,20 @@ use crate::state::{
     info_notice, persist_browser_session_snapshot, ConnectionStatus, IdentityState, OperationState,
     PendingFlow,
 };
+use protocol::WorkshopCreateConfig;
 
 pub async fn submit_create_flow(
     mut identity: Signal<IdentityState>,
     mut game_state: Signal<Option<ClientGameState>>,
     mut ops: Signal<OperationState>,
     create_name: Signal<String>,
+    phase0_minutes: Signal<String>,
+    phase1_minutes: Signal<String>,
+    phase2_minutes: Signal<String>,
+    image_generator_token: Signal<String>,
+    image_generator_model: Signal<String>,
+    judge_token: Signal<String>,
+    judge_model: Signal<String>,
     mut join_session_code: Signal<String>,
     mut reconnect_session_code: Signal<String>,
     mut reconnect_token: Signal<String>,
@@ -25,6 +33,25 @@ pub async fn submit_create_flow(
         let id = identity.read();
         let name = create_name.read();
         (id.api_base_url.clone(), name.trim().to_string())
+    };
+    let config = {
+        let phase0 = phase0_minutes.read().trim().parse::<u32>().unwrap_or(8);
+        let phase1 = phase1_minutes.read().trim().parse::<u32>().unwrap_or(8);
+        let phase2 = phase2_minutes.read().trim().parse::<u32>().unwrap_or(8);
+        let image_token = image_generator_token.read().trim().to_string();
+        let image_model = image_generator_model.read().trim().to_string();
+        let judge_token = judge_token.read().trim().to_string();
+        let judge_model = judge_model.read().trim().to_string();
+
+        WorkshopCreateConfig {
+            phase0_minutes: phase0,
+            phase1_minutes: phase1,
+            phase2_minutes: phase2,
+            image_generator_token: if image_token.is_empty() { None } else { Some(image_token) },
+            image_generator_model: if image_model.is_empty() { None } else { Some(image_model) },
+            judge_token: if judge_token.is_empty() { None } else { Some(judge_token) },
+            judge_model: if judge_model.is_empty() { None } else { Some(judge_model) },
+        }
     };
 
     if name.is_empty() {
@@ -41,7 +68,7 @@ pub async fn submit_create_flow(
     });
 
     let api = AppWebApi::new(base_url);
-    match api.create_workshop(name).await {
+    match api.create_workshop(name, config).await {
         Ok(success) => {
             identity.with_mut(|id| {
                 game_state.with_mut(|gs| {

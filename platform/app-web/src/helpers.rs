@@ -1,3 +1,4 @@
+use chrono::{DateTime, Utc};
 use protocol::{
     ClientDragon, ClientGameState, DragonAction, DragonEmotion, JudgeBundle, Phase, Player,
     SessionCommand,
@@ -91,6 +92,7 @@ pub fn notice_class(tone: NoticeTone) -> &'static str {
     match tone {
         NoticeTone::Info => "notice-info",
         NoticeTone::Success => "notice-success",
+        NoticeTone::Warning => "notice-warning",
         NoticeTone::Error => "notice-error",
     }
 }
@@ -145,6 +147,31 @@ pub fn phase_screen_body(phase: Phase) -> &'static str {
         Phase::Voting => "Cast a creative vote, track submission progress, and wait for the host to reveal the standings.",
         Phase::End => "Review creative awards and final standings, then let the host reset when the workshop is complete.",
     }
+}
+
+pub fn phase_duration_seconds(state: &ClientGameState) -> Option<i32> {
+    state
+        .session
+        .settings
+        .phases
+        .get(&state.phase)
+        .map(|settings| settings.duration_seconds)
+        .filter(|seconds| *seconds > 0)
+}
+
+pub fn phase_remaining_seconds(state: &ClientGameState, now: DateTime<Utc>) -> Option<i32> {
+    let duration_seconds = phase_duration_seconds(state)?;
+    let phase_started_at = DateTime::parse_from_rfc3339(&state.session.phase_started_at)
+        .ok()?
+        .with_timezone(&Utc);
+    let elapsed = (now - phase_started_at).num_seconds().max(0) as i32;
+    Some((duration_seconds - elapsed).max(0))
+}
+
+pub fn format_remaining_duration(total_seconds: i32) -> String {
+    let minutes = total_seconds / 60;
+    let seconds = total_seconds % 60;
+    format!("{minutes:02}:{seconds:02}")
 }
 
 pub fn current_player(state: &ClientGameState) -> Option<&Player> {
@@ -653,6 +680,7 @@ pub mod tests {
                     code: "123456".to_string(),
                     created_at: "2026-01-01T00:00:00Z".to_string(),
                     updated_at: "2026-01-01T00:00:00Z".to_string(),
+                    phase_started_at: "2026-01-01T00:00:00Z".to_string(),
                     host_player_id: Some("player-1".to_string()),
                     settings: create_default_session_settings(),
                 },

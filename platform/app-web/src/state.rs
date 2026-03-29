@@ -33,6 +33,7 @@ pub enum PendingFlow {
 pub enum NoticeTone {
     Info,
     Success,
+    Warning,
     Error,
 }
 
@@ -104,7 +105,8 @@ fn map_notice_tone(level: NoticeLevel) -> NoticeTone {
     match level {
         NoticeLevel::Info => NoticeTone::Info,
         NoticeLevel::Success => NoticeTone::Success,
-        NoticeLevel::Warning | NoticeLevel::Error => NoticeTone::Error,
+        NoticeLevel::Warning => NoticeTone::Warning,
+        NoticeLevel::Error => NoticeTone::Error,
     }
 }
 
@@ -522,6 +524,7 @@ mod tests {
                     code: "123456".to_string(),
                     created_at: "2026-01-01T00:00:00Z".to_string(),
                     updated_at: "2026-01-01T00:00:00Z".to_string(),
+                    phase_started_at: "2026-01-01T00:00:00Z".to_string(),
                     host_player_id: Some("player-1".to_string()),
                     settings: create_default_session_settings(),
                 },

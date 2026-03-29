@@ -14,7 +14,7 @@ use chrono::Utc;
 use domain::{DomainError, Phase1Assignment, PlayerAction, SessionCode, SessionPlayer, WorkshopSession};
 use persistence::{InMemorySessionStore, PostgresSessionStore, SessionStore};
 use protocol::{
-    create_default_session_settings, ActionPayload, ClientGameState, ClientWsMessage, CoordinatorType,
+    create_session_settings, ActionPayload, ClientGameState, ClientWsMessage, CoordinatorType,
     CreateWorkshopRequest, DiscoveryObservationRequest, DragonStats, FoodType, JudgeActionTrace,
     JudgeBundle, JudgeDragonBundle, JudgeHandoverChain, JudgePlayerSummary, JoinWorkshopRequest,
     PlayType, Player, SessionArtifactKind, SessionArtifactRecord, SessionMeta, ServerWsMessage,
@@ -22,6 +22,7 @@ use protocol::{
     WorkshopCommandSuccess, WorkshopError, WorkshopJoinResult, WorkshopJoinSuccess,
     WorkshopJudgeBundleRequest, WorkshopJudgeBundleResult, WorkshopJudgeBundleSuccess,
 };
+use protocol::NoticeLevel;
 use realtime::SessionRegistry;
 use security::{
     create_origin_policy, validate_session_code, FixedWindowRateLimiter, OriginPolicy, OriginPolicyOptions,
@@ -55,6 +56,8 @@ struct AppState {
     config: Arc<AppConfig>,
     store: Arc<dyn SessionStore>,
     sessions: Arc<Mutex<BTreeMap<String, WorkshopSession>>>,
+    session_cache_load_locks: Arc<Mutex<BTreeMap<String, Arc<Mutex<()>>>>>,
+    session_write_locks: Arc<Mutex<BTreeMap<String, Arc<Mutex<()>>>>>,
     create_limiter: Arc<Mutex<FixedWindowRateLimiter>>,
     join_limiter: Arc<Mutex<FixedWindowRateLimiter>>,
     realtime: Arc<Mutex<SessionRegistry>>,
@@ -94,6 +97,8 @@ async fn main() {
         config: config.clone(),
         store,
         sessions: Arc::new(Mutex::new(BTreeMap::new())),
+        session_cache_load_locks: Arc::new(Mutex::new(BTreeMap::new())),
+        session_write_locks: Arc::new(Mutex::new(BTreeMap::new())),
         create_limiter: Arc::new(Mutex::new(FixedWindowRateLimiter::new(20, 60_000))),
         join_limiter: Arc::new(Mutex::new(FixedWindowRateLimiter::new(40, 60_000))),
         realtime: Arc::new(Mutex::new(SessionRegistry::new())),
@@ -136,7 +141,15 @@ async fn main() {
         });
     }
 
+    let ticker_state = state.clone();
     let app = build_app(state);
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+        loop {
+            interval.tick().await;
+            emit_phase_warning_notices(&ticker_state).await;
+        }
+    });
 
     info!(bind_addr = %config.bind_addr, "starting platform app-server");
 
@@ -173,6 +186,87 @@ async fn build_session_store(config: &AppConfig) -> Result<Arc<dyn SessionStore>
         Ok(Arc::new(store))
     } else {
         Ok(Arc::new(InMemorySessionStore::new()))
+    }
+}
+
+async fn emit_phase_warning_notices(state: &AppState) {
+    let now = Utc::now();
+    let mut sessions_to_warn = Vec::new();
+
+    {
+        let mut sessions = state.sessions.lock().await;
+        for session in sessions.values_mut() {
+            let Some(remaining_seconds) = session.remaining_phase_seconds(now) else {
+                continue;
+            };
+            if session.warned_for_current_phase {
+                continue;
+            }
+            if remaining_seconds <= session.phase_warning_threshold_seconds() {
+                session.warned_for_current_phase = true;
+                sessions_to_warn.push((session.code.0.clone(), session.phase, remaining_seconds));
+            }
+        }
+    }
+
+    for (session_code, phase, remaining_seconds) in sessions_to_warn {
+        broadcast_notice(
+            state,
+            &session_code,
+            NoticeLevel::Warning,
+            "Phase ending soon",
+            &format!("{} ends in {} seconds.", phase_label(phase), remaining_seconds),
+        )
+        .await;
+    }
+}
+
+async fn broadcast_notice(
+    state: &AppState,
+    session_code: &str,
+    level: protocol::NoticeLevel,
+    title: &str,
+    message: &str,
+) {
+    let registrations = state.realtime.lock().await.session_registrations(session_code);
+    if registrations.is_empty() {
+        return;
+    }
+
+    let notice = ServerWsMessage::Notice(protocol::SessionNotice {
+        level,
+        title: title.to_string(),
+        message: message.to_string(),
+    });
+
+    let failed_connection_ids = {
+        let senders = state.realtime_senders.lock().await;
+        registrations
+            .into_iter()
+            .filter_map(|registration| {
+                senders
+                    .get(&registration.connection_id)
+                    .and_then(|sender| sender.send(notice.clone()).err().map(|_| registration.connection_id))
+            })
+            .collect::<Vec<_>>()
+    };
+
+    if !failed_connection_ids.is_empty() {
+        let mut senders = state.realtime_senders.lock().await;
+        for connection_id in failed_connection_ids {
+            senders.remove(&connection_id);
+        }
+    }
+}
+
+fn phase_label(phase: protocol::Phase) -> &'static str {
+    match phase {
+        protocol::Phase::Lobby => "Phase 0",
+        protocol::Phase::Phase1 => "Phase 1",
+        protocol::Phase::Handover => "Handover",
+        protocol::Phase::Phase2 => "Phase 2",
+        protocol::Phase::Voting => "Voting",
+        protocol::Phase::End => "Results",
     }
 }
 
@@ -235,6 +329,16 @@ async fn ensure_session_cached(state: &AppState, session_code: &str) -> Result<b
         }
     }
 
+    let load_lock = session_cache_load_lock(state, session_code).await;
+    let _load_guard = load_lock.lock().await;
+
+    {
+        let sessions = state.sessions.lock().await;
+        if sessions.contains_key(session_code) {
+            return Ok(true);
+        }
+    }
+
     let Some(session) = state
         .store
         .load_session_by_code(session_code)
@@ -247,6 +351,22 @@ async fn ensure_session_cached(state: &AppState, session_code: &str) -> Result<b
     let mut sessions = state.sessions.lock().await;
     sessions.entry(session.code.0.clone()).or_insert(session);
     Ok(true)
+}
+
+async fn session_cache_load_lock(state: &AppState, session_code: &str) -> Arc<Mutex<()>> {
+    let mut locks = state.session_cache_load_locks.lock().await;
+    locks
+        .entry(session_code.to_string())
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone()
+}
+
+async fn session_write_lock(state: &AppState, session_code: &str) -> Arc<Mutex<()>> {
+    let mut locks = state.session_write_locks.lock().await;
+    locks
+        .entry(session_code.to_string())
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone()
 }
 
 async fn workshop_ws(
@@ -435,6 +555,8 @@ async fn sync_ws_disconnect(state: &AppState, connection_id: &str) {
     let timestamp = Utc::now();
     let session_code = registration.session_code;
     let player_id = registration.player_id;
+    let write_lock = session_write_lock(state, &session_code).await;
+    let _write_guard = write_lock.lock().await;
     let disconnect_payload = json!({
         "sessionCode": session_code.clone(),
         "playerId": player_id.clone(),
@@ -506,6 +628,10 @@ async fn attach_ws_session(
     if identity.player_id != player_id {
         return Err("Session identity is invalid or expired.".to_string());
     }
+
+    let write_lock = session_write_lock(state, session_code).await;
+    let _write_guard = write_lock.lock().await;
+
     if !ensure_session_cached(state, session_code).await? {
         return Err("Workshop not found.".to_string());
     }
@@ -569,6 +695,8 @@ async fn attach_ws_session(
             .map_err(|error| format!("failed to append reconnect artifact: {error}"))?;
     }
 
+    drop(_write_guard);
+
     let attach_result = state
         .realtime
         .lock()
@@ -621,7 +749,12 @@ async fn create_workshop(
     let session_code = allocate_session_code(&state).await;
     let player_id = random_prefixed_id("player");
     let reconnect_token = random_prefixed_id("reconnect");
-    let mut session = WorkshopSession::new(Uuid::new_v4(), SessionCode(session_code.clone()), timestamp);
+    let mut session = WorkshopSession::new(
+        Uuid::new_v4(),
+        SessionCode(session_code.clone()),
+        timestamp,
+        session_config_from_request(&payload),
+    );
     let host_player = SessionPlayer {
         id: player_id.clone(),
         name: normalized_name.to_string(),
@@ -656,7 +789,15 @@ async fn create_workshop(
         kind: SessionArtifactKind::SessionCreated,
         player_id: Some(player_id.clone()),
         created_at: timestamp.to_rfc3339(),
-        payload: json!({ "sessionCode": session_code, "hostName": normalized_name }),
+        payload: json!({
+            "sessionCode": session_code,
+            "hostName": normalized_name,
+            "phase0Minutes": session.config.phase0_minutes,
+            "phase1Minutes": session.config.phase1_minutes,
+            "phase2Minutes": session.config.phase2_minutes,
+            "hasImageGeneratorToken": session.config.image_generator_token.is_some(),
+            "hasJudgeToken": session.config.judge_token.is_some(),
+        }),
     }).await {
         return internal_join_error(format!("failed to append session artifact: {error}"));
     }
@@ -677,6 +818,10 @@ async fn create_workshop(
         .insert(session.code.0.clone(), session);
 
     (StatusCode::OK, Json(WorkshopJoinResult::Success(response)))
+}
+
+fn session_config_from_request(payload: &CreateWorkshopRequest) -> protocol::WorkshopCreateConfig {
+    payload.config.clone()
 }
 
 async fn join_workshop(
@@ -710,26 +855,34 @@ async fn join_workshop(
             Err(error) => return internal_join_error(format!("failed to lookup player identity: {error}")),
         };
 
-        if !ensure_session_cached(&state, session_code).await.unwrap_or(false) {
-            return bad_join_request("Workshop not found.");
+        let write_lock = session_write_lock(&state, session_code).await;
+        let _write_guard = write_lock.lock().await;
+
+        match ensure_session_cached(&state, session_code).await {
+            Ok(true) => {}
+            Ok(false) => return bad_join_request("Workshop not found."),
+            Err(error) => return internal_join_error(format!("failed to load session: {error}")),
         }
 
         let timestamp = Utc::now();
-        let session_clone = {
+        let (session_before, session_clone) = {
             let mut sessions = state.sessions.lock().await;
             let Some(session) = sessions.get_mut(session_code) else {
                 return bad_join_request("Workshop not found.");
             };
+            let session_before = session.clone();
             let Some(player) = session.players.get_mut(&identity.player_id) else {
                 return bad_join_request("Session identity is invalid or expired.");
             };
             player.is_connected = true;
             session.ensure_host_assigned(true);
             session.updated_at = timestamp;
-            session.clone()
+            (session_before, session.clone())
         };
 
         if let Err(error) = state.store.save_session(&session_clone).await {
+            let mut sessions = state.sessions.lock().await;
+            sessions.insert(session_code.to_string(), session_before);
             return internal_join_error(format!("failed to save session: {error}"));
         }
         if let Err(error) = state.store.touch_player_identity(reconnect_token, &timestamp.to_rfc3339()).await {
@@ -754,6 +907,8 @@ async fn join_workshop(
             return internal_join_error(format!("failed to append session artifact: {error}"));
         }
 
+        drop(_write_guard);
+
         let response = WorkshopJoinSuccess {
             ok: true,
             session_code: session_clone.code.0.clone(),
@@ -773,11 +928,16 @@ async fn join_workshop(
         return bad_join_request("Please enter a player name.");
     }
 
-    if !ensure_session_cached(&state, session_code).await.unwrap_or(false) {
-        return bad_join_request("Workshop not found.");
+    let write_lock = session_write_lock(&state, session_code).await;
+    let _write_guard = write_lock.lock().await;
+
+    match ensure_session_cached(&state, session_code).await {
+        Ok(true) => {}
+        Ok(false) => return bad_join_request("Workshop not found."),
+        Err(error) => return internal_join_error(format!("failed to load session: {error}")),
     }
 
-    let (session_clone, player_id, reconnect_token) = {
+    let (session_before, session_clone, player_id, reconnect_token) = {
         let mut sessions = state.sessions.lock().await;
         let Some(session) = sessions.get_mut(session_code) else {
             return bad_join_request("Workshop not found.");
@@ -793,6 +953,7 @@ async fn join_workshop(
             return bad_join_request("That player name is already taken in this workshop.");
         }
 
+        let session_before = session.clone();
         let timestamp = Utc::now();
         let player_id = random_prefixed_id("player");
         let reconnect_token = random_prefixed_id("reconnect");
@@ -809,11 +970,13 @@ async fn join_workshop(
             joined_at: timestamp,
         };
         session.add_player(player.clone());
-        (session.clone(), player_id, reconnect_token)
+        (session_before, session.clone(), player_id, reconnect_token)
     };
 
     let timestamp = Utc::now();
     if let Err(error) = state.store.save_session(&session_clone).await {
+        let mut sessions = state.sessions.lock().await;
+        sessions.insert(session_code.to_string(), session_before);
         return internal_join_error(format!("failed to save session: {error}"));
     }
     if let Err(error) = state.store.create_player_identity(&persistence::PlayerIdentity {
@@ -837,6 +1000,8 @@ async fn join_workshop(
     }).await {
         return internal_join_error(format!("failed to append session artifact: {error}"));
     }
+
+    drop(_write_guard);
 
     let response = WorkshopJoinSuccess {
         ok: true,
@@ -873,16 +1038,24 @@ async fn workshop_command(
         Err(error) => return internal_command_error(format!("failed to lookup identity: {error}")),
     };
 
-    if !ensure_session_cached(&state, session_code).await.unwrap_or(false) {
-        return bad_command_request("Workshop not found.");
+    let write_lock = session_write_lock(&state, session_code).await;
+    let _write_guard = write_lock.lock().await;
+
+    match ensure_session_cached(&state, session_code).await {
+        Ok(true) => {}
+        Ok(false) => return bad_command_request("Workshop not found."),
+        Err(error) => return internal_command_error(format!("failed to load session: {error}")),
     }
 
-    let (response, should_broadcast) = {
+    let (response, should_broadcast, session_before, session_to_persist, artifact_to_append) = {
         let mut sessions = state.sessions.lock().await;
         let Some(session) = sessions.get_mut(session_code) else {
             return bad_command_request("Workshop not found.");
         };
         let mut should_broadcast = false;
+        let session_before = session.clone();
+        let mut session_to_persist = None;
+        let mut artifact_to_append = None;
 
         let response = match request.command {
         SessionCommand::StartPhase1 => {
@@ -905,10 +1078,8 @@ async fn workshop_command(
             if let Err(error) = session.begin_phase1(&assignments) {
                 return bad_command_request(&error.to_string());
             }
-            if let Err(error) = state.store.save_session(session).await {
-                return internal_command_error(format!("failed to save session: {error}"));
-            }
-            if let Err(error) = state.store.append_session_artifact(&SessionArtifactRecord {
+            session_to_persist = Some(session.clone());
+            artifact_to_append = Some(SessionArtifactRecord {
                 id: random_prefixed_id("artifact"),
                 session_id: session.id.to_string(),
                 phase: session.phase,
@@ -917,9 +1088,7 @@ async fn workshop_command(
                 player_id: Some(identity.player_id.clone()),
                 created_at: Utc::now().to_rfc3339(),
                 payload: json!({ "toPhase": "phase1" }),
-            }).await {
-                return internal_command_error(format!("failed to append session artifact: {error}"));
-            }
+            });
 
             successful_workshop_command(&mut should_broadcast)
         }
@@ -948,10 +1117,8 @@ async fn workshop_command(
             };
 
             session.record_discovery_observation(&identity.player_id, text.to_string());
-            if let Err(error) = state.store.save_session(session).await {
-                return internal_command_error(format!("failed to save session: {error}"));
-            }
-            if let Err(error) = state.store.append_session_artifact(&SessionArtifactRecord {
+            session_to_persist = Some(session.clone());
+            artifact_to_append = Some(SessionArtifactRecord {
                 id: random_prefixed_id("artifact"),
                 session_id: session.id.to_string(),
                 phase: session.phase,
@@ -960,9 +1127,7 @@ async fn workshop_command(
                 player_id: Some(identity.player_id.clone()),
                 created_at: Utc::now().to_rfc3339(),
                 payload: json!({ "dragonId": dragon_id, "text": text }),
-            }).await {
-                return internal_command_error(format!("failed to append session artifact: {error}"));
-            }
+            });
 
             successful_workshop_command(&mut should_broadcast)
         }
@@ -998,10 +1163,6 @@ async fn workshop_command(
                     return bad_command_request(&message);
                 }
             };
-            if let Err(error) = state.store.save_session(session).await {
-                return internal_command_error(format!("failed to save session: {error}"));
-            }
-
             let mut artifact_payload = json!({
                 "dragonId": dragon_id,
                 "actionType": action_type,
@@ -1030,7 +1191,8 @@ async fn workshop_command(
                 }
             }
 
-            if let Err(error) = state.store.append_session_artifact(&SessionArtifactRecord {
+            session_to_persist = Some(session.clone());
+            artifact_to_append = Some(SessionArtifactRecord {
                 id: random_prefixed_id("artifact"),
                 session_id: session.id.to_string(),
                 phase: session.phase,
@@ -1039,9 +1201,7 @@ async fn workshop_command(
                 player_id: Some(identity.player_id.clone()),
                 created_at: Utc::now().to_rfc3339(),
                 payload: artifact_payload,
-            }).await {
-                return internal_command_error(format!("failed to append session artifact: {error}"));
-            }
+            });
 
             successful_workshop_command(&mut should_broadcast)
         }
@@ -1055,10 +1215,8 @@ async fn workshop_command(
             if let Err(error) = session.transition_to(protocol::Phase::Handover) {
                 return bad_command_request(&error.to_string());
             }
-            if let Err(error) = state.store.save_session(session).await {
-                return internal_command_error(format!("failed to save session: {error}"));
-            }
-            if let Err(error) = state.store.append_session_artifact(&SessionArtifactRecord {
+            session_to_persist = Some(session.clone());
+            artifact_to_append = Some(SessionArtifactRecord {
                 id: random_prefixed_id("artifact"),
                 session_id: session.id.to_string(),
                 phase: session.phase,
@@ -1067,9 +1225,7 @@ async fn workshop_command(
                 player_id: Some(identity.player_id.clone()),
                 created_at: Utc::now().to_rfc3339(),
                 payload: json!({ "toPhase": "handover" }),
-            }).await {
-                return internal_command_error(format!("failed to append session artifact: {error}"));
-            }
+            });
 
             successful_workshop_command(&mut should_broadcast)
         }
@@ -1089,10 +1245,6 @@ async fn workshop_command(
             };
 
             session.save_handover_tags(&identity.player_id, tags);
-            if let Err(error) = state.store.save_session(session).await {
-                return internal_command_error(format!("failed to save session: {error}"));
-            }
-
             let saved_tags = session
                 .players
                 .get(&identity.player_id)
@@ -1101,7 +1253,8 @@ async fn workshop_command(
                 .map(|dragon| dragon.handover_tags.clone())
                 .unwrap_or_default();
 
-            if let Err(error) = state.store.append_session_artifact(&SessionArtifactRecord {
+            session_to_persist = Some(session.clone());
+            artifact_to_append = Some(SessionArtifactRecord {
                 id: random_prefixed_id("artifact"),
                 session_id: session.id.to_string(),
                 phase: session.phase,
@@ -1110,9 +1263,7 @@ async fn workshop_command(
                 player_id: Some(identity.player_id.clone()),
                 created_at: Utc::now().to_rfc3339(),
                 payload: json!({ "tagCount": saved_tags.len(), "tags": saved_tags }),
-            }).await {
-                return internal_command_error(format!("failed to append session artifact: {error}"));
-            }
+            });
 
             successful_workshop_command(&mut should_broadcast)
         }
@@ -1131,10 +1282,8 @@ async fn workshop_command(
                     _ => bad_command_request(&error.to_string()),
                 };
             }
-            if let Err(error) = state.store.save_session(session).await {
-                return internal_command_error(format!("failed to save session: {error}"));
-            }
-            if let Err(error) = state.store.append_session_artifact(&SessionArtifactRecord {
+            session_to_persist = Some(session.clone());
+            artifact_to_append = Some(SessionArtifactRecord {
                 id: random_prefixed_id("artifact"),
                 session_id: session.id.to_string(),
                 phase: session.phase,
@@ -1143,9 +1292,7 @@ async fn workshop_command(
                 player_id: Some(identity.player_id.clone()),
                 created_at: Utc::now().to_rfc3339(),
                 payload: json!({ "toPhase": "phase2" }),
-            }).await {
-                return internal_command_error(format!("failed to append session artifact: {error}"));
-            }
+            });
 
             successful_workshop_command(&mut should_broadcast)
         }
@@ -1165,10 +1312,8 @@ async fn workshop_command(
                     return bad_command_request(&error.to_string());
                 }
             }
-            if let Err(error) = state.store.save_session(session).await {
-                return internal_command_error(format!("failed to save session: {error}"));
-            }
-            if let Err(error) = state.store.append_session_artifact(&SessionArtifactRecord {
+            session_to_persist = Some(session.clone());
+            artifact_to_append = Some(SessionArtifactRecord {
                 id: random_prefixed_id("artifact"),
                 session_id: session.id.to_string(),
                 phase: session.phase,
@@ -1177,9 +1322,7 @@ async fn workshop_command(
                 player_id: Some(identity.player_id.clone()),
                 created_at: Utc::now().to_rfc3339(),
                 payload: json!({ "toPhase": if immediate_finalize { "end" } else { "voting" } }),
-            }).await {
-                return internal_command_error(format!("failed to append session artifact: {error}"));
-            }
+            });
 
             successful_workshop_command(&mut should_broadcast)
         }
@@ -1204,10 +1347,8 @@ async fn workshop_command(
                 };
                 return bad_command_request(&message);
             }
-            if let Err(error) = state.store.save_session(session).await {
-                return internal_command_error(format!("failed to save session: {error}"));
-            }
-            if let Err(error) = state.store.append_session_artifact(&SessionArtifactRecord {
+            session_to_persist = Some(session.clone());
+            artifact_to_append = Some(SessionArtifactRecord {
                 id: random_prefixed_id("artifact"),
                 session_id: session.id.to_string(),
                 phase: session.phase,
@@ -1216,9 +1357,7 @@ async fn workshop_command(
                 player_id: Some(identity.player_id.clone()),
                 created_at: Utc::now().to_rfc3339(),
                 payload: json!({ "dragonId": payload.dragon_id }),
-            }).await {
-                return internal_command_error(format!("failed to append session artifact: {error}"));
-            }
+            });
 
             successful_workshop_command(&mut should_broadcast)
         }
@@ -1237,10 +1376,8 @@ async fn workshop_command(
             if let Err(error) = session.finalize_voting() {
                 return bad_command_request(&error.to_string());
             }
-            if let Err(error) = state.store.save_session(session).await {
-                return internal_command_error(format!("failed to save session: {error}"));
-            }
-            if let Err(error) = state.store.append_session_artifact(&SessionArtifactRecord {
+            session_to_persist = Some(session.clone());
+            artifact_to_append = Some(SessionArtifactRecord {
                 id: random_prefixed_id("artifact"),
                 session_id: session.id.to_string(),
                 phase: session.phase,
@@ -1256,9 +1393,7 @@ async fn workshop_command(
                         .map(|(player_id, player)| (player_id.clone(), player.score))
                         .collect::<BTreeMap<_, _>>()
                 }),
-            }).await {
-                return internal_command_error(format!("failed to append session artifact: {error}"));
-            }
+            });
 
             successful_workshop_command(&mut should_broadcast)
         }
@@ -1269,10 +1404,8 @@ async fn workshop_command(
             if let Err(error) = session.reset_to_lobby() {
                 return bad_command_request(&error.to_string());
             }
-            if let Err(error) = state.store.save_session(session).await {
-                return internal_command_error(format!("failed to save session: {error}"));
-            }
-            if let Err(error) = state.store.append_session_artifact(&SessionArtifactRecord {
+            session_to_persist = Some(session.clone());
+            artifact_to_append = Some(SessionArtifactRecord {
                 id: random_prefixed_id("artifact"),
                 session_id: session.id.to_string(),
                 phase: session.phase,
@@ -1281,17 +1414,33 @@ async fn workshop_command(
                 player_id: Some(identity.player_id.clone()),
                 created_at: Utc::now().to_rfc3339(),
                 payload: json!({ "toPhase": "lobby" }),
-            }).await {
-                return internal_command_error(format!("failed to append session artifact: {error}"));
-            }
+            });
 
             successful_workshop_command(&mut should_broadcast)
         }
         _ => bad_command_request("Unsupported workshop command."),
         };
 
-        (response, should_broadcast)
+        (response, should_broadcast, session_before, session_to_persist, artifact_to_append)
     };
+
+    if let Some(session) = session_to_persist.as_ref() {
+        if let Err(error) = state.store.save_session(session).await {
+            let mut sessions = state.sessions.lock().await;
+            sessions.insert(session_code.to_string(), session_before);
+            return internal_command_error(format!("failed to save session: {error}"));
+        }
+    }
+
+    if let Some(artifact) = artifact_to_append.as_ref() {
+        if let Err(error) = state.store.append_session_artifact(artifact).await {
+            let mut sessions = state.sessions.lock().await;
+            sessions.insert(session_code.to_string(), session_before);
+            return internal_command_error(format!("failed to append session artifact: {error}"));
+        }
+    }
+
+    drop(_write_guard);
 
     if should_broadcast {
         broadcast_session_state(&state, session_code, None).await;
@@ -1316,8 +1465,10 @@ async fn workshop_judge_bundle(
     }
 
     let session = {
-        if !ensure_session_cached(&state, session_code).await.unwrap_or(false) {
-            return bad_judge_bundle_request("Workshop not found.");
+        match ensure_session_cached(&state, session_code).await {
+            Ok(true) => {}
+            Ok(false) => return bad_judge_bundle_request("Workshop not found."),
+            Err(error) => return internal_judge_bundle_error(format!("failed to load session: {error}")),
         }
         let sessions = state.sessions.lock().await;
         let Some(session) = sessions.get(session_code) else {
@@ -1467,23 +1618,31 @@ async fn workshop_judge_bundle(
      format!("{prefix}_{}", Uuid::new_v4().simple())
  }
 
- async fn allocate_session_code(state: &AppState) -> String {
-     loop {
-         let entropy = Uuid::new_v4().simple().to_string();
-         let suffix = entropy
-             .chars()
+async fn allocate_session_code(state: &AppState) -> String {
+    loop {
+        let entropy = Uuid::new_v4().simple().to_string();
+        let suffix = entropy
+            .chars()
              .filter(|ch| ch.is_ascii_hexdigit())
-             .take(5)
-             .map(|ch| (((ch as u8) % 10) + b'0') as char)
-             .collect::<String>();
-         let candidate = format!("{}{}", state.config.rust_session_code_prefix, suffix);
-         if !state.sessions.lock().await.contains_key(&candidate)
-              && state.store.load_session_by_code(&candidate).await.ok().flatten().is_none()
-         {
-             return candidate;
-         }
-     }
- }
+            .take(5)
+            .map(|ch| (((ch as u8) % 10) + b'0') as char)
+            .collect::<String>();
+        let candidate = format!("{}{}", state.config.rust_session_code_prefix, suffix);
+        let is_cached = {
+            let sessions = state.sessions.lock().await;
+            sessions.contains_key(&candidate)
+        };
+        let is_persisted = state
+            .store
+            .load_session_by_code(&candidate)
+            .await
+            .map(|session| session.is_some())
+            .unwrap_or(true);
+        if !is_cached && !is_persisted {
+            return candidate;
+        }
+    }
+}
 
  fn to_client_game_state(session: &WorkshopSession, current_player_id: &str) -> ClientGameState {
      let players = session
@@ -1508,14 +1667,15 @@ async fn workshop_judge_bundle(
          .collect();
 
      ClientGameState {
-         session: SessionMeta {
-             id: session.id.to_string(),
-             code: session.code.0.clone(),
-             created_at: session.created_at.to_rfc3339(),
-             updated_at: session.updated_at.to_rfc3339(),
-             host_player_id: session.host_player_id.clone(),
-             settings: create_default_session_settings(),
-         },
+        session: SessionMeta {
+            id: session.id.to_string(),
+            code: session.code.0.clone(),
+            created_at: session.created_at.to_rfc3339(),
+            updated_at: session.updated_at.to_rfc3339(),
+            phase_started_at: session.phase_started_at.to_rfc3339(),
+            host_player_id: session.host_player_id.clone(),
+            settings: create_session_settings(&session.config),
+        },
          phase: session.phase,
          time: session.time,
          players,
@@ -1776,15 +1936,142 @@ fn successful_workshop_command(should_broadcast: &mut bool) -> (StatusCode, Json
  mod tests {
      use super::*;
      use axum::{
-         body::{to_bytes, Body},
-         http::{HeaderValue, Request, StatusCode},
+          body::{to_bytes, Body},
+          http::{HeaderValue, Request, StatusCode},
      };
      use futures_util::{SinkExt, StreamExt};
+     use persistence::{PersistenceError, PlayerIdentityMatch};
+     use std::{future::Future, pin::Pin, sync::atomic::{AtomicBool, AtomicUsize, Ordering}};
      use tokio_tungstenite::{
-         connect_async,
-         tungstenite::{client::IntoClientRequest, Message as WsMessage},
+          connect_async,
+          tungstenite::{client::IntoClientRequest, Message as WsMessage},
      };
      use tower::util::ServiceExt;
+
+     #[derive(Default)]
+     struct FaultyStore {
+         inner: InMemorySessionStore,
+         fail_load_session_by_code: AtomicBool,
+         fail_save_session: AtomicBool,
+         fail_touch_player_identity: AtomicBool,
+         fail_create_player_identity: AtomicBool,
+         fail_append_session_artifact: AtomicBool,
+         load_session_by_code_calls: AtomicUsize,
+     }
+
+     impl FaultyStore {
+         fn new() -> Self {
+             Self::default()
+         }
+
+         fn fail_loads(&self) {
+             self.fail_load_session_by_code.store(true, Ordering::SeqCst);
+         }
+
+         fn fail_saves(&self) {
+             self.fail_save_session.store(true, Ordering::SeqCst);
+         }
+
+         fn fail_touches(&self) {
+             self.fail_touch_player_identity.store(true, Ordering::SeqCst);
+         }
+
+         fn fail_identity_creates(&self) {
+             self.fail_create_player_identity.store(true, Ordering::SeqCst);
+         }
+
+         fn fail_artifact_appends(&self) {
+             self.fail_append_session_artifact.store(true, Ordering::SeqCst);
+         }
+
+         fn load_calls(&self) -> usize {
+             self.load_session_by_code_calls.load(Ordering::SeqCst)
+         }
+     }
+
+     impl SessionStore for FaultyStore {
+         fn init(&self) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + '_>> {
+             self.inner.init()
+         }
+
+         fn health_check(&self) -> Pin<Box<dyn Future<Output = Result<bool, PersistenceError>> + Send + '_>> {
+             self.inner.health_check()
+         }
+
+         fn load_session_by_code(
+             &self,
+             session_code: &str,
+         ) -> Pin<Box<dyn Future<Output = Result<Option<WorkshopSession>, PersistenceError>> + Send + '_>> {
+             self.load_session_by_code_calls.fetch_add(1, Ordering::SeqCst);
+             if self.fail_load_session_by_code.load(Ordering::SeqCst) {
+                 return Box::pin(async { Err(PersistenceError::LockPoisoned) });
+             }
+             self.inner.load_session_by_code(session_code)
+         }
+
+         fn save_session(
+             &self,
+             session: &WorkshopSession,
+         ) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + '_>> {
+             if self.fail_save_session.load(Ordering::SeqCst) {
+                 return Box::pin(async { Err(PersistenceError::LockPoisoned) });
+             }
+             self.inner.save_session(session)
+         }
+
+        fn append_session_artifact(
+            &self,
+            artifact: &SessionArtifactRecord,
+        ) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + '_>> {
+            if self.fail_append_session_artifact.load(Ordering::SeqCst) {
+                return Box::pin(async { Err(PersistenceError::LockPoisoned) });
+            }
+            self.inner.append_session_artifact(artifact)
+        }
+
+         fn list_session_artifacts(
+             &self,
+             session_id: &str,
+         ) -> Pin<Box<dyn Future<Output = Result<Vec<SessionArtifactRecord>, PersistenceError>> + Send + '_>> {
+             self.inner.list_session_artifacts(session_id)
+         }
+
+        fn create_player_identity(
+            &self,
+            identity: &persistence::PlayerIdentity,
+        ) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + '_>> {
+            if self.fail_create_player_identity.load(Ordering::SeqCst) {
+                return Box::pin(async { Err(PersistenceError::LockPoisoned) });
+            }
+            self.inner.create_player_identity(identity)
+        }
+
+         fn find_player_identity(
+             &self,
+             session_code: &str,
+             reconnect_token: &str,
+         ) -> Pin<Box<dyn Future<Output = Result<Option<PlayerIdentityMatch>, PersistenceError>> + Send + '_>> {
+             self.inner.find_player_identity(session_code, reconnect_token)
+         }
+
+        fn touch_player_identity(
+            &self,
+            reconnect_token: &str,
+            last_seen_at: &str,
+        ) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + '_>> {
+            if self.fail_touch_player_identity.load(Ordering::SeqCst) {
+                return Box::pin(async { Err(PersistenceError::LockPoisoned) });
+            }
+            self.inner.touch_player_identity(reconnect_token, last_seen_at)
+        }
+
+         fn revoke_player_identity(
+             &self,
+             reconnect_token: &str,
+         ) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + '_>> {
+             self.inner.revoke_player_identity(reconnect_token)
+         }
+     }
 
      fn session_player(id: &str, name: &str, joined_at_seconds: i64) -> SessionPlayer {
          SessionPlayer {
@@ -1799,6 +2086,18 @@ fn successful_workshop_command(should_broadcast: &mut bool) -> (StatusCode, Json
              achievements: Vec::new(),
              joined_at: chrono::DateTime::from_timestamp(joined_at_seconds, 0).expect("valid timestamp"),
          }
+     }
+
+     fn create_workshop_body(name: &str) -> String {
+         serde_json::json!({
+             "name": name,
+             "config": {
+                 "phase0Minutes": 5,
+                 "phase1Minutes": 10,
+                 "phase2Minutes": 10
+             }
+         })
+         .to_string()
      }
 
      fn test_state() -> AppState {
@@ -1822,9 +2121,11 @@ fn successful_workshop_command(should_broadcast: &mut bool) -> (StatusCode, Json
          });
 
          AppState {
-            config,
-            store: Arc::new(InMemorySessionStore::new()),
+             config,
+             store: Arc::new(InMemorySessionStore::new()),
             sessions: Arc::new(Mutex::new(BTreeMap::new())),
+            session_cache_load_locks: Arc::new(Mutex::new(BTreeMap::new())),
+            session_write_locks: Arc::new(Mutex::new(BTreeMap::new())),
             create_limiter: Arc::new(Mutex::new(FixedWindowRateLimiter::new(create_limit, 60_000))),
             join_limiter: Arc::new(Mutex::new(FixedWindowRateLimiter::new(join_limit, 60_000))),
             realtime: Arc::new(Mutex::new(SessionRegistry::new())),
@@ -1887,6 +2188,115 @@ fn successful_workshop_command(should_broadcast: &mut bool) -> (StatusCode, Json
      }
 
      #[tokio::test]
+     async fn join_workshop_returns_internal_error_when_cache_load_fails() {
+         let store = Arc::new(FaultyStore::new());
+         let state = test_state_with_store(store.clone());
+
+         let session = WorkshopSession::new(
+             Uuid::new_v4(),
+             SessionCode("123456".into()),
+             Utc::now(),
+             protocol::WorkshopCreateConfig::default(),
+         );
+         store.inner.save_session(&session).await.expect("seed session");
+         store.fail_loads();
+
+         let app = build_app(state);
+         let response = app
+             .oneshot(
+                 Request::builder()
+                     .method("POST")
+                     .uri("/api/workshops/join")
+                     .header("content-type", "application/json")
+                     .body(Body::from(r#"{"sessionCode":"123456","name":"Bob"}"#))
+                     .expect("build join request"),
+             )
+             .await
+             .expect("call join workshop");
+
+         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+         let body = to_bytes(response.into_body(), usize::MAX).await.expect("read join body");
+         let result: WorkshopJoinResult = serde_json::from_slice(&body).expect("parse join result");
+         match result {
+             WorkshopJoinResult::Error(error) => assert!(error.error.contains("failed to load session")),
+             WorkshopJoinResult::Success(_) => panic!("expected error response"),
+         }
+     }
+
+     #[tokio::test]
+     async fn workshop_command_does_not_leave_mutated_cache_when_save_fails() {
+         let store = Arc::new(FaultyStore::new());
+         let state = test_state_with_store(store.clone());
+         let session_code = "123456";
+         let player_id = "player-1".to_string();
+         let reconnect_token = "token-1".to_string();
+         let timestamp = Utc::now();
+
+         let mut session = WorkshopSession::new(
+             Uuid::new_v4(),
+             SessionCode(session_code.into()),
+             timestamp,
+             protocol::WorkshopCreateConfig::default(),
+         );
+         let host_player = SessionPlayer {
+             id: player_id.clone(),
+             name: "Alice".to_string(),
+             pet_description: Some("Alice's workshop dragon".to_string()),
+             is_host: true,
+             is_connected: true,
+             is_ready: false,
+             score: 0,
+             current_dragon_id: None,
+             achievements: Vec::new(),
+             joined_at: timestamp,
+         };
+         session.add_player(host_player);
+         store.inner.save_session(&session).await.expect("seed session");
+         store
+             .inner
+             .create_player_identity(&persistence::PlayerIdentity {
+                 session_id: session.id.to_string(),
+                 player_id: player_id.clone(),
+                 reconnect_token: reconnect_token.clone(),
+                 created_at: timestamp.to_rfc3339(),
+                 last_seen_at: timestamp.to_rfc3339(),
+             })
+             .await
+             .expect("seed identity");
+         state.sessions.lock().await.insert(session_code.to_string(), session.clone());
+         store.fail_saves();
+
+         let app = build_app(state.clone());
+         let response = app
+             .oneshot(
+                 Request::builder()
+                     .method("POST")
+                     .uri("/api/workshops/command")
+                     .header("origin", "http://localhost:5173")
+                     .header("content-type", "application/json")
+                     .body(Body::from(
+                         serde_json::to_vec(&WorkshopCommandRequest {
+                             session_code: session_code.to_string(),
+                             reconnect_token: reconnect_token.clone(),
+                             coordinator_type: Some(CoordinatorType::Rust),
+                             command: SessionCommand::StartPhase1,
+                             payload: None,
+                         })
+                         .expect("encode command request"),
+                     ))
+                     .expect("build command request"),
+             )
+             .await
+             .expect("call command endpoint");
+
+         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+         let sessions = state.sessions.lock().await;
+         let cached = sessions.get(session_code).expect("session remains cached");
+         assert_eq!(cached.phase, protocol::Phase::Lobby);
+     }
+
+     #[tokio::test]
      async fn root_path_serves_static_index_when_bundle_exists() {
          let app = build_app(test_state_with_static_assets());
 
@@ -1913,7 +2323,7 @@ fn successful_workshop_command(should_broadcast: &mut bool) -> (StatusCode, Json
                      .method("POST")
                      .uri("/api/workshops")
                      .header("content-type", "application/json")
-                     .body(Body::from(r#"{"name":"Alice"}"#))
+                     .body(Body::from(create_workshop_body("Alice")))
                      .expect("build create request"),
              )
              .await
@@ -1958,6 +2368,42 @@ fn successful_workshop_command(should_broadcast: &mut bool) -> (StatusCode, Json
      }
 
      #[tokio::test]
+     async fn ensure_session_cached_deduplicates_concurrent_loads() {
+         let store = Arc::new(FaultyStore::new());
+         let state = test_state_with_store(store.clone());
+         let session = WorkshopSession::new(
+             Uuid::new_v4(),
+             SessionCode("123456".into()),
+             Utc::now(),
+             protocol::WorkshopCreateConfig::default(),
+         );
+         store.inner.save_session(&session).await.expect("seed session");
+
+         let first = ensure_session_cached(&state, "123456");
+         let second = ensure_session_cached(&state, "123456");
+         let (first_result, second_result) = tokio::join!(first, second);
+
+         assert_eq!(first_result.expect("first load"), true);
+         assert_eq!(second_result.expect("second load"), true);
+         assert_eq!(store.load_calls(), 1);
+     }
+
+     #[tokio::test]
+     async fn allocate_session_code_treats_store_errors_as_unavailable() {
+         let store = Arc::new(FaultyStore::new());
+         let state = test_state_with_store(store.clone());
+         store.fail_loads();
+
+         let result = tokio::time::timeout(
+             std::time::Duration::from_millis(50),
+             allocate_session_code(&state),
+         )
+         .await;
+
+         assert!(result.is_err(), "allocation should keep retrying while store reads fail");
+     }
+
+     #[tokio::test]
      async fn workshop_command_pushes_state_update_to_attached_websocket() {
          let state = test_state();
          let app = build_app(state.clone());
@@ -1969,7 +2415,7 @@ fn successful_workshop_command(should_broadcast: &mut bool) -> (StatusCode, Json
                      .method("POST")
                      .uri("/api/workshops")
                      .header("content-type", "application/json")
-                     .body(Body::from(r#"{"name":"Alice"}"#))
+                     .body(Body::from(create_workshop_body("Alice")))
                      .expect("build create request"),
              )
              .await
@@ -2050,7 +2496,7 @@ fn successful_workshop_command(should_broadcast: &mut bool) -> (StatusCode, Json
                      .method("POST")
                      .uri("/api/workshops")
                      .header("content-type", "application/json")
-                     .body(Body::from(r#"{"name":"Alice"}"#))
+                     .body(Body::from(create_workshop_body("Alice")))
                      .expect("build create request"),
              )
              .await
@@ -2180,6 +2626,192 @@ fn successful_workshop_command(should_broadcast: &mut bool) -> (StatusCode, Json
      }
 
      #[tokio::test]
+     async fn workshop_ws_attach_keeps_cache_state_when_artifact_append_fails_after_save() {
+         let store = Arc::new(FaultyStore::new());
+         let state = test_state_with_store(store.clone());
+         let session_code = "123456";
+         let player_id = "player-1".to_string();
+         let reconnect_token = "token-1".to_string();
+         let timestamp = Utc::now();
+
+         let mut session = WorkshopSession::new(
+             Uuid::new_v4(),
+             SessionCode(session_code.into()),
+             timestamp,
+             protocol::WorkshopCreateConfig::default(),
+         );
+         session.add_player(SessionPlayer {
+             id: player_id.clone(),
+             name: "Alice".to_string(),
+             pet_description: Some("Alice's workshop dragon".to_string()),
+             is_host: true,
+             is_connected: false,
+             is_ready: false,
+             score: 0,
+             current_dragon_id: None,
+             achievements: Vec::new(),
+             joined_at: timestamp,
+         });
+         store.inner.save_session(&session).await.expect("seed session");
+         store
+             .inner
+             .create_player_identity(&persistence::PlayerIdentity {
+                 session_id: session.id.to_string(),
+                 player_id: player_id.clone(),
+                 reconnect_token: reconnect_token.clone(),
+                 created_at: timestamp.to_rfc3339(),
+                 last_seen_at: timestamp.to_rfc3339(),
+             })
+             .await
+             .expect("seed identity");
+         state.sessions.lock().await.insert(session_code.to_string(), session.clone());
+         store.fail_artifact_appends();
+
+         let app = build_app(state.clone());
+         let (addr, server_handle) = spawn_test_server(app).await;
+         let (mut socket, _) = connect_async(ws_request(addr)).await.expect("connect ws");
+         let attach_message = ClientWsMessage::AttachSession(SessionEnvelope {
+             session_code: session_code.to_string(),
+             player_id: player_id.clone(),
+             reconnect_token: reconnect_token.clone(),
+             coordinator_type: Some(CoordinatorType::Rust),
+         });
+         socket
+             .send(WsMessage::Text(serde_json::to_string(&attach_message).expect("encode attach").into()))
+             .await
+             .expect("send attach");
+
+         let message = socket.next().await.expect("error frame").expect("error message");
+         let payload = match message {
+             WsMessage::Text(payload) => payload,
+             other => panic!("expected text frame, got {other:?}"),
+         };
+         let server_message: ServerWsMessage = serde_json::from_str(&payload).expect("parse server ws message");
+         match server_message {
+             ServerWsMessage::Error { message } => assert!(message.contains("failed to append reconnect artifact")),
+             other => panic!("expected error message, got {other:?}"),
+         }
+
+         let sessions = state.sessions.lock().await;
+         let cached = sessions.get(session_code).expect("session remains cached");
+         let player = cached.players.get(&player_id).expect("player exists");
+         assert!(player.is_connected, "cache should keep the committed reconnect state");
+
+         let _ = socket.close(None).await;
+         server_handle.abort();
+     }
+
+     #[tokio::test]
+     async fn reconnect_join_keeps_cache_state_when_touch_fails_after_save() {
+         let store = Arc::new(FaultyStore::new());
+         let state = test_state_with_store(store.clone());
+         let session_code = "123456";
+         let player_id = "player-1".to_string();
+         let reconnect_token = "token-1".to_string();
+         let timestamp = Utc::now();
+
+         let mut session = WorkshopSession::new(
+             Uuid::new_v4(),
+             SessionCode(session_code.into()),
+             timestamp,
+             protocol::WorkshopCreateConfig::default(),
+         );
+         session.add_player(SessionPlayer {
+             id: player_id.clone(),
+             name: "Alice".to_string(),
+             pet_description: Some("Alice's workshop dragon".to_string()),
+             is_host: true,
+             is_connected: false,
+             is_ready: false,
+             score: 0,
+             current_dragon_id: None,
+             achievements: Vec::new(),
+             joined_at: timestamp,
+         });
+         store.inner.save_session(&session).await.expect("seed session");
+         store
+             .inner
+             .create_player_identity(&persistence::PlayerIdentity {
+                 session_id: session.id.to_string(),
+                 player_id: player_id.clone(),
+                 reconnect_token: reconnect_token.clone(),
+                 created_at: timestamp.to_rfc3339(),
+                 last_seen_at: timestamp.to_rfc3339(),
+             })
+             .await
+             .expect("seed identity");
+         state.sessions.lock().await.insert(session_code.to_string(), session.clone());
+         store.fail_touches();
+
+         let app = build_app(state.clone());
+         let response = app
+             .oneshot(
+                 Request::builder()
+                     .method("POST")
+                     .uri("/api/workshops/join")
+                     .header("content-type", "application/json")
+                     .body(Body::from(format!(r#"{{"sessionCode":"{}","reconnectToken":"{}"}}"#, session_code, reconnect_token)))
+                     .expect("build join request"),
+             )
+             .await
+             .expect("call join workshop");
+
+         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+         let sessions = state.sessions.lock().await;
+         let cached = sessions.get(session_code).expect("session remains cached");
+         let player = cached.players.get(&player_id).expect("player exists");
+         assert!(player.is_connected, "cache should keep the committed reconnect state");
+     }
+
+     #[tokio::test]
+     async fn fresh_join_keeps_cache_state_when_identity_create_fails_after_save() {
+         let store = Arc::new(FaultyStore::new());
+         let state = test_state_with_store(store.clone());
+         let session_code = "123456";
+         let timestamp = Utc::now();
+
+         let mut session = WorkshopSession::new(
+             Uuid::new_v4(),
+             SessionCode(session_code.into()),
+             timestamp,
+             protocol::WorkshopCreateConfig::default(),
+         );
+         session.add_player(SessionPlayer {
+             id: "host-1".to_string(),
+             name: "Alice".to_string(),
+             pet_description: Some("Alice's workshop dragon".to_string()),
+             is_host: true,
+             is_connected: true,
+             is_ready: false,
+             score: 0,
+             current_dragon_id: None,
+             achievements: Vec::new(),
+             joined_at: timestamp,
+         });
+         store.inner.save_session(&session).await.expect("seed session");
+         state.sessions.lock().await.insert(session_code.to_string(), session.clone());
+         store.fail_identity_creates();
+
+         let app = build_app(state.clone());
+         let response = app
+             .oneshot(
+                 Request::builder()
+                     .method("POST")
+                     .uri("/api/workshops/join")
+                     .header("content-type", "application/json")
+                     .body(Body::from(format!(r#"{{"sessionCode":"{}","name":"Bob"}}"#, session_code)))
+                     .expect("build join request"),
+             )
+             .await
+             .expect("call join workshop");
+
+         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+         let sessions = state.sessions.lock().await;
+         let cached = sessions.get(session_code).expect("session remains cached");
+         assert_eq!(cached.players.len(), 2, "cache should keep the committed join state after save succeeds");
+     }
+
+     #[tokio::test]
      async fn workshop_ws_replies_with_pong_for_ping_message() {
          let app = build_app(test_state());
          let (addr, server_handle) = spawn_test_server(app).await;
@@ -2201,13 +2833,114 @@ fn successful_workshop_command(should_broadcast: &mut bool) -> (StatusCode, Json
          server_handle.abort();
      }
 
+     #[tokio::test]
+     async fn phase_timer_broadcasts_warning_notice_at_thirty_seconds_remaining() {
+         let state = test_state();
+         let app = build_app(state.clone());
+
+         let create_response = app
+             .clone()
+             .oneshot(
+                 Request::builder()
+                     .method("POST")
+                     .uri("/api/workshops")
+                     .header("content-type", "application/json")
+                     .body(Body::from(create_workshop_body("Alice")))
+                     .expect("build create request"),
+             )
+             .await
+             .expect("call create workshop");
+         let create_body = to_bytes(create_response.into_body(), usize::MAX).await.expect("read create body");
+         let create_result: WorkshopJoinResult = serde_json::from_slice(&create_body).expect("parse create result");
+         let create_success = match create_result {
+             WorkshopJoinResult::Success(success) => success,
+             WorkshopJoinResult::Error(error) => panic!("expected create success, got error: {}", error.error),
+         };
+
+         let command_response = app
+             .clone()
+             .oneshot(
+                 Request::builder()
+                     .method("POST")
+                     .uri("/api/workshops/command")
+                     .header("origin", "http://localhost:5173")
+                     .header("content-type", "application/json")
+                     .body(Body::from(
+                         serde_json::to_vec(&WorkshopCommandRequest {
+                             session_code: create_success.session_code.clone(),
+                             reconnect_token: create_success.reconnect_token.clone(),
+                             coordinator_type: Some(CoordinatorType::Rust),
+                             command: SessionCommand::StartPhase1,
+                             payload: None,
+                         })
+                         .expect("encode command request"),
+                     ))
+                     .expect("build command request"),
+             )
+             .await
+             .expect("call command endpoint");
+         assert_eq!(command_response.status(), StatusCode::OK);
+
+         let (addr, server_handle) = spawn_test_server(app).await;
+         let (mut socket, _) = connect_async(ws_request(addr)).await.expect("connect ws");
+         let attach_message = ClientWsMessage::AttachSession(SessionEnvelope {
+             session_code: create_success.session_code.clone(),
+             player_id: create_success.player_id.clone(),
+             reconnect_token: create_success.reconnect_token.clone(),
+             coordinator_type: Some(CoordinatorType::Rust),
+         });
+         socket
+             .send(WsMessage::Text(serde_json::to_string(&attach_message).expect("encode attach").into()))
+             .await
+             .expect("send attach");
+         let _ = socket.next().await.expect("initial state update frame").expect("initial state update message");
+
+         {
+             let mut sessions = state.sessions.lock().await;
+             let session = sessions
+                 .get_mut(&create_success.session_code)
+                 .expect("cached session");
+             session.phase_started_at = Utc::now() - chrono::Duration::seconds((session.config.phase1_minutes as i64 * 60) - 30);
+             session.warned_for_current_phase = false;
+         }
+
+         emit_phase_warning_notices(&state).await;
+
+         let message = socket.next().await.expect("warning notice frame").expect("warning notice message");
+         let payload = match message {
+             WsMessage::Text(payload) => payload,
+             other => panic!("expected text frame, got {other:?}"),
+         };
+         let server_message: ServerWsMessage = serde_json::from_str(&payload).expect("parse server ws message");
+         match server_message {
+             ServerWsMessage::Notice(notice) => {
+                 assert_eq!(notice.level, NoticeLevel::Warning);
+                 assert_eq!(notice.title, "Phase ending soon");
+                 assert!(notice.message.contains("Phase 1 ends in 30 seconds."));
+             }
+             other => panic!("expected warning notice, got {other:?}"),
+         }
+
+         let _ = socket.close(None).await;
+         server_handle.abort();
+     }
+
      #[test]
      fn build_judge_action_traces_groups_action_artifacts_by_dragon() {
          let mut session = WorkshopSession::new(
              Uuid::new_v4(),
              SessionCode("123456".into()),
              chrono::DateTime::from_timestamp(1, 0).expect("valid timestamp"),
-         );
+             protocol::WorkshopCreateConfig {
+                  phase0_minutes: 5,
+                  phase1_minutes: 10,
+                  phase2_minutes: 10,
+                  image_generator_token: None,
+                  image_generator_model: None,
+                  judge_token: None,
+                  judge_model: None,
+              },
+          );
          session.add_player(session_player("p1", "Alice", 10));
 
          let artifacts = vec![
@@ -2272,7 +3005,16 @@ fn successful_workshop_command(should_broadcast: &mut bool) -> (StatusCode, Json
              Uuid::new_v4(),
              SessionCode("123456".into()),
              chrono::DateTime::from_timestamp(1, 0).expect("valid timestamp"),
-         );
+             protocol::WorkshopCreateConfig {
+                  phase0_minutes: 5,
+                  phase1_minutes: 10,
+                  phase2_minutes: 10,
+                  image_generator_token: None,
+                  image_generator_model: None,
+                  judge_token: None,
+                  judge_model: None,
+              },
+          );
          let artifacts = vec![SessionArtifactRecord {
              id: "artifact-1".into(),
              session_id: session.id.to_string(),
@@ -2306,7 +3048,7 @@ fn successful_workshop_command(should_broadcast: &mut bool) -> (StatusCode, Json
                      .method("POST")
                      .uri("/api/workshops")
                      .header("content-type", "application/json")
-                     .body(Body::from(r#"{"name":"Alice"}"#))
+                     .body(Body::from(create_workshop_body("Alice")))
                      .expect("build create request"),
              )
              .await
@@ -2341,6 +3083,12 @@ fn successful_workshop_command(should_broadcast: &mut bool) -> (StatusCode, Json
          }
      }
 
+     fn test_state_with_store(store: Arc<dyn SessionStore>) -> AppState {
+         let mut state = test_state();
+         state.store = store;
+         state
+     }
+
      #[tokio::test]
      async fn workshop_judge_bundle_returns_bundle_for_completed_session() {
          let state = test_state();
@@ -2353,7 +3101,7 @@ fn successful_workshop_command(should_broadcast: &mut bool) -> (StatusCode, Json
                      .method("POST")
                      .uri("/api/workshops")
                      .header("content-type", "application/json")
-                     .body(Body::from(r#"{"name":"Alice"}"#))
+                     .body(Body::from(create_workshop_body("Alice")))
                      .expect("build create request"),
              )
              .await
@@ -2522,7 +3270,7 @@ fn successful_workshop_command(should_broadcast: &mut bool) -> (StatusCode, Json
                      .method("POST")
                      .uri("/api/workshops")
                      .header("content-type", "application/json")
-                     .body(Body::from(r#"{"name":"Alice"}"#))
+                     .body(Body::from(create_workshop_body("Alice")))
                      .expect("build request"),
              )
              .await
@@ -2554,7 +3302,7 @@ fn successful_workshop_command(should_broadcast: &mut bool) -> (StatusCode, Json
                      .method("POST")
                      .uri("/api/workshops")
                      .header("content-type", "application/json")
-                     .body(Body::from(r#"{"name":"   "}"#))
+                     .body(Body::from(create_workshop_body("   ")))
                      .expect("build request"),
              )
              .await
@@ -2580,7 +3328,7 @@ fn successful_workshop_command(should_broadcast: &mut bool) -> (StatusCode, Json
                      .uri("/api/workshops")
                      .header("content-type", "application/json")
                      .header("origin", "https://evil.example.com")
-                     .body(Body::from(r#"{"name":"Alice"}"#))
+                     .body(Body::from(create_workshop_body("Alice")))
                      .expect("build request"),
              )
              .await
@@ -2607,7 +3355,7 @@ fn successful_workshop_command(should_broadcast: &mut bool) -> (StatusCode, Json
                      .uri("/api/workshops")
                      .header("content-type", "application/json")
                      .header("x-forwarded-for", "10.0.0.1")
-                     .body(Body::from(r#"{"name":"Alice"}"#))
+                     .body(Body::from(create_workshop_body("Alice")))
                      .expect("build first request"),
              )
              .await
@@ -2621,7 +3369,7 @@ fn successful_workshop_command(should_broadcast: &mut bool) -> (StatusCode, Json
                      .uri("/api/workshops")
                      .header("content-type", "application/json")
                      .header("x-forwarded-for", "10.0.0.1")
-                     .body(Body::from(r#"{"name":"Bob"}"#))
+                     .body(Body::from(create_workshop_body("Bob")))
                      .expect("build second request"),
              )
              .await
@@ -2698,7 +3446,7 @@ fn successful_workshop_command(should_broadcast: &mut bool) -> (StatusCode, Json
                      .method("POST")
                      .uri("/api/workshops")
                      .header("content-type", "application/json")
-                     .body(Body::from(r#"{"name":"Alice"}"#))
+                     .body(Body::from(create_workshop_body("Alice")))
                      .expect("build request"),
              )
              .await
@@ -2749,7 +3497,7 @@ fn successful_workshop_command(should_broadcast: &mut bool) -> (StatusCode, Json
                     .method("POST")
                     .uri("/api/workshops")
                     .header("content-type", "application/json")
-                    .body(Body::from(r#"{"name":"Alice"}"#))
+                    .body(Body::from(create_workshop_body("Alice")))
                     .expect("build create request"),
             )
             .await
@@ -2837,7 +3585,7 @@ fn successful_workshop_command(should_broadcast: &mut bool) -> (StatusCode, Json
                     .method("POST")
                     .uri("/api/workshops")
                     .header("content-type", "application/json")
-                    .body(Body::from(r#"{"name":"Alice"}"#))
+                    .body(Body::from(create_workshop_body("Alice")))
                     .expect("build create request"),
             )
             .await
@@ -2886,7 +3634,7 @@ fn successful_workshop_command(should_broadcast: &mut bool) -> (StatusCode, Json
                     .method("POST")
                     .uri("/api/workshops")
                     .header("content-type", "application/json")
-                    .body(Body::from(r#"{"name":"Alice"}"#))
+                    .body(Body::from(create_workshop_body("Alice")))
                     .expect("build create request"),
             )
             .await
@@ -2962,7 +3710,7 @@ fn successful_workshop_command(should_broadcast: &mut bool) -> (StatusCode, Json
                     .method("POST")
                     .uri("/api/workshops")
                     .header("content-type", "application/json")
-                    .body(Body::from(r#"{"name":"Alice"}"#))
+                    .body(Body::from(create_workshop_body("Alice")))
                     .expect("build create request"),
             )
             .await
@@ -3090,7 +3838,7 @@ fn successful_workshop_command(should_broadcast: &mut bool) -> (StatusCode, Json
                      .method("POST")
                      .uri("/api/workshops")
                      .header("content-type", "application/json")
-                     .body(Body::from(r#"{"name":"Alice"}"#))
+                     .body(Body::from(create_workshop_body("Alice")))
                      .expect("build create request"),
              )
              .await
@@ -3155,7 +3903,7 @@ fn successful_workshop_command(should_broadcast: &mut bool) -> (StatusCode, Json
                      .method("POST")
                      .uri("/api/workshops")
                      .header("content-type", "application/json")
-                     .body(Body::from(r#"{"name":"Alice"}"#))
+                     .body(Body::from(create_workshop_body("Alice")))
                      .expect("build create request"),
              )
              .await
@@ -3203,7 +3951,7 @@ fn successful_workshop_command(should_broadcast: &mut bool) -> (StatusCode, Json
                      .method("POST")
                      .uri("/api/workshops")
                      .header("content-type", "application/json")
-                     .body(Body::from(r#"{"name":"Alice"}"#))
+                     .body(Body::from(create_workshop_body("Alice")))
                      .expect("build create request"),
              )
              .await
@@ -3248,7 +3996,7 @@ fn successful_workshop_command(should_broadcast: &mut bool) -> (StatusCode, Json
                      .method("POST")
                      .uri("/api/workshops")
                      .header("content-type", "application/json")
-                     .body(Body::from(r#"{"name":"Alice"}"#))
+                     .body(Body::from(create_workshop_body("Alice")))
                      .expect("build create request"),
              )
              .await
@@ -3327,7 +4075,7 @@ fn successful_workshop_command(should_broadcast: &mut bool) -> (StatusCode, Json
                      .method("POST")
                      .uri("/api/workshops")
                      .header("content-type", "application/json")
-                     .body(Body::from(r#"{"name":"Alice"}"#))
+                     .body(Body::from(create_workshop_body("Alice")))
                      .expect("build create request"),
              )
              .await
@@ -3388,7 +4136,7 @@ fn successful_workshop_command(should_broadcast: &mut bool) -> (StatusCode, Json
                      .method("POST")
                      .uri("/api/workshops")
                      .header("content-type", "application/json")
-                     .body(Body::from(r#"{"name":"Alice"}"#))
+                     .body(Body::from(create_workshop_body("Alice")))
                      .expect("build create request"),
              )
              .await
@@ -3433,7 +4181,7 @@ fn successful_workshop_command(should_broadcast: &mut bool) -> (StatusCode, Json
                      .method("POST")
                      .uri("/api/workshops")
                      .header("content-type", "application/json")
-                     .body(Body::from(r#"{"name":"Alice"}"#))
+                     .body(Body::from(create_workshop_body("Alice")))
                      .expect("build create request"),
              )
              .await
@@ -3507,7 +4255,7 @@ fn successful_workshop_command(should_broadcast: &mut bool) -> (StatusCode, Json
                      .method("POST")
                      .uri("/api/workshops")
                      .header("content-type", "application/json")
-                     .body(Body::from(r#"{"name":"Alice"}"#))
+                     .body(Body::from(create_workshop_body("Alice")))
                      .expect("build create request"),
              )
              .await
@@ -3588,7 +4336,7 @@ fn successful_workshop_command(should_broadcast: &mut bool) -> (StatusCode, Json
                      .method("POST")
                      .uri("/api/workshops")
                      .header("content-type", "application/json")
-                     .body(Body::from(r#"{"name":"Alice"}"#))
+                     .body(Body::from(create_workshop_body("Alice")))
                      .expect("build create request"),
              )
              .await
@@ -3633,7 +4381,7 @@ fn successful_workshop_command(should_broadcast: &mut bool) -> (StatusCode, Json
                      .method("POST")
                      .uri("/api/workshops")
                      .header("content-type", "application/json")
-                     .body(Body::from(r#"{"name":"Alice"}"#))
+                     .body(Body::from(create_workshop_body("Alice")))
                      .expect("build create request"),
              )
              .await
@@ -3726,7 +4474,7 @@ fn successful_workshop_command(should_broadcast: &mut bool) -> (StatusCode, Json
                      .method("POST")
                      .uri("/api/workshops")
                      .header("content-type", "application/json")
-                     .body(Body::from(r#"{"name":"Alice"}"#))
+                     .body(Body::from(create_workshop_body("Alice")))
                      .expect("build create request"),
              )
              .await
@@ -3800,7 +4548,7 @@ fn successful_workshop_command(should_broadcast: &mut bool) -> (StatusCode, Json
                      .method("POST")
                      .uri("/api/workshops")
                      .header("content-type", "application/json")
-                     .body(Body::from(r#"{"name":"Alice"}"#))
+                     .body(Body::from(create_workshop_body("Alice")))
                      .expect("build create request"),
              )
              .await
@@ -3889,7 +4637,7 @@ fn successful_workshop_command(should_broadcast: &mut bool) -> (StatusCode, Json
                      .method("POST")
                      .uri("/api/workshops")
                      .header("content-type", "application/json")
-                     .body(Body::from(r#"{"name":"Alice"}"#))
+                     .body(Body::from(create_workshop_body("Alice")))
                      .expect("build create request"),
              )
              .await
@@ -3934,7 +4682,7 @@ fn successful_workshop_command(should_broadcast: &mut bool) -> (StatusCode, Json
                      .method("POST")
                      .uri("/api/workshops")
                      .header("content-type", "application/json")
-                     .body(Body::from(r#"{"name":"Alice"}"#))
+                     .body(Body::from(create_workshop_body("Alice")))
                      .expect("build create request"),
              )
              .await
@@ -4070,7 +4818,7 @@ fn successful_workshop_command(should_broadcast: &mut bool) -> (StatusCode, Json
                      .method("POST")
                      .uri("/api/workshops")
                      .header("content-type", "application/json")
-                     .body(Body::from(r#"{"name":"Alice"}"#))
+                     .body(Body::from(create_workshop_body("Alice")))
                      .expect("build create request"),
              )
              .await
@@ -4160,7 +4908,7 @@ fn successful_workshop_command(should_broadcast: &mut bool) -> (StatusCode, Json
                      .method("POST")
                      .uri("/api/workshops")
                      .header("content-type", "application/json")
-                     .body(Body::from(r#"{"name":"Alice"}"#))
+                     .body(Body::from(create_workshop_body("Alice")))
                      .expect("build create request"),
              )
              .await
@@ -4205,7 +4953,7 @@ fn successful_workshop_command(should_broadcast: &mut bool) -> (StatusCode, Json
                      .method("POST")
                      .uri("/api/workshops")
                      .header("content-type", "application/json")
-                     .body(Body::from(r#"{"name":"Alice"}"#))
+                     .body(Body::from(create_workshop_body("Alice")))
                      .expect("build create request"),
              )
              .await
@@ -4251,7 +4999,7 @@ fn successful_workshop_command(should_broadcast: &mut bool) -> (StatusCode, Json
                      .method("POST")
                      .uri("/api/workshops")
                      .header("content-type", "application/json")
-                     .body(Body::from(r#"{"name":"Alice"}"#))
+                     .body(Body::from(create_workshop_body("Alice")))
                      .expect("build create request"),
              )
              .await
@@ -4349,7 +5097,7 @@ fn successful_workshop_command(should_broadcast: &mut bool) -> (StatusCode, Json
                      .method("POST")
                      .uri("/api/workshops")
                      .header("content-type", "application/json")
-                     .body(Body::from(r#"{"name":"Alice"}"#))
+                     .body(Body::from(create_workshop_body("Alice")))
                      .expect("build create request"),
              )
              .await
@@ -4444,7 +5192,7 @@ fn successful_workshop_command(should_broadcast: &mut bool) -> (StatusCode, Json
                      .method("POST")
                      .uri("/api/workshops")
                      .header("content-type", "application/json")
-                     .body(Body::from(r#"{"name":"Alice"}"#))
+                     .body(Body::from(create_workshop_body("Alice")))
                      .expect("build create request"),
              )
              .await
@@ -4489,7 +5237,7 @@ fn successful_workshop_command(should_broadcast: &mut bool) -> (StatusCode, Json
                      .method("POST")
                      .uri("/api/workshops")
                      .header("content-type", "application/json")
-                     .body(Body::from(r#"{"name":"Alice"}"#))
+                     .body(Body::from(create_workshop_body("Alice")))
                      .expect("build create request"),
              )
              .await
@@ -4577,7 +5325,7 @@ fn successful_workshop_command(should_broadcast: &mut bool) -> (StatusCode, Json
                      .method("POST")
                      .uri("/api/workshops")
                      .header("content-type", "application/json")
-                     .body(Body::from(r#"{"name":"Alice"}"#))
+                     .body(Body::from(create_workshop_body("Alice")))
                      .expect("build create request"),
              )
              .await
@@ -4666,7 +5414,7 @@ fn successful_workshop_command(should_broadcast: &mut bool) -> (StatusCode, Json
                      .method("POST")
                      .uri("/api/workshops")
                      .header("content-type", "application/json")
-                     .body(Body::from(r#"{"name":"Alice"}"#))
+                     .body(Body::from(create_workshop_body("Alice")))
                      .expect("build create request"),
              )
              .await
@@ -4790,7 +5538,7 @@ fn successful_workshop_command(should_broadcast: &mut bool) -> (StatusCode, Json
                      .method("POST")
                      .uri("/api/workshops")
                      .header("content-type", "application/json")
-                     .body(Body::from(r#"{"name":"Alice"}"#))
+                     .body(Body::from(create_workshop_body("Alice")))
                      .expect("build create request"),
              )
              .await
@@ -4854,7 +5602,7 @@ fn successful_workshop_command(should_broadcast: &mut bool) -> (StatusCode, Json
                      .method("POST")
                      .uri("/api/workshops")
                      .header("content-type", "application/json")
-                     .body(Body::from(r#"{"name":"Alice"}"#))
+                     .body(Body::from(create_workshop_body("Alice")))
                      .expect("build create request"),
              )
              .await

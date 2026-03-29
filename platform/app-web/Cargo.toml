@@ -6,6 +6,7 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
+chrono.workspace = true
 console_error_panic_hook = "0.1"
 dioxus.workspace = true
 dioxus-web.workspace = true

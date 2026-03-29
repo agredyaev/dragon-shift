@@ -1,7 +1,7 @@
 use protocol::{
     ClientSessionSnapshot, CreateWorkshopRequest, JoinWorkshopRequest, JudgeBundle, SessionCommand,
-    SessionEnvelope, WorkshopCommandRequest, WorkshopCommandResult, WorkshopJoinResult,
-    WorkshopJoinSuccess, WorkshopJudgeBundleRequest, WorkshopJudgeBundleResult,
+    SessionEnvelope, WorkshopCommandRequest, WorkshopCommandResult, WorkshopCreateConfig,
+    WorkshopJoinResult, WorkshopJoinSuccess, WorkshopJudgeBundleRequest, WorkshopJudgeBundleResult,
 };
 
 use crate::state::default_api_base_url;
@@ -24,11 +24,15 @@ impl AppWebApi {
         }
     }
 
-    pub async fn create_workshop(&self, name: String) -> Result<WorkshopJoinSuccess, String> {
+    pub async fn create_workshop(
+        &self,
+        name: String,
+        config: WorkshopCreateConfig,
+    ) -> Result<WorkshopJoinSuccess, String> {
         let response = self
             .client
             .post(format!("{}/api/workshops", self.base_url))
-            .json(&CreateWorkshopRequest { name })
+            .json(&CreateWorkshopRequest { name, config })
             .send()
             .await
             .map_err(|error| format!("failed to reach backend: {error}"))?;

@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod postgres_tests {
-    use super::*;
+    use crate::{PlayerIdentity, PostgresSessionStore, SessionStore};
     use chrono::Utc;
     use domain::{SessionCode, WorkshopSession};
     use protocol::{Phase, SessionArtifactKind, SessionArtifactRecord};
@@ -24,7 +24,20 @@ mod postgres_tests {
 
     fn make_session(code: &str) -> WorkshopSession {
         let now = Utc::now();
-        WorkshopSession::new(Uuid::new_v4(), SessionCode(code.to_string()), now)
+        WorkshopSession::new(
+            Uuid::new_v4(),
+            SessionCode(code.to_string()),
+            now,
+            protocol::WorkshopCreateConfig {
+                phase0_minutes: 5,
+                phase1_minutes: 10,
+                phase2_minutes: 10,
+                image_generator_token: None,
+                image_generator_model: None,
+                judge_token: None,
+                judge_model: None,
+            },
+        )
     }
 
     fn make_artifact(session_id: &str, kind: SessionArtifactKind) -> SessionArtifactRecord {

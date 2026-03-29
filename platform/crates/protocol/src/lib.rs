@@ -242,6 +242,7 @@ pub struct SessionMeta {
     pub code: String,
     pub created_at: String,
     pub updated_at: String,
+    pub phase_started_at: String,
     pub host_player_id: Option<String>,
     pub settings: SessionSettings,
 }
@@ -285,6 +286,7 @@ pub struct SessionPhaseSettings {
     pub step: SessionStage,
     pub label: String,
     pub description: String,
+    pub duration_seconds: i32,
     pub allowed_commands: Vec<SessionCommand>,
 }
 
@@ -336,8 +338,39 @@ pub struct ClientSessionSnapshot {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct WorkshopCreateConfig {
+    pub phase0_minutes: u32,
+    pub phase1_minutes: u32,
+    pub phase2_minutes: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_generator_token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_generator_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub judge_token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub judge_model: Option<String>,
+}
+
+impl Default for WorkshopCreateConfig {
+    fn default() -> Self {
+        Self {
+            phase0_minutes: 8,
+            phase1_minutes: 8,
+            phase2_minutes: 8,
+            image_generator_token: None,
+            image_generator_model: None,
+            judge_token: None,
+            judge_model: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CreateWorkshopRequest {
     pub name: String,
+    pub config: WorkshopCreateConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -541,13 +574,20 @@ pub enum WorkshopJudgeBundleResult {
 }
 
 pub fn create_default_session_settings() -> SessionSettings {
+    create_session_settings(&WorkshopCreateConfig::default())
+}
+
+pub fn create_session_settings(config: &WorkshopCreateConfig) -> SessionSettings {
     let mut phases = BTreeMap::new();
     phases.insert(
         Phase::Lobby,
         SessionPhaseSettings {
             step: 0,
             label: "Phase 0 - Intro & Create Pet".to_string(),
-            description: "Review the rules, join the session, and create a pet before the workshop starts.".to_string(),
+            description:
+                "Review the rules, join the session, and create a pet before the workshop starts."
+                    .to_string(),
+            duration_seconds: (config.phase0_minutes as i32) * 60,
             allowed_commands: vec![
                 SessionCommand::Join,
                 SessionCommand::UpdatePlayerPet,
@@ -562,7 +602,10 @@ pub fn create_default_session_settings() -> SessionSettings {
         SessionPhaseSettings {
             step: 1,
             label: "Phase 1 - Discovery".to_string(),
-            description: "Observe the pet, test assumptions, and discover what care patterns actually work.".to_string(),
+            description:
+                "Observe the pet, test assumptions, and discover what care patterns actually work."
+                    .to_string(),
+            duration_seconds: (config.phase1_minutes as i32) * 60,
             allowed_commands: vec![
                 SessionCommand::Action,
                 SessionCommand::SubmitObservation,
@@ -576,7 +619,10 @@ pub fn create_default_session_settings() -> SessionSettings {
         SessionPhaseSettings {
             step: 2,
             label: "Phase 2 - Handover".to_string(),
-            description: "Capture instructions and context so another teammate can inherit the pet.".to_string(),
+            description:
+                "Capture instructions and context so another teammate can inherit the pet."
+                    .to_string(),
+            duration_seconds: (config.phase2_minutes as i32) * 60,
             allowed_commands: vec![
                 SessionCommand::SubmitTags,
                 SessionCommand::StartPhase2,
@@ -589,7 +635,10 @@ pub fn create_default_session_settings() -> SessionSettings {
         SessionPhaseSettings {
             step: 2,
             label: "Phase 2 - Shuffle & Care".to_string(),
-            description: "Take over a reassigned pet and apply what the previous teammate documented.".to_string(),
+            description:
+                "Take over a reassigned pet and apply what the previous teammate documented."
+                    .to_string(),
+            duration_seconds: (config.phase2_minutes as i32) * 60,
             allowed_commands: vec![
                 SessionCommand::Action,
                 SessionCommand::EndGame,
@@ -603,6 +652,7 @@ pub fn create_default_session_settings() -> SessionSettings {
             step: 3,
             label: "Phase 3 - Review & Voting".to_string(),
             description: "Review the session, vote for the most creative pet, and prepare the final scoreboard.".to_string(),
+            duration_seconds: 0,
             allowed_commands: vec![
                 SessionCommand::SubmitVote,
                 SessionCommand::RevealVotingResults,
@@ -615,7 +665,9 @@ pub fn create_default_session_settings() -> SessionSettings {
         SessionPhaseSettings {
             step: 3,
             label: "Phase 3 - Leaderboard".to_string(),
-            description: "Reveal final scores, creator identities, and wrap up the workshop.".to_string(),
+            description: "Reveal final scores, creator identities, and wrap up the workshop."
+                .to_string(),
+            duration_seconds: 0,
             allowed_commands: vec![SessionCommand::ResetGame, SessionCommand::LeaveWorkshop],
         },
     );
@@ -641,8 +693,8 @@ mod tests {
 
     #[test]
     fn join_request_allows_missing_optional_fields() {
-        let request: JoinWorkshopRequest = serde_json::from_str(r#"{"sessionCode":"123456"}"#)
-            .expect("deserialize join request");
+        let request: JoinWorkshopRequest =
+            serde_json::from_str(r#"{"sessionCode":"123456"}"#).expect("deserialize join request");
 
         assert_eq!(request.session_code, "123456");
         assert_eq!(request.name, None);
@@ -657,8 +709,8 @@ mod tests {
 
     #[test]
     fn action_payload_allows_missing_value() {
-        let payload: ActionPayload = serde_json::from_str(r#"{"type":"sleep"}"#)
-            .expect("deserialize action payload");
+        let payload: ActionPayload =
+            serde_json::from_str(r#"{"type":"sleep"}"#).expect("deserialize action payload");
 
         assert_eq!(payload.action_type, "sleep");
         assert_eq!(payload.value, None);
@@ -685,7 +737,10 @@ mod tests {
 
         assert!(!object.contains_key("payload"));
         assert!(!object.contains_key("coordinatorType"));
-        assert_eq!(object.get("command").and_then(|v| v.as_str()), Some("resetGame"));
+        assert_eq!(
+            object.get("command").and_then(|v| v.as_str()),
+            Some("resetGame")
+        );
     }
 
     #[test]
@@ -711,7 +766,14 @@ mod tests {
         let settings = create_default_session_settings();
 
         assert_eq!(settings.phases.len(), 6);
-        assert_eq!(settings.phases.get(&Phase::Lobby).expect("lobby phase").step, 0);
+        assert_eq!(
+            settings
+                .phases
+                .get(&Phase::Lobby)
+                .expect("lobby phase")
+                .step,
+            0
+        );
         assert!(settings
             .phases
             .get(&Phase::Lobby)

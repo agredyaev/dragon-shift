@@ -1,5 +1,7 @@
 use chrono::{DateTime, Utc};
-use protocol::{ActiveTime, DragonAction, DragonEmotion, FoodType, Phase, PlayType};
+use protocol::{
+    ActiveTime, DragonAction, DragonEmotion, FoodType, Phase, PlayType, WorkshopCreateConfig,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use thiserror::Error;
@@ -65,8 +67,12 @@ pub enum PlayerAction {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ActionOutcome {
-    Applied { awarded_achievement: Option<&'static str> },
-    Blocked { reason: ActionBlockReason },
+    Applied {
+        awarded_achievement: Option<&'static str>,
+    },
+    Blocked {
+        reason: ActionBlockReason,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -105,6 +111,9 @@ pub struct WorkshopSession {
     pub code: SessionCode,
     pub phase: Phase,
     pub time: i32,
+    pub config: WorkshopCreateConfig,
+    pub phase_started_at: DateTime<Utc>,
+    pub warned_for_current_phase: bool,
     pub host_player_id: Option<String>,
     pub players: BTreeMap<String, SessionPlayer>,
     pub dragons: BTreeMap<String, SessionDragon>,
@@ -134,12 +143,20 @@ pub enum DomainError {
 }
 
 impl WorkshopSession {
-    pub fn new(id: Uuid, code: SessionCode, created_at: DateTime<Utc>) -> Self {
+    pub fn new(
+        id: Uuid,
+        code: SessionCode,
+        created_at: DateTime<Utc>,
+        config: WorkshopCreateConfig,
+    ) -> Self {
         Self {
             id,
             code,
             phase: Phase::Lobby,
             time: 8,
+            config,
+            phase_started_at: created_at,
+            warned_for_current_phase: false,
             host_player_id: None,
             players: BTreeMap::new(),
             dragons: BTreeMap::new(),
@@ -177,6 +194,8 @@ impl WorkshopSession {
         }
 
         self.phase = next;
+        self.phase_started_at = Utc::now();
+        self.warned_for_current_phase = false;
         self.touch();
         Ok(())
     }
@@ -240,7 +259,11 @@ impl WorkshopSession {
     }
 
     pub fn save_handover_tags(&mut self, player_id: &str, tags: Vec<String>) {
-        let Some(dragon_id) = self.players.get(player_id).and_then(|player| player.current_dragon_id.clone()) else {
+        let Some(dragon_id) = self
+            .players
+            .get(player_id)
+            .and_then(|player| player.current_dragon_id.clone())
+        else {
             return;
         };
         if let Some(dragon) = self.dragons.get_mut(&dragon_id) {
@@ -293,7 +316,12 @@ impl WorkshopSession {
             let mut shifted_dragon_ids = Vec::new();
             if let Some(last) = dragon_ids.last() {
                 shifted_dragon_ids.push(last.clone());
-                shifted_dragon_ids.extend(dragon_ids.iter().take(dragon_ids.len().saturating_sub(1)).cloned());
+                shifted_dragon_ids.extend(
+                    dragon_ids
+                        .iter()
+                        .take(dragon_ids.len().saturating_sub(1))
+                        .cloned(),
+                );
             }
 
             for (index, player_id) in player_ids.iter().enumerate() {
@@ -320,7 +348,11 @@ impl WorkshopSession {
                 }
             }
         } else if let Some(player_id) = player_ids.first() {
-            if let Some(dragon_id) = self.players.get(player_id).and_then(|player| player.current_dragon_id.clone()) {
+            if let Some(dragon_id) = self
+                .players
+                .get(player_id)
+                .and_then(|player| player.current_dragon_id.clone())
+            {
                 if let Some(dragon) = self.dragons.get_mut(&dragon_id) {
                     dragon.hunger = 100;
                     dragon.energy = 100;
@@ -334,7 +366,8 @@ impl WorkshopSession {
                     dragon.last_action = DragonAction::Idle;
                     dragon.last_emotion = DragonEmotion::Neutral;
                     dragon.speech = Some(
-                        "New shift, same dragon. Time to document and support your own handoff.".to_string(),
+                        "New shift, same dragon. Time to document and support your own handoff."
+                            .to_string(),
                     );
                     dragon.speech_timer = 5;
                 }
@@ -342,10 +375,16 @@ impl WorkshopSession {
         }
 
         self.touch();
-        Ok(Phase2TransitionResult { auto_filled_players })
+        Ok(Phase2TransitionResult {
+            auto_filled_players,
+        })
     }
 
-    pub fn apply_action(&mut self, player_id: &str, action: PlayerAction) -> Result<ActionOutcome, DomainError> {
+    pub fn apply_action(
+        &mut self,
+        player_id: &str,
+        action: PlayerAction,
+    ) -> Result<ActionOutcome, DomainError> {
         if self.phase != Phase::Phase1 && self.phase != Phase::Phase2 {
             return Err(DomainError::ActionNotAllowed);
         }
@@ -357,7 +396,10 @@ impl WorkshopSession {
             .and_then(|player| player.current_dragon_id.clone())
             .ok_or(DomainError::DragonNotAssigned)?;
 
-        let dragon = self.dragons.get_mut(&dragon_id).ok_or(DomainError::DragonNotAssigned)?;
+        let dragon = self
+            .dragons
+            .get_mut(&dragon_id)
+            .ok_or(DomainError::DragonNotAssigned)?;
 
         let outcome = match action {
             PlayerAction::Feed(food) => {
@@ -373,7 +415,11 @@ impl WorkshopSession {
                     dragon.action_cooldown = 3;
                     dragon.sleep_shield_ticks = 0;
                     dragon.food_tries += 1;
-                    let favorite_food = if current_is_day { dragon.day_food } else { dragon.night_food };
+                    let favorite_food = if current_is_day {
+                        dragon.day_food
+                    } else {
+                        dragon.night_food
+                    };
                     let mut awarded = None;
                     if food == favorite_food {
                         if dragon.food_tries == 1 {
@@ -382,7 +428,11 @@ impl WorkshopSession {
                         dragon.hunger = (dragon.hunger + 40).min(100);
                         dragon.happiness = (dragon.happiness + 15).min(100);
                         dragon.last_emotion = DragonEmotion::Happy;
-                        dragon.speech = Some(format!("Yummy! I love {:?}!", food).to_lowercase().replace("feed(", ""));
+                        dragon.speech = Some(
+                            format!("Yummy! I love {:?}!", food)
+                                .to_lowercase()
+                                .replace("feed(", ""),
+                        );
                     } else {
                         dragon.hunger = (dragon.hunger + 5).min(100);
                         dragon.happiness = (dragon.happiness - 20).max(0);
@@ -415,7 +465,11 @@ impl WorkshopSession {
                     dragon.action_cooldown = 3;
                     dragon.sleep_shield_ticks = 0;
                     dragon.play_tries += 1;
-                    let favorite_play = if current_is_day { dragon.day_play } else { dragon.night_play };
+                    let favorite_play = if current_is_day {
+                        dragon.day_play
+                    } else {
+                        dragon.night_play
+                    };
                     let mut awarded = None;
                     if play == favorite_play {
                         if dragon.play_tries == 1 {
@@ -449,9 +503,9 @@ impl WorkshopSession {
                     dragon.last_action = DragonAction::Sleep;
                     dragon.action_cooldown = 3;
                     dragon.energy = (dragon.energy + 50).min(100);
-                    let is_correct_time =
-                        (dragon.active_time == ActiveTime::Day && !current_is_day)
-                            || (dragon.active_time == ActiveTime::Night && current_is_day);
+                    let is_correct_time = (dragon.active_time == ActiveTime::Day
+                        && !current_is_day)
+                        || (dragon.active_time == ActiveTime::Night && current_is_day);
                     if is_correct_time {
                         dragon.happiness = (dragon.happiness + 10).min(100);
                     }
@@ -488,9 +542,8 @@ impl WorkshopSession {
                 continue;
             }
 
-            let wrong_time =
-                (dragon.active_time == ActiveTime::Day && !current_is_day)
-                    || (dragon.active_time == ActiveTime::Night && current_is_day);
+            let wrong_time = (dragon.active_time == ActiveTime::Day && !current_is_day)
+                || (dragon.active_time == ActiveTime::Night && current_is_day);
             let time_penalty = if wrong_time { 2 } else { 1 };
 
             if current_is_day != previous_is_day {
@@ -499,7 +552,8 @@ impl WorkshopSession {
             }
 
             dragon.hunger = (dragon.hunger - decay_multiplier).max(0);
-            dragon.energy = (dragon.energy - (dragon.sleep_rate * time_penalty * decay_multiplier)).max(0);
+            dragon.energy =
+                (dragon.energy - (dragon.sleep_rate * time_penalty * decay_multiplier)).max(0);
 
             let mut happiness_decay = 1;
             if dragon.hunger < 30 {
@@ -551,6 +605,31 @@ impl WorkshopSession {
         self.touch();
     }
 
+    pub fn phase_duration_minutes(&self, phase: Phase) -> u32 {
+        match phase {
+            Phase::Lobby => self.config.phase0_minutes,
+            Phase::Phase1 => self.config.phase1_minutes,
+            Phase::Handover | Phase::Phase2 => self.config.phase2_minutes,
+            Phase::Voting | Phase::End => 0,
+        }
+    }
+
+    pub fn phase_warning_threshold_seconds(&self) -> i32 {
+        30
+    }
+
+    pub fn elapsed_phase_seconds(&self, now: DateTime<Utc>) -> i32 {
+        (now - self.phase_started_at).num_seconds().max(0) as i32
+    }
+
+    pub fn remaining_phase_seconds(&self, now: DateTime<Utc>) -> Option<i32> {
+        let duration_seconds = self.phase_duration_minutes(self.phase) as i32 * 60;
+        if duration_seconds <= 0 {
+            return None;
+        }
+        Some((duration_seconds - self.elapsed_phase_seconds(now)).max(0))
+    }
+
     pub fn enter_voting(&mut self) -> Result<bool, DomainError> {
         self.transition_to(Phase::Voting)?;
 
@@ -580,7 +659,11 @@ impl WorkshopSession {
     pub fn submit_vote(&mut self, player_id: &str, dragon_id: &str) -> Result<(), DomainError> {
         let voting = self.voting.as_mut().ok_or(DomainError::VotingNotActive)?;
 
-        if !voting.eligible_player_ids.iter().any(|eligible| eligible == player_id) {
+        if !voting
+            .eligible_player_ids
+            .iter()
+            .any(|eligible| eligible == player_id)
+        {
             return Err(DomainError::IneligibleVoter);
         }
 
@@ -615,7 +698,10 @@ impl WorkshopSession {
                 continue;
             };
 
-            player.score = dragon.happiness + dragon.hunger + dragon.energy + (player.achievements.len() as i32 * 50);
+            player.score = dragon.happiness
+                + dragon.hunger
+                + dragon.energy
+                + (player.achievements.len() as i32 * 50);
         }
 
         self.touch();
@@ -732,6 +818,18 @@ fn default_dragon_name(player_name: &str) -> String {
 mod tests {
     use super::*;
 
+    fn config() -> WorkshopCreateConfig {
+        WorkshopCreateConfig {
+            phase0_minutes: 5,
+            phase1_minutes: 10,
+            phase2_minutes: 10,
+            image_generator_token: None,
+            image_generator_model: None,
+            judge_token: None,
+            judge_model: None,
+        }
+    }
+
     fn ts(seconds: i64) -> DateTime<Utc> {
         DateTime::from_timestamp(seconds, 0).expect("valid timestamp")
     }
@@ -753,7 +851,12 @@ mod tests {
 
     #[test]
     fn allows_valid_lobby_to_phase1_transition() {
-        let mut session = WorkshopSession::new(Uuid::new_v4(), SessionCode("123456".into()), ts(1));
+        let mut session = WorkshopSession::new(
+            Uuid::new_v4(),
+            SessionCode("123456".into()),
+            ts(1),
+            config(),
+        );
 
         let result = session.transition_to(Phase::Phase1);
 
@@ -763,7 +866,12 @@ mod tests {
 
     #[test]
     fn rejects_invalid_lobby_to_end_transition() {
-        let mut session = WorkshopSession::new(Uuid::new_v4(), SessionCode("123456".into()), ts(1));
+        let mut session = WorkshopSession::new(
+            Uuid::new_v4(),
+            SessionCode("123456".into()),
+            ts(1),
+            config(),
+        );
 
         let result = session.transition_to(Phase::End);
 
@@ -779,7 +887,12 @@ mod tests {
 
     #[test]
     fn first_player_becomes_host_automatically() {
-        let mut session = WorkshopSession::new(Uuid::new_v4(), SessionCode("123456".into()), ts(1));
+        let mut session = WorkshopSession::new(
+            Uuid::new_v4(),
+            SessionCode("123456".into()),
+            ts(1),
+            config(),
+        );
         session.add_player(player("p1", true, 10));
 
         assert_eq!(session.host_player_id.as_deref(), Some("p1"));
@@ -788,7 +901,12 @@ mod tests {
 
     #[test]
     fn ensure_host_assigned_prefers_connected_player_when_requested() {
-        let mut session = WorkshopSession::new(Uuid::new_v4(), SessionCode("123456".into()), ts(1));
+        let mut session = WorkshopSession::new(
+            Uuid::new_v4(),
+            SessionCode("123456".into()),
+            ts(1),
+            config(),
+        );
         session.add_player(player("p1", false, 10));
         session.add_player(player("p2", true, 20));
         session.host_player_id = Some("p1".to_string());
@@ -802,7 +920,12 @@ mod tests {
 
     #[test]
     fn ensure_host_assigned_returns_none_when_session_has_no_players() {
-        let mut session = WorkshopSession::new(Uuid::new_v4(), SessionCode("123456".into()), ts(1));
+        let mut session = WorkshopSession::new(
+            Uuid::new_v4(),
+            SessionCode("123456".into()),
+            ts(1),
+            config(),
+        );
 
         let host = session.ensure_host_assigned(true);
 
@@ -812,7 +935,12 @@ mod tests {
 
     #[test]
     fn begin_phase1_assigns_dragons_and_resets_player_progress() {
-        let mut session = WorkshopSession::new(Uuid::new_v4(), SessionCode("123456".into()), ts(1));
+        let mut session = WorkshopSession::new(
+            Uuid::new_v4(),
+            SessionCode("123456".into()),
+            ts(1),
+            config(),
+        );
         let mut p1 = player("p1", true, 10);
         p1.pet_description = Some("Curious cave dragon".into());
         p1.score = 90;
@@ -838,10 +966,27 @@ mod tests {
         assert!(result.is_ok());
         assert_eq!(session.phase, Phase::Phase1);
         assert_eq!(session.time, 8);
-        assert_eq!(session.players.get("p1").and_then(|p| p.current_dragon_id.as_deref()), Some("dragon-a"));
-        assert_eq!(session.players.get("p2").and_then(|p| p.current_dragon_id.as_deref()), Some("dragon-b"));
+        assert_eq!(
+            session
+                .players
+                .get("p1")
+                .and_then(|p| p.current_dragon_id.as_deref()),
+            Some("dragon-a")
+        );
+        assert_eq!(
+            session
+                .players
+                .get("p2")
+                .and_then(|p| p.current_dragon_id.as_deref()),
+            Some("dragon-b")
+        );
         assert_eq!(session.players.get("p1").map(|p| p.score), Some(0));
-        assert!(session.players.get("p1").expect("player p1").achievements.is_empty());
+        assert!(session
+            .players
+            .get("p1")
+            .expect("player p1")
+            .achievements
+            .is_empty());
         let dragon_a = session.dragons.get("dragon-a").expect("dragon a");
         assert_eq!(dragon_a.name, "player-p1's dragon");
         assert_eq!(dragon_a.creator_instructions, "Curious cave dragon");
@@ -852,7 +997,12 @@ mod tests {
 
     #[test]
     fn record_discovery_observation_keeps_last_six_entries() {
-        let mut session = WorkshopSession::new(Uuid::new_v4(), SessionCode("123456".into()), ts(1));
+        let mut session = WorkshopSession::new(
+            Uuid::new_v4(),
+            SessionCode("123456".into()),
+            ts(1),
+            config(),
+        );
         session.add_player(player("p1", true, 10));
         session
             .begin_phase1(&[Phase1Assignment {
@@ -867,18 +1017,31 @@ mod tests {
 
         let dragon = session.dragons.get("dragon-a").expect("dragon-a");
         assert_eq!(dragon.discovery_observations.len(), 6);
-        assert_eq!(dragon.discovery_observations.first().map(String::as_str), Some("note-2"));
-        assert_eq!(dragon.discovery_observations.last().map(String::as_str), Some("note-7"));
+        assert_eq!(
+            dragon.discovery_observations.first().map(String::as_str),
+            Some("note-2")
+        );
+        assert_eq!(
+            dragon.discovery_observations.last().map(String::as_str),
+            Some("note-7")
+        );
     }
 
     #[test]
     fn enter_voting_with_single_assigned_player_immediately_finalizes() {
-        let mut session = WorkshopSession::new(Uuid::new_v4(), SessionCode("123456".into()), ts(1));
+        let mut session = WorkshopSession::new(
+            Uuid::new_v4(),
+            SessionCode("123456".into()),
+            ts(1),
+            config(),
+        );
         session.add_player(player("p1", true, 10));
-        session.begin_phase1(&[Phase1Assignment {
-            player_id: "p1".into(),
-            dragon_id: "dragon-a".into(),
-        }]).expect("start phase1");
+        session
+            .begin_phase1(&[Phase1Assignment {
+                player_id: "p1".into(),
+                dragon_id: "dragon-a".into(),
+            }])
+            .expect("start phase1");
         session.transition_to(Phase::Handover).expect("to handover");
         session.transition_to(Phase::Phase2).expect("to phase2");
 
@@ -886,19 +1049,29 @@ mod tests {
 
         assert!(immediate_finalize);
         assert_eq!(session.phase, Phase::Voting);
-        assert_eq!(session.voting.as_ref().map(|v| v.eligible_player_ids.len()), Some(0));
+        assert_eq!(
+            session.voting.as_ref().map(|v| v.eligible_player_ids.len()),
+            Some(0)
+        );
     }
 
     #[test]
     fn reset_to_lobby_clears_runtime_player_state() {
-        let mut session = WorkshopSession::new(Uuid::new_v4(), SessionCode("123456".into()), ts(1));
+        let mut session = WorkshopSession::new(
+            Uuid::new_v4(),
+            SessionCode("123456".into()),
+            ts(1),
+            config(),
+        );
         let mut p1 = player("p1", true, 10);
         p1.is_ready = true;
         session.add_player(p1);
-        session.begin_phase1(&[Phase1Assignment {
-            player_id: "p1".into(),
-            dragon_id: "dragon-a".into(),
-        }]).expect("start phase1");
+        session
+            .begin_phase1(&[Phase1Assignment {
+                player_id: "p1".into(),
+                dragon_id: "dragon-a".into(),
+            }])
+            .expect("start phase1");
         session.transition_to(Phase::Handover).expect("to handover");
         session.transition_to(Phase::Phase2).expect("to phase2");
         session.enter_voting().expect("enter voting");
@@ -924,12 +1097,19 @@ mod tests {
 
     #[test]
     fn enter_phase2_autofills_offline_players_with_missing_notes() {
-        let mut session = WorkshopSession::new(Uuid::new_v4(), SessionCode("123456".into()), ts(1));
+        let mut session = WorkshopSession::new(
+            Uuid::new_v4(),
+            SessionCode("123456".into()),
+            ts(1),
+            config(),
+        );
         session.add_player(player("p1", false, 10));
-        session.begin_phase1(&[Phase1Assignment {
-            player_id: "p1".into(),
-            dragon_id: "dragon-a".into(),
-        }]).expect("start phase1");
+        session
+            .begin_phase1(&[Phase1Assignment {
+                player_id: "p1".into(),
+                dragon_id: "dragon-a".into(),
+            }])
+            .expect("start phase1");
         session.transition_to(Phase::Handover).expect("to handover");
 
         let result = session.enter_phase2().expect("enter phase2");
@@ -942,12 +1122,19 @@ mod tests {
 
     #[test]
     fn enter_phase2_rejects_connected_players_with_missing_tags() {
-        let mut session = WorkshopSession::new(Uuid::new_v4(), SessionCode("123456".into()), ts(1));
+        let mut session = WorkshopSession::new(
+            Uuid::new_v4(),
+            SessionCode("123456".into()),
+            ts(1),
+            config(),
+        );
         session.add_player(player("p1", true, 10));
-        session.begin_phase1(&[Phase1Assignment {
-            player_id: "p1".into(),
-            dragon_id: "dragon-a".into(),
-        }]).expect("start phase1");
+        session
+            .begin_phase1(&[Phase1Assignment {
+                player_id: "p1".into(),
+                dragon_id: "dragon-a".into(),
+            }])
+            .expect("start phase1");
         session.transition_to(Phase::Handover).expect("to handover");
 
         let result = session.enter_phase2();
@@ -962,19 +1149,26 @@ mod tests {
 
     #[test]
     fn enter_phase2_reassigns_dragons_in_multiplayer_session() {
-        let mut session = WorkshopSession::new(Uuid::new_v4(), SessionCode("123456".into()), ts(1));
+        let mut session = WorkshopSession::new(
+            Uuid::new_v4(),
+            SessionCode("123456".into()),
+            ts(1),
+            config(),
+        );
         session.add_player(player("p1", true, 10));
         session.add_player(player("p2", true, 20));
-        session.begin_phase1(&[
-            Phase1Assignment {
-                player_id: "p1".into(),
-                dragon_id: "dragon-a".into(),
-            },
-            Phase1Assignment {
-                player_id: "p2".into(),
-                dragon_id: "dragon-b".into(),
-            },
-        ]).expect("start phase1");
+        session
+            .begin_phase1(&[
+                Phase1Assignment {
+                    player_id: "p1".into(),
+                    dragon_id: "dragon-a".into(),
+                },
+                Phase1Assignment {
+                    player_id: "p2".into(),
+                    dragon_id: "dragon-b".into(),
+                },
+            ])
+            .expect("start phase1");
         session.transition_to(Phase::Handover).expect("to handover");
         session.save_handover_tags("p1", vec!["a".into(), "b".into(), "c".into()]);
         session.save_handover_tags("p2", vec!["d".into(), "e".into(), "f".into()]);
@@ -982,41 +1176,94 @@ mod tests {
         let result = session.enter_phase2().expect("enter phase2");
 
         assert!(result.auto_filled_players.is_empty());
-        assert_eq!(session.players.get("p1").and_then(|p| p.current_dragon_id.as_deref()), Some("dragon-b"));
-        assert_eq!(session.players.get("p2").and_then(|p| p.current_dragon_id.as_deref()), Some("dragon-a"));
-        assert_eq!(session.dragons.get("dragon-a").map(|d| d.current_owner_id.as_str()), Some("p2"));
-        assert_eq!(session.dragons.get("dragon-b").map(|d| d.current_owner_id.as_str()), Some("p1"));
+        assert_eq!(
+            session
+                .players
+                .get("p1")
+                .and_then(|p| p.current_dragon_id.as_deref()),
+            Some("dragon-b")
+        );
+        assert_eq!(
+            session
+                .players
+                .get("p2")
+                .and_then(|p| p.current_dragon_id.as_deref()),
+            Some("dragon-a")
+        );
+        assert_eq!(
+            session
+                .dragons
+                .get("dragon-a")
+                .map(|d| d.current_owner_id.as_str()),
+            Some("p2")
+        );
+        assert_eq!(
+            session
+                .dragons
+                .get("dragon-b")
+                .map(|d| d.current_owner_id.as_str()),
+            Some("p1")
+        );
     }
 
     #[test]
     fn enter_phase2_single_player_keeps_same_dragon_and_updates_speech() {
-        let mut session = WorkshopSession::new(Uuid::new_v4(), SessionCode("123456".into()), ts(1));
+        let mut session = WorkshopSession::new(
+            Uuid::new_v4(),
+            SessionCode("123456".into()),
+            ts(1),
+            config(),
+        );
         session.add_player(player("p1", true, 10));
-        session.begin_phase1(&[Phase1Assignment {
-            player_id: "p1".into(),
-            dragon_id: "dragon-a".into(),
-        }]).expect("start phase1");
+        session
+            .begin_phase1(&[Phase1Assignment {
+                player_id: "p1".into(),
+                dragon_id: "dragon-a".into(),
+            }])
+            .expect("start phase1");
         session.transition_to(Phase::Handover).expect("to handover");
         session.save_handover_tags("p1", vec!["a".into(), "b".into(), "c".into()]);
 
         let result = session.enter_phase2().expect("enter phase2");
 
         assert!(result.auto_filled_players.is_empty());
-        assert_eq!(session.players.get("p1").and_then(|p| p.current_dragon_id.as_deref()), Some("dragon-a"));
+        assert_eq!(
+            session
+                .players
+                .get("p1")
+                .and_then(|p| p.current_dragon_id.as_deref()),
+            Some("dragon-a")
+        );
         let dragon = session.dragons.get("dragon-a").expect("dragon-a");
         assert_eq!(dragon.current_owner_id, "p1");
-        assert_eq!(dragon.speech.as_deref(), Some("New shift, same dragon. Time to document and support your own handoff."));
+        assert_eq!(
+            dragon.speech.as_deref(),
+            Some("New shift, same dragon. Time to document and support your own handoff.")
+        );
     }
 
     #[test]
     fn submit_vote_rejects_ineligible_player() {
-        let mut session = WorkshopSession::new(Uuid::new_v4(), SessionCode("123456".into()), ts(1));
+        let mut session = WorkshopSession::new(
+            Uuid::new_v4(),
+            SessionCode("123456".into()),
+            ts(1),
+            config(),
+        );
         session.add_player(player("p1", true, 10));
         session.add_player(player("p2", true, 20));
-        session.begin_phase1(&[
-            Phase1Assignment { player_id: "p1".into(), dragon_id: "dragon-a".into() },
-            Phase1Assignment { player_id: "p2".into(), dragon_id: "dragon-b".into() },
-        ]).expect("start phase1");
+        session
+            .begin_phase1(&[
+                Phase1Assignment {
+                    player_id: "p1".into(),
+                    dragon_id: "dragon-a".into(),
+                },
+                Phase1Assignment {
+                    player_id: "p2".into(),
+                    dragon_id: "dragon-b".into(),
+                },
+            ])
+            .expect("start phase1");
         session.transition_to(Phase::Handover).expect("to handover");
         session.save_handover_tags("p1", vec!["a".into(), "b".into(), "c".into()]);
         session.save_handover_tags("p2", vec!["d".into(), "e".into(), "f".into()]);
@@ -1030,20 +1277,38 @@ mod tests {
 
     #[test]
     fn submit_vote_rejects_unknown_dragon() {
-        let mut session = WorkshopSession::new(Uuid::new_v4(), SessionCode("123456".into()), ts(1));
+        let mut session = WorkshopSession::new(
+            Uuid::new_v4(),
+            SessionCode("123456".into()),
+            ts(1),
+            config(),
+        );
         session.add_player(player("p1", true, 10));
         session.add_player(player("p2", true, 20));
-        session.begin_phase1(&[
-            Phase1Assignment { player_id: "p1".into(), dragon_id: "dragon-a".into() },
-            Phase1Assignment { player_id: "p2".into(), dragon_id: "dragon-b".into() },
-        ]).expect("start phase1");
+        session
+            .begin_phase1(&[
+                Phase1Assignment {
+                    player_id: "p1".into(),
+                    dragon_id: "dragon-a".into(),
+                },
+                Phase1Assignment {
+                    player_id: "p2".into(),
+                    dragon_id: "dragon-b".into(),
+                },
+            ])
+            .expect("start phase1");
         session.transition_to(Phase::Handover).expect("to handover");
         session.save_handover_tags("p1", vec!["a".into(), "b".into(), "c".into()]);
         session.save_handover_tags("p2", vec!["d".into(), "e".into(), "f".into()]);
         session.enter_phase2().expect("enter phase2");
         session.enter_voting().expect("enter voting");
 
-        let eligible_player = session.voting.as_ref().and_then(|v| v.eligible_player_ids.first()).cloned().expect("eligible player");
+        let eligible_player = session
+            .voting
+            .as_ref()
+            .and_then(|v| v.eligible_player_ids.first())
+            .cloned()
+            .expect("eligible player");
         let result = session.submit_vote(&eligible_player, "missing-dragon");
 
         assert_eq!(result, Err(DomainError::UnknownDragon));
@@ -1051,21 +1316,43 @@ mod tests {
 
     #[test]
     fn submit_vote_rejects_vote_for_current_dragon() {
-        let mut session = WorkshopSession::new(Uuid::new_v4(), SessionCode("123456".into()), ts(1));
+        let mut session = WorkshopSession::new(
+            Uuid::new_v4(),
+            SessionCode("123456".into()),
+            ts(1),
+            config(),
+        );
         session.add_player(player("p1", true, 10));
         session.add_player(player("p2", true, 20));
-        session.begin_phase1(&[
-            Phase1Assignment { player_id: "p1".into(), dragon_id: "dragon-a".into() },
-            Phase1Assignment { player_id: "p2".into(), dragon_id: "dragon-b".into() },
-        ]).expect("start phase1");
+        session
+            .begin_phase1(&[
+                Phase1Assignment {
+                    player_id: "p1".into(),
+                    dragon_id: "dragon-a".into(),
+                },
+                Phase1Assignment {
+                    player_id: "p2".into(),
+                    dragon_id: "dragon-b".into(),
+                },
+            ])
+            .expect("start phase1");
         session.transition_to(Phase::Handover).expect("to handover");
         session.save_handover_tags("p1", vec!["a".into(), "b".into(), "c".into()]);
         session.save_handover_tags("p2", vec!["d".into(), "e".into(), "f".into()]);
         session.enter_phase2().expect("enter phase2");
         session.enter_voting().expect("enter voting");
 
-        let eligible_player = session.voting.as_ref().and_then(|v| v.eligible_player_ids.first()).cloned().expect("eligible player");
-        let own_dragon = session.players.get(&eligible_player).and_then(|p| p.current_dragon_id.clone()).expect("current dragon");
+        let eligible_player = session
+            .voting
+            .as_ref()
+            .and_then(|v| v.eligible_player_ids.first())
+            .cloned()
+            .expect("eligible player");
+        let own_dragon = session
+            .players
+            .get(&eligible_player)
+            .and_then(|p| p.current_dragon_id.clone())
+            .expect("current dragon");
         let result = session.submit_vote(&eligible_player, &own_dragon);
 
         assert_eq!(result, Err(DomainError::SelfVoteForbidden));
@@ -1073,20 +1360,37 @@ mod tests {
 
     #[test]
     fn finalize_voting_sets_end_phase_and_computes_scores() {
-        let mut session = WorkshopSession::new(Uuid::new_v4(), SessionCode("123456".into()), ts(1));
+        let mut session = WorkshopSession::new(
+            Uuid::new_v4(),
+            SessionCode("123456".into()),
+            ts(1),
+            config(),
+        );
         session.add_player(player("p1", true, 10));
         session.add_player(player("p2", true, 20));
-        session.begin_phase1(&[
-            Phase1Assignment { player_id: "p1".into(), dragon_id: "dragon-a".into() },
-            Phase1Assignment { player_id: "p2".into(), dragon_id: "dragon-b".into() },
-        ]).expect("start phase1");
+        session
+            .begin_phase1(&[
+                Phase1Assignment {
+                    player_id: "p1".into(),
+                    dragon_id: "dragon-a".into(),
+                },
+                Phase1Assignment {
+                    player_id: "p2".into(),
+                    dragon_id: "dragon-b".into(),
+                },
+            ])
+            .expect("start phase1");
         session.transition_to(Phase::Handover).expect("to handover");
         session.save_handover_tags("p1", vec!["a".into(), "b".into(), "c".into()]);
         session.save_handover_tags("p2", vec!["d".into(), "e".into(), "f".into()]);
         session.enter_phase2().expect("enter phase2");
         session.enter_voting().expect("enter voting");
         {
-            let dragon_id = session.players.get("p1").and_then(|p| p.current_dragon_id.clone()).expect("p1 dragon");
+            let dragon_id = session
+                .players
+                .get("p1")
+                .and_then(|p| p.current_dragon_id.clone())
+                .expect("p1 dragon");
             let dragon = session.dragons.get_mut(&dragon_id).expect("dragon stats");
             dragon.happiness = 80;
             dragon.hunger = 70;
@@ -1101,17 +1405,31 @@ mod tests {
 
         assert!(result.is_ok());
         assert_eq!(session.phase, Phase::End);
-        assert_eq!(session.players.get("p1").map(|p| p.score), Some(80 + 70 + 60 + 100));
+        assert_eq!(
+            session.players.get("p1").map(|p| p.score),
+            Some(80 + 70 + 60 + 100)
+        );
     }
 
     #[test]
     fn feed_action_blocks_when_dragon_is_already_full() {
-        let mut session = WorkshopSession::new(Uuid::new_v4(), SessionCode("123456".into()), ts(1));
+        let mut session = WorkshopSession::new(
+            Uuid::new_v4(),
+            SessionCode("123456".into()),
+            ts(1),
+            config(),
+        );
         session.add_player(player("p1", true, 10));
-        session.begin_phase1(&[Phase1Assignment { player_id: "p1".into(), dragon_id: "dragon-a".into() }])
+        session
+            .begin_phase1(&[Phase1Assignment {
+                player_id: "p1".into(),
+                dragon_id: "dragon-a".into(),
+            }])
             .expect("start phase1");
 
-        let outcome = session.apply_action("p1", PlayerAction::Feed(FoodType::Meat)).expect("apply action");
+        let outcome = session
+            .apply_action("p1", PlayerAction::Feed(FoodType::Meat))
+            .expect("apply action");
 
         assert_eq!(
             outcome,
@@ -1123,14 +1441,25 @@ mod tests {
 
     #[test]
     fn play_action_blocks_when_dragon_is_too_hungry() {
-        let mut session = WorkshopSession::new(Uuid::new_v4(), SessionCode("123456".into()), ts(1));
+        let mut session = WorkshopSession::new(
+            Uuid::new_v4(),
+            SessionCode("123456".into()),
+            ts(1),
+            config(),
+        );
         session.add_player(player("p1", true, 10));
-        session.begin_phase1(&[Phase1Assignment { player_id: "p1".into(), dragon_id: "dragon-a".into() }])
+        session
+            .begin_phase1(&[Phase1Assignment {
+                player_id: "p1".into(),
+                dragon_id: "dragon-a".into(),
+            }])
             .expect("start phase1");
         let dragon = session.dragons.get_mut("dragon-a").expect("dragon-a");
         dragon.hunger = 10;
 
-        let outcome = session.apply_action("p1", PlayerAction::Play(PlayType::Fetch)).expect("apply action");
+        let outcome = session
+            .apply_action("p1", PlayerAction::Play(PlayType::Fetch))
+            .expect("apply action");
 
         assert_eq!(
             outcome,
@@ -1142,12 +1471,23 @@ mod tests {
 
     #[test]
     fn sleep_action_blocks_when_dragon_is_too_awake() {
-        let mut session = WorkshopSession::new(Uuid::new_v4(), SessionCode("123456".into()), ts(1));
+        let mut session = WorkshopSession::new(
+            Uuid::new_v4(),
+            SessionCode("123456".into()),
+            ts(1),
+            config(),
+        );
         session.add_player(player("p1", true, 10));
-        session.begin_phase1(&[Phase1Assignment { player_id: "p1".into(), dragon_id: "dragon-a".into() }])
+        session
+            .begin_phase1(&[Phase1Assignment {
+                player_id: "p1".into(),
+                dragon_id: "dragon-a".into(),
+            }])
             .expect("start phase1");
 
-        let outcome = session.apply_action("p1", PlayerAction::Sleep).expect("apply action");
+        let outcome = session
+            .apply_action("p1", PlayerAction::Sleep)
+            .expect("apply action");
 
         assert_eq!(
             outcome,
@@ -1159,9 +1499,18 @@ mod tests {
 
     #[test]
     fn phase2_tick_uses_stronger_decay_multiplier() {
-        let mut session = WorkshopSession::new(Uuid::new_v4(), SessionCode("123456".into()), ts(1));
+        let mut session = WorkshopSession::new(
+            Uuid::new_v4(),
+            SessionCode("123456".into()),
+            ts(1),
+            config(),
+        );
         session.add_player(player("p1", true, 10));
-        session.begin_phase1(&[Phase1Assignment { player_id: "p1".into(), dragon_id: "dragon-a".into() }])
+        session
+            .begin_phase1(&[Phase1Assignment {
+                player_id: "p1".into(),
+                dragon_id: "dragon-a".into(),
+            }])
             .expect("start phase1");
         session.transition_to(Phase::Handover).expect("to handover");
         session.save_handover_tags("p1", vec!["a".into(), "b".into(), "c".into()]);

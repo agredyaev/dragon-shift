@@ -1,7 +1,11 @@
+use chrono::Utc;
 use dioxus::prelude::*;
 use protocol::ClientGameState;
 use protocol::JudgeBundle;
 use protocol::Phase;
+
+#[cfg(target_arch = "wasm32")]
+use wasm_bindgen::JsCast;
 
 use crate::helpers::*;
 use crate::realtime::bootstrap_realtime;
@@ -22,6 +26,26 @@ pub fn SessionPanel(
     handover_tags_input: Signal<String>,
     judge_bundle: Signal<Option<JudgeBundle>>,
 ) -> Element {
+    let now_tick = use_signal(Utc::now);
+
+    #[cfg(target_arch = "wasm32")]
+    {
+        use_effect(move || {
+            let mut now_tick = now_tick;
+            if let Some(window) = web_sys::window() {
+                let callback = wasm_bindgen::closure::Closure::wrap(Box::new(move || {
+                    now_tick.set(Utc::now());
+                })
+                    as Box<dyn FnMut()>);
+                let _ = window.set_interval_with_callback_and_timeout_and_arguments_0(
+                    callback.as_ref().unchecked_ref(),
+                    1000,
+                );
+                callback.forget();
+            }
+        });
+    }
+
     // Summary chip data — cheap string computations
     let session_code_label = {
         let id = identity.read();
@@ -36,9 +60,11 @@ pub fn SessionPanel(
         players_count_label,
         session_phase_title,
         session_phase_body,
+        countdown_label,
         current_phase,
     ) = {
         let gs = game_state.read();
+        let now = *now_tick.read();
         let active = gs
             .as_ref()
             .and_then(active_player_name)
@@ -59,8 +85,12 @@ pub fn SessionPanel(
             .as_ref()
             .map(|s| phase_screen_body(s.phase))
             .unwrap_or("Connect to a workshop to see the active gameplay screen.");
+        let countdown = gs
+            .as_ref()
+            .and_then(|s| phase_remaining_seconds(s, now))
+            .map(format_remaining_duration);
         let phase = gs.as_ref().map(|s| s.phase);
-        (active, phase_label, count, title, body, phase)
+        (active, phase_label, count, title, body, countdown, phase)
     };
 
     // Realtime button state
@@ -88,6 +118,9 @@ pub fn SessionPanel(
                 p { class: "summary-chip", "Current caretaker: " {active_player_label} }
                 p { class: "summary-chip", "Current round: " {session_phase_label} }
                 p { class: "summary-chip", "Players in view: " {players_count_label} }
+                if let Some(countdown_label) = countdown_label {
+                    p { class: "summary-chip", "Time left: " {countdown_label} }
+                }
             }
             h2 { class: "panel__title", "Current round" }
             h3 { class: "panel__title", {session_phase_title} }

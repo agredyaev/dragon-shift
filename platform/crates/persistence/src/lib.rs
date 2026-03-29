@@ -6,6 +6,9 @@ use std::pin::Pin;
 use std::sync::RwLock;
 use thiserror::Error;
 
+#[cfg(test)]
+mod postgres_tests;
+
 #[derive(Debug, Error)]
 pub enum PersistenceError {
     #[error("session store lock poisoned")]
@@ -516,12 +519,24 @@ mod tests {
     use serde_json::json;
     use uuid::Uuid;
 
+    fn config() -> protocol::WorkshopCreateConfig {
+        protocol::WorkshopCreateConfig {
+            phase0_minutes: 5,
+            phase1_minutes: 10,
+            phase2_minutes: 10,
+            image_generator_token: None,
+            image_generator_model: None,
+            judge_token: None,
+            judge_model: None,
+        }
+    }
+
     fn ts(seconds: i64) -> DateTime<Utc> {
         DateTime::from_timestamp(seconds, 0).expect("valid timestamp")
     }
 
     fn session(code: &str, phase: Phase, updated_at_seconds: i64) -> WorkshopSession {
-        let mut session = WorkshopSession::new(Uuid::new_v4(), SessionCode(code.to_string()), ts(updated_at_seconds));
+        let mut session = WorkshopSession::new(Uuid::new_v4(), SessionCode(code.to_string()), ts(updated_at_seconds), config());
         session.phase = phase;
         session.updated_at = ts(updated_at_seconds);
         session

@@ -817,6 +817,15 @@ async fn create_workshop(
         .header("Origin", base_url)
         .json(&CreateWorkshopRequest {
             name: name.to_string(),
+            config: protocol::WorkshopCreateConfig {
+                phase0_minutes: 5,
+                phase1_minutes: 10,
+                phase2_minutes: 10,
+                image_generator_token: None,
+                image_generator_model: None,
+                judge_token: None,
+                judge_model: None,
+            },
         })
         .send()
         .await
