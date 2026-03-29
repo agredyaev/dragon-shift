@@ -277,15 +277,79 @@ fn build_web_bundle(config: WebBuildConfig) -> Result<(), String> {
         )
     })?;
 
+    // ── wasm-opt -Oz ───────────────────────────────────────────────────
+    let wasm_bg = config.out_dir.join("app-web_bg.wasm");
+    let pre_opt_bytes = fs::metadata(&wasm_bg).map(|m| m.len()).unwrap_or(0);
+    run_tool_owned(
+        "wasm-opt",
+        vec![
+            "-Oz".to_string(),
+            "--enable-bulk-memory".to_string(),
+            "-o".to_string(),
+            wasm_bg.to_string_lossy().into_owned(),
+            wasm_bg.to_string_lossy().into_owned(),
+        ],
+    )
+    .map_err(|error| {
+        format!(
+            "{error}. Install binaryen with `brew install binaryen` (or your system package manager) to enable wasm-opt."
+        )
+    })?;
+    let post_opt_bytes = fs::metadata(&wasm_bg).map(|m| m.len()).unwrap_or(0);
+    let saved_pct = if pre_opt_bytes > 0 {
+        ((pre_opt_bytes as f64 - post_opt_bytes as f64) / pre_opt_bytes as f64 * 100.0) as u64
+    } else {
+        0
+    };
+    eprintln!(
+        "wasm-opt: {} KB -> {} KB (-{}%)",
+        pre_opt_bytes / 1024,
+        post_opt_bytes / 1024,
+        saved_pct
+    );
+
     write_app_web_index_html(&config.out_dir)?;
 
-    print_json(json!({
+    // ── WASM bundle size gate ──────────────────────────────────────────
+    let wasm_output = config.out_dir.join("app-web_bg.wasm");
+    let wasm_size_bytes = fs::metadata(&wasm_output)
+        .map(|m| m.len())
+        .unwrap_or(0);
+    let wasm_size_kb = wasm_size_bytes / 1024;
+    const WASM_SIZE_WARN_KB: u64 = 2048; // 2 MB — warn threshold
+    const WASM_SIZE_FAIL_KB: u64 = 3072; // 3 MB — hard fail threshold
+    if wasm_size_kb > WASM_SIZE_FAIL_KB {
+        return Err(format!(
+            "WASM bundle size regression: {wasm_size_kb} KB exceeds hard limit of {WASM_SIZE_FAIL_KB} KB"
+        ));
+    }
+    let wasm_size_warning = if wasm_size_kb > WASM_SIZE_WARN_KB {
+        Some(format!(
+            "WASM bundle is {wasm_size_kb} KB — approaching {WASM_SIZE_FAIL_KB} KB limit"
+        ))
+    } else {
+        None
+    };
+
+    let js_output = config.out_dir.join("app-web.js");
+    let js_size_bytes = fs::metadata(&js_output).map(|m| m.len()).unwrap_or(0);
+
+    let mut result = json!({
         "ok": true,
         "outDir": config.out_dir.display().to_string(),
         "entryHtml": config.out_dir.join("index.html").display().to_string(),
         "entryJs": config.out_dir.join("app-web.js").display().to_string(),
         "entryWasm": config.out_dir.join("app-web_bg.wasm").display().to_string(),
-    }))
+        "wasmSizeKb": wasm_size_kb,
+        "wasmPreOptKb": pre_opt_bytes / 1024,
+        "wasmOptSavedPct": saved_pct,
+        "jsSizeKb": js_size_bytes / 1024,
+    });
+    if let Some(warning) = wasm_size_warning {
+        result["wasmSizeWarning"] = json!(warning);
+    }
+
+    print_json(result)
 }
 
 fn write_app_web_index_html(out_dir: &Path) -> Result<(), String> {
@@ -299,6 +363,9 @@ fn write_app_web_index_html(out_dir: &Path) -> Result<(), String> {
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Dragon Shift</title>
     <link rel="icon" href="data:," />
+    <link rel="preload" href="fonts/silkscreen-400-latin.woff2" as="font" type="font/woff2" crossorigin />
+    <link rel="preload" href="fonts/silkscreen-700-latin.woff2" as="font" type="font/woff2" crossorigin />
+    <link rel="stylesheet" href="style.css" />
   </head>
   <body>
     <main id="main"></main>
@@ -366,17 +433,26 @@ fn print_json(value: serde_json::Value) -> Result<(), String> {
 }
 
 async fn smoke_phase1(base_url: String) -> Result<(), String> {
+    let smoke_start = std::time::Instant::now();
     let client = reqwest::Client::new();
-    let host = create_workshop(&client, &base_url, "XtaskSmokeHost").await?;
 
+    let t0 = std::time::Instant::now();
+    let host = create_workshop(&client, &base_url, "XtaskSmokeHost").await?;
+    let create_ms = t0.elapsed().as_millis();
+
+    let t1 = std::time::Instant::now();
     send_command(
         &client,
         &base_url,
         command_request(&host, SessionCommand::StartPhase1, None),
     )
     .await?;
+    let command_ms = t1.elapsed().as_millis();
 
+    let t2 = std::time::Instant::now();
     let reconnected = reconnect_workshop(&client, &base_url, &host).await?;
+    let reconnect_ms = t2.elapsed().as_millis();
+
     ensure_phase(&reconnected, Phase::Phase1, "smoke-phase1 reconnect")?;
     if reconnected.state.current_player_id.as_deref() != Some(host.player_id.as_str()) {
         return Err("reconnect returned a different current player than the host".to_string());
@@ -390,6 +466,12 @@ async fn smoke_phase1(base_url: String) -> Result<(), String> {
         "baseUrl": base_url,
         "sessionCode": host.session_code,
         "phase": "phase1",
+        "timing": {
+            "totalMs": smoke_start.elapsed().as_millis() as u64,
+            "createWorkshopMs": create_ms as u64,
+            "startPhase1CommandMs": command_ms as u64,
+            "reconnectMs": reconnect_ms as u64,
+        },
     }))
 }
 
@@ -444,6 +526,7 @@ async fn smoke_join_load(config: JoinLoadConfig) -> Result<(), String> {
 }
 
 async fn smoke_judge_bundle(base_url: String) -> Result<(), String> {
+    let smoke_start = std::time::Instant::now();
     let client = reqwest::Client::new();
     let host = create_workshop(&client, &base_url, "XtaskJudgeHost").await?;
     let guest = join_workshop(&client, &base_url, &host.session_code, "XtaskJudgeGuest").await?;
@@ -519,7 +602,9 @@ async fn smoke_judge_bundle(base_url: String) -> Result<(), String> {
 
     let host_end = reconnect_workshop(&client, &base_url, &host).await?;
     ensure_phase(&host_end, Phase::End, "host end")?;
+    let t_bundle = std::time::Instant::now();
     let bundle = fetch_judge_bundle(&client, &base_url, &host).await?;
+    let fetch_bundle_ms = t_bundle.elapsed().as_millis();
     if bundle.artifact_count <= 0 {
         return Err("judge bundle did not include artifacts".to_string());
     }
@@ -543,10 +628,15 @@ async fn smoke_judge_bundle(base_url: String) -> Result<(), String> {
         "phase": "end",
         "dragons": bundle.dragons.len(),
         "artifactCount": bundle.artifact_count,
+        "timing": {
+            "totalMs": smoke_start.elapsed().as_millis() as u64,
+            "fetchJudgeBundleMs": fetch_bundle_ms as u64,
+        },
     }))
 }
 
 async fn smoke_offline_failover(base_url: String) -> Result<(), String> {
+    let smoke_start = std::time::Instant::now();
     let client = reqwest::Client::new();
     let host = create_workshop(&client, &base_url, "XtaskFailoverHost").await?;
     let guest = join_workshop(&client, &base_url, &host.session_code, "XtaskFailoverGuest").await?;
@@ -614,6 +704,9 @@ async fn smoke_offline_failover(base_url: String) -> Result<(), String> {
         "hostAfterFailover": guest.player_id,
         "phaseAfterReset": "lobby",
         "reconnectedHostConnected": host_player_after_reconnect.is_connected,
+        "timing": {
+            "totalMs": smoke_start.elapsed().as_millis() as u64,
+        },
     }))
 }
 

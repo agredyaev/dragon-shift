@@ -1,6 +1,8 @@
 use axum::{
     extract::ws::{Message, WebSocket, WebSocketUpgrade},
     extract::State,
+    http::header::CACHE_CONTROL,
+    http::HeaderValue,
     http::HeaderMap,
     http::StatusCode,
     response::IntoResponse,
@@ -33,6 +35,7 @@ use std::{
 use tokio::sync::{mpsc, Mutex};
 use tower_http::services::{ServeDir, ServeFile};
 use tower_http::trace::TraceLayer;
+use tower_http::set_header::SetResponseHeaderLayer;
 use tracing::info;
 use uuid::Uuid;
 
@@ -157,6 +160,7 @@ fn build_app(state: AppState) -> Router {
         .route("/api/ready", get(ready))
         .route("/api/runtime", get(runtime_snapshot))
         .fallback_service(ServeDir::new(static_assets_dir).not_found_service(ServeFile::new(index_file)))
+        .layer(SetResponseHeaderLayer::overriding(CACHE_CONTROL, HeaderValue::from_static("no-store")))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }
