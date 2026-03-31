@@ -44,7 +44,18 @@ impl SessionRegistry {
         connection_id: &str,
     ) -> AttachResult {
         let key = (session_code.to_string(), player_id.to_string());
-        let replaced_connection_id = self.connection_by_session_player.insert(key.clone(), connection_id.to_string());
+        if let Some(existing_registration) = self.connections_by_id.get(connection_id)
+            && (existing_registration.session_code != key.0
+                || existing_registration.player_id != key.1)
+        {
+            self.connection_by_session_player.remove(&(
+                existing_registration.session_code.clone(),
+                existing_registration.player_id.clone(),
+            ));
+        }
+        let replaced_connection_id = self
+            .connection_by_session_player
+            .insert(key.clone(), connection_id.to_string());
 
         if let Some(previous_connection_id) = &replaced_connection_id {
             self.connections_by_id.remove(previous_connection_id);
@@ -60,14 +71,21 @@ impl SessionRegistry {
         );
 
         AttachResult {
-            replaced_connection_id,
+            replaced_connection_id: replaced_connection_id.filter(|value| value != connection_id),
         }
+    }
+
+    pub fn connection_registration(&self, connection_id: &str) -> Option<ConnectionRegistration> {
+        self.connections_by_id.get(connection_id).cloned()
     }
 
     pub fn detach(&mut self, connection_id: &str) -> Option<ConnectionRegistration> {
         let registration = self.connections_by_id.remove(connection_id)?;
 
-        let key = (registration.session_code.clone(), registration.player_id.clone());
+        let key = (
+            registration.session_code.clone(),
+            registration.player_id.clone(),
+        );
         self.connection_by_session_player.remove(&key);
         Some(registration)
     }
@@ -184,8 +202,37 @@ mod tests {
         let registrations = registry.session_registrations("123456");
 
         assert_eq!(registrations.len(), 2);
-        assert!(registrations.iter().any(|registration| registration.player_id == "player-1"));
-        assert!(registrations.iter().any(|registration| registration.player_id == "player-2"));
-        assert!(!registrations.iter().any(|registration| registration.player_id == "player-3"));
+        assert!(
+            registrations
+                .iter()
+                .any(|registration| registration.player_id == "player-1")
+        );
+        assert!(
+            registrations
+                .iter()
+                .any(|registration| registration.player_id == "player-2")
+        );
+        assert!(
+            !registrations
+                .iter()
+                .any(|registration| registration.player_id == "player-3")
+        );
+    }
+
+    #[test]
+    fn reusing_same_connection_id_removes_stale_session_player_mapping() {
+        let mut registry = SessionRegistry::new();
+        registry.attach("123456", "player-1", "conn-1");
+        registry.attach("654321", "player-2", "conn-1");
+
+        let reattached = registry.attach("123456", "player-1", "conn-2");
+
+        assert_eq!(reattached.replaced_connection_id, None);
+        assert_eq!(registry.session_connection_count("123456"), 1);
+        assert_eq!(registry.session_connection_count("654321"), 1);
+        let original_session = registry.session_registrations("123456");
+        assert_eq!(original_session[0].connection_id, "conn-2");
+        let replacement_session = registry.session_registrations("654321");
+        assert_eq!(replacement_session[0].connection_id, "conn-1");
     }
 }

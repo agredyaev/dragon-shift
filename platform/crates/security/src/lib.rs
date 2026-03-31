@@ -56,7 +56,17 @@ struct RateLimitBucket {
 
 pub fn normalize_origin(origin: &str) -> Option<String> {
     let url = Url::parse(origin).ok()?;
-    Some(format!("{}://{}{}", url.scheme(), url.host_str()?, url.port().map(|port| format!(":{}", port)).unwrap_or_default()).to_lowercase())
+    Some(
+        format!(
+            "{}://{}{}",
+            url.scheme(),
+            url.host_str()?,
+            url.port()
+                .map(|port| format!(":{}", port))
+                .unwrap_or_default()
+        )
+        .to_lowercase(),
+    )
 }
 
 impl FixedWindowRateLimiter {
@@ -104,7 +114,9 @@ impl FixedWindowRateLimiter {
     }
 }
 
-pub fn create_origin_policy(options: OriginPolicyOptions<'_>) -> Result<OriginPolicy, SecurityError> {
+pub fn create_origin_policy(
+    options: OriginPolicyOptions<'_>,
+) -> Result<OriginPolicy, SecurityError> {
     let configured_origins = options
         .allowed_origins
         .unwrap_or_default()
@@ -167,7 +179,10 @@ pub fn is_origin_allowed(origin: Option<&str>, policy: &OriginPolicy) -> bool {
         return false;
     };
     if !policy.is_production {
-        return matches!(url.host_str(), Some("localhost") | Some("127.0.0.1") | Some("[::1]"));
+        return matches!(
+            url.host_str(),
+            Some("localhost") | Some("127.0.0.1") | Some("[::1]")
+        );
     }
 
     false
@@ -189,7 +204,11 @@ pub fn estimate_data_url_bytes(data_url: &str) -> usize {
     let Some((_, base64_part)) = data_url.split_once(",") else {
         return usize::MAX;
     };
-    let padding = base64_part.chars().rev().take_while(|ch| *ch == '=').count();
+    let padding = base64_part
+        .chars()
+        .rev()
+        .take_while(|ch| *ch == '=')
+        .count();
     ((base64_part.len() * 3) / 4).saturating_sub(padding)
 }
 
@@ -231,7 +250,10 @@ mod tests {
 
     #[test]
     fn validate_session_code_rejects_non_digits() {
-        assert_eq!(validate_session_code("12ab56"), Err(SecurityError::InvalidSessionCode));
+        assert_eq!(
+            validate_session_code("12ab56"),
+            Err(SecurityError::InvalidSessionCode)
+        );
     }
 
     #[test]
@@ -279,7 +301,10 @@ mod tests {
         })
         .expect("create origin policy");
 
-        assert!(!is_origin_allowed(Some("https://evil.example.com"), &policy));
+        assert!(!is_origin_allowed(
+            Some("https://evil.example.com"),
+            &policy
+        ));
     }
 
     #[test]
@@ -302,9 +327,18 @@ mod tests {
 
     #[test]
     fn rust_session_code_uses_prefix_and_numeric_validation() {
-        assert!(is_rust_session_code("912345", DEFAULT_RUST_SESSION_CODE_PREFIX));
-        assert!(!is_rust_session_code("812345", DEFAULT_RUST_SESSION_CODE_PREFIX));
-        assert!(!is_rust_session_code("9abc45", DEFAULT_RUST_SESSION_CODE_PREFIX));
+        assert!(is_rust_session_code(
+            "912345",
+            DEFAULT_RUST_SESSION_CODE_PREFIX
+        ));
+        assert!(!is_rust_session_code(
+            "812345",
+            DEFAULT_RUST_SESSION_CODE_PREFIX
+        ));
+        assert!(!is_rust_session_code(
+            "9abc45",
+            DEFAULT_RUST_SESSION_CODE_PREFIX
+        ));
     }
 
     #[test]

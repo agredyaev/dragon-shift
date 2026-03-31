@@ -774,17 +774,21 @@ mod tests {
                 .step,
             0
         );
-        assert!(settings
-            .phases
-            .get(&Phase::Lobby)
-            .expect("lobby phase")
-            .allowed_commands
-            .contains(&SessionCommand::Join));
-        assert!(settings
-            .phases
-            .get(&Phase::Voting)
-            .expect("voting phase")
-            .allowed_commands
-            .contains(&SessionCommand::SubmitVote));
+        assert!(
+            settings
+                .phases
+                .get(&Phase::Lobby)
+                .expect("lobby phase")
+                .allowed_commands
+                .contains(&SessionCommand::Join)
+        );
+        assert!(
+            settings
+                .phases
+                .get(&Phase::Voting)
+                .expect("voting phase")
+                .allowed_commands
+                .contains(&SessionCommand::SubmitVote)
+        );
     }
 }
