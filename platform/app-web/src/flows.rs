@@ -34,6 +34,7 @@ pub async fn submit_create_flow(
         let name = create_name.read();
         (id.api_base_url.clone(), name.trim().to_string())
     };
+    let is_production = base_url.starts_with("https://");
     let config = {
         let phase0 = phase0_minutes.read().trim().parse::<u32>().unwrap_or(8);
         let phase1 = phase1_minutes.read().trim().parse::<u32>().unwrap_or(8);
@@ -47,7 +48,7 @@ pub async fn submit_create_flow(
             phase0_minutes: phase0,
             phase1_minutes: phase1,
             phase2_minutes: phase2,
-            image_generator_token: if image_token.is_empty() {
+            image_generator_token: if is_production || image_token.is_empty() {
                 None
             } else {
                 Some(image_token)
@@ -57,7 +58,7 @@ pub async fn submit_create_flow(
             } else {
                 Some(image_model)
             },
-            judge_token: if judge_token.is_empty() {
+            judge_token: if is_production || judge_token.is_empty() {
                 None
             } else {
                 Some(judge_token)
@@ -313,6 +314,13 @@ pub async fn submit_reconnect_flow(
                     });
                 }
             }
+            if let Err(error) = bootstrap_realtime(identity, game_state, ops, judge_bundle) {
+                identity.with_mut(|id| {
+                    ops.with_mut(|o| {
+                        apply_realtime_bootstrap_error(id, o, error);
+                    });
+                });
+            }
         }
         Err(error) => {
             identity.with_mut(|id| {
@@ -321,6 +329,148 @@ pub async fn submit_reconnect_flow(
                 });
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::{
+        ConnectionStatus, ShellScreen, default_identity_state, default_operation_state,
+    };
+    use protocol::{
+        ClientGameState, CoordinatorType, Phase, Player, SessionMeta, WorkshopJoinResult,
+        WorkshopJoinSuccess, create_default_session_settings,
+    };
+    use std::collections::BTreeMap;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
+
+    fn mock_join_success() -> WorkshopJoinSuccess {
+        let mut players = BTreeMap::new();
+        players.insert(
+            "player-1".to_string(),
+            Player {
+                id: "player-1".to_string(),
+                name: "Alice".to_string(),
+                is_host: true,
+                score: 0,
+                current_dragon_id: None,
+                achievements: Vec::new(),
+                is_ready: false,
+                is_connected: true,
+                pet_description: Some("Alice's workshop dragon".to_string()),
+            },
+        );
+
+        WorkshopJoinSuccess {
+            ok: true,
+            session_code: "123456".to_string(),
+            player_id: "player-1".to_string(),
+            reconnect_token: "reconnect-1".to_string(),
+            coordinator_type: CoordinatorType::Rust,
+            state: ClientGameState {
+                session: SessionMeta {
+                    id: "session-1".to_string(),
+                    code: "123456".to_string(),
+                    created_at: "2026-01-01T00:00:00Z".to_string(),
+                    updated_at: "2026-01-01T00:00:00Z".to_string(),
+                    phase_started_at: "2026-01-01T00:00:00Z".to_string(),
+                    host_player_id: Some("player-1".to_string()),
+                    settings: create_default_session_settings(),
+                },
+                phase: Phase::Lobby,
+                time: 8,
+                players,
+                dragons: BTreeMap::new(),
+                current_player_id: Some("player-1".to_string()),
+                voting: None,
+            },
+        }
+    }
+
+    fn spawn_join_success_server(success: WorkshopJoinSuccess) -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let address = listener.local_addr().expect("read test server address");
+
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept reconnect request");
+            let mut buffer = [0_u8; 8192];
+            let _ = stream.read(&mut buffer).expect("read reconnect request");
+
+            let body = serde_json::to_string(&WorkshopJoinResult::Success(success))
+                .expect("encode reconnect response");
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write reconnect response");
+        });
+
+        (format!("http://{address}"), handle)
+    }
+
+    #[test]
+    fn reconnect_success_bootstraps_realtime() {
+        let (base_url, server) = spawn_join_success_server(mock_join_success());
+
+        let mut dom = VirtualDom::new(|| rsx! { div {} });
+        dom.rebuild_in_place();
+
+        dom.in_scope(ScopeId::ROOT, || {
+            let runtime = tokio::runtime::Runtime::new().expect("create tokio runtime");
+
+            let mut initial_identity = default_identity_state();
+            initial_identity.api_base_url = base_url;
+
+            let identity = Signal::new(initial_identity);
+            let game_state = Signal::new(None);
+            let ops = Signal::new(default_operation_state());
+            let join_session_code = Signal::new(String::new());
+            let reconnect_session_code = Signal::new("123456".to_string());
+            let reconnect_token = Signal::new("reconnect-1".to_string());
+            let judge_bundle = Signal::new(None);
+
+            runtime.block_on(submit_reconnect_flow(
+                identity,
+                game_state,
+                ops,
+                join_session_code,
+                reconnect_session_code,
+                reconnect_token,
+                judge_bundle,
+            ));
+
+            server.join().expect("join reconnect server thread");
+
+            assert_eq!(identity.read().screen, ShellScreen::Session);
+            assert_eq!(
+                identity.read().connection_status,
+                ConnectionStatus::Connected
+            );
+            assert!(identity.read().realtime_bootstrap_attempted);
+            assert_eq!(
+                identity
+                    .read()
+                    .session_snapshot
+                    .as_ref()
+                    .map(|snapshot| snapshot.session_code.as_str()),
+                Some("123456")
+            );
+            assert!(game_state.read().is_some());
+            assert_eq!(ops.read().pending_flow, None);
+            assert_eq!(
+                ops.read()
+                    .notice
+                    .as_ref()
+                    .map(|notice| notice.message.as_str()),
+                Some("Reconnected to workshop.")
+            );
+        });
     }
 }
 

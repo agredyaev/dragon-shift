@@ -22,6 +22,7 @@ pub fn CreatePanel(
     reconnect_token: Signal<String>,
     judge_bundle: Signal<Option<JudgeBundle>>,
 ) -> Element {
+    let is_production = identity.read().api_base_url.starts_with("https://");
     let name = create_name.read().clone();
     let phase0_minutes_value = phase0_minutes.read().clone();
     let phase1_minutes_value = phase1_minutes.read().clone();
@@ -44,7 +45,7 @@ pub fn CreatePanel(
     rsx! {
         article { class: "panel", "data-testid": "create-panel",
             h2 { class: "panel__title", "Create workshop" }
-            p { class: "panel__body", "Start a new workshop and share the code with your group." }
+            p { class: "panel__body", if is_production { "Start a new workshop and share the code with your group. Third-party token entry is disabled in production; use server-side configuration instead." } else { "Start a new workshop and share the code with your group. Third-party token fields below are for local/dev use only and are rejected by production servers." } }
             div { class: "panel__stack",
                 input {
                     class: "input",
@@ -73,29 +74,31 @@ pub fn CreatePanel(
                         oninput: move |event| phase2_minutes_w.set(event.value())
                     }
                 }
-                input {
-                    class: "input",
-                    value: image_generator_token_value,
-                    placeholder: "Image generator token",
-                    oninput: move |event| image_generator_token_w.set(event.value())
-                }
-                input {
-                    class: "input",
-                    value: image_generator_model_value,
-                    placeholder: "Image generator model",
-                    oninput: move |event| image_generator_model_w.set(event.value())
-                }
-                input {
-                    class: "input",
-                    value: judge_token_value,
-                    placeholder: "Judge token",
-                    oninput: move |event| judge_token_w.set(event.value())
-                }
-                input {
-                    class: "input",
-                    value: judge_model_value,
-                    placeholder: "Judge model",
-                    oninput: move |event| judge_model_w.set(event.value())
+                if !is_production {
+                    input {
+                        class: "input",
+                        value: image_generator_token_value,
+                        placeholder: "Image generator token (local/dev only)",
+                        oninput: move |event| image_generator_token_w.set(event.value())
+                    }
+                    input {
+                        class: "input",
+                        value: image_generator_model_value,
+                        placeholder: "Image generator model",
+                        oninput: move |event| image_generator_model_w.set(event.value())
+                    }
+                    input {
+                        class: "input",
+                        value: judge_token_value,
+                        placeholder: "Judge token (local/dev only)",
+                        oninput: move |event| judge_token_w.set(event.value())
+                    }
+                    input {
+                        class: "input",
+                        value: judge_model_value,
+                        placeholder: "Judge model",
+                        oninput: move |event| judge_model_w.set(event.value())
+                    }
                 }
                 div { class: "button-row",
                     button {

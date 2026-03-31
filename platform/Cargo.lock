@@ -67,6 +67,7 @@ dependencies = [
  "protocol",
  "reqwest",
  "serde_json",
+ "tokio",
  "wasm-bindgen",
  "web-sys",
 ]
