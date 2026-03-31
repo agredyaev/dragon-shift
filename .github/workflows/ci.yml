@@ -60,7 +60,10 @@ jobs:
         run: cargo install wasm-bindgen-cli --version 0.2.115 --locked
 
       - name: Install binaryen
-        run: sudo apt-get update && sudo apt-get install -y binaryen
+        run: |
+          curl -fsSL -o /tmp/binaryen.tar.gz https://github.com/WebAssembly/binaryen/releases/download/version_128/binaryen-version_128-x86_64-linux.tar.gz
+          tar -xzf /tmp/binaryen.tar.gz -C /tmp
+          echo "/tmp/binaryen-version_128/bin" >> "$GITHUB_PATH"
 
       - name: Build web bundle
         run: cargo run --locked -p xtask -- build-web --out-dir /tmp/app-web-dist
@@ -109,7 +112,10 @@ jobs:
         working-directory: platform
 
       - name: Install binaryen
-        run: sudo apt-get update && sudo apt-get install -y binaryen
+        run: |
+          curl -fsSL -o /tmp/binaryen.tar.gz https://github.com/WebAssembly/binaryen/releases/download/version_128/binaryen-version_128-x86_64-linux.tar.gz
+          tar -xzf /tmp/binaryen.tar.gz -C /tmp
+          echo "/tmp/binaryen-version_128/bin" >> "$GITHUB_PATH"
 
       - name: Build app-web bundle
         run: cargo run --locked -p xtask -- build-web --out-dir app-web/dist
