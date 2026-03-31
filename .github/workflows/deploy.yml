@@ -1,0 +1,190 @@
+name: Deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: GitHub environment to target
+        required: true
+        type: choice
+        options:
+          - staging
+          - production
+      action:
+        description: Operation to run
+        required: true
+        type: choice
+        options:
+          - deploy
+          - promote
+          - rollback
+      image_ref:
+        description: Image digest or tag value to deploy, promote, or roll back to
+        required: true
+      rollback_revision:
+        description: Explicit Helm revision for rollback (required when action=rollback)
+        required: false
+      use_digest:
+        description: Treat image_ref as a sha256 digest instead of a tag
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+env:
+  RELEASE_NAME: dragon-shift
+  CHART_PATH: ./helm/dragon-shift
+
+concurrency:
+  group: deploy-${{ github.event.inputs.environment }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: ${{ github.event.inputs.action }} ${{ github.event.inputs.environment }}
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v4
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: e2e/package-lock.json
+
+      - name: Configure kubeconfig
+        env:
+          KUBECONFIG_B64: ${{ secrets.KUBECONFIG_B64 }}
+        run: |
+          test -n "${KUBECONFIG_B64}"
+          mkdir -p "${HOME}/.kube"
+          printf '%s' "${KUBECONFIG_B64}" | base64 --decode > "${HOME}/.kube/config"
+
+      - name: Resolve deployment inputs
+        id: vars
+        env:
+          TARGET_ENV: ${{ github.event.inputs.environment }}
+          ACTION: ${{ github.event.inputs.action }}
+          IMAGE_REF: ${{ github.event.inputs.image_ref }}
+          USE_DIGEST: ${{ github.event.inputs.use_digest }}
+          IMAGE_REPOSITORY: ${{ vars.IMAGE_REPOSITORY }}
+          KUBE_NAMESPACE: ${{ vars.KUBE_NAMESPACE }}
+          VALUES_FILE: ${{ vars.HELM_VALUES_FILE }}
+          APP_ALLOWED_ORIGINS: ${{ vars.APP_ALLOWED_ORIGINS }}
+          APP_VITE_APP_URL: ${{ vars.APP_VITE_APP_URL }}
+          DATABASE_SECRET_NAME: ${{ vars.DATABASE_SECRET_NAME }}
+          DATABASE_SECRET_KEY: ${{ vars.DATABASE_SECRET_KEY }}
+          VERIFY_URL: ${{ vars.VERIFY_URL }}
+          PORT_FORWARD_SERVICE: ${{ vars.PORT_FORWARD_SERVICE }}
+          ROLLBACK_REVISION: ${{ github.event.inputs.rollback_revision }}
+        run: |
+          test -n "${IMAGE_REPOSITORY}"
+          test -n "${KUBE_NAMESPACE}"
+          test -n "${APP_ALLOWED_ORIGINS}"
+          test -n "${APP_VITE_APP_URL}"
+          test -n "${VERIFY_URL}"
+          if [[ -z "${PORT_FORWARD_SERVICE}" ]]; then
+            PORT_FORWARD_SERVICE="${RELEASE_NAME}-dragon-shift"
+          fi
+          {
+            echo "target_env=${TARGET_ENV}"
+            echo "action=${ACTION}"
+            echo "image_repository=${IMAGE_REPOSITORY}"
+            echo "image_ref=${IMAGE_REF}"
+            echo "use_digest=${USE_DIGEST}"
+            echo "namespace=${KUBE_NAMESPACE}"
+            echo "values_file=${VALUES_FILE}"
+            echo "allowed_origins=${APP_ALLOWED_ORIGINS}"
+            echo "vite_app_url=${APP_VITE_APP_URL}"
+            echo "database_secret_name=${DATABASE_SECRET_NAME}"
+             echo "database_secret_key=${DATABASE_SECRET_KEY:-DATABASE_URL}"
+             echo "verify_url=${VERIFY_URL}"
+             echo "port_forward_service=${PORT_FORWARD_SERVICE}"
+             echo "rollback_revision=${ROLLBACK_REVISION}"
+           } >> "${GITHUB_OUTPUT}"
+
+      - name: Show rollback candidates
+        if: github.event.inputs.action == 'rollback'
+        run: helm history "${RELEASE_NAME}" --namespace "${{ steps.vars.outputs.namespace }}"
+
+      - name: Build Helm arguments
+        id: helm_args
+        run: |
+          args=(
+            --namespace "${{ steps.vars.outputs.namespace }}"
+            --create-namespace
+          )
+          if [[ -n "${{ steps.vars.outputs.values_file }}" ]]; then
+            args+=( -f "${{ steps.vars.outputs.values_file }}" )
+          fi
+          args+=(
+            --set image.repository="${{ steps.vars.outputs.image_repository }}"
+            --set app.allowedOrigins="${{ steps.vars.outputs.allowed_origins }}"
+            --set app.viteAppUrl="${{ steps.vars.outputs.vite_app_url }}"
+          )
+          if [[ -n "${{ steps.vars.outputs.database_secret_name }}" ]]; then
+            args+=(
+              --set database.existingSecretName="${{ steps.vars.outputs.database_secret_name }}"
+              --set database.existingSecretKey="${{ steps.vars.outputs.database_secret_key }}"
+            )
+          fi
+          if [[ "${{ steps.vars.outputs.use_digest }}" == "true" ]]; then
+            args+=( --set image.digest="${{ steps.vars.outputs.image_ref }}" )
+          else
+            args+=( --set image.tag="${{ steps.vars.outputs.image_ref }}" )
+          fi
+          printf 'helm_args=%s\n' "$(printf '%q ' "${args[@]}")" >> "${GITHUB_OUTPUT}"
+
+      - name: Helm upgrade
+        if: github.event.inputs.action != 'rollback'
+        run: |
+          eval "set -- ${{ steps.helm_args.outputs.helm_args }}"
+          helm upgrade --install "${RELEASE_NAME}" "${CHART_PATH}" --wait --atomic --timeout 10m "$@"
+
+      - name: Helm rollback
+        if: github.event.inputs.action == 'rollback'
+        run: |
+          test -n "${{ steps.vars.outputs.rollback_revision }}"
+          helm rollback "${RELEASE_NAME}" "${{ steps.vars.outputs.rollback_revision }}" --namespace "${{ steps.vars.outputs.namespace }}" --wait --timeout 10m
+
+      - name: Check rollout status
+        run: |
+          kubectl rollout status deployment/"${RELEASE_NAME}-dragon-shift" \
+            --namespace "${{ steps.vars.outputs.namespace }}" \
+            --timeout=5m
+
+      - name: Verify health endpoints
+        env:
+          VERIFY_URL: ${{ steps.vars.outputs.verify_url }}
+        run: |
+          live="$(curl --fail --silent "${VERIFY_URL}/api/live")"
+          ready="$(curl --fail --silent "${VERIFY_URL}/api/ready")"
+          [[ "${live}" == *'"ok":true'* ]]
+          [[ "${live}" == *'"service":"app-server"'* ]]
+          [[ "${live}" == *'"status":"live"'* ]]
+          [[ "${ready}" == *'"service":"app-server"'* ]]
+          [[ "${ready}" == *'"status":"ready"'* ]]
+
+      - name: Install e2e dependencies
+        run: npm --prefix e2e ci
+
+      - name: Install Playwright browsers
+        run: npm --prefix e2e run install:browsers
+
+      - name: Run deployed smoke
+        env:
+          E2E_BASE_URL: ${{ steps.vars.outputs.verify_url }}
+          PORT_FORWARD_NAMESPACE: ${{ steps.vars.outputs.namespace }}
+          PORT_FORWARD_SERVICE: ${{ steps.vars.outputs.port_forward_service }}
+        run: npm --prefix e2e run test:deployed -- --project=chromium

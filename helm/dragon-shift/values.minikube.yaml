@@ -19,12 +19,10 @@ app:
   staticDir: /app/static
   rustSessionCodePrefix: "9"
   databasePoolSize: 5
-  geminiApiKey: ""
-  trustProxyHeaders: false
-  joinRateLimitMax: 120
-  joinRateLimitWindowMs: 60000
+  createRateLimitMax: 20
+  joinRateLimitMax: 40
+  commandRateLimitMax: 120
   socketRateLimitMax: 300
-  socketRateLimitWindowMs: 60000
 
 database:
   url: ""

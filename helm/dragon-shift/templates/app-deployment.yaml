@@ -9,11 +9,18 @@ metadata:
     {{- toYaml . | nindent 4 }}
   {{- end }}
 spec:
+  {{- if ne .Values.deploymentStrategy.type "Recreate" }}
+  {{- fail "deploymentStrategy.type must remain Recreate for the current singleton runtime" }}
+  {{- end }}
   replicas: {{ .Values.replicaCount }}
   revisionHistoryLimit: {{ .Values.revisionHistoryLimit }}
   minReadySeconds: {{ .Values.minReadySeconds }}
   strategy:
-    {{- toYaml .Values.deploymentStrategy | nindent 4 }}
+    type: {{ .Values.deploymentStrategy.type }}
+    {{- if and (eq .Values.deploymentStrategy.type "RollingUpdate") .Values.deploymentStrategy.rollingUpdate }}
+    rollingUpdate:
+      {{- toYaml .Values.deploymentStrategy.rollingUpdate | nindent 6 }}
+    {{- end }}
   selector:
     matchLabels:
       {{- include "dragon-shift.app.selectorLabels" . | nindent 6 }}
@@ -66,6 +73,18 @@ spec:
               value: {{ .Values.app.viteAppUrl | quote }}
             - name: RUST_SESSION_CODE_PREFIX
               value: {{ .Values.app.rustSessionCodePrefix | quote }}
+            - name: TRUST_X_FORWARDED_FOR
+              value: {{ ternary "true" "false" .Values.app.trustForwardedFor | quote }}
+            - name: CREATE_RATE_LIMIT_MAX
+              value: {{ .Values.app.createRateLimitMax | quote }}
+            - name: JOIN_RATE_LIMIT_MAX
+              value: {{ .Values.app.joinRateLimitMax | quote }}
+            - name: COMMAND_RATE_LIMIT_MAX
+              value: {{ .Values.app.commandRateLimitMax | quote }}
+            - name: WEBSOCKET_RATE_LIMIT_MAX
+              value: {{ .Values.app.socketRateLimitMax | quote }}
+            - name: DATABASE_POOL_SIZE
+              value: {{ .Values.app.databasePoolSize | quote }}
             {{- if .Values.database.url }}
             - name: DATABASE_URL
               value: {{ .Values.database.url | quote }}

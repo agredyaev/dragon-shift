@@ -7,6 +7,8 @@ ingress:
   enabled: true
   className: nginx
   host: dragon-shift.example.com
+  # Public traffic should terminate TLS at the trusted ingress/gateway or an
+  # upstream load balancer in front of it. Do not expose the app directly.
   annotations: {}
   tls:
     enabled: false
@@ -18,15 +20,21 @@ app:
   viteAppUrl: https://dragon-shift.example.com
   staticDir: /app/static
   rustSessionCodePrefix: "9"
-  trustProxyHeaders: true
+  # Only trust forwarded client IPs when a trusted edge normalizes them.
+  trustForwardedFor: true
+  createRateLimitMax: 20
   joinRateLimitMax: 180
-  joinRateLimitWindowMs: 60000
+  commandRateLimitMax: 180
   socketRateLimitMax: 500
-  socketRateLimitWindowMs: 60000
 
 database:
   url: ""
   existingSecretName: dragon-shift-app
   existingSecretKey: DATABASE_URL
 
+postgresql:
+  enabled: false
+
 replicaCount: 1
+# Keep production at a single app replica; horizontal scaling/autoscaling are
+# unsupported until the runtime gains distributed coordination.

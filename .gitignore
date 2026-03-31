@@ -9,3 +9,5 @@ coverage/
 !.env.example
 target/
 */.tmp/
+.tmp/
+test-results/

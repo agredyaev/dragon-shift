@@ -1,6 +1,6 @@
 image:
-  repository: ghcr.io/your-org/dragon-shift-rust
-  tag: 0.1.0
+  repository: ghcr.io/your-org/dragon-switch
+  tag: v0.1.0
   digest: ""
   pullPolicy: IfNotPresent
 
@@ -28,13 +28,12 @@ app:
   viteAppUrl: https://dragon-shift.example.com
   staticDir: /app/static
   rustSessionCodePrefix: "9"
+  trustForwardedFor: false
   databasePoolSize: 10
-  geminiApiKey: ""
-  trustProxyHeaders: true
-  joinRateLimitMax: 120
-  joinRateLimitWindowMs: 60000
+  createRateLimitMax: 20
+  joinRateLimitMax: 40
+  commandRateLimitMax: 120
   socketRateLimitMax: 300
-  socketRateLimitWindowMs: 60000
 
 database:
   url: ""
@@ -42,6 +41,9 @@ database:
   existingSecretKey: DATABASE_URL
 
 postgresql:
+  # Bundled Postgres is the local/dev default. For cloud production, prefer an
+  # external managed Postgres/Cloud SQL instance with `postgresql.enabled=false`
+  # and a secret-backed `DATABASE_URL`.
   enabled: true
   auth:
     username: dragon_shift
@@ -60,6 +62,8 @@ resources:
     memory: 1Gi
 
 autoscaling:
+  # Unsupported today: the runtime is intentionally singleton-only, so do not
+  # enable HPA/autoscaling until realtime ownership and fan-out are distributed.
   enabled: false
 
 imagePullSecrets: []
@@ -98,10 +102,9 @@ startupProbe:
   periodSeconds: 5
 
 deploymentStrategy:
-  type: RollingUpdate
-  rollingUpdate:
-    maxUnavailable: 0
-    maxSurge: 1
+  # The current runtime is a singleton authoritative process, so default
+  # upgrades must not overlap old and new pods.
+  type: Recreate
 
 revisionHistoryLimit: 2
 
@@ -116,6 +119,9 @@ tolerations: []
 affinity: {}
 
 replicaCount: 1
+# Production is single-replica only today. Keep this at 1; multi-replica
+# operation and horizontal scaling are unsupported until the runtime gains
+# distributed coordination for authoritative workshop ownership and socket fan-out.
 
 podDisruptionBudget:
   enabled: true
