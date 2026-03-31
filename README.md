@@ -9,6 +9,7 @@ Dragon Shift is a Rust-only multiplayer workshop game about handoffs, operationa
 - `platform/app-web` - Dioxus Web frontend
 - `platform/crates/*` - domain, protocol, persistence, security, realtime
 - `helm/dragon-shift` - Rust-first Helm chart
+- `terraform/` - GCP production infrastructure and deployment environments
 - `Dockerfile` - Rust-only container build
 
 ## Confirmed stack
@@ -34,19 +35,20 @@ Dragon Shift is a Rust-only multiplayer workshop game about handoffs, operationa
 ## Production requirements
 
 - `NODE_ENV=production`
-- `DATABASE_URL` must be set
+- `DATABASE_URL` or `DATABASE_URL_FILE` must be set
 - `ALLOWED_ORIGINS` must explicitly match the public app origin
 - `VITE_APP_URL` must match the externally visible base URL
 - production is single-replica only today: keep `replicaCount=1`; multi-replica operation, horizontal scaling, and autoscaling are unsupported until the runtime gains distributed coordination for realtime ownership and socket fan-out
 
-If `NODE_ENV=production` is set without `DATABASE_URL`, `app-server` now fails fast during startup.
+If `NODE_ENV=production` is set without `DATABASE_URL` or `DATABASE_URL_FILE`, `app-server` now fails fast during startup.
 
 ## Environment
 
 Copy `.env.example` and set values appropriate for your environment.
 
 - `APP_SERVER_BIND_ADDR` - bind address for Axum, e.g. `0.0.0.0:3000`
-- `DATABASE_URL` - required in production for durable workshop state
+- `DATABASE_URL` - required in production unless `DATABASE_URL_FILE` is provided for durable workshop state
+- `DATABASE_URL_FILE` - optional path to a file containing the database URL; useful for mounted secret volumes in Kubernetes
 - `ALLOWED_ORIGINS` - explicit comma-separated origin allowlist
 - `VITE_APP_URL` - public base URL used for same-origin validation/bootstrap
 - `RUST_SESSION_CODE_PREFIX` - optional single-digit code prefix override
@@ -198,7 +200,7 @@ Required production inputs:
 - `image.digest` preferred, or `image.tag` when you intentionally want a mutable reference
 - `app.allowedOrigins`
 - `app.viteAppUrl`
-- `database.url` or `database.existingSecretName`
+- `database.url`, `database.existingSecretName`, or `database.existingSecretFile`
 
 Production secret handling note:
 
@@ -247,6 +249,8 @@ Portable chart defaults now avoid assuming a specific ingress controller. The ch
 
 The chart values surface intentionally does not expose browser-only AI token knobs. The current Helm templates wire the app runtime controls shown under `app.*`, but not deprecated or unsupported browser-side token injection.
 
+Service metadata is also configurable through `service.annotations`, which the GCP Terraform path uses for NEG and BackendConfig wiring on GKE.
+
 Example render with a direct database URL:
 
 ```bash
@@ -263,10 +267,42 @@ helm upgrade --install dragon-shift ./helm/dragon-shift --set image.repository=g
 On GKE or similar managed Kubernetes, point that secret at your managed Postgres or
 Cloud SQL connection string and keep it out of committed values files.
 
-Cloud-operability prerequisites that are not fully represented in this repository
-are documented in `operations/CLOUD_OPERABILITY.md`. Treat that file as the
-boundary between repo-owned app deploy assets and operator-owned cloud
-infrastructure, secret management, observability, and restore readiness.
+For GKE Secret Manager CSI or similar file-mounted secret flows, you can instead
+mount the secret as a file and point the chart at it:
+
+```bash
+helm upgrade --install dragon-shift ./helm/dragon-shift --set image.repository=ghcr.io/your-org/dragon-switch --set image.digest=sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef --set app.allowedOrigins=https://dragon-shift.example.com --set app.viteAppUrl=https://dragon-shift.example.com --set postgresql.enabled=false --set database.existingSecretFile=/var/run/secrets/dragon-shift/DATABASE_URL --set secretManager.enabled=true --set secretManager.secretProviderClassName=dragon-shift-database-url --set secretManager.mountPath=/var/run/secrets/dragon-shift
+```
+
+Cloud-operability prerequisites and the remaining operator-owned boundaries are
+documented in `operations/CLOUD_OPERABILITY.md`. Production-ready GCP foundation
+and platform Terraform now live under `terraform/`; treat the operability doc as
+the boundary between repo-managed infrastructure/application deployment and the
+still operator-owned concerns such as domain delegation, notification routing,
+access governance, and restore execution.
+
+## Terraform on GCP
+
+The repository now includes a production-oriented Terraform path for Google
+Cloud under `terraform/`.
+
+- `terraform/bootstrap` - remote-state bucket bootstrap
+- `terraform/environments/production/foundation` - project services, VPC,
+  private-service access, regional GKE Autopilot, and Cloud SQL for Postgres
+- `terraform/environments/production/platform` - Kubernetes namespace/runtime secret wiring,
+  GKE ingress edge, Cloud Armor, DNS, uptime checks, and Helm release
+
+Validation commands:
+
+```bash
+terraform fmt -check -recursive terraform
+terraform -chdir=terraform/bootstrap init -backend=false && terraform -chdir=terraform/bootstrap validate
+terraform -chdir=terraform/environments/production/foundation init -backend=false && terraform -chdir=terraform/environments/production/foundation validate
+terraform -chdir=terraform/environments/production/platform init -backend=false && terraform -chdir=terraform/environments/production/platform validate
+```
+
+See `terraform/README.md` for the apply order, required variables, remote-state
+setup, and the GCP architecture rationale.
 
 ## Automated deploy and rollback
 

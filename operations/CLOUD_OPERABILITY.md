@@ -1,8 +1,9 @@
 # Cloud Operability
 
-This repository contains the application, Helm chart, and deploy workflow for
-Dragon Shift. A production-capable cloud environment still depends on external
-assets that are owned by platform or operations staff rather than this repo.
+This repository contains the application, Helm chart, deploy workflow, and a
+production-oriented Terraform path for Google Cloud under `terraform/`.
+Production operation still depends on a smaller set of external assets and
+decisions that remain owned by platform or operations staff.
 
 ## Ownership Boundary
 
@@ -10,6 +11,7 @@ Repo-owned:
 
 - application container image and app runtime configuration surface
 - Helm chart in `helm/dragon-shift`
+- Terraform under `terraform/` for GCP state bootstrap, foundation, and platform
 - manual deploy, promote, and rollback workflow in `.github/workflows/deploy.yml`
 - app health endpoints and deployed smoke checks described in `README.md`
 
@@ -23,7 +25,9 @@ Operator-owned:
 - backup, PITR, restore execution, and restore verification scheduling
 
 Cloud readiness should be evaluated against both sides of that boundary. The repo
-does not by itself create or validate all required cloud infrastructure.
+can now provision the core GCP foundation and application platform for the
+current supported production shape, but operators still own the access,
+governance, approval, and restore practices around it.
 
 ## Required External Prerequisites
 
@@ -48,8 +52,9 @@ resources, WAF settings, or controller-specific annotations remain operator-owne
 
 ### Secret Management
 
-- provide `DATABASE_URL` through `database.existingSecretName` or another
-  operator-managed secret source rather than committed values
+- provide `DATABASE_URL` through `database.existingSecretName`,
+  `database.existingSecretFile`, or another operator-managed secret source rather
+  than committed values
 - manage secret creation, rotation, access review, and incident response outside
   the repo
 - provide any required registry pull credentials when GHCR access is private

@@ -5,6 +5,7 @@ on:
     paths:
       - "platform/**"
       - "helm/**"
+      - "terraform/**"
       - "Dockerfile"
       - ".github/workflows/**"
       - "README.md"
@@ -14,6 +15,7 @@ on:
     paths:
       - "platform/**"
       - "helm/**"
+      - "terraform/**"
       - "Dockerfile"
       - ".github/workflows/**"
       - "README.md"
@@ -143,8 +145,10 @@ jobs:
           --set image.digest=sha256:1111111111111111111111111111111111111111111111111111111111111111
           --set app.allowedOrigins=https://dragon-shift.example.com
           --set app.viteAppUrl=https://dragon-shift.example.com
-          --set database.existingSecretName=dragon-shift-app
-          --set database.existingSecretKey=DATABASE_URL
+          --set postgresql.enabled=false
+          --set database.existingSecretFile=/var/run/secrets/dragon-shift/DATABASE_URL
+          --set secretManager.enabled=true
+          --set secretManager.secretProviderClassName=dragon-shift-database-url
 
       - name: Helm template
         run: >-
@@ -153,9 +157,36 @@ jobs:
           --set image.digest=sha256:1111111111111111111111111111111111111111111111111111111111111111
           --set app.allowedOrigins=https://dragon-shift.example.com
           --set app.viteAppUrl=https://dragon-shift.example.com
-          --set database.existingSecretName=dragon-shift-app
-          --set database.existingSecretKey=DATABASE_URL
+          --set postgresql.enabled=false
+          --set database.existingSecretFile=/var/run/secrets/dragon-shift/DATABASE_URL
+          --set secretManager.enabled=true
+          --set secretManager.secretProviderClassName=dragon-shift-database-url
           > /tmp/dragon-shift-rendered.yaml
+
+  terraform:
+    name: Terraform
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+
+      - name: Check Terraform formatting
+        run: terraform fmt -check -recursive terraform
+
+      - name: Validate bootstrap
+        run: terraform init -backend=false && terraform validate
+        working-directory: terraform/bootstrap
+
+      - name: Validate production foundation
+        run: terraform init -backend=false && terraform validate
+        working-directory: terraform/environments/production/foundation
+
+      - name: Validate production platform
+        run: terraform init -backend=false && terraform validate
+        working-directory: terraform/environments/production/platform
 
   docker:
     name: Docker image build
