@@ -80,5 +80,5 @@ jobs:
           push: true
           tags: ${{ steps.vars.outputs.tags }}
           labels: |
-            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.source=https://github.com/agredyaev/dragon-shift
             org.opencontainers.image.revision=${{ github.sha }}

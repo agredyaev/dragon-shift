@@ -20,7 +20,7 @@ Operator-owned:
 - Kubernetes cluster, namespaces, network policy, and ingress or gateway setup
 - DNS, public hostnames, TLS certificates, and certificate rotation
 - managed Postgres or Cloud SQL provisioning and lifecycle policies
-- Kubernetes secrets or equivalent secret manager wiring for runtime credentials
+- runtime secret material and access review for production credentials
 - monitoring, alerting, log retention, dashboards, and on-call escalation
 - backup, PITR, restore execution, and restore verification scheduling
 
@@ -147,10 +147,9 @@ observed app readiness outage and recovery while operators execute the restore.
 - websocket reattach is verified after restart
 - command and persistence continuity are verified by successfully submitting one additional HTTP command and confirming artifact growth afterward
 
-`platform/PERSISTENCE_VALIDATION.md` and the persistence smoke commands in
-`README.md` are the repository-contained verification inputs. Restore execution,
-backup selection, traffic coordination, and sign-off remain operator
-responsibilities.
+`platform/PERSISTENCE_VALIDATION.md` and `e2e/` are the repository-contained
+verification inputs. Restore execution, backup selection, traffic coordination,
+and sign-off remain operator responsibilities.
 
 ## Caveat
 

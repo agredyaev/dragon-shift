@@ -141,7 +141,7 @@ jobs:
       - name: Helm lint
         run: >-
           helm lint ./helm/dragon-shift
-          --set image.repository=ghcr.io/example/dragon-switch
+          --set image.repository=ghcr.io/agredyaev/dragon-shift
           --set image.digest=sha256:1111111111111111111111111111111111111111111111111111111111111111
           --set app.allowedOrigins=https://dragon-shift.example.com
           --set app.viteAppUrl=https://dragon-shift.example.com
@@ -153,7 +153,7 @@ jobs:
       - name: Helm template
         run: >-
           helm template dragon-shift ./helm/dragon-shift
-          --set image.repository=ghcr.io/example/dragon-switch
+          --set image.repository=ghcr.io/agredyaev/dragon-shift
           --set image.digest=sha256:1111111111111111111111111111111111111111111111111111111111111111
           --set app.allowedOrigins=https://dragon-shift.example.com
           --set app.viteAppUrl=https://dragon-shift.example.com
