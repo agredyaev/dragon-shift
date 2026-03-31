@@ -981,12 +981,14 @@ mod tests {
             Some("dragon-b")
         );
         assert_eq!(session.players.get("p1").map(|p| p.score), Some(0));
-        assert!(session
-            .players
-            .get("p1")
-            .expect("player p1")
-            .achievements
-            .is_empty());
+        assert!(
+            session
+                .players
+                .get("p1")
+                .expect("player p1")
+                .achievements
+                .is_empty()
+        );
         let dragon_a = session.dragons.get("dragon-a").expect("dragon a");
         assert_eq!(dragon_a.name, "player-p1's dragon");
         assert_eq!(dragon_a.creator_instructions, "Curious cave dragon");

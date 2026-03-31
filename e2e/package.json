@@ -6,8 +6,10 @@
   "scripts": {
     "test": "playwright test",
     "test:headed": "playwright test --headed",
+    "test:mobile": "playwright test --project=mobile-safari",
+    "test:restart-local": "playwright test --config=playwright.local-restart.config.ts",
     "test:deployed": "bash ./run-deployed.sh",
-    "install:browsers": "playwright install --with-deps chromium"
+    "install:browsers": "playwright install --with-deps chromium webkit"
   },
   "devDependencies": {
     "@playwright/test": "^1.53.2"

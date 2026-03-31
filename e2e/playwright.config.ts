@@ -1,4 +1,6 @@
-import { defineConfig, devices } from '@playwright/test'
+import { defineConfig } from '@playwright/test'
+
+import { projectProfiles } from './project-profiles'
 
 const baseURL = process.env.E2E_BASE_URL ?? 'http://127.0.0.1:32000'
 
@@ -20,9 +22,9 @@ export default defineConfig({
     video: 'retain-on-failure',
   },
   projects: [
-    {
-      name: 'chromium',
-      use: { ...devices['Desktop Chrome'] },
-    },
+    ...Object.entries(projectProfiles).map(([name, profile]) => ({
+      name,
+      use: { ...profile },
+    })),
   ],
 })

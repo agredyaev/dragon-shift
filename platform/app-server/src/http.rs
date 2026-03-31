@@ -1,9 +1,9 @@
 use axum::{
     Json,
-    extract::State,
-    http::{HeaderMap, StatusCode},
+    extract::{ConnectInfo, FromRequestParts, State},
+    http::{HeaderMap, StatusCode, request::Parts},
 };
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use domain::{DomainError, Phase1Assignment, SessionCode, SessionPlayer, WorkshopSession};
 use protocol::{
     ActionPayload, CoordinatorType, CreateWorkshopRequest, DiscoveryObservationRequest,
@@ -14,17 +14,93 @@ use protocol::{
 };
 use security::{FixedWindowRateLimiter, OriginPolicy};
 use serde_json::json;
-use std::{collections::BTreeMap, sync::Arc};
+use std::{collections::BTreeMap, convert::Infallible, net::SocketAddr, sync::Arc};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
-use crate::app::{AppState, RuntimeSnapshot};
-use crate::cache::{ensure_session_cached, session_write_lock};
+use crate::app::AppState;
+use crate::cache::{SessionWriteLease, ensure_session_cached, reload_cached_session};
 use crate::helpers::{
     build_judge_bundle, parse_player_action, phase_step, random_prefixed_id,
     session_config_from_request, to_client_game_state,
 };
 use crate::ws::broadcast_session_state;
+
+pub(crate) fn reconnect_identity_is_valid(
+    identity: &persistence::PlayerIdentityMatch,
+    ttl: std::time::Duration,
+    now: DateTime<Utc>,
+) -> bool {
+    let Ok(last_seen_at) = DateTime::parse_from_rfc3339(&identity.last_seen_at) else {
+        return false;
+    };
+    let Ok(ttl) = chrono::Duration::from_std(ttl) else {
+        return false;
+    };
+    now.signed_duration_since(last_seen_at.with_timezone(&Utc)) <= ttl
+}
+
+pub(crate) async fn authorize_reconnect_identity(
+    state: &AppState,
+    session_code: &str,
+    reconnect_token: &str,
+) -> Result<Option<persistence::PlayerIdentityMatch>, persistence::PersistenceError> {
+    let identity = match state
+        .store
+        .find_player_identity(session_code, reconnect_token)
+        .await?
+    {
+        Some(identity) => identity,
+        None => return Ok(None),
+    };
+
+    if reconnect_identity_is_valid(&identity, state.config.reconnect_token_ttl, Utc::now()) {
+        Ok(Some(identity))
+    } else {
+        let _ = state.store.revoke_player_identity(reconnect_token).await;
+        Ok(None)
+    }
+}
+
+pub(crate) async fn refresh_reconnect_identity(
+    state: &AppState,
+    reconnect_token: &str,
+    timestamp: DateTime<Utc>,
+) -> Result<(), persistence::PersistenceError> {
+    state
+        .store
+        .touch_player_identity(reconnect_token, &timestamp.to_rfc3339())
+        .await
+}
+
+pub(crate) async fn rotate_reconnect_identity(
+    _state: &AppState,
+    _identity: &persistence::PlayerIdentityMatch,
+    _previous_token: &str,
+    _timestamp: DateTime<Utc>,
+) -> Result<String, persistence::PersistenceError> {
+    let next_token = random_prefixed_id("reconnect");
+    Ok(next_token)
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct MaybeConnectInfo(pub(crate) Option<SocketAddr>);
+
+impl<S> FromRequestParts<S> for MaybeConnectInfo
+where
+    S: Send + Sync,
+{
+    type Rejection = Infallible;
+
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        Ok(Self(
+            parts
+                .extensions
+                .get::<ConnectInfo<SocketAddr>>()
+                .map(|connect_info| connect_info.0),
+        ))
+    }
+}
 
 pub(crate) async fn live() -> Json<serde_json::Value> {
     Json(json!({ "ok": true, "service": "app-server", "status": "live" }))
@@ -32,15 +108,15 @@ pub(crate) async fn live() -> Json<serde_json::Value> {
 
 pub(crate) async fn create_workshop(
     State(state): State<AppState>,
+    connect_info: MaybeConnectInfo,
     headers: HeaderMap,
     Json(payload): Json<CreateWorkshopRequest>,
 ) -> (StatusCode, Json<WorkshopJoinResult>) {
     if let Some(response) = reject_disallowed_origin(&headers, &state.config.origin_policy) {
         return response;
     }
-    if let Some(response) =
-        reject_rate_limited(&state.create_limiter, client_key_from_headers(&headers)).await
-    {
+    let client_key = client_key(&state, connect_info, &headers);
+    if let Some(response) = reject_rate_limited(&state.create_limiter, &client_key).await {
         return response;
     }
     let normalized_name = payload.name.trim();
@@ -53,6 +129,28 @@ pub(crate) async fn create_workshop(
             })),
         );
     }
+    if state.config.origin_policy.is_production
+        && (payload
+            .config
+            .image_generator_token
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|value| !value.is_empty())
+            || payload
+                .config
+                .judge_token
+                .as_deref()
+                .map(str::trim)
+                .is_some_and(|value| !value.is_empty()))
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(WorkshopJoinResult::Error(WorkshopError {
+                ok: false,
+                error: "Browser-supplied third-party tokens are disabled in production. Use local/dev only or move secrets to server-side configuration.".to_string(),
+            })),
+        );
+    }
 
     let timestamp = Utc::now();
     let session_code = allocate_session_code(&state).await;
@@ -62,7 +160,7 @@ pub(crate) async fn create_workshop(
         Uuid::new_v4(),
         SessionCode(session_code.clone()),
         timestamp,
-        session_config_from_request(&payload),
+        session_config_from_request(&payload, state.config.origin_policy.is_production),
     );
     let host_player = SessionPlayer {
         id: player_id.clone(),
@@ -78,45 +176,38 @@ pub(crate) async fn create_workshop(
     };
     session.add_player(host_player.clone());
 
-    if let Err(error) = state.store.save_session(&session).await {
-        return internal_join_error(format!("failed to save session: {error}"));
-    }
+    let identity = persistence::PlayerIdentity {
+        session_id: session.id.to_string(),
+        player_id: player_id.clone(),
+        reconnect_token: reconnect_token.clone(),
+        created_at: timestamp.to_rfc3339(),
+        last_seen_at: timestamp.to_rfc3339(),
+    };
+    let artifact = SessionArtifactRecord {
+        id: random_prefixed_id("artifact"),
+        session_id: session.id.to_string(),
+        phase: protocol::Phase::Lobby,
+        step: 0,
+        kind: SessionArtifactKind::SessionCreated,
+        player_id: Some(player_id.clone()),
+        created_at: timestamp.to_rfc3339(),
+        payload: json!({
+            "sessionCode": session_code,
+            "hostName": normalized_name,
+            "phase0Minutes": session.config.phase0_minutes,
+            "phase1Minutes": session.config.phase1_minutes,
+            "phase2Minutes": session.config.phase2_minutes,
+            "hasImageGeneratorToken": session.config.image_generator_token.is_some(),
+            "hasJudgeToken": session.config.judge_token.is_some(),
+        }),
+    };
+
     if let Err(error) = state
         .store
-        .create_player_identity(&persistence::PlayerIdentity {
-            session_id: session.id.to_string(),
-            player_id: player_id.clone(),
-            reconnect_token: reconnect_token.clone(),
-            created_at: timestamp.to_rfc3339(),
-            last_seen_at: timestamp.to_rfc3339(),
-        })
+        .save_session_with_identity_and_artifact(&session, &identity, &artifact)
         .await
     {
-        return internal_join_error(format!("failed to save player identity: {error}"));
-    }
-    if let Err(error) = state
-        .store
-        .append_session_artifact(&SessionArtifactRecord {
-            id: random_prefixed_id("artifact"),
-            session_id: session.id.to_string(),
-            phase: protocol::Phase::Lobby,
-            step: 0,
-            kind: SessionArtifactKind::SessionCreated,
-            player_id: Some(player_id.clone()),
-            created_at: timestamp.to_rfc3339(),
-            payload: json!({
-                "sessionCode": session_code,
-                "hostName": normalized_name,
-                "phase0Minutes": session.config.phase0_minutes,
-                "phase1Minutes": session.config.phase1_minutes,
-                "phase2Minutes": session.config.phase2_minutes,
-                "hasImageGeneratorToken": session.config.image_generator_token.is_some(),
-                "hasJudgeToken": session.config.judge_token.is_some(),
-            }),
-        })
-        .await
-    {
-        return internal_join_error(format!("failed to append session artifact: {error}"));
+        return internal_join_error(format!("failed to persist workshop creation: {error}"));
     }
 
     let response = WorkshopJoinSuccess {
@@ -139,15 +230,15 @@ pub(crate) async fn create_workshop(
 
 pub(crate) async fn join_workshop(
     State(state): State<AppState>,
+    connect_info: MaybeConnectInfo,
     headers: HeaderMap,
     Json(payload): Json<JoinWorkshopRequest>,
 ) -> (StatusCode, Json<WorkshopJoinResult>) {
     if let Some(response) = reject_disallowed_origin(&headers, &state.config.origin_policy) {
         return response;
     }
-    if let Some(response) =
-        reject_rate_limited(&state.join_limiter, client_key_from_headers(&headers)).await
-    {
+    let client_key = client_key(&state, connect_info, &headers);
+    if let Some(response) = reject_rate_limited(&state.join_limiter, &client_key).await {
         return response;
     }
     let session_code = payload.session_code.trim();
@@ -164,9 +255,7 @@ pub(crate) async fn join_workshop(
         .map(str::trim)
         .filter(|value| !value.is_empty())
     {
-        let identity = match state
-            .store
-            .find_player_identity(session_code, reconnect_token)
+        let identity = match authorize_reconnect_identity(&state, session_code, reconnect_token)
             .await
         {
             Ok(Some(identity)) => identity,
@@ -176,13 +265,23 @@ pub(crate) async fn join_workshop(
             }
         };
 
-        let write_lock = session_write_lock(&state, session_code).await;
-        let _write_guard = write_lock.lock().await;
+        let (_, _write_guard, write_lease) = match SessionWriteLease::acquire(&state, session_code).await {
+            Ok(guard) => guard,
+            Err(error) => {
+                return internal_join_error(format!("failed to acquire session lease: {error}"));
+            }
+        };
+        if let Err(error) = write_lease.ensure_active() {
+            return internal_join_error(format!("lost session lease before reconnect load: {error}"));
+        }
 
-        match ensure_session_cached(&state, session_code).await {
+        match reload_cached_session(&state, session_code).await {
             Ok(true) => {}
             Ok(false) => return bad_join_request("Workshop not found."),
             Err(error) => return internal_join_error(format!("failed to load session: {error}")),
+        }
+        if let Err(error) = write_lease.ensure_active() {
+            return internal_join_error(format!("lost session lease before reconnect mutation: {error}"));
         }
 
         let timestamp = Utc::now();
@@ -201,19 +300,23 @@ pub(crate) async fn join_workshop(
             (session_before, session.clone())
         };
 
-        if let Err(error) = state.store.save_session(&session_clone).await {
-            let mut sessions = state.sessions.lock().await;
-            sessions.insert(session_code.to_string(), session_before);
-            return internal_join_error(format!("failed to save session: {error}"));
-        }
-        if let Err(error) = state
-            .store
-            .touch_player_identity(reconnect_token, &timestamp.to_rfc3339())
-            .await
-        {
-            return internal_join_error(format!("failed to touch player identity: {error}"));
-        }
-        if let Err(error) = state.store.append_session_artifact(&SessionArtifactRecord {
+        let next_reconnect_token =
+            rotate_reconnect_identity(&state, &identity, reconnect_token, timestamp)
+                .await
+                .map_err(|error| {
+                    internal_join_error(format!("failed to rotate player identity: {error}"))
+                });
+        let Ok(next_reconnect_token) = next_reconnect_token else {
+            return next_reconnect_token.err().expect("identity rotation error");
+        };
+        let next_identity = persistence::PlayerIdentity {
+            session_id: identity.session_id.clone(),
+            player_id: identity.player_id.clone(),
+            reconnect_token: next_reconnect_token.clone(),
+            created_at: timestamp.to_rfc3339(),
+            last_seen_at: timestamp.to_rfc3339(),
+        };
+        let reconnect_artifact = SessionArtifactRecord {
             id: random_prefixed_id("artifact"),
             session_id: session_clone.id.to_string(),
             phase: session_clone.phase,
@@ -228,17 +331,34 @@ pub(crate) async fn join_workshop(
             player_id: Some(identity.player_id.clone()),
             created_at: timestamp.to_rfc3339(),
             payload: json!({ "sessionCode": session_code, "playerId": identity.player_id.clone() }),
-        }).await {
-            return internal_join_error(format!("failed to append session artifact: {error}"));
+        };
+
+        if let Err(error) = write_lease.ensure_active() {
+            let mut sessions = state.sessions.lock().await;
+            sessions.insert(session_code.to_string(), session_before);
+            return internal_join_error(format!("lost session lease before reconnect persist: {error}"));
         }
 
-        drop(_write_guard);
+        if let Err(error) = state
+            .store
+            .replace_player_identity_and_save_session_with_artifact(
+                reconnect_token,
+                &next_identity,
+                &session_clone,
+                &reconnect_artifact,
+            )
+            .await
+        {
+            let mut sessions = state.sessions.lock().await;
+            sessions.insert(session_code.to_string(), session_before);
+            return internal_join_error(format!("failed to persist reconnect: {error}"));
+        }
 
         let response = WorkshopJoinSuccess {
             ok: true,
             session_code: session_clone.code.0.clone(),
             player_id: identity.player_id.clone(),
-            reconnect_token: reconnect_token.to_string(),
+            reconnect_token: next_reconnect_token,
             coordinator_type: CoordinatorType::Rust,
             state: to_client_game_state(&session_clone, &identity.player_id),
         };
@@ -253,13 +373,23 @@ pub(crate) async fn join_workshop(
         return bad_join_request("Please enter a player name.");
     }
 
-    let write_lock = session_write_lock(&state, session_code).await;
-    let _write_guard = write_lock.lock().await;
+    let (_, _write_guard, write_lease) = match SessionWriteLease::acquire(&state, session_code).await {
+        Ok(guard) => guard,
+        Err(error) => {
+            return internal_join_error(format!("failed to acquire session lease: {error}"));
+        }
+    };
+    if let Err(error) = write_lease.ensure_active() {
+        return internal_join_error(format!("lost session lease before join load: {error}"));
+    }
 
-    match ensure_session_cached(&state, session_code).await {
+    match reload_cached_session(&state, session_code).await {
         Ok(true) => {}
         Ok(false) => return bad_join_request("Workshop not found."),
         Err(error) => return internal_join_error(format!("failed to load session: {error}")),
+    }
+    if let Err(error) = write_lease.ensure_active() {
+        return internal_join_error(format!("lost session lease before join mutation: {error}"));
     }
 
     let (session_before, session_clone, player_id, reconnect_token) = {
@@ -301,42 +431,37 @@ pub(crate) async fn join_workshop(
     };
 
     let timestamp = Utc::now();
-    if let Err(error) = state.store.save_session(&session_clone).await {
+    let identity = persistence::PlayerIdentity {
+        session_id: session_clone.id.to_string(),
+        player_id: player_id.clone(),
+        reconnect_token: reconnect_token.clone(),
+        created_at: timestamp.to_rfc3339(),
+        last_seen_at: timestamp.to_rfc3339(),
+    };
+    let join_artifact = SessionArtifactRecord {
+        id: random_prefixed_id("artifact"),
+        session_id: session_clone.id.to_string(),
+        phase: protocol::Phase::Lobby,
+        step: 0,
+        kind: SessionArtifactKind::PlayerJoined,
+        player_id: Some(player_id.clone()),
+        created_at: timestamp.to_rfc3339(),
+        payload: json!({ "sessionCode": session_code, "playerName": normalized_name }),
+    };
+    if let Err(error) = write_lease.ensure_active() {
         let mut sessions = state.sessions.lock().await;
         sessions.insert(session_code.to_string(), session_before);
-        return internal_join_error(format!("failed to save session: {error}"));
+        return internal_join_error(format!("lost session lease before join persist: {error}"));
     }
     if let Err(error) = state
         .store
-        .create_player_identity(&persistence::PlayerIdentity {
-            session_id: session_clone.id.to_string(),
-            player_id: player_id.clone(),
-            reconnect_token: reconnect_token.clone(),
-            created_at: timestamp.to_rfc3339(),
-            last_seen_at: timestamp.to_rfc3339(),
-        })
+        .save_session_with_identity_and_artifact(&session_clone, &identity, &join_artifact)
         .await
     {
-        return internal_join_error(format!("failed to save player identity: {error}"));
+        let mut sessions = state.sessions.lock().await;
+        sessions.insert(session_code.to_string(), session_before);
+        return internal_join_error(format!("failed to persist join: {error}"));
     }
-    if let Err(error) = state
-        .store
-        .append_session_artifact(&SessionArtifactRecord {
-            id: random_prefixed_id("artifact"),
-            session_id: session_clone.id.to_string(),
-            phase: protocol::Phase::Lobby,
-            step: 0,
-            kind: SessionArtifactKind::PlayerJoined,
-            player_id: Some(player_id.clone()),
-            created_at: timestamp.to_rfc3339(),
-            payload: json!({ "sessionCode": session_code, "playerName": normalized_name }),
-        })
-        .await
-    {
-        return internal_join_error(format!("failed to append session artifact: {error}"));
-    }
-
-    drop(_write_guard);
 
     let response = WorkshopJoinSuccess {
         ok: true,
@@ -354,12 +479,17 @@ pub(crate) async fn join_workshop(
 
 pub(crate) async fn workshop_command(
     State(state): State<AppState>,
+    connect_info: MaybeConnectInfo,
     headers: HeaderMap,
     Json(request): Json<WorkshopCommandRequest>,
 ) -> (StatusCode, Json<WorkshopCommandResult>) {
     if let Some(response) = reject_disallowed_command_origin(&headers, &state.config.origin_policy)
     {
         return response;
+    }
+    let client_key = client_key(&state, connect_info, &headers);
+    if is_rate_limited(&state.command_limiter, &client_key).await {
+        return too_many_command_requests();
     }
 
     let session_code = request.session_code.trim();
@@ -371,23 +501,33 @@ pub(crate) async fn workshop_command(
         return bad_command_request("Missing workshop credentials.");
     }
 
-    let identity = match state
-        .store
-        .find_player_identity(session_code, reconnect_token)
-        .await
-    {
+    let identity = match authorize_reconnect_identity(&state, session_code, reconnect_token).await {
         Ok(Some(identity)) => identity,
         Ok(None) => return bad_command_request("Session identity is invalid or expired."),
         Err(error) => return internal_command_error(format!("failed to lookup identity: {error}")),
     };
 
-    let write_lock = session_write_lock(&state, session_code).await;
-    let _write_guard = write_lock.lock().await;
+    if let Err(error) = refresh_reconnect_identity(&state, reconnect_token, Utc::now()).await {
+        return internal_command_error(format!("failed to touch player identity: {error}"));
+    }
 
-    match ensure_session_cached(&state, session_code).await {
+    let (_, _write_guard, write_lease) = match SessionWriteLease::acquire(&state, session_code).await {
+        Ok(guard) => guard,
+        Err(error) => {
+            return internal_command_error(format!("failed to acquire session lease: {error}"));
+        }
+    };
+    if let Err(error) = write_lease.ensure_active() {
+        return internal_command_error(format!("lost session lease before command load: {error}"));
+    }
+
+    match reload_cached_session(&state, session_code).await {
         Ok(true) => {}
         Ok(false) => return bad_command_request("Workshop not found."),
         Err(error) => return internal_command_error(format!("failed to load session: {error}")),
+    }
+    if let Err(error) = write_lease.ensure_active() {
+        return internal_command_error(format!("lost session lease before command mutation: {error}"));
     }
 
     let (response, should_broadcast, session_before, session_to_persist, artifact_to_append) = {
@@ -804,23 +944,46 @@ pub(crate) async fn workshop_command(
         )
     };
 
-    if let Some(session) = session_to_persist.as_ref() {
-        if let Err(error) = state.store.save_session(session).await {
-            let mut sessions = state.sessions.lock().await;
-            sessions.insert(session_code.to_string(), session_before);
-            return internal_command_error(format!("failed to save session: {error}"));
-        }
+    if session_to_persist.is_some() && artifact_to_append.is_none() {
+        let mut sessions = state.sessions.lock().await;
+        sessions.insert(session_code.to_string(), session_before);
+        return internal_command_error(
+            "session command mutated state without an artifact".to_string(),
+        );
     }
 
-    if let Some(artifact) = artifact_to_append.as_ref() {
-        if let Err(error) = state.store.append_session_artifact(artifact).await {
-            let mut sessions = state.sessions.lock().await;
-            sessions.insert(session_code.to_string(), session_before);
-            return internal_command_error(format!("failed to append session artifact: {error}"));
-        }
+    if session_to_persist.is_none() && artifact_to_append.is_some() {
+        let mut sessions = state.sessions.lock().await;
+        sessions.insert(session_code.to_string(), session_before);
+        return internal_command_error(
+            "session command emitted an artifact without session state".to_string(),
+        );
     }
 
-    drop(_write_guard);
+    match (session_to_persist.as_ref(), artifact_to_append.as_ref()) {
+        (Some(session), Some(artifact)) => {
+            if let Err(error) = write_lease.ensure_active() {
+                let mut sessions = state.sessions.lock().await;
+                sessions.insert(session_code.to_string(), session_before);
+                return internal_command_error(format!(
+                    "lost session lease before command persist: {error}"
+                ));
+            }
+            if let Err(error) = state
+                .store
+                .save_session_with_artifact(session, artifact)
+                .await
+            {
+                let mut sessions = state.sessions.lock().await;
+                sessions.insert(session_code.to_string(), session_before);
+                return internal_command_error(format!(
+                    "failed to persist session command: {error}"
+                ));
+            }
+        }
+        (None, None) => {}
+        _ => unreachable!("checked command persistence invariants above"),
+    }
 
     if should_broadcast {
         broadcast_session_state(&state, session_code, None).await;
@@ -864,17 +1027,17 @@ pub(crate) async fn workshop_judge_bundle(
         session.clone()
     };
 
-    let identity = match state
-        .store
-        .find_player_identity(session_code, reconnect_token)
-        .await
-    {
+    let identity = match authorize_reconnect_identity(&state, session_code, reconnect_token).await {
         Ok(Some(identity)) => identity,
         Ok(None) => return bad_judge_bundle_request("Session identity is invalid or expired."),
         Err(error) => {
             return internal_judge_bundle_error(format!("failed to lookup identity: {error}"));
         }
     };
+
+    if let Err(error) = refresh_reconnect_identity(&state, reconnect_token, Utc::now()).await {
+        return internal_judge_bundle_error(format!("failed to touch player identity: {error}"));
+    }
 
     let artifacts = match state
         .store
@@ -919,39 +1082,25 @@ pub(crate) async fn workshop_judge_bundle(
     )
 }
 
-pub(crate) async fn ready(State(state): State<AppState>) -> Json<serde_json::Value> {
+pub(crate) async fn ready(State(state): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
     let store_healthy = state.store.health_check().await.unwrap_or(false);
+    let status = if store_healthy {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
 
-    Json(json!({
-        "ok": store_healthy,
-        "service": "app-server",
-        "status": if store_healthy { "ready" } else { "degraded" },
-        "checks": {
-            "store": store_healthy
-        }
-    }))
-}
-
-pub(crate) async fn runtime_snapshot(State(state): State<AppState>) -> Json<RuntimeSnapshot> {
-    let active_realtime_sessions = state.realtime.lock().await.total_connection_count();
-    let allowed_origins = state
-        .config
-        .origin_policy
-        .allowed_origins
-        .iter()
-        .cloned()
-        .collect::<Vec<_>>();
-
-    Json(RuntimeSnapshot {
-        bind_addr: state.config.bind_addr.to_string(),
-        is_production: state.config.is_production,
-        rust_session_code_prefix: state.config.rust_session_code_prefix.clone(),
-        persistence_backend: state.config.persistence_backend.clone(),
-        allow_any_origin: state.config.origin_policy.allow_any_origin,
-        require_origin: state.config.origin_policy.require_origin,
-        allowed_origins,
-        active_realtime_sessions,
-    })
+    (
+        status,
+        Json(json!({
+            "ok": store_healthy,
+            "service": "app-server",
+            "status": if store_healthy { "ready" } else { "degraded" },
+            "checks": {
+                "store": store_healthy
+            }
+        })),
+    )
 }
 
 fn internal_join_error(message: String) -> (StatusCode, Json<WorkshopJoinResult>) {
@@ -1096,10 +1245,9 @@ fn reject_disallowed_judge_bundle_origin(
 
 async fn reject_rate_limited(
     limiter: &Arc<Mutex<FixedWindowRateLimiter>>,
-    client_key: String,
+    client_key: &str,
 ) -> Option<(StatusCode, Json<WorkshopJoinResult>)> {
-    let now_ms = Utc::now().timestamp_millis().max(0) as u64;
-    let decision = limiter.lock().await.consume(&client_key, now_ms);
+    let decision = consume_rate_limit(limiter, client_key).await;
     if decision.allowed {
         None
     } else {
@@ -1113,15 +1261,42 @@ async fn reject_rate_limited(
     }
 }
 
-fn client_key_from_headers(headers: &HeaderMap) -> String {
-    headers
-        .get("x-forwarded-for")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.split(',').next())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or("unknown")
-        .to_string()
+pub(crate) async fn is_rate_limited(
+    limiter: &Arc<Mutex<FixedWindowRateLimiter>>,
+    client_key: &str,
+) -> bool {
+    !consume_rate_limit(limiter, client_key).await.allowed
+}
+
+async fn consume_rate_limit(
+    limiter: &Arc<Mutex<FixedWindowRateLimiter>>,
+    client_key: &str,
+) -> security::RateLimitDecision {
+    let now_ms = Utc::now().timestamp_millis().max(0) as u64;
+    limiter.lock().await.consume(client_key, now_ms)
+}
+
+pub(crate) fn client_key(
+    state: &AppState,
+    connect_info: MaybeConnectInfo,
+    headers: &HeaderMap,
+) -> String {
+    if state.config.trust_forwarded_for {
+        if let Some(forwarded_for) = headers
+            .get("x-forwarded-for")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.split(',').next())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            return forwarded_for.to_string();
+        }
+    }
+
+    connect_info
+        .0
+        .map(|addr| addr.ip().to_string())
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
 fn successful_workshop_command(
@@ -1132,6 +1307,16 @@ fn successful_workshop_command(
         StatusCode::OK,
         Json(WorkshopCommandResult::Success(WorkshopCommandSuccess {
             ok: true,
+        })),
+    )
+}
+
+fn too_many_command_requests() -> (StatusCode, Json<WorkshopCommandResult>) {
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        Json(WorkshopCommandResult::Error(WorkshopError {
+            ok: false,
+            error: "Too many requests. Please slow down and try again.".to_string(),
         })),
     )
 }

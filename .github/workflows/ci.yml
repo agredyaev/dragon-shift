@@ -37,7 +37,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.94.1
         with:
           components: clippy,rustfmt
           targets: wasm32-unknown-unknown
@@ -55,10 +55,76 @@ jobs:
         run: cargo test --workspace
 
       - name: Install wasm-bindgen-cli
-        run: cargo install wasm-bindgen-cli --version 0.2.114 --locked
+        run: cargo install wasm-bindgen-cli --version 0.2.115 --locked
 
       - name: Build web bundle
         run: cargo run --locked -p xtask -- build-web --out-dir /tmp/app-web-dist
+
+  e2e-restart:
+    name: Browser restart reconnect proof
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: dragon_shift_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d dragon_shift_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.94.1
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            platform -> target
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: e2e/package-lock.json
+
+      - name: Install wasm-bindgen-cli
+        run: cargo install wasm-bindgen-cli --version 0.2.115 --locked
+        working-directory: platform
+
+      - name: Build app-web bundle
+        run: cargo run --locked -p xtask -- build-web --out-dir app-web/dist
+        working-directory: platform
+
+      - name: Build app-server
+        run: cargo build -p app-server
+        working-directory: platform
+
+      - name: Install e2e dependencies
+        run: npm ci
+        working-directory: e2e
+
+      - name: Install Playwright Chromium
+        run: npx playwright install --with-deps chromium
+        working-directory: e2e
+
+      - name: Run browser restart reconnect proof
+        run: npm run test:restart-local
+        working-directory: e2e
+        env:
+          TEST_DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/dragon_shift_test
+          TEST_DATABASE_SCHEMA: ci_e2e_restart
 
   helm:
     name: Helm chart
@@ -73,8 +139,8 @@ jobs:
       - name: Helm lint
         run: >-
           helm lint ./helm/dragon-shift
-          --set image.repository=ghcr.io/example/dragon-shift
-          --set image.tag=ci
+          --set image.repository=ghcr.io/example/dragon-switch
+          --set image.digest=sha256:1111111111111111111111111111111111111111111111111111111111111111
           --set app.allowedOrigins=https://dragon-shift.example.com
           --set app.viteAppUrl=https://dragon-shift.example.com
           --set database.existingSecretName=dragon-shift-app
@@ -83,8 +149,8 @@ jobs:
       - name: Helm template
         run: >-
           helm template dragon-shift ./helm/dragon-shift
-          --set image.repository=ghcr.io/example/dragon-shift
-          --set image.tag=ci
+          --set image.repository=ghcr.io/example/dragon-switch
+          --set image.digest=sha256:1111111111111111111111111111111111111111111111111111111111111111
           --set app.allowedOrigins=https://dragon-shift.example.com
           --set app.viteAppUrl=https://dragon-shift.example.com
           --set database.existingSecretName=dragon-shift-app

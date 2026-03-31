@@ -3,6 +3,7 @@ use crate::{
     cache::ensure_session_cached,
     helpers::{build_judge_action_traces, to_client_game_state},
     http::allocate_session_code,
+    handle_session_update_notification, parse_session_update_notification,
     ws::emit_phase_warning_notices,
 };
 use axum::{
@@ -10,20 +11,27 @@ use axum::{
     body::{Body, to_bytes},
     http::{HeaderValue, Request, StatusCode},
 };
-use chrono::Utc;
+use chrono::{Duration as ChronoDuration, Utc};
 use domain::{SessionCode, SessionPlayer, WorkshopSession};
 use futures_util::{SinkExt, StreamExt};
-use persistence::{InMemorySessionStore, PersistenceError, PlayerIdentityMatch, SessionStore};
+use persistence::{
+    InMemorySessionStore, PersistenceError, PlayerIdentityMatch, PostgresSessionStore,
+    RealtimeConnectionClaim, RealtimeConnectionRegistration, RealtimeConnectionRestore,
+    SessionStore,
+    SessionUpdateNotification,
+};
 use protocol::{
-    ClientWsMessage, CoordinatorType, DragonStats, NoticeLevel, ServerWsMessage,
-    SessionArtifactKind, SessionArtifactRecord, SessionCommand, SessionEnvelope,
+    ClientWsMessage, CoordinatorType, DragonStats, JoinWorkshopRequest, NoticeLevel,
+    ServerWsMessage, SessionArtifactKind, SessionArtifactRecord, SessionCommand, SessionEnvelope,
     WorkshopCommandRequest, WorkshopCommandResult, WorkshopJoinResult, WorkshopJudgeBundleResult,
 };
 use security::{DEFAULT_RUST_SESSION_CODE_PREFIX, OriginPolicyOptions, create_origin_policy};
+use sqlx::PgPool;
 use std::{
     future::Future,
     net::SocketAddr,
     pin::Pin,
+    process::Command,
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -37,14 +45,231 @@ use tokio_tungstenite::{
 use tower::util::ServiceExt;
 use uuid::Uuid;
 
+fn postgres_test_database_url() -> Option<String> {
+    std::env::var("TEST_DATABASE_URL").ok()
+}
+
+fn postgres_test_schema_prefix() -> String {
+    std::env::var("TEST_DATABASE_SCHEMA")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "app_server_itest".to_string())
+}
+
+fn sanitize_identifier(value: &str) -> String {
+    let sanitized = value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('_')
+        .to_string();
+
+    if sanitized.is_empty() {
+        "itest".to_string()
+    } else {
+        sanitized
+    }
+}
+
+fn postgres_test_schema_name(test_name: &str) -> String {
+    let prefix = sanitize_identifier(&postgres_test_schema_prefix());
+    let test_name = sanitize_identifier(test_name);
+    let suffix = Uuid::new_v4().simple().to_string();
+    let mut schema = format!("{}_{}_{}", prefix, test_name, &suffix[..12]);
+    schema.truncate(63);
+    schema
+}
+
+fn scoped_database_url(base_url: &str, schema: &str) -> String {
+    let separator = if base_url.contains('?') { '&' } else { '?' };
+    format!("{base_url}{separator}options=-csearch_path%3D{schema}")
+}
+
+async fn create_schema(base_url: &str, schema: &str) {
+    let pool = PgPool::connect(base_url)
+        .await
+        .expect("connect admin pool for schema creation");
+    sqlx::query(&format!("CREATE SCHEMA IF NOT EXISTS {schema}"))
+        .execute(&pool)
+        .await
+        .expect("create isolated test schema");
+    pool.close().await;
+}
+
+async fn drop_schema(base_url: &str, schema: &str) {
+    let pool = PgPool::connect(base_url)
+        .await
+        .expect("connect admin pool for schema cleanup");
+    sqlx::query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
+        .execute(&pool)
+        .await
+        .expect("drop isolated test schema");
+    pool.close().await;
+}
+
+struct PostgresAppTestStore {
+    container_name: Option<String>,
+    base_url: String,
+    schema: String,
+    store: Arc<PostgresSessionStore>,
+}
+
+impl PostgresAppTestStore {
+    async fn new(test_name: &str) -> Self {
+        let (container_name, url) = if let Some(url) = postgres_test_database_url() {
+            (None, url)
+        } else {
+            let container_name = format!("dragon-shift-pg-{}", Uuid::new_v4().simple());
+            let host_port = allocate_local_port().await;
+            let status = Command::new("docker")
+                .args([
+                    "run",
+                    "--rm",
+                    "-d",
+                    "--name",
+                    &container_name,
+                    "-e",
+                    "POSTGRES_PASSWORD=postgres",
+                    "-e",
+                    "POSTGRES_USER=postgres",
+                    "-e",
+                    "POSTGRES_DB=dragon_shift_test",
+                    "-p",
+                    &format!("{}:5432", host_port),
+                    "postgres:16-alpine",
+                ])
+                .status()
+                .expect("start ephemeral Postgres container");
+            assert!(status.success(), "docker run for Postgres test container failed");
+
+            let url = format!(
+                "postgres://postgres:postgres@127.0.0.1:{}/dragon_shift_test",
+                host_port
+            );
+            wait_for_postgres(&url).await;
+            (Some(container_name), url)
+        };
+        let schema = postgres_test_schema_name(test_name);
+        create_schema(&url, &schema).await;
+        let scoped_url = scoped_database_url(&url, &schema);
+        let store = Arc::new(
+            PostgresSessionStore::connect(&scoped_url, 10)
+                .await
+                .expect("connect postgres session store"),
+        );
+        store.init().await.expect("init postgres schema");
+        Self {
+            container_name,
+            base_url: url,
+            schema,
+            store,
+        }
+    }
+
+    async fn reconnect(&self) -> Arc<PostgresSessionStore> {
+        let scoped_url = scoped_database_url(&self.base_url, &self.schema);
+        let store = Arc::new(
+            PostgresSessionStore::connect(&scoped_url, 10)
+                .await
+                .expect("reconnect postgres session store"),
+        );
+        store.init().await.expect("re-init postgres schema");
+        store
+    }
+
+    fn scoped_database_url(&self) -> String {
+        scoped_database_url(&self.base_url, &self.schema)
+    }
+
+    async fn cleanup(self) {
+        let PostgresAppTestStore {
+            container_name,
+            base_url,
+            schema,
+            store,
+        } = self;
+        drop(store);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        drop_schema(&base_url, &schema).await;
+        if let Some(container_name) = container_name {
+            let status = Command::new("docker")
+                .args(["stop", &container_name])
+                .status()
+                .expect("stop ephemeral Postgres container");
+            assert!(status.success(), "docker stop for Postgres test container failed");
+        }
+    }
+}
+
+async fn allocate_local_port() -> u16 {
+    tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .await
+        .expect("bind ephemeral port")
+        .local_addr()
+        .expect("local addr")
+        .port()
+}
+
+async fn wait_for_postgres(database_url: &str) {
+    for _ in 0..60 {
+        if PgPool::connect(database_url).await.is_ok() {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    panic!("timed out waiting for ephemeral postgres");
+}
+
+struct ScopedEnvVar {
+    key: &'static str,
+    original: Option<String>,
+}
+
+impl ScopedEnvVar {
+    fn set(key: &'static str, value: &str) -> Self {
+        let original = std::env::var(key).ok();
+        unsafe {
+            std::env::set_var(key, value);
+        }
+        Self { key, original }
+    }
+}
+
+impl Drop for ScopedEnvVar {
+    fn drop(&mut self) {
+        if let Some(original) = &self.original {
+            unsafe {
+                std::env::set_var(self.key, original);
+            }
+        } else {
+            unsafe {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
+}
+
 #[derive(Default)]
 struct FaultyStore {
     inner: InMemorySessionStore,
+    fail_health_check: AtomicBool,
+    unhealthy_health_check: AtomicBool,
     fail_load_session_by_code: AtomicBool,
-    fail_save_session: AtomicBool,
     fail_touch_player_identity: AtomicBool,
     fail_create_player_identity: AtomicBool,
     fail_append_session_artifact: AtomicBool,
+    fail_save_session_with_artifact: AtomicBool,
+    fail_grouped_session_artifact_persist: AtomicBool,
+    fail_save_session_with_identity_and_artifact: AtomicBool,
+    fail_replace_player_identity_and_save_session_with_artifact: AtomicBool,
+    fail_renew_session_lease: AtomicBool,
+    fail_claim_realtime_connection: AtomicBool,
     load_session_by_code_calls: AtomicUsize,
 }
 
@@ -57,23 +282,40 @@ impl FaultyStore {
         self.fail_load_session_by_code.store(true, Ordering::SeqCst);
     }
 
-    fn fail_saves(&self) {
-        self.fail_save_session.store(true, Ordering::SeqCst);
+    fn fail_health_checks(&self) {
+        self.fail_health_check.store(true, Ordering::SeqCst);
     }
 
-    fn fail_touches(&self) {
-        self.fail_touch_player_identity
+    fn return_unhealthy_health_checks(&self) {
+        self.unhealthy_health_check.store(true, Ordering::SeqCst);
+    }
+
+    fn fail_save_with_artifact(&self) {
+        self.fail_save_session_with_artifact
             .store(true, Ordering::SeqCst);
     }
 
-    fn fail_identity_creates(&self) {
-        self.fail_create_player_identity
+    fn fail_grouped_session_artifact_persist(&self) {
+        self.fail_grouped_session_artifact_persist
             .store(true, Ordering::SeqCst);
     }
 
-    fn fail_artifact_appends(&self) {
-        self.fail_append_session_artifact
+    fn fail_save_with_identity_and_artifact(&self) {
+        self.fail_save_session_with_identity_and_artifact
             .store(true, Ordering::SeqCst);
+    }
+
+    fn fail_replace_identity_and_save_with_artifact(&self) {
+        self.fail_replace_player_identity_and_save_session_with_artifact
+            .store(true, Ordering::SeqCst);
+    }
+
+    fn fail_lease_renewal(&self) {
+        self.fail_renew_session_lease.store(true, Ordering::SeqCst);
+    }
+
+    fn fail_realtime_claims(&self) {
+        self.fail_claim_realtime_connection.store(true, Ordering::SeqCst);
     }
 
     fn load_calls(&self) -> usize {
@@ -89,6 +331,12 @@ impl SessionStore for FaultyStore {
     fn health_check(
         &self,
     ) -> Pin<Box<dyn Future<Output = Result<bool, PersistenceError>> + Send + '_>> {
+        if self.fail_health_check.load(Ordering::SeqCst) {
+            return Box::pin(async { Err(PersistenceError::LockPoisoned) });
+        }
+        if self.unhealthy_health_check.load(Ordering::SeqCst) {
+            return Box::pin(async { Ok(false) });
+        }
         self.inner.health_check()
     }
 
@@ -109,9 +357,6 @@ impl SessionStore for FaultyStore {
         &self,
         session: &WorkshopSession,
     ) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + '_>> {
-        if self.fail_save_session.load(Ordering::SeqCst) {
-            return Box::pin(async { Err(PersistenceError::LockPoisoned) });
-        }
         self.inner.save_session(session)
     }
 
@@ -173,6 +418,168 @@ impl SessionStore for FaultyStore {
     ) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + '_>> {
         self.inner.revoke_player_identity(reconnect_token)
     }
+
+    fn save_session_with_artifact(
+        &self,
+        session: &WorkshopSession,
+        artifact: &SessionArtifactRecord,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + '_>> {
+        if self.fail_save_session_with_artifact.load(Ordering::SeqCst)
+            || self
+                .fail_grouped_session_artifact_persist
+                .load(Ordering::SeqCst)
+        {
+            return Box::pin(async { Err(PersistenceError::LockPoisoned) });
+        }
+        self.inner.save_session_with_artifact(session, artifact)
+    }
+
+    fn save_session_with_identity_and_artifact(
+        &self,
+        session: &WorkshopSession,
+        identity: &persistence::PlayerIdentity,
+        artifact: &SessionArtifactRecord,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + '_>> {
+        if self
+            .fail_save_session_with_identity_and_artifact
+            .load(Ordering::SeqCst)
+        {
+            return Box::pin(async { Err(PersistenceError::LockPoisoned) });
+        }
+        self.inner
+            .save_session_with_identity_and_artifact(session, identity, artifact)
+    }
+
+    fn replace_player_identity_and_save_session_with_artifact(
+        &self,
+        previous_reconnect_token: &str,
+        next_identity: &persistence::PlayerIdentity,
+        session: &WorkshopSession,
+        artifact: &SessionArtifactRecord,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + '_>> {
+        if self
+            .fail_replace_player_identity_and_save_session_with_artifact
+            .load(Ordering::SeqCst)
+        {
+            return Box::pin(async { Err(PersistenceError::LockPoisoned) });
+        }
+        self.inner
+            .replace_player_identity_and_save_session_with_artifact(
+                previous_reconnect_token,
+                next_identity,
+                session,
+                artifact,
+            )
+    }
+
+    fn acquire_session_lease(
+        &self,
+        session_code: &str,
+        lease_id: &str,
+        expires_at: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, PersistenceError>> + Send + '_>> {
+        self.inner
+            .acquire_session_lease(session_code, lease_id, expires_at)
+    }
+
+    fn release_session_lease(
+        &self,
+        session_code: &str,
+        lease_id: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + '_>> {
+        self.inner.release_session_lease(session_code, lease_id)
+    }
+
+    fn renew_session_lease(
+        &self,
+        session_code: &str,
+        lease_id: &str,
+        expires_at: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, PersistenceError>> + Send + '_>> {
+        if self.fail_renew_session_lease.load(Ordering::SeqCst) {
+            return Box::pin(async { Err(PersistenceError::LockPoisoned) });
+        }
+        self.inner
+            .renew_session_lease(session_code, lease_id, expires_at)
+    }
+
+    fn renew_realtime_connection(
+        &self,
+        connection_id: &str,
+        replica_id: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, PersistenceError>> + Send + '_>> {
+        self.inner
+            .renew_realtime_connection(connection_id, replica_id)
+    }
+
+    fn claim_realtime_connection(
+        &self,
+        registration: &RealtimeConnectionRegistration,
+    ) -> Pin<Box<dyn Future<Output = Result<RealtimeConnectionClaim, PersistenceError>> + Send + '_>>
+    {
+        if self.fail_claim_realtime_connection.load(Ordering::SeqCst) {
+            return Box::pin(async { Err(PersistenceError::LockPoisoned) });
+        }
+        self.inner.claim_realtime_connection(registration)
+    }
+
+    fn restore_realtime_connection(
+        &self,
+        registration: &RealtimeConnectionRegistration,
+    ) -> Pin<Box<dyn Future<Output = Result<RealtimeConnectionRestore, PersistenceError>> + Send + '_>>
+    {
+        self.inner.restore_realtime_connection(registration)
+    }
+
+    fn release_realtime_connection(
+        &self,
+        connection_id: &str,
+        replica_id: &str,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Option<RealtimeConnectionRegistration>, PersistenceError>>
+                + Send
+                + '_,
+        >,
+    > {
+        self.inner
+            .release_realtime_connection(connection_id, replica_id)
+    }
+
+    fn take_retired_realtime_connection(
+        &self,
+        connection_id: &str,
+        replica_id: &str,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Option<RealtimeConnectionRegistration>, PersistenceError>>
+                + Send
+                + '_,
+        >,
+    > {
+        self.inner
+            .take_retired_realtime_connection(connection_id, replica_id)
+    }
+
+    fn list_realtime_connections(
+        &self,
+        session_code: &str,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Vec<RealtimeConnectionRegistration>, PersistenceError>>
+                + Send
+                + '_,
+        >,
+    > {
+        self.inner.list_realtime_connections(session_code)
+    }
+
+    fn publish_session_notification(
+        &self,
+        notification: &SessionUpdateNotification,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + '_>> {
+        self.inner.publish_session_notification(notification)
+    }
 }
 
 fn session_player(id: &str, name: &str, joined_at_seconds: i64) -> SessionPlayer {
@@ -202,6 +609,22 @@ fn create_workshop_body(name: &str) -> String {
     .to_string()
 }
 
+fn create_workshop_body_with_tokens(name: &str) -> String {
+    serde_json::json!({
+        "name": name,
+        "config": {
+            "phase0Minutes": 5,
+            "phase1Minutes": 10,
+            "phase2Minutes": 10,
+            "imageGeneratorToken": "img-secret",
+            "imageGeneratorModel": "gemini-image",
+            "judgeToken": "judge-secret",
+            "judgeModel": "gemini-judge"
+        }
+    })
+    .to_string()
+}
+
 fn test_state() -> AppState {
     test_state_with_limits(20, 40)
 }
@@ -209,8 +632,14 @@ fn test_state() -> AppState {
 fn test_state_with_limits(create_limit: u32, join_limit: u32) -> AppState {
     let config = Arc::new(AppConfig {
         bind_addr: SocketAddr::from(([127, 0, 0, 1], 4100)),
-        is_production: false,
         rust_session_code_prefix: DEFAULT_RUST_SESSION_CODE_PREFIX.to_string(),
+        trust_forwarded_for: false,
+        create_rate_limit: create_limit,
+        join_rate_limit: join_limit,
+        command_rate_limit: 120,
+        websocket_rate_limit: 300,
+        reconnect_token_ttl: std::time::Duration::from_secs(60 * 60 * 12),
+        database_pool_size: 10,
         origin_policy: create_origin_policy(OriginPolicyOptions {
             allowed_origins: Some("http://localhost:5173"),
             app_origin: None,
@@ -219,15 +648,9 @@ fn test_state_with_limits(create_limit: u32, join_limit: u32) -> AppState {
         .expect("create origin policy"),
         static_assets_dir: std::env::temp_dir().join("dragon-shift-test-static-missing"),
         database_url: None,
-        persistence_backend: "memory".to_string(),
     });
 
-    AppState::new(
-        config,
-        Arc::new(InMemorySessionStore::new()),
-        create_limit,
-        join_limit,
-    )
+    AppState::new(config, Arc::new(InMemorySessionStore::new()))
 }
 
 async fn spawn_test_server(app: Router) -> (SocketAddr, tokio::task::JoinHandle<()>) {
@@ -236,7 +659,12 @@ async fn spawn_test_server(app: Router) -> (SocketAddr, tokio::task::JoinHandle<
         .expect("bind test listener");
     let addr = listener.local_addr().expect("listener addr");
     let handle = tokio::spawn(async move {
-        axum::serve(listener, app).await.expect("serve test app");
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .expect("serve test app");
     });
     (addr, handle)
 }
@@ -316,13 +744,6 @@ async fn send_raw_ws_message(stream: &mut tokio::net::TcpStream, message: &Clien
     stream.flush().await.expect("flush websocket frame");
 }
 
-async fn send_attach_and_reset_connection(addr: SocketAddr, message: &ClientWsMessage) {
-    let mut stream = connect_raw_ws(addr).await;
-    send_raw_ws_message(&mut stream, message).await;
-    let _ = stream.shutdown().await;
-    drop(stream);
-}
-
 fn test_state_with_static_assets() -> AppState {
     let static_assets_dir =
         std::env::temp_dir().join(format!("dragon-shift-test-static-{}", Uuid::new_v4()));
@@ -362,6 +783,162 @@ async fn live_endpoint_returns_ok() {
     let json: serde_json::Value = serde_json::from_slice(&body).expect("parse live json");
     assert_eq!(json["status"], "live");
     assert_eq!(json["ok"], true);
+}
+
+#[tokio::test]
+async fn ready_endpoint_returns_ok_when_store_is_healthy() {
+    let app = build_app(test_state());
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/ready")
+                .body(Body::empty())
+                .expect("build request"),
+        )
+        .await
+        .expect("call ready endpoint");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read ready body");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("parse ready json");
+    assert_eq!(json["ok"], true);
+    assert_eq!(json["service"], "app-server");
+    assert_eq!(json["status"], "ready");
+    assert_eq!(json["checks"]["store"], true);
+}
+
+#[test]
+fn load_config_parses_trust_x_forwarded_for() {
+    let _bind = ScopedEnvVar::set("APP_SERVER_BIND_ADDR", "127.0.0.1:4100");
+    let _app_url = ScopedEnvVar::set("VITE_APP_URL", "http://127.0.0.1:4100");
+    let _origins = ScopedEnvVar::set("ALLOWED_ORIGINS", "http://127.0.0.1:4100");
+    let _trust = ScopedEnvVar::set("TRUST_X_FORWARDED_FOR", "true");
+    let _node_env = ScopedEnvVar::set("NODE_ENV", "development");
+    let _database = ScopedEnvVar::set("DATABASE_URL", "postgres://user:pass@localhost:5432/db");
+
+    let config = crate::app::load_config().expect("load config");
+
+    assert!(config.trust_forwarded_for);
+}
+
+#[test]
+fn load_config_parses_database_pool_size() {
+    let _bind = ScopedEnvVar::set("APP_SERVER_BIND_ADDR", "127.0.0.1:4100");
+    let _app_url = ScopedEnvVar::set("VITE_APP_URL", "http://127.0.0.1:4100");
+    let _origins = ScopedEnvVar::set("ALLOWED_ORIGINS", "http://127.0.0.1:4100");
+    let _node_env = ScopedEnvVar::set("NODE_ENV", "development");
+    let _database = ScopedEnvVar::set("DATABASE_URL", "postgres://user:pass@localhost:5432/db");
+    let _pool = ScopedEnvVar::set("DATABASE_POOL_SIZE", "17");
+
+    let config = crate::app::load_config().expect("load config");
+
+    assert_eq!(config.database_pool_size, 17);
+}
+
+#[test]
+fn load_config_parses_rate_limits() {
+    let _bind = ScopedEnvVar::set("APP_SERVER_BIND_ADDR", "127.0.0.1:4100");
+    let _app_url = ScopedEnvVar::set("VITE_APP_URL", "http://127.0.0.1:4100");
+    let _origins = ScopedEnvVar::set("ALLOWED_ORIGINS", "http://127.0.0.1:4100");
+    let _node_env = ScopedEnvVar::set("NODE_ENV", "development");
+    let _database = ScopedEnvVar::set("DATABASE_URL", "postgres://user:pass@localhost:5432/db");
+    let _create_limit = ScopedEnvVar::set("CREATE_RATE_LIMIT_MAX", "11");
+    let _join_limit = ScopedEnvVar::set("JOIN_RATE_LIMIT_MAX", "22");
+    let _command_limit = ScopedEnvVar::set("COMMAND_RATE_LIMIT_MAX", "33");
+    let _websocket_limit = ScopedEnvVar::set("WEBSOCKET_RATE_LIMIT_MAX", "44");
+
+    let config = crate::app::load_config().expect("load config");
+
+    assert_eq!(config.create_rate_limit, 11);
+    assert_eq!(config.join_rate_limit, 22);
+    assert_eq!(config.command_rate_limit, 33);
+    assert_eq!(config.websocket_rate_limit, 44);
+}
+
+#[tokio::test]
+async fn ready_endpoint_returns_service_unavailable_when_store_is_degraded() {
+    let store = Arc::new(FaultyStore::new());
+    store.fail_health_checks();
+    let app = build_app(test_state_with_store(store));
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/ready")
+                .body(Body::empty())
+                .expect("build request"),
+        )
+        .await
+        .expect("call ready endpoint");
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read ready body");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("parse ready json");
+    assert_eq!(json["ok"], false);
+    assert_eq!(json["service"], "app-server");
+    assert_eq!(json["status"], "degraded");
+    assert_eq!(json["checks"]["store"], false);
+}
+
+#[tokio::test]
+async fn ready_endpoint_returns_service_unavailable_when_store_reports_unhealthy() {
+    let store = Arc::new(FaultyStore::new());
+    store.return_unhealthy_health_checks();
+    let app = build_app(test_state_with_store(store));
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/ready")
+                .body(Body::empty())
+                .expect("build request"),
+        )
+        .await
+        .expect("call ready endpoint");
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read ready body");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("parse ready json");
+    assert_eq!(json["ok"], false);
+    assert_eq!(json["service"], "app-server");
+    assert_eq!(json["status"], "degraded");
+    assert_eq!(json["checks"]["store"], false);
+}
+
+#[tokio::test]
+async fn runtime_endpoint_is_absent_for_get_and_post() {
+    let get_response = build_app(test_state_with_static_assets())
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/runtime")
+                .body(Body::empty())
+                .expect("build request"),
+        )
+        .await
+        .expect("call runtime endpoint with GET");
+
+    assert_eq!(get_response.status(), StatusCode::NOT_FOUND);
+
+    let post_response = build_app(test_state_with_static_assets())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/runtime")
+                .body(Body::empty())
+                .expect("build request"),
+        )
+        .await
+        .expect("call runtime endpoint with POST");
+
+    assert_eq!(post_response.status(), StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
@@ -407,7 +984,7 @@ async fn join_workshop_returns_internal_error_when_cache_load_fails() {
 }
 
 #[tokio::test]
-async fn workshop_command_does_not_leave_mutated_cache_when_save_fails() {
+async fn workshop_command_does_not_leave_mutated_cache_when_persisted_command_write_fails() {
     let store = Arc::new(FaultyStore::new());
     let state = test_state_with_store(store.clone());
     let session_code = "123456";
@@ -455,7 +1032,7 @@ async fn workshop_command_does_not_leave_mutated_cache_when_save_fails() {
         .lock()
         .await
         .insert(session_code.to_string(), session.clone());
-    store.fail_saves();
+    store.fail_save_with_artifact();
 
     let app = build_app(state.clone());
     let response = app
@@ -615,6 +1192,53 @@ async fn ensure_session_cached_deduplicates_concurrent_loads() {
 }
 
 #[tokio::test]
+async fn ensure_session_cached_clears_restored_transient_connectivity() {
+    let state = test_state();
+    let session_code = "123456";
+    let timestamp = Utc::now();
+
+    let mut session = WorkshopSession::new(
+        Uuid::new_v4(),
+        SessionCode(session_code.into()),
+        timestamp,
+        protocol::WorkshopCreateConfig::default(),
+    );
+    session.add_player(SessionPlayer {
+        id: "player-1".to_string(),
+        name: "Alice".to_string(),
+        pet_description: Some("Alice's workshop dragon".to_string()),
+        is_host: true,
+        is_connected: true,
+        is_ready: false,
+        score: 0,
+        current_dragon_id: None,
+        achievements: Vec::new(),
+        joined_at: timestamp,
+    });
+    session.host_player_id = Some("player-1".to_string());
+    state
+        .store
+        .save_session(&session)
+        .await
+        .expect("seed persisted session");
+
+    assert!(
+        ensure_session_cached(&state, session_code)
+            .await
+            .expect("load session")
+    );
+
+    let sessions = state.sessions.lock().await;
+    let restored = sessions.get(session_code).expect("restored session");
+    let player = restored.players.get("player-1").expect("restored player");
+    assert!(player.is_host);
+    assert!(
+        !player.is_connected,
+        "restored cache should treat persisted connectivity as transient"
+    );
+}
+
+#[tokio::test]
 async fn workshop_command_pushes_state_update_to_attached_websocket() {
     let state = test_state();
     let app = build_app(state.clone());
@@ -714,6 +1338,863 @@ async fn workshop_command_pushes_state_update_to_attached_websocket() {
 }
 
 #[tokio::test]
+async fn session_update_notification_skip_does_not_evict_cache_or_broadcast() {
+    let state = test_state();
+    let timestamp = Utc::now();
+    let mut session = WorkshopSession::new(
+        Uuid::new_v4(),
+        SessionCode("123456".into()),
+        timestamp,
+        protocol::WorkshopCreateConfig::default(),
+    );
+    session.add_player(SessionPlayer {
+        id: "player-1".to_string(),
+        name: "Alice".to_string(),
+        pet_description: Some("Alice's workshop dragon".to_string()),
+        is_host: true,
+        is_connected: true,
+        is_ready: false,
+        score: 0,
+        current_dragon_id: None,
+        achievements: Vec::new(),
+        joined_at: timestamp,
+    });
+
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(session.code.0.clone(), session.clone());
+
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+    state
+        .realtime
+        .lock()
+        .await
+        .attach(&session.code.0, "player-1", "conn-1");
+    state
+        .realtime_senders
+        .lock()
+        .await
+        .insert("conn-1".to_string(), sender);
+
+    let notification = parse_session_update_notification(
+        &SessionUpdateNotification::session_state_changed(&session)
+            .to_payload()
+            .expect("serialize typed notification"),
+    )
+    .expect("parse notification");
+
+    handle_session_update_notification(&state, &notification).await;
+
+    assert!(
+        state.sessions.lock().await.contains_key("123456"),
+        "matching updated_at should preserve cached session"
+    );
+    assert!(receiver.try_recv().is_err(), "skip path should not broadcast");
+}
+
+#[tokio::test]
+async fn session_update_notification_same_timestamp_different_payload_evicts_cache() {
+    let state = test_state();
+    let timestamp = Utc::now();
+    let mut lower_order = WorkshopSession::new(
+        Uuid::new_v4(),
+        SessionCode("123456".into()),
+        timestamp,
+        protocol::WorkshopCreateConfig::default(),
+    );
+    lower_order.host_player_id = Some("host-a".to_string());
+    lower_order.updated_at = timestamp;
+
+    let mut higher_order = lower_order.clone();
+    higher_order.host_player_id = Some("host-z".to_string());
+
+    state
+        .store
+        .save_session(&higher_order)
+        .await
+        .expect("seed higher-order session");
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(lower_order.code.0.clone(), lower_order.clone());
+
+    let notification = parse_session_update_notification(
+        &SessionUpdateNotification::session_state_changed(&higher_order)
+            .to_payload()
+            .expect("serialize typed notification"),
+    )
+    .expect("parse typed notification");
+
+    handle_session_update_notification(&state, &notification).await;
+
+    assert!(
+        !state.sessions.lock().await.contains_key("123456"),
+        "same-timestamp different payload should invalidate stale cache"
+    );
+}
+
+#[tokio::test]
+async fn session_update_notification_without_local_interest_does_not_reload_or_broadcast() {
+    let store = Arc::new(FaultyStore::new());
+    let state = test_state_with_store(store.clone());
+    let notification = parse_session_update_notification("123456").expect("parse notification");
+
+    handle_session_update_notification(&state, &notification).await;
+
+    assert_eq!(store.load_calls(), 0, "uninterested replica should not reload session");
+    assert!(
+        !state.sessions.lock().await.contains_key("123456"),
+        "uninterested replica should not populate cache"
+    );
+}
+
+#[tokio::test]
+async fn session_update_notification_typed_payload_without_local_interest_does_not_reload_or_broadcast() {
+    let store = Arc::new(FaultyStore::new());
+    let state = test_state_with_store(store.clone());
+    let notification = parse_session_update_notification(
+        &serde_json::json!({
+            "kind": "session_state_changed",
+            "sessionCode": "123456",
+            "updatedAt": Utc::now().to_rfc3339(),
+        })
+        .to_string(),
+    )
+    .expect("parse typed notification");
+
+    handle_session_update_notification(&state, &notification).await;
+
+    assert_eq!(store.load_calls(), 0, "typed uninterested replica should not reload session");
+    assert!(
+        !state.sessions.lock().await.contains_key("123456"),
+        "typed uninterested replica should not populate cache"
+    );
+}
+
+#[tokio::test]
+async fn session_update_notification_cached_without_registrations_evicts_without_reloading() {
+    let store = Arc::new(FaultyStore::new());
+    let state = test_state_with_store(store.clone());
+    let timestamp = Utc::now();
+    let session = WorkshopSession::new(
+        Uuid::new_v4(),
+        SessionCode("123456".into()),
+        timestamp,
+        protocol::WorkshopCreateConfig::default(),
+    );
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(session.code.0.clone(), session.clone());
+
+    let notification = parse_session_update_notification("123456").expect("parse notification");
+
+    handle_session_update_notification(&state, &notification).await;
+
+    assert_eq!(store.load_calls(), 0, "cache-only replica should not reload session");
+    assert!(
+        !state.sessions.lock().await.contains_key("123456"),
+        "cache-only replica should evict stale cache without repopulating it"
+    );
+}
+
+#[tokio::test]
+async fn typed_notification_followed_by_legacy_notification_does_not_rebroadcast_same_update() {
+    let state = test_state();
+    let timestamp = Utc::now();
+    let mut session = WorkshopSession::new(
+        Uuid::new_v4(),
+        SessionCode("123456".into()),
+        timestamp,
+        protocol::WorkshopCreateConfig::default(),
+    );
+    session.add_player(SessionPlayer {
+        id: "player-1".to_string(),
+        name: "Alice".to_string(),
+        pet_description: Some("Alice's workshop dragon".to_string()),
+        is_host: true,
+        is_connected: true,
+        is_ready: false,
+        score: 0,
+        current_dragon_id: None,
+        achievements: Vec::new(),
+        joined_at: timestamp,
+    });
+
+    state
+        .store
+        .save_session(&session)
+        .await
+        .expect("seed persisted session");
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(session.code.0.clone(), session.clone());
+
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+    state
+        .realtime
+        .lock()
+        .await
+        .attach(&session.code.0, "player-1", "conn-1");
+    state
+        .realtime_senders
+        .lock()
+        .await
+        .insert("conn-1".to_string(), sender);
+
+    let typed_notification = parse_session_update_notification(
+        &SessionUpdateNotification::session_state_changed(&session)
+            .to_payload()
+            .expect("serialize typed notification"),
+    )
+    .expect("parse typed notification");
+    let legacy_notification =
+        parse_session_update_notification("123456").expect("parse legacy notification");
+
+    handle_session_update_notification(&state, &typed_notification).await;
+    handle_session_update_notification(&state, &legacy_notification).await;
+
+    assert!(receiver.try_recv().is_err(), "duplicate legacy follow-up should not rebroadcast");
+    assert!(
+        state.sessions.lock().await.contains_key("123456"),
+        "typed notification should keep matched cache hot"
+    );
+}
+
+#[tokio::test]
+async fn legacy_notification_after_typed_dedupe_window_is_still_processed() {
+    let store = Arc::new(FaultyStore::new());
+    let state = test_state_with_store(store.clone());
+    let timestamp = Utc::now();
+    let session = WorkshopSession::new(
+        Uuid::new_v4(),
+        SessionCode("123456".into()),
+        timestamp,
+        protocol::WorkshopCreateConfig::default(),
+    );
+    store
+        .inner
+        .save_session(&session)
+        .await
+        .expect("seed persisted session");
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(session.code.0.clone(), session.clone());
+
+    let typed_notification = parse_session_update_notification(
+        &SessionUpdateNotification::session_state_changed(&session)
+            .to_payload()
+            .expect("serialize typed notification"),
+    )
+    .expect("parse typed notification");
+    let legacy_notification =
+        parse_session_update_notification("123456").expect("parse legacy notification");
+
+    handle_session_update_notification(&state, &typed_notification).await;
+    handle_session_update_notification(&state, &legacy_notification).await;
+    assert!(
+        state.sessions.lock().await.contains_key("123456"),
+        "first legacy follow-up should be deduped"
+    );
+
+    handle_session_update_notification(&state, &legacy_notification).await;
+
+    assert!(
+        !state.sessions.lock().await.contains_key("123456"),
+        "later legacy-only invalidation should still evict stale cache"
+    );
+}
+
+#[tokio::test]
+async fn realtime_replaced_notification_clears_local_registration_without_persisting_disconnect() {
+    let state = test_state();
+    let timestamp = Utc::now();
+    let mut session = WorkshopSession::new(
+        Uuid::new_v4(),
+        SessionCode("123456".into()),
+        timestamp,
+        protocol::WorkshopCreateConfig::default(),
+    );
+    session.add_player(SessionPlayer {
+        id: "player-1".to_string(),
+        name: "Alice".to_string(),
+        pet_description: Some("Alice's workshop dragon".to_string()),
+        is_host: true,
+        is_connected: true,
+        is_ready: false,
+        score: 0,
+        current_dragon_id: None,
+        achievements: Vec::new(),
+        joined_at: timestamp,
+    });
+    state
+        .store
+        .save_session(&session)
+        .await
+        .expect("seed persisted session");
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(session.code.0.clone(), session.clone());
+
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+    state
+        .realtime
+        .lock()
+        .await
+        .attach(&session.code.0, "player-1", "conn-1");
+    state
+        .realtime_senders
+        .lock()
+        .await
+        .insert("conn-1".to_string(), sender);
+
+    let notification = SessionUpdateNotification::realtime_connection_replaced(
+        &RealtimeConnectionRegistration {
+            session_code: session.code.0.clone(),
+            player_id: "player-1".to_string(),
+            connection_id: "conn-1".to_string(),
+            replica_id: state.replica_id.clone(),
+        },
+    );
+
+    handle_session_update_notification(&state, &notification).await;
+
+    let close_message = receiver.try_recv().expect("close message sent to replaced connection");
+    assert!(matches!(close_message, crate::ws::WsOutbound::Close));
+    assert!(
+        state
+            .realtime
+            .lock()
+            .await
+            .session_registrations(&session.code.0)
+            .is_empty(),
+        "replaced local registration should be cleared before socket shutdown"
+    );
+
+    super::ws::sync_ws_disconnect(&state, "conn-1").await;
+
+    let cached = state
+        .sessions
+        .lock()
+        .await
+        .get(&session.code.0)
+        .expect("cached session remains")
+        .clone();
+    assert!(
+        cached
+            .players
+            .get("player-1")
+            .expect("cached player exists")
+            .is_connected,
+        "takeover notification must not persist a false disconnect"
+    );
+
+    let persisted = state
+        .store
+        .load_session_by_code(&session.code.0)
+        .await
+        .expect("load persisted session")
+        .expect("persisted session exists");
+    assert!(
+        !persisted
+            .players
+            .get("player-1")
+            .expect("persisted player exists")
+            .is_connected,
+        "persisted sessions must still sanitize runtime-only presence"
+    );
+    assert_eq!(
+        cached.host_player_id,
+        Some("player-1".to_string()),
+        "takeover notification must not reassign host ownership"
+    );
+    assert_eq!(
+        persisted.host_player_id,
+        Some("player-1".to_string()),
+        "takeover notification must not durably reassign host ownership"
+    );
+    let artifacts = state
+        .store
+        .list_session_artifacts(&persisted.id.to_string())
+        .await
+        .expect("list artifacts");
+    assert!(
+        !artifacts.iter().any(|artifact| artifact.kind == SessionArtifactKind::PlayerLeft),
+        "takeover notification must not emit a PlayerLeft artifact"
+    );
+}
+
+#[tokio::test]
+async fn clearing_local_realtime_before_close_prevents_false_disconnect_fallback() {
+    let state = test_state();
+    let timestamp = Utc::now();
+    let mut session = WorkshopSession::new(
+        Uuid::new_v4(),
+        SessionCode("123456".into()),
+        timestamp,
+        protocol::WorkshopCreateConfig::default(),
+    );
+    session.add_player(SessionPlayer {
+        id: "player-1".to_string(),
+        name: "Alice".to_string(),
+        pet_description: Some("Alice's workshop dragon".to_string()),
+        is_host: true,
+        is_connected: true,
+        is_ready: false,
+        score: 0,
+        current_dragon_id: None,
+        achievements: Vec::new(),
+        joined_at: timestamp,
+    });
+    state
+        .store
+        .save_session(&session)
+        .await
+        .expect("seed persisted session");
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(session.code.0.clone(), session.clone());
+
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+    state
+        .realtime
+        .lock()
+        .await
+        .attach(&session.code.0, "player-1", "conn-1");
+    state
+        .realtime_senders
+        .lock()
+        .await
+        .insert("conn-1".to_string(), sender);
+
+    super::ws::clear_local_realtime_connection(&state, "conn-1").await;
+    super::ws::close_local_connection(&state, "conn-1").await;
+
+    let close_message = receiver.try_recv().expect("close message sent to stale connection");
+    assert!(matches!(close_message, crate::ws::WsOutbound::Close));
+
+    super::ws::sync_ws_disconnect(&state, "conn-1").await;
+
+    let cached = state
+        .sessions
+        .lock()
+        .await
+        .get(&session.code.0)
+        .expect("cached session remains")
+        .clone();
+    assert!(
+        cached
+            .players
+            .get("player-1")
+            .expect("cached player exists")
+            .is_connected,
+        "fallback close path must not persist a false disconnect after local ownership is cleared"
+    );
+    assert_eq!(cached.host_player_id, Some("player-1".to_string()));
+
+    let artifacts = state
+        .store
+        .list_session_artifacts(&session.id.to_string())
+        .await
+        .expect("list artifacts");
+    assert!(
+        !artifacts.iter().any(|artifact| artifact.kind == SessionArtifactKind::PlayerLeft),
+        "fallback close path must not emit a PlayerLeft artifact"
+    );
+}
+
+#[tokio::test]
+async fn retired_connection_id_cannot_reattach_before_socket_closes() {
+    let state = test_state();
+    let app = build_app(state.clone());
+
+    let create_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops")
+                .header("content-type", "application/json")
+                .body(Body::from(create_workshop_body("Alice")))
+                .expect("build create request"),
+        )
+        .await
+        .expect("call create workshop");
+    let create_body = to_bytes(create_response.into_body(), usize::MAX)
+        .await
+        .expect("read create body");
+    let create_result: WorkshopJoinResult =
+        serde_json::from_slice(&create_body).expect("parse create result");
+    let create_success = match create_result {
+        WorkshopJoinResult::Success(success) => success,
+        WorkshopJoinResult::Error(error) => {
+            panic!("expected create success, got error: {}", error.error)
+        }
+    };
+
+    let attach_message = ClientWsMessage::AttachSession(SessionEnvelope {
+        session_code: create_success.session_code.clone(),
+        player_id: create_success.player_id.clone(),
+        reconnect_token: create_success.reconnect_token.clone(),
+        coordinator_type: Some(CoordinatorType::Rust),
+    });
+
+    let (addr, server_handle) = spawn_test_server(app).await;
+    let mut stream = connect_raw_ws(addr).await;
+    send_raw_ws_message(&mut stream, &attach_message).await;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let connection_id = {
+        let registrations = state
+            .realtime
+            .lock()
+            .await
+            .session_registrations(&create_success.session_code);
+        assert_eq!(registrations.len(), 1, "expected one local registration");
+        registrations[0].connection_id.clone()
+    };
+
+    super::ws::clear_local_realtime_connection(&state, &connection_id).await;
+    send_raw_ws_message(&mut stream, &attach_message).await;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    assert!(
+        state
+            .realtime
+            .lock()
+            .await
+            .session_registrations(&create_success.session_code)
+            .is_empty(),
+        "retired connection id must not be able to reattach before shutdown completes"
+    );
+
+    let _ = stream.shutdown().await;
+    drop(stream);
+    server_handle.abort();
+}
+
+#[tokio::test]
+async fn same_replica_replaced_connection_is_retired_before_close_signal() {
+    let state = test_state();
+    let app = build_app(state.clone());
+
+    let create_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops")
+                .header("content-type", "application/json")
+                .body(Body::from(create_workshop_body("Alice")))
+                .expect("build create request"),
+        )
+        .await
+        .expect("call create workshop");
+    let create_body = to_bytes(create_response.into_body(), usize::MAX)
+        .await
+        .expect("read create body");
+    let create_result: WorkshopJoinResult =
+        serde_json::from_slice(&create_body).expect("parse create result");
+    let create_success = match create_result {
+        WorkshopJoinResult::Success(success) => success,
+        WorkshopJoinResult::Error(error) => {
+            panic!("expected create success, got error: {}", error.error)
+        }
+    };
+
+    let attach_message = ClientWsMessage::AttachSession(SessionEnvelope {
+        session_code: create_success.session_code.clone(),
+        player_id: create_success.player_id.clone(),
+        reconnect_token: create_success.reconnect_token.clone(),
+        coordinator_type: Some(CoordinatorType::Rust),
+    });
+
+    let (addr, server_handle) = spawn_test_server(app).await;
+    let mut first_stream = connect_raw_ws(addr).await;
+    send_raw_ws_message(&mut first_stream, &attach_message).await;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let first_connection_id = {
+        let registrations = state
+            .realtime
+            .lock()
+            .await
+            .session_registrations(&create_success.session_code);
+        assert_eq!(registrations.len(), 1, "first attach should register connection");
+        registrations[0].connection_id.clone()
+    };
+
+    let (mut second_socket, _) = connect_async(ws_request(addr))
+        .await
+        .expect("connect replacement ws");
+    second_socket
+        .send(WsMessage::Text(
+            serde_json::to_string(&attach_message)
+                .expect("encode attach")
+                .into(),
+        ))
+        .await
+        .expect("send replacement attach");
+    let _ = second_socket
+        .next()
+        .await
+        .expect("replacement state frame")
+        .expect("replacement state message");
+
+    send_raw_ws_message(&mut first_stream, &attach_message).await;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let registrations = state
+        .realtime
+        .lock()
+        .await
+        .session_registrations(&create_success.session_code);
+    assert_eq!(registrations.len(), 1, "replaced socket must not reclaim ownership");
+    assert_ne!(
+        registrations[0].connection_id,
+        first_connection_id,
+        "replacement owner must remain active"
+    );
+
+    let _ = second_socket.close(None).await;
+    let _ = first_stream.shutdown().await;
+    drop(first_stream);
+    server_handle.abort();
+}
+
+#[tokio::test]
+async fn same_socket_cannot_attach_to_different_player_after_already_attached() {
+    let state = test_state();
+    let app = build_app(state.clone());
+
+    let create_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops")
+                .header("content-type", "application/json")
+                .body(Body::from(create_workshop_body("Alice")))
+                .expect("build create request"),
+        )
+        .await
+        .expect("call create workshop");
+    let create_body = to_bytes(create_response.into_body(), usize::MAX)
+        .await
+        .expect("read create body");
+    let create_result: WorkshopJoinResult =
+        serde_json::from_slice(&create_body).expect("parse create result");
+    let create_success = match create_result {
+        WorkshopJoinResult::Success(success) => success,
+        WorkshopJoinResult::Error(error) => {
+            panic!("expected create success, got error: {}", error.error)
+        }
+    };
+
+    let join_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops/join")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&JoinWorkshopRequest {
+                        session_code: create_success.session_code.clone(),
+                        name: Some("Bob".to_string()),
+                        reconnect_token: None,
+                    })
+                    .expect("encode join request"),
+                ))
+                .expect("build join request"),
+        )
+        .await
+        .expect("call join workshop");
+    let join_body = to_bytes(join_response.into_body(), usize::MAX)
+        .await
+        .expect("read join body");
+    let join_result: WorkshopJoinResult = serde_json::from_slice(&join_body).expect("parse join result");
+    let join_success = match join_result {
+        WorkshopJoinResult::Success(success) => success,
+        WorkshopJoinResult::Error(error) => panic!("expected join success, got error: {}", error.error),
+    };
+
+    let first_attach = ClientWsMessage::AttachSession(SessionEnvelope {
+        session_code: create_success.session_code.clone(),
+        player_id: create_success.player_id.clone(),
+        reconnect_token: create_success.reconnect_token.clone(),
+        coordinator_type: Some(CoordinatorType::Rust),
+    });
+    let second_attach = ClientWsMessage::AttachSession(SessionEnvelope {
+        session_code: join_success.session_code.clone(),
+        player_id: join_success.player_id.clone(),
+        reconnect_token: join_success.reconnect_token.clone(),
+        coordinator_type: Some(CoordinatorType::Rust),
+    });
+
+    let (addr, server_handle) = spawn_test_server(app).await;
+    let (mut socket, _) = connect_async(ws_request(addr)).await.expect("connect ws");
+    socket
+        .send(WsMessage::Text(
+            serde_json::to_string(&first_attach).expect("encode first attach").into(),
+        ))
+        .await
+        .expect("send first attach");
+    let _ = socket
+        .next()
+        .await
+        .expect("first state frame")
+        .expect("first state message");
+
+    socket
+        .send(WsMessage::Text(
+            serde_json::to_string(&second_attach).expect("encode second attach").into(),
+        ))
+        .await
+        .expect("send second attach");
+    let message = socket
+        .next()
+        .await
+        .expect("second response frame")
+        .expect("second response message");
+    let payload = match message {
+        WsMessage::Text(payload) => payload,
+        other => panic!("expected text frame, got {other:?}"),
+    };
+    let server_message: ServerWsMessage =
+        serde_json::from_str(&payload).expect("parse server ws message");
+    match server_message {
+        ServerWsMessage::Error { message } => assert_eq!(
+            message,
+            "WebSocket is already attached to a different player."
+        ),
+        other => panic!("expected close error, got {other:?}"),
+    }
+
+    let registrations = state
+        .realtime
+        .lock()
+        .await
+        .session_registrations(&create_success.session_code);
+    assert_eq!(registrations.len(), 1, "original ownership must remain intact");
+    assert_eq!(registrations[0].player_id, create_success.player_id);
+
+    let _ = socket.close(None).await;
+    server_handle.abort();
+}
+
+#[tokio::test]
+async fn workshop_command_endpoint_is_rate_limited_for_repeated_requests() {
+    let mut state = test_state();
+    state.config = Arc::new(AppConfig {
+        command_rate_limit: 1,
+        ..state.config.as_ref().clone()
+    });
+    state.command_limiter = Arc::new(tokio::sync::Mutex::new(
+        security::FixedWindowRateLimiter::new(1, 60_000),
+    ));
+    let app = build_app(state);
+
+    let create_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops")
+                .header("content-type", "application/json")
+                .body(Body::from(create_workshop_body("Alice")))
+                .expect("build create request"),
+        )
+        .await
+        .expect("call create workshop");
+    let create_body = to_bytes(create_response.into_body(), usize::MAX)
+        .await
+        .expect("read create body");
+    let create_result: WorkshopJoinResult =
+        serde_json::from_slice(&create_body).expect("parse create result");
+    let create_success = match create_result {
+        WorkshopJoinResult::Success(success) => success,
+        WorkshopJoinResult::Error(error) => {
+            panic!("expected create success, got error: {}", error.error)
+        }
+    };
+
+    let first = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops/command")
+                .header("origin", "http://localhost:5173")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&WorkshopCommandRequest {
+                        session_code: create_success.session_code.clone(),
+                        reconnect_token: create_success.reconnect_token.clone(),
+                        coordinator_type: Some(CoordinatorType::Rust),
+                        command: SessionCommand::StartPhase1,
+                        payload: None,
+                    })
+                    .expect("encode first command request"),
+                ))
+                .expect("build first command request"),
+        )
+        .await
+        .expect("call first command endpoint");
+    assert_eq!(first.status(), StatusCode::OK);
+
+    let second = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops/command")
+                .header("origin", "http://localhost:5173")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&WorkshopCommandRequest {
+                        session_code: create_success.session_code.clone(),
+                        reconnect_token: create_success.reconnect_token.clone(),
+                        coordinator_type: Some(CoordinatorType::Rust),
+                        command: SessionCommand::StartPhase1,
+                        payload: None,
+                    })
+                    .expect("encode second command request"),
+                ))
+                .expect("build second command request"),
+        )
+        .await
+        .expect("call second command endpoint");
+
+    assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+    let body = to_bytes(second.into_body(), usize::MAX)
+        .await
+        .expect("read rate limited command body");
+    let result: WorkshopCommandResult =
+        serde_json::from_slice(&body).expect("parse rate limited command result");
+    match result {
+        WorkshopCommandResult::Error(error) => {
+            assert_eq!(
+                error.error,
+                "Too many requests. Please slow down and try again."
+            );
+        }
+        WorkshopCommandResult::Success(_) => panic!("expected error response"),
+    }
+}
+
+#[tokio::test]
 async fn allocate_session_code_treats_store_errors_as_unavailable() {
     let store = Arc::new(FaultyStore::new());
     let state = test_state_with_store(store.clone());
@@ -735,6 +2216,34 @@ fn test_state_with_store(store: Arc<dyn SessionStore>) -> AppState {
     let mut state = test_state();
     state.store = store;
     state
+}
+
+fn test_state_with_reconnect_ttl(ttl: std::time::Duration) -> AppState {
+    let mut state = test_state();
+    state.config = Arc::new(AppConfig {
+        reconnect_token_ttl: ttl,
+        ..state.config.as_ref().clone()
+    });
+    state
+}
+
+async fn overwrite_identity_last_seen_at(
+    store: &dyn SessionStore,
+    session_id: &str,
+    player_id: &str,
+    reconnect_token: &str,
+    last_seen_at: chrono::DateTime<Utc>,
+) {
+    store
+        .create_player_identity(&persistence::PlayerIdentity {
+            session_id: session_id.to_string(),
+            player_id: player_id.to_string(),
+            reconnect_token: reconnect_token.to_string(),
+            created_at: last_seen_at.to_rfc3339(),
+            last_seen_at: last_seen_at.to_rfc3339(),
+        })
+        .await
+        .expect("overwrite player identity");
 }
 
 #[tokio::test]
@@ -1062,6 +2571,82 @@ async fn workshop_judge_bundle_rejects_invalid_credentials() {
 }
 
 #[tokio::test]
+async fn workshop_judge_bundle_rejects_expired_reconnect_token() {
+    let state = test_state_with_reconnect_ttl(std::time::Duration::from_secs(60));
+    let app = build_app(state.clone());
+    let create_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops")
+                .header("content-type", "application/json")
+                .body(Body::from(create_workshop_body("Alice")))
+                .expect("build create request"),
+        )
+        .await
+        .expect("call create workshop");
+    let create_body = to_bytes(create_response.into_body(), usize::MAX)
+        .await
+        .expect("read create body");
+    let create_result: WorkshopJoinResult =
+        serde_json::from_slice(&create_body).expect("parse create result");
+    let create_success = match create_result {
+        WorkshopJoinResult::Success(success) => success,
+        WorkshopJoinResult::Error(error) => {
+            panic!("expected create success, got error: {}", error.error)
+        }
+    };
+
+    overwrite_identity_last_seen_at(
+        state.store.as_ref(),
+        &create_success.state.session.id,
+        &create_success.player_id,
+        &create_success.reconnect_token,
+        Utc::now() - ChronoDuration::seconds(61),
+    )
+    .await;
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops/judge-bundle")
+                .header("content-type", "application/json")
+                .body(Body::from(format!(
+                    r#"{{"sessionCode":"{}","reconnectToken":"{}"}}"#,
+                    create_success.session_code, create_success.reconnect_token
+                )))
+                .expect("build expired judge bundle request"),
+        )
+        .await
+        .expect("call judge bundle endpoint");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read judge bundle body");
+    let result: WorkshopJudgeBundleResult =
+        serde_json::from_slice(&body).expect("parse judge bundle result");
+    match result {
+        WorkshopJudgeBundleResult::Error(error) => {
+            assert_eq!(error.error, "Session identity is invalid or expired.");
+        }
+        WorkshopJudgeBundleResult::Success(_) => panic!("expected error response"),
+    }
+
+    let found = state
+        .store
+        .find_player_identity(
+            &create_success.session_code,
+            &create_success.reconnect_token,
+        )
+        .await
+        .expect("find expired reconnect token after judge bundle check");
+    assert_eq!(found, None);
+}
+
+#[tokio::test]
 async fn create_workshop_endpoint_rejects_empty_host_name() {
     let app = build_app(test_state());
 
@@ -1117,6 +2702,48 @@ async fn create_workshop_endpoint_rejects_forbidden_origin() {
 }
 
 #[tokio::test]
+async fn create_workshop_endpoint_rejects_browser_tokens_in_production() {
+    let mut state = test_state();
+    state.config = Arc::new(AppConfig {
+        origin_policy: create_origin_policy(OriginPolicyOptions {
+            allowed_origins: Some("https://dragon-shift.example.com"),
+            app_origin: None,
+            is_production: true,
+        })
+        .expect("create production origin policy"),
+        database_url: Some("postgres://prod.example/dragon_shift".into()),
+        ..state.config.as_ref().clone()
+    });
+    let app = build_app(state);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops")
+                .header("content-type", "application/json")
+                .header("origin", "https://dragon-shift.example.com")
+                .body(Body::from(create_workshop_body_with_tokens("Alice")))
+                .expect("build request"),
+        )
+        .await
+        .expect("call create workshop");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read error body");
+    let result: WorkshopJoinResult = serde_json::from_slice(&body).expect("parse join result");
+    match result {
+        WorkshopJoinResult::Error(error) => assert_eq!(
+            error.error,
+            "Browser-supplied third-party tokens are disabled in production. Use local/dev only or move secrets to server-side configuration."
+        ),
+        WorkshopJoinResult::Success(_) => panic!("expected error response"),
+    }
+}
+
+#[tokio::test]
 async fn create_workshop_endpoint_is_rate_limited_for_repeated_requests() {
     let app = build_app(test_state_with_limits(1, 40));
 
@@ -1163,6 +2790,256 @@ async fn create_workshop_endpoint_is_rate_limited_for_repeated_requests() {
         }
         WorkshopJoinResult::Success(_) => panic!("expected error response"),
     }
+}
+
+#[tokio::test]
+async fn create_workshop_rate_limit_ignores_spoofed_forwarded_for_by_default() {
+    let app = build_app(test_state_with_limits(1, 40));
+
+    let first = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops")
+                .header("content-type", "application/json")
+                .header("x-forwarded-for", "10.0.0.1")
+                .body(Body::from(create_workshop_body("Alice")))
+                .expect("build first request"),
+        )
+        .await
+        .expect("call first create workshop");
+    assert_eq!(first.status(), StatusCode::OK);
+
+    let second = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops")
+                .header("content-type", "application/json")
+                .header("x-forwarded-for", "203.0.113.99")
+                .body(Body::from(create_workshop_body("Bob")))
+                .expect("build second request"),
+        )
+        .await
+        .expect("call second create workshop");
+
+    assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[tokio::test]
+async fn create_workshop_rate_limit_uses_forwarded_for_when_trusted() {
+    let mut state = test_state_with_limits(1, 40);
+    state.config = Arc::new(AppConfig {
+        trust_forwarded_for: true,
+        ..state.config.as_ref().clone()
+    });
+    let app = build_app(state);
+
+    let first = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops")
+                .header("content-type", "application/json")
+                .header("x-forwarded-for", "10.0.0.1")
+                .body(Body::from(create_workshop_body("Alice")))
+                .expect("build first request"),
+        )
+        .await
+        .expect("call first create workshop");
+    assert_eq!(first.status(), StatusCode::OK);
+
+    let second = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops")
+                .header("content-type", "application/json")
+                .header("x-forwarded-for", "203.0.113.99")
+                .body(Body::from(create_workshop_body("Bob")))
+                .expect("build second request"),
+        )
+        .await
+        .expect("call second create workshop");
+
+    assert_eq!(second.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn workshop_command_rate_limit_ignores_spoofed_forwarded_for_by_default() {
+    let mut state = test_state();
+    state.config = Arc::new(AppConfig {
+        command_rate_limit: 1,
+        ..state.config.as_ref().clone()
+    });
+    state.command_limiter = Arc::new(tokio::sync::Mutex::new(
+        security::FixedWindowRateLimiter::new(1, 60_000),
+    ));
+    let app = build_app(state);
+
+    let create_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops")
+                .header("content-type", "application/json")
+                .body(Body::from(create_workshop_body("Alice")))
+                .expect("build create request"),
+        )
+        .await
+        .expect("call create workshop");
+    let create_body = to_bytes(create_response.into_body(), usize::MAX)
+        .await
+        .expect("read create body");
+    let create_result: WorkshopJoinResult =
+        serde_json::from_slice(&create_body).expect("parse create result");
+    let create_success = match create_result {
+        WorkshopJoinResult::Success(success) => success,
+        WorkshopJoinResult::Error(error) => {
+            panic!("expected create success, got error: {}", error.error)
+        }
+    };
+
+    let first = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops/command")
+                .header("origin", "http://localhost:5173")
+                .header("content-type", "application/json")
+                .header("x-forwarded-for", "10.0.0.1")
+                .body(Body::from(
+                    serde_json::to_vec(&WorkshopCommandRequest {
+                        session_code: create_success.session_code.clone(),
+                        reconnect_token: create_success.reconnect_token.clone(),
+                        coordinator_type: Some(CoordinatorType::Rust),
+                        command: SessionCommand::ResetGame,
+                        payload: None,
+                    })
+                    .expect("encode first command request"),
+                ))
+                .expect("build first command request"),
+        )
+        .await
+        .expect("call first command request");
+    assert_eq!(first.status(), StatusCode::OK);
+
+    let second = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops/command")
+                .header("origin", "http://localhost:5173")
+                .header("content-type", "application/json")
+                .header("x-forwarded-for", "203.0.113.99")
+                .body(Body::from(
+                    serde_json::to_vec(&WorkshopCommandRequest {
+                        session_code: create_success.session_code.clone(),
+                        reconnect_token: create_success.reconnect_token.clone(),
+                        coordinator_type: Some(CoordinatorType::Rust),
+                        command: SessionCommand::ResetGame,
+                        payload: None,
+                    })
+                    .expect("encode second command request"),
+                ))
+                .expect("build second command request"),
+        )
+        .await
+        .expect("call second command request");
+
+    assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[tokio::test]
+async fn workshop_command_rate_limit_uses_forwarded_for_when_trusted() {
+    let mut state = test_state();
+    state.config = Arc::new(AppConfig {
+        trust_forwarded_for: true,
+        command_rate_limit: 1,
+        ..state.config.as_ref().clone()
+    });
+    state.command_limiter = Arc::new(tokio::sync::Mutex::new(
+        security::FixedWindowRateLimiter::new(1, 60_000),
+    ));
+    let app = build_app(state);
+
+    let create_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops")
+                .header("content-type", "application/json")
+                .body(Body::from(create_workshop_body("Alice")))
+                .expect("build create request"),
+        )
+        .await
+        .expect("call create workshop");
+    let create_body = to_bytes(create_response.into_body(), usize::MAX)
+        .await
+        .expect("read create body");
+    let create_result: WorkshopJoinResult =
+        serde_json::from_slice(&create_body).expect("parse create result");
+    let create_success = match create_result {
+        WorkshopJoinResult::Success(success) => success,
+        WorkshopJoinResult::Error(error) => {
+            panic!("expected create success, got error: {}", error.error)
+        }
+    };
+
+    let first = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops/command")
+                .header("origin", "http://localhost:5173")
+                .header("content-type", "application/json")
+                .header("x-forwarded-for", "10.0.0.1")
+                .body(Body::from(
+                    serde_json::to_vec(&WorkshopCommandRequest {
+                        session_code: create_success.session_code.clone(),
+                        reconnect_token: create_success.reconnect_token.clone(),
+                        coordinator_type: Some(CoordinatorType::Rust),
+                        command: SessionCommand::ResetGame,
+                        payload: None,
+                    })
+                    .expect("encode first command request"),
+                ))
+                .expect("build first command request"),
+        )
+        .await
+        .expect("call first command request");
+    assert_eq!(first.status(), StatusCode::OK);
+
+    let second = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops/command")
+                .header("origin", "http://localhost:5173")
+                .header("content-type", "application/json")
+                .header("x-forwarded-for", "203.0.113.99")
+                .body(Body::from(
+                    serde_json::to_vec(&WorkshopCommandRequest {
+                        session_code: create_success.session_code.clone(),
+                        reconnect_token: create_success.reconnect_token.clone(),
+                        coordinator_type: Some(CoordinatorType::Rust),
+                        command: SessionCommand::ResetGame,
+                        payload: None,
+                    })
+                    .expect("encode second command request"),
+                ))
+                .expect("build second command request"),
+        )
+        .await
+        .expect("call second command request");
+
+    assert_eq!(second.status(), StatusCode::OK);
 }
 
 #[tokio::test]
@@ -1372,7 +3249,7 @@ async fn join_workshop_endpoint_reconnects_existing_player_without_name() {
         WorkshopJoinResult::Success(success) => {
             assert!(success.ok);
             assert_eq!(success.player_id, create_success.player_id);
-            assert_eq!(success.reconnect_token, create_success.reconnect_token);
+            assert_ne!(success.reconnect_token, create_success.reconnect_token);
             assert_eq!(success.state.phase, protocol::Phase::Phase1);
             assert_eq!(
                 success.state.current_player_id.as_deref(),
@@ -1385,11 +3262,692 @@ async fn join_workshop_endpoint_reconnects_existing_player_without_name() {
                 .expect("reconnected player in state");
             assert!(player.is_connected);
             assert!(player.current_dragon_id.is_some());
+
+            let revoked = state
+                .store
+                .find_player_identity(
+                    &create_success.session_code,
+                    &create_success.reconnect_token,
+                )
+                .await
+                .expect("find revoked reconnect token");
+            assert_eq!(revoked, None);
+
+            let rotated = state
+                .store
+                .find_player_identity(&create_success.session_code, &success.reconnect_token)
+                .await
+                .expect("find rotated reconnect token");
+            assert!(rotated.is_some());
         }
         WorkshopJoinResult::Error(error) => {
             panic!("expected reconnect success, got error: {}", error.error)
         }
     }
+}
+
+#[tokio::test]
+async fn http_reconnect_does_not_persist_connected_presence() {
+    let state = test_state();
+    let app = build_app(state.clone());
+
+    let create_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops")
+                .header("content-type", "application/json")
+                .body(Body::from(create_workshop_body("Alice")))
+                .expect("build create request"),
+        )
+        .await
+        .expect("call create workshop");
+    let create_body = to_bytes(create_response.into_body(), usize::MAX)
+        .await
+        .expect("read create body");
+    let create_result: WorkshopJoinResult =
+        serde_json::from_slice(&create_body).expect("parse create result");
+    let create_success = match create_result {
+        WorkshopJoinResult::Success(success) => success,
+        WorkshopJoinResult::Error(error) => {
+            panic!("expected create success, got error: {}", error.error)
+        }
+    };
+
+    {
+        let mut sessions = state.sessions.lock().await;
+        let session = sessions
+            .get_mut(&create_success.session_code)
+            .expect("cached session exists");
+        session
+            .players
+            .get_mut(&create_success.player_id)
+            .expect("player exists")
+            .is_connected = false;
+    }
+
+    let reconnect_response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops/join")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&JoinWorkshopRequest {
+                        session_code: create_success.session_code.clone(),
+                        name: None,
+                        reconnect_token: Some(create_success.reconnect_token.clone()),
+                    })
+                    .expect("encode reconnect request"),
+                ))
+                .expect("build reconnect request"),
+        )
+        .await
+        .expect("call reconnect join");
+    assert_eq!(reconnect_response.status(), StatusCode::OK);
+
+    let persisted = state
+        .store
+        .load_session_by_code(&create_success.session_code)
+        .await
+        .expect("load persisted session after http reconnect")
+        .expect("persisted session exists");
+    assert!(
+        !persisted
+            .players
+            .get(&create_success.player_id)
+            .expect("persisted player exists")
+            .is_connected,
+        "http reconnect must not persist durable live presence"
+    );
+}
+
+#[tokio::test]
+async fn restart_reload_and_reconnect_keep_presence_runtime_only() {
+    let store: Arc<dyn SessionStore> = Arc::new(InMemorySessionStore::new());
+    let state1 = test_state_with_store(store.clone());
+    let app1 = build_app(state1.clone());
+
+    let create_response = app1
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops")
+                .header("content-type", "application/json")
+                .body(Body::from(create_workshop_body("Alice")))
+                .expect("build create request"),
+        )
+        .await
+        .expect("call create workshop");
+    let create_body = to_bytes(create_response.into_body(), usize::MAX)
+        .await
+        .expect("read create body");
+    let create_result: WorkshopJoinResult =
+        serde_json::from_slice(&create_body).expect("parse create result");
+    let create_success = match create_result {
+        WorkshopJoinResult::Success(success) => success,
+        WorkshopJoinResult::Error(error) => {
+            panic!("expected create success, got error: {}", error.error)
+        }
+    };
+
+    let persisted_after_create = store
+        .load_session_by_code(&create_success.session_code)
+        .await
+        .expect("load persisted session after create")
+        .expect("persisted session exists");
+    assert!(
+        persisted_after_create
+            .players
+            .values()
+            .all(|player| !player.is_connected),
+        "created persisted session should not store live presence"
+    );
+
+    let state2 = test_state_with_store(store.clone());
+    assert!(
+        ensure_session_cached(&state2, &create_success.session_code)
+            .await
+            .expect("reload cached session after restart"),
+        "restarted app should reload session"
+    );
+    {
+        let sessions = state2.sessions.lock().await;
+        let reloaded = sessions
+            .get(&create_success.session_code)
+            .expect("reloaded session exists");
+        assert!(
+            reloaded.players.values().all(|player| !player.is_connected),
+            "reloaded cache should treat presence as runtime-only"
+        );
+    }
+
+    let app2 = build_app(state2.clone());
+    let reconnect_response = app2
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops/join")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&JoinWorkshopRequest {
+                        session_code: create_success.session_code.clone(),
+                        name: None,
+                        reconnect_token: Some(create_success.reconnect_token.clone()),
+                    })
+                    .expect("encode reconnect request"),
+                ))
+                .expect("build reconnect request"),
+        )
+        .await
+        .expect("call reconnect after restart");
+    assert_eq!(reconnect_response.status(), StatusCode::OK);
+
+    let persisted_after_reconnect = store
+        .load_session_by_code(&create_success.session_code)
+        .await
+        .expect("load persisted session after reconnect")
+        .expect("persisted session exists after reconnect");
+    assert!(
+        persisted_after_reconnect
+            .players
+            .values()
+            .all(|player| !player.is_connected),
+        "persisted session after reconnect should still keep presence runtime-only"
+    );
+
+    let state3 = test_state_with_store(store);
+    assert!(
+        ensure_session_cached(&state3, &create_success.session_code)
+            .await
+            .expect("reload cached session after second restart"),
+        "second restarted app should reload session"
+    );
+    let sessions = state3.sessions.lock().await;
+    let reloaded = sessions
+        .get(&create_success.session_code)
+        .expect("reloaded session exists after reconnect");
+    assert!(
+        reloaded.players.values().all(|player| !player.is_connected),
+        "reloaded cache after reconnect should still clear durable presence"
+    );
+}
+
+#[tokio::test]
+async fn postgres_restart_reload_and_reconnect_keep_presence_runtime_only() {
+    let pg =
+        PostgresAppTestStore::new("postgres_restart_reload_and_reconnect_keep_presence_runtime_only")
+            .await;
+
+    let state1 = test_state_with_store(pg.store.clone() as Arc<dyn SessionStore>);
+    let app1 = build_app(state1.clone());
+
+    let create_response = app1
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops")
+                .header("content-type", "application/json")
+                .body(Body::from(create_workshop_body("Alice")))
+                .expect("build create request"),
+        )
+        .await
+        .expect("call create workshop");
+    let create_body = to_bytes(create_response.into_body(), usize::MAX)
+        .await
+        .expect("read create body");
+    let create_result: WorkshopJoinResult =
+        serde_json::from_slice(&create_body).expect("parse create result");
+    let create_success = match create_result {
+        WorkshopJoinResult::Success(success) => success,
+        WorkshopJoinResult::Error(error) => {
+            panic!("expected create success, got error: {}", error.error)
+        }
+    };
+
+    let persisted_after_create = pg
+        .store
+        .load_session_by_code(&create_success.session_code)
+        .await
+        .expect("load persisted session after create")
+        .expect("persisted session exists");
+    assert!(
+        persisted_after_create
+            .players
+            .values()
+            .all(|player| !player.is_connected),
+        "created persisted session should not store live presence"
+    );
+
+    let store2 = pg.reconnect().await;
+    let state2 = test_state_with_store(store2.clone() as Arc<dyn SessionStore>);
+    assert!(
+        ensure_session_cached(&state2, &create_success.session_code)
+            .await
+            .expect("reload cached session after restart"),
+        "restarted app should reload session"
+    );
+    {
+        let sessions = state2.sessions.lock().await;
+        let reloaded = sessions
+            .get(&create_success.session_code)
+            .expect("reloaded session exists");
+        assert!(
+            reloaded.players.values().all(|player| !player.is_connected),
+            "reloaded cache should treat presence as runtime-only"
+        );
+    }
+
+    let app2 = build_app(state2.clone());
+    let reconnect_response = app2
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops/join")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&JoinWorkshopRequest {
+                        session_code: create_success.session_code.clone(),
+                        name: None,
+                        reconnect_token: Some(create_success.reconnect_token.clone()),
+                    })
+                    .expect("encode reconnect request"),
+                ))
+                .expect("build reconnect request"),
+        )
+        .await
+        .expect("call reconnect after restart");
+    let reconnect_status = reconnect_response.status();
+    let reconnect_body = to_bytes(reconnect_response.into_body(), usize::MAX)
+        .await
+        .expect("read reconnect body");
+    assert_eq!(
+        reconnect_status,
+        StatusCode::OK,
+        "unexpected reconnect body: {}",
+        String::from_utf8_lossy(&reconnect_body)
+    );
+    let reconnect_result: WorkshopJoinResult =
+        serde_json::from_slice(&reconnect_body).expect("parse reconnect result");
+    let reconnect_success = match reconnect_result {
+        WorkshopJoinResult::Success(success) => success,
+        WorkshopJoinResult::Error(error) => {
+            panic!("expected reconnect success, got error: {}", error.error)
+        }
+    };
+
+    let (addr, server_handle) = spawn_test_server(app2.clone()).await;
+    let (mut socket, _) = connect_async(ws_request(addr)).await.expect("connect ws after restart");
+    let attach_message = ClientWsMessage::AttachSession(SessionEnvelope {
+        session_code: reconnect_success.session_code.clone(),
+        player_id: reconnect_success.player_id.clone(),
+        reconnect_token: reconnect_success.reconnect_token.clone(),
+        coordinator_type: Some(CoordinatorType::Rust),
+    });
+    socket
+        .send(WsMessage::Text(
+            serde_json::to_string(&attach_message)
+                .expect("encode attach")
+                .into(),
+        ))
+        .await
+        .expect("send attach after restart");
+
+    let message = socket
+        .next()
+        .await
+        .expect("state update frame")
+        .expect("state update message");
+    let payload = match message {
+        WsMessage::Text(payload) => payload,
+        other => panic!("expected text frame, got {other:?}"),
+    };
+    let server_message: ServerWsMessage =
+        serde_json::from_str(&payload).expect("parse server ws message");
+    match server_message {
+        ServerWsMessage::StateUpdate(client_state) => {
+            assert_eq!(client_state.session.code, reconnect_success.session_code);
+            assert_eq!(
+                client_state.current_player_id.as_deref(),
+                Some(reconnect_success.player_id.as_str())
+            );
+        }
+        other => panic!("expected state update, got {other:?}"),
+    }
+
+    let command_response = app2
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops/command")
+                .header("origin", "http://localhost:5173")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&WorkshopCommandRequest {
+                        session_code: reconnect_success.session_code.clone(),
+                        reconnect_token: reconnect_success.reconnect_token.clone(),
+                        coordinator_type: Some(CoordinatorType::Rust),
+                        command: SessionCommand::StartPhase1,
+                        payload: None,
+                    })
+                    .expect("encode command request"),
+                ))
+                .expect("build command request"),
+        )
+        .await
+        .expect("call command after websocket reconnect");
+    assert_eq!(command_response.status(), StatusCode::OK);
+
+    let message = socket
+        .next()
+        .await
+        .expect("follow-up update frame")
+        .expect("follow-up update message");
+    let payload = match message {
+        WsMessage::Text(payload) => payload,
+        other => panic!("expected text frame, got {other:?}"),
+    };
+    let server_message: ServerWsMessage =
+        serde_json::from_str(&payload).expect("parse follow-up server ws message");
+    match server_message {
+        ServerWsMessage::StateUpdate(client_state) => {
+            assert_eq!(client_state.phase, protocol::Phase::Phase1);
+            assert_eq!(
+                client_state.current_player_id.as_deref(),
+                Some(reconnect_success.player_id.as_str())
+            );
+        }
+        other => panic!("expected follow-up state update, got {other:?}"),
+    }
+
+    let persisted_after_reconnect = store2
+        .load_session_by_code(&create_success.session_code)
+        .await
+        .expect("load persisted session after reconnect")
+        .expect("persisted session exists after reconnect");
+    assert!(
+        persisted_after_reconnect
+            .players
+            .values()
+            .all(|player| !player.is_connected),
+        "persisted session after reconnect should still keep presence runtime-only"
+    );
+
+    let store3 = pg.reconnect().await;
+    let state3 = test_state_with_store(store3 as Arc<dyn SessionStore>);
+    assert!(
+        ensure_session_cached(&state3, &create_success.session_code)
+            .await
+            .expect("reload cached session after second restart"),
+        "second restarted app should reload session"
+    );
+    let sessions = state3.sessions.lock().await;
+    let reloaded = sessions
+        .get(&create_success.session_code)
+        .expect("reloaded session exists after reconnect");
+    let reloaded_player = reloaded
+        .players
+        .get(&reconnect_success.player_id)
+        .expect("reloaded player exists after reconnect");
+    assert!(
+        reloaded_player.is_connected,
+        "restarted replica should recover live presence from distributed realtime ownership"
+    );
+
+    let _ = socket.close(None).await;
+    server_handle.abort();
+
+    pg.cleanup().await;
+}
+
+#[tokio::test]
+async fn reload_cached_session_clears_stale_cached_presence_without_realtime_registration() {
+    let state = test_state();
+    let timestamp = Utc::now();
+    let session_code = "123456";
+    let player_id = "player-1".to_string();
+
+    let mut session = WorkshopSession::new(
+        Uuid::new_v4(),
+        SessionCode(session_code.to_string()),
+        timestamp,
+        protocol::WorkshopCreateConfig::default(),
+    );
+    session.add_player(SessionPlayer {
+        id: player_id.clone(),
+        name: "Alice".to_string(),
+        pet_description: Some("Alice's workshop dragon".to_string()),
+        is_host: true,
+        is_connected: false,
+        is_ready: false,
+        score: 0,
+        current_dragon_id: None,
+        achievements: Vec::new(),
+        joined_at: timestamp,
+    });
+    state
+        .store
+        .save_session(&session)
+        .await
+        .expect("persist session");
+
+    let mut stale_cached = session.clone();
+    stale_cached.players.get_mut(&player_id).expect("player exists").is_connected = true;
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(session_code.to_string(), stale_cached);
+
+    assert!(crate::cache::reload_cached_session(&state, session_code)
+        .await
+        .expect("reload cached session"));
+
+    let sessions = state.sessions.lock().await;
+    let reloaded = sessions.get(session_code).expect("reloaded session exists");
+    assert!(
+        !reloaded
+            .players
+            .get(&player_id)
+            .expect("reloaded player exists")
+            .is_connected,
+        "reload must source presence from distributed realtime ownership, not stale cache"
+    );
+}
+
+#[tokio::test]
+async fn postgres_reload_ignores_stale_distributed_realtime_presence() {
+    let pg = PostgresAppTestStore::new("postgres_reload_ignores_stale_distributed_realtime_presence").await;
+    let timestamp = Utc::now();
+    let session_code = "654321";
+    let player_id = "player-1".to_string();
+
+    let mut session = WorkshopSession::new(
+        Uuid::new_v4(),
+        SessionCode(session_code.to_string()),
+        timestamp,
+        protocol::WorkshopCreateConfig::default(),
+    );
+    session.add_player(SessionPlayer {
+        id: player_id.clone(),
+        name: "Alice".to_string(),
+        pet_description: Some("Alice's workshop dragon".to_string()),
+        is_host: true,
+        is_connected: false,
+        is_ready: false,
+        score: 0,
+        current_dragon_id: None,
+        achievements: Vec::new(),
+        joined_at: timestamp,
+    });
+    pg.store.save_session(&session).await.expect("persist session");
+    pg.store
+        .claim_realtime_connection(&RealtimeConnectionRegistration {
+            session_code: session_code.to_string(),
+            player_id: player_id.clone(),
+            connection_id: "conn-stale".to_string(),
+            replica_id: "replica-dead".to_string(),
+        })
+        .await
+        .expect("seed realtime registration");
+
+    let scoped_pool = PgPool::connect(&pg.scoped_database_url())
+        .await
+        .expect("connect scoped postgres pool");
+    sqlx::query(
+        "UPDATE realtime_connections SET updated_at = NOW() - INTERVAL '16 seconds' WHERE connection_id = 'conn-stale'",
+    )
+    .execute(&scoped_pool)
+    .await
+    .expect("age realtime registration");
+    scoped_pool.close().await;
+
+    let reloaded_store = pg.reconnect().await;
+    let state = test_state_with_store(reloaded_store as Arc<dyn SessionStore>);
+    assert!(
+        ensure_session_cached(&state, session_code)
+            .await
+            .expect("reload cached session"),
+        "session should reload"
+    );
+
+    let sessions = state.sessions.lock().await;
+    let reloaded = sessions.get(session_code).expect("reloaded session exists");
+    let player = reloaded.players.get(&player_id).expect("reloaded player exists");
+    assert!(
+        !player.is_connected,
+        "stale distributed realtime ownership must not resurrect live presence"
+    );
+
+    pg.cleanup().await;
+}
+
+#[tokio::test]
+async fn postgres_replaced_connection_cannot_reclaim_before_notification_is_processed() {
+    let pg = PostgresAppTestStore::new(
+        "postgres_replaced_connection_cannot_reclaim_before_notification_is_processed",
+    )
+    .await;
+    let state = test_state_with_store(pg.store.clone() as Arc<dyn SessionStore>);
+    let app = build_app(state.clone());
+
+    let create_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops")
+                .header("content-type", "application/json")
+                .body(Body::from(create_workshop_body("Alice")))
+                .expect("build create request"),
+        )
+        .await
+        .expect("call create workshop");
+    let create_body = to_bytes(create_response.into_body(), usize::MAX)
+        .await
+        .expect("read create body");
+    let create_result: WorkshopJoinResult =
+        serde_json::from_slice(&create_body).expect("parse create result");
+    let create_success = match create_result {
+        WorkshopJoinResult::Success(success) => success,
+        WorkshopJoinResult::Error(error) => {
+            panic!("expected create success, got error: {}", error.error)
+        }
+    };
+
+    let attach_message = ClientWsMessage::AttachSession(SessionEnvelope {
+        session_code: create_success.session_code.clone(),
+        player_id: create_success.player_id.clone(),
+        reconnect_token: create_success.reconnect_token.clone(),
+        coordinator_type: Some(CoordinatorType::Rust),
+    });
+
+    let (addr, server_handle) = spawn_test_server(app).await;
+    let mut first_stream = connect_raw_ws(addr).await;
+    send_raw_ws_message(&mut first_stream, &attach_message).await;
+    let first_connection_id = loop {
+        let registrations = pg
+            .store
+            .list_realtime_connections(&create_success.session_code)
+            .await
+            .expect("list initial distributed registrations");
+        if registrations.len() == 1 {
+            assert_eq!(registrations[0].replica_id, state.replica_id);
+            break registrations[0].connection_id.clone();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    };
+
+    let remote_store = pg.reconnect().await;
+    let remote_replica_id = "replica-remote".to_string();
+    let replacement = remote_store
+        .claim_realtime_connection(&RealtimeConnectionRegistration {
+            session_code: create_success.session_code.clone(),
+            player_id: create_success.player_id.clone(),
+            connection_id: "conn-remote".to_string(),
+            replica_id: remote_replica_id.clone(),
+        })
+        .await
+        .expect("remote replica should replace original connection");
+    assert_eq!(
+        replacement.replaced,
+        Some(RealtimeConnectionRegistration {
+            session_code: create_success.session_code.clone(),
+            player_id: create_success.player_id.clone(),
+            connection_id: first_connection_id.clone(),
+            replica_id: state.replica_id.clone(),
+        })
+    );
+
+    send_raw_ws_message(&mut first_stream, &attach_message).await;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let registrations = pg
+        .store
+        .list_realtime_connections(&create_success.session_code)
+        .await
+        .expect("list distributed registrations after stale reclaim attempt");
+    assert_eq!(registrations.len(), 1, "stale socket must not reclaim distributed ownership");
+    assert_eq!(registrations[0].connection_id, "conn-remote");
+    assert_eq!(registrations[0].replica_id, remote_replica_id);
+
+    let _ = first_stream.shutdown().await;
+    drop(first_stream);
+    drop(remote_store);
+    server_handle.abort();
+    pg.cleanup().await;
+}
+
+#[tokio::test]
+async fn session_write_lease_detects_renewal_loss_before_another_writer_can_proceed() {
+    let store = Arc::new(FaultyStore::new());
+    let state = test_state_with_store(store.clone());
+    let session_code = "123456";
+
+    let (_, _write_guard, write_lease) = crate::cache::SessionWriteLease::acquire(&state, session_code)
+        .await
+        .expect("acquire write lease");
+
+    store.fail_lease_renewal();
+    tokio::time::sleep(std::time::Duration::from_secs(6)).await;
+
+    assert!(
+        write_lease.ensure_active().is_err(),
+        "request guard must fence itself after lease renewal stops and ownership expires"
+    );
+
+    let replacement_expires_at = (Utc::now() + ChronoDuration::seconds(5)).to_rfc3339();
+    assert!(store
+        .inner
+        .acquire_session_lease(session_code, "replacement-lease", &replacement_expires_at)
+        .await
+        .expect("replacement writer should acquire expired lease after fence trips"));
 }
 
 #[tokio::test]
@@ -1445,6 +4003,81 @@ async fn join_workshop_endpoint_rejects_invalid_reconnect_token() {
         }
         WorkshopJoinResult::Success(_) => panic!("expected reconnect error response"),
     }
+}
+
+#[tokio::test]
+async fn join_workshop_endpoint_rejects_expired_reconnect_token() {
+    let state = test_state_with_reconnect_ttl(std::time::Duration::from_secs(60));
+    let app = build_app(state.clone());
+    let create_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops")
+                .header("content-type", "application/json")
+                .body(Body::from(create_workshop_body("Alice")))
+                .expect("build create request"),
+        )
+        .await
+        .expect("call create workshop");
+    let create_body = to_bytes(create_response.into_body(), usize::MAX)
+        .await
+        .expect("read create body");
+    let create_result: WorkshopJoinResult =
+        serde_json::from_slice(&create_body).expect("parse create result");
+    let create_success = match create_result {
+        WorkshopJoinResult::Success(success) => success,
+        WorkshopJoinResult::Error(error) => {
+            panic!("expected create success, got error: {}", error.error)
+        }
+    };
+
+    overwrite_identity_last_seen_at(
+        state.store.as_ref(),
+        &create_success.state.session.id,
+        &create_success.player_id,
+        &create_success.reconnect_token,
+        Utc::now() - ChronoDuration::seconds(61),
+    )
+    .await;
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops/join")
+                .header("content-type", "application/json")
+                .body(Body::from(format!(
+                    r#"{{"sessionCode":"{}","reconnectToken":"{}"}}"#,
+                    create_success.session_code, create_success.reconnect_token
+                )))
+                .expect("build reconnect request"),
+        )
+        .await
+        .expect("call reconnect join workshop");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read reconnect body");
+    let result: WorkshopJoinResult = serde_json::from_slice(&body).expect("parse reconnect result");
+    match result {
+        WorkshopJoinResult::Error(error) => {
+            assert_eq!(error.error, "Session identity is invalid or expired.");
+        }
+        WorkshopJoinResult::Success(_) => panic!("expected reconnect error response"),
+    }
+
+    let found = state
+        .store
+        .find_player_identity(
+            &create_success.session_code,
+            &create_success.reconnect_token,
+        )
+        .await
+        .expect("find identity after expiry");
+    assert_eq!(found, None);
 }
 
 #[tokio::test]
@@ -2514,7 +5147,8 @@ async fn workshop_command_rejects_non_host_start_phase2() {
 
 #[tokio::test]
 async fn workshop_command_rejects_start_phase2_when_tags_are_missing() {
-    let app = build_app(test_state());
+    let state = test_state();
+    let app = build_app(state.clone());
     let create_response = app
         .clone()
         .oneshot(
@@ -2538,6 +5172,17 @@ async fn workshop_command_rejects_start_phase2_when_tags_are_missing() {
             panic!("expected create success, got error: {}", error.error)
         }
     };
+
+    state
+        .store
+        .claim_realtime_connection(&RealtimeConnectionRegistration {
+            session_code: create_success.session_code.clone(),
+            player_id: create_success.player_id.clone(),
+            connection_id: "conn-host".to_string(),
+            replica_id: state.replica_id.clone(),
+        })
+        .await
+        .expect("seed host realtime registration");
 
     let start_phase1_response = app
         .clone()
@@ -4139,13 +6784,33 @@ async fn workshop_ws_close_marks_player_offline_and_reassigns_host() {
         .await
         .expect("state update frame")
         .expect("state update message");
+    let (mut guest_socket, _) = connect_async(ws_request(addr)).await.expect("connect guest ws");
+    let guest_attach_message = ClientWsMessage::AttachSession(SessionEnvelope {
+        session_code: join_success.session_code.clone(),
+        player_id: join_success.player_id.clone(),
+        reconnect_token: join_success.reconnect_token.clone(),
+        coordinator_type: Some(CoordinatorType::Rust),
+    });
+    guest_socket
+        .send(WsMessage::Text(
+            serde_json::to_string(&guest_attach_message)
+                .expect("encode guest attach")
+                .into(),
+        ))
+        .await
+        .expect("send guest attach");
+    let _ = guest_socket
+        .next()
+        .await
+        .expect("guest state update frame")
+        .expect("guest state update message");
     assert_eq!(
         state
             .realtime
             .lock()
             .await
             .session_connection_count(&create_success.session_code),
-        1
+        2
     );
 
     let _ = socket.close(None).await;
@@ -4157,7 +6822,7 @@ async fn workshop_ws_close_marks_player_offline_and_reassigns_host() {
             .lock()
             .await
             .session_connection_count(&create_success.session_code),
-        0
+        1
     );
 
     let (session_id, host_player, guest_player) = {
@@ -4207,6 +6872,7 @@ async fn workshop_ws_close_marks_player_offline_and_reassigns_host() {
         Some(create_success.session_code.as_str())
     );
 
+    let _ = guest_socket.close(None).await;
     server_handle.abort();
 }
 
@@ -4253,62 +6919,49 @@ async fn workshop_ws_rejects_invalid_identity() {
 }
 
 #[tokio::test]
-async fn workshop_ws_attach_keeps_cache_state_when_artifact_append_fails_after_save() {
-    let store = Arc::new(FaultyStore::new());
-    let state = test_state_with_store(store.clone());
-    let session_code = "123456";
-    let player_id = "player-1".to_string();
-    let reconnect_token = "token-1".to_string();
-    let timestamp = Utc::now();
-
-    let mut session = WorkshopSession::new(
-        Uuid::new_v4(),
-        SessionCode(session_code.into()),
-        timestamp,
-        protocol::WorkshopCreateConfig::default(),
-    );
-    session.add_player(SessionPlayer {
-        id: player_id.clone(),
-        name: "Alice".to_string(),
-        pet_description: Some("Alice's workshop dragon".to_string()),
-        is_host: true,
-        is_connected: false,
-        is_ready: false,
-        score: 0,
-        current_dragon_id: None,
-        achievements: Vec::new(),
-        joined_at: timestamp,
-    });
-    store
-        .inner
-        .save_session(&session)
-        .await
-        .expect("seed session");
-    store
-        .inner
-        .create_player_identity(&persistence::PlayerIdentity {
-            session_id: session.id.to_string(),
-            player_id: player_id.clone(),
-            reconnect_token: reconnect_token.clone(),
-            created_at: timestamp.to_rfc3339(),
-            last_seen_at: timestamp.to_rfc3339(),
-        })
-        .await
-        .expect("seed identity");
-    state
-        .sessions
-        .lock()
-        .await
-        .insert(session_code.to_string(), session.clone());
-    store.fail_artifact_appends();
-
+async fn workshop_ws_rejects_expired_identity() {
+    let state = test_state_with_reconnect_ttl(std::time::Duration::from_secs(60));
     let app = build_app(state.clone());
+
+    let create_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops")
+                .header("content-type", "application/json")
+                .body(Body::from(create_workshop_body("Alice")))
+                .expect("build create request"),
+        )
+        .await
+        .expect("call create workshop");
+    let create_body = to_bytes(create_response.into_body(), usize::MAX)
+        .await
+        .expect("read create body");
+    let create_result: WorkshopJoinResult =
+        serde_json::from_slice(&create_body).expect("parse create result");
+    let create_success = match create_result {
+        WorkshopJoinResult::Success(success) => success,
+        WorkshopJoinResult::Error(error) => {
+            panic!("expected create success, got error: {}", error.error)
+        }
+    };
+
+    overwrite_identity_last_seen_at(
+        state.store.as_ref(),
+        &create_success.state.session.id,
+        &create_success.player_id,
+        &create_success.reconnect_token,
+        Utc::now() - ChronoDuration::seconds(61),
+    )
+    .await;
+
     let (addr, server_handle) = spawn_test_server(app).await;
     let (mut socket, _) = connect_async(ws_request(addr)).await.expect("connect ws");
     let attach_message = ClientWsMessage::AttachSession(SessionEnvelope {
-        session_code: session_code.to_string(),
-        player_id: player_id.clone(),
-        reconnect_token: reconnect_token.clone(),
+        session_code: create_success.session_code.clone(),
+        player_id: create_success.player_id.clone(),
+        reconnect_token: create_success.reconnect_token.clone(),
         coordinator_type: Some(CoordinatorType::Rust),
     });
     socket
@@ -4333,25 +6986,27 @@ async fn workshop_ws_attach_keeps_cache_state_when_artifact_append_fails_after_s
         serde_json::from_str(&payload).expect("parse server ws message");
     match server_message {
         ServerWsMessage::Error { message } => {
-            assert!(message.contains("failed to append reconnect artifact"))
+            assert_eq!(message, "Session identity is invalid or expired.");
         }
         other => panic!("expected error message, got {other:?}"),
     }
 
-    let sessions = state.sessions.lock().await;
-    let cached = sessions.get(session_code).expect("session remains cached");
-    let player = cached.players.get(&player_id).expect("player exists");
-    assert!(
-        player.is_connected,
-        "cache should keep the committed reconnect state"
-    );
+    let found = state
+        .store
+        .find_player_identity(
+            &create_success.session_code,
+            &create_success.reconnect_token,
+        )
+        .await
+        .expect("find identity after expiry");
+    assert_eq!(found, None);
 
     let _ = socket.close(None).await;
     server_handle.abort();
 }
 
 #[tokio::test]
-async fn workshop_ws_attach_restores_cache_state_when_save_fails() {
+async fn workshop_ws_attach_restores_cache_state_when_grouped_reconnect_persist_fails() {
     let store = Arc::new(FaultyStore::new());
     let state = test_state_with_store(store.clone());
     let session_code = "123456";
@@ -4398,7 +7053,7 @@ async fn workshop_ws_attach_restores_cache_state_when_save_fails() {
         .lock()
         .await
         .insert(session_code.to_string(), session.clone());
-    store.fail_saves();
+    store.fail_save_with_artifact();
 
     let app = build_app(state.clone());
     let (addr, server_handle) = spawn_test_server(app).await;
@@ -4421,6 +7076,31 @@ async fn workshop_ws_attach_restores_cache_state_when_save_fails() {
     let message = socket
         .next()
         .await
+        .expect("state frame")
+        .expect("state message");
+    let payload = match message {
+        WsMessage::Text(payload) => payload,
+        other => panic!("expected text frame, got {other:?}"),
+    };
+    let server_message: ServerWsMessage =
+        serde_json::from_str(&payload).expect("parse server ws message");
+    match server_message {
+        ServerWsMessage::StateUpdate(state_update) => {
+            assert!(
+                state_update
+                    .players
+                    .get(&player_id)
+                    .expect("player in state update")
+                    .is_connected,
+                "initial websocket state should still reflect the optimistic reconnect"
+            );
+        }
+        other => panic!("expected state update, got {other:?}"),
+    }
+
+    let message = socket
+        .next()
+        .await
         .expect("error frame")
         .expect("error message");
     let payload = match message {
@@ -4430,7 +7110,9 @@ async fn workshop_ws_attach_restores_cache_state_when_save_fails() {
     let server_message: ServerWsMessage =
         serde_json::from_str(&payload).expect("parse server ws message");
     match server_message {
-        ServerWsMessage::Error { message } => assert!(message.contains("failed to save session")),
+        ServerWsMessage::Error { message } => {
+            assert!(message.contains("failed to persist websocket reconnect"))
+        }
         other => panic!("expected error message, got {other:?}"),
     }
 
@@ -4439,7 +7121,23 @@ async fn workshop_ws_attach_restores_cache_state_when_save_fails() {
     let player = cached.players.get(&player_id).expect("player exists");
     assert!(
         !player.is_connected,
-        "cache should roll back when reconnect save fails"
+        "cache should roll back when grouped reconnect persistence fails"
+    );
+    drop(sessions);
+
+    let persisted = state
+        .store
+        .load_session_by_code(session_code)
+        .await
+        .expect("load persisted session after failed reconnect persist")
+        .expect("persisted session remains");
+    assert!(
+        !persisted
+            .players
+            .get(&player_id)
+            .expect("persisted player exists")
+            .is_connected,
+        "persisted reconnect state should roll back when grouped reconnect persistence fails"
     );
 
     let _ = socket.close(None).await;
@@ -4475,17 +7173,41 @@ async fn workshop_ws_attach_does_not_leave_registration_when_initial_state_send_
         }
     };
 
+    state
+        .fail_next_initial_state_send
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+
     let (addr, server_handle) = spawn_test_server(app).await;
-    send_attach_and_reset_connection(
-        addr,
-        &ClientWsMessage::AttachSession(SessionEnvelope {
-            session_code: create_success.session_code.clone(),
-            player_id: create_success.player_id.clone(),
-            reconnect_token: create_success.reconnect_token.clone(),
-            coordinator_type: Some(CoordinatorType::Rust),
-        }),
-    )
-    .await;
+    let (mut socket, _) = connect_async(ws_request(addr)).await.expect("connect ws");
+    socket
+        .send(WsMessage::Text(
+            serde_json::to_string(&ClientWsMessage::AttachSession(SessionEnvelope {
+                session_code: create_success.session_code.clone(),
+                player_id: create_success.player_id.clone(),
+                reconnect_token: create_success.reconnect_token.clone(),
+                coordinator_type: Some(CoordinatorType::Rust),
+            }))
+            .expect("encode attach")
+            .into(),
+        ))
+        .await
+        .expect("send attach");
+
+    let message = socket
+        .next()
+        .await
+        .expect("error frame")
+        .expect("error message");
+    let payload = match message {
+        WsMessage::Text(payload) => payload,
+        other => panic!("expected text frame, got {other:?}"),
+    };
+    let server_message: ServerWsMessage =
+        serde_json::from_str(&payload).expect("parse server ws message");
+    match server_message {
+        ServerWsMessage::Error { message } => assert_eq!(message, "connection is closed"),
+        other => panic!("expected error message, got {other:?}"),
+    }
 
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
@@ -4497,6 +7219,272 @@ async fn workshop_ws_attach_does_not_leave_registration_when_initial_state_send_
             .session_connection_count(&create_success.session_code),
         0,
         "failed initial state send should not leave a realtime registration behind"
+    );
+
+    server_handle.abort();
+}
+
+#[tokio::test]
+async fn workshop_ws_attach_restores_connected_state_when_initial_state_send_fails() {
+    let state = test_state();
+    let app = build_app(state.clone());
+
+    let create_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops")
+                .header("content-type", "application/json")
+                .body(Body::from(create_workshop_body("Alice")))
+                .expect("build create request"),
+        )
+        .await
+        .expect("call create workshop");
+    let create_body = to_bytes(create_response.into_body(), usize::MAX)
+        .await
+        .expect("read create body");
+    let create_result: WorkshopJoinResult =
+        serde_json::from_slice(&create_body).expect("parse create result");
+    let create_success = match create_result {
+        WorkshopJoinResult::Success(success) => success,
+        WorkshopJoinResult::Error(error) => {
+            panic!("expected create success, got error: {}", error.error)
+        }
+    };
+
+    let mut persisted = state
+        .store
+        .load_session_by_code(&create_success.session_code)
+        .await
+        .expect("load persisted session")
+        .expect("persisted session exists");
+    persisted
+        .players
+        .get_mut(&create_success.player_id)
+        .expect("persisted player exists")
+        .is_connected = false;
+    persisted.updated_at = Utc::now();
+    state
+        .store
+        .save_session(&persisted)
+        .await
+        .expect("persist disconnected session");
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(create_success.session_code.clone(), persisted.clone());
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+    state
+        .fail_next_initial_state_send
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+
+    let (addr, server_handle) = spawn_test_server(app).await;
+    let (mut socket, _) = connect_async(ws_request(addr)).await.expect("connect ws");
+    socket
+        .send(WsMessage::Text(
+            serde_json::to_string(&ClientWsMessage::AttachSession(SessionEnvelope {
+                session_code: create_success.session_code.clone(),
+                player_id: create_success.player_id.clone(),
+                reconnect_token: create_success.reconnect_token.clone(),
+                coordinator_type: Some(CoordinatorType::Rust),
+            }))
+            .expect("encode attach")
+            .into(),
+        ))
+        .await
+        .expect("send attach");
+
+    let message = socket
+        .next()
+        .await
+        .expect("error frame")
+        .expect("error message");
+    let payload = match message {
+        WsMessage::Text(payload) => payload,
+        other => panic!("expected text frame, got {other:?}"),
+    };
+    let server_message: ServerWsMessage =
+        serde_json::from_str(&payload).expect("parse server ws message");
+    match server_message {
+        ServerWsMessage::Error { message } => assert_eq!(message, "connection is closed"),
+        other => panic!("expected error message, got {other:?}"),
+    }
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let cached = state
+        .sessions
+        .lock()
+        .await
+        .get(&create_success.session_code)
+        .expect("cached session remains")
+        .clone();
+    assert!(
+        !cached
+            .players
+            .get(&create_success.player_id)
+            .expect("cached player exists")
+            .is_connected,
+        "failed initial state send should roll back cached reconnect state"
+    );
+
+    let persisted = state
+        .store
+        .load_session_by_code(&create_success.session_code)
+        .await
+        .expect("load persisted session after failed attach")
+        .expect("persisted session remains");
+    assert!(
+        !persisted
+            .players
+            .get(&create_success.player_id)
+            .expect("persisted player exists")
+            .is_connected,
+        "failed initial state send should roll back persisted reconnect state"
+    );
+
+    let artifacts = state
+        .store
+        .list_session_artifacts(&persisted.id.to_string())
+        .await
+        .expect("list artifacts after failed attach");
+    assert!(
+        !artifacts.iter().any(|artifact| {
+            matches!(
+                artifact.kind,
+                SessionArtifactKind::PlayerReconnected | SessionArtifactKind::PlayerLeft
+            )
+        }),
+        "failed initial state send should not persist reconnect/disconnect artifacts"
+    );
+
+    server_handle.abort();
+}
+
+#[tokio::test]
+async fn workshop_ws_attach_restores_connected_state_when_realtime_claim_fails() {
+    let store = Arc::new(FaultyStore::new());
+    let state = test_state_with_store(store.clone());
+    let app = build_app(state.clone());
+
+    let create_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops")
+                .header("content-type", "application/json")
+                .body(Body::from(create_workshop_body("Alice")))
+                .expect("build create request"),
+        )
+        .await
+        .expect("call create workshop");
+    let create_body = to_bytes(create_response.into_body(), usize::MAX)
+        .await
+        .expect("read create body");
+    let create_result: WorkshopJoinResult =
+        serde_json::from_slice(&create_body).expect("parse create result");
+    let create_success = match create_result {
+        WorkshopJoinResult::Success(success) => success,
+        WorkshopJoinResult::Error(error) => {
+            panic!("expected create success, got error: {}", error.error)
+        }
+    };
+
+    let mut persisted = state
+        .store
+        .load_session_by_code(&create_success.session_code)
+        .await
+        .expect("load persisted session")
+        .expect("persisted session exists");
+    persisted
+        .players
+        .get_mut(&create_success.player_id)
+        .expect("persisted player exists")
+        .is_connected = false;
+    persisted.updated_at = Utc::now();
+    state
+        .store
+        .save_session(&persisted)
+        .await
+        .expect("persist disconnected session");
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(create_success.session_code.clone(), persisted.clone());
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+    store.fail_realtime_claims();
+
+    let (addr, server_handle) = spawn_test_server(app).await;
+    let (mut socket, _) = connect_async(ws_request(addr)).await.expect("connect ws");
+    socket
+        .send(WsMessage::Text(
+            serde_json::to_string(&ClientWsMessage::AttachSession(SessionEnvelope {
+                session_code: create_success.session_code.clone(),
+                player_id: create_success.player_id.clone(),
+                reconnect_token: create_success.reconnect_token.clone(),
+                coordinator_type: Some(CoordinatorType::Rust),
+            }))
+            .expect("encode attach")
+            .into(),
+        ))
+        .await
+        .expect("send attach");
+
+    let message = socket
+        .next()
+        .await
+        .expect("error frame")
+        .expect("error message");
+    let payload = match message {
+        WsMessage::Text(payload) => payload,
+        other => panic!("expected text frame, got {other:?}"),
+    };
+    let server_message: ServerWsMessage =
+        serde_json::from_str(&payload).expect("parse server ws message");
+    match server_message {
+        ServerWsMessage::Error { message } => {
+            assert!(message.contains("failed to claim realtime connection"))
+        }
+        other => panic!("expected error message, got {other:?}"),
+    }
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let cached = state
+        .sessions
+        .lock()
+        .await
+        .get(&create_success.session_code)
+        .expect("cached session remains")
+        .clone();
+    assert!(
+        !cached
+            .players
+            .get(&create_success.player_id)
+            .expect("cached player exists")
+            .is_connected,
+        "failed realtime claim should roll back cached reconnect state"
+    );
+
+    let persisted = state
+        .store
+        .load_session_by_code(&create_success.session_code)
+        .await
+        .expect("load persisted session after failed attach")
+        .expect("persisted session remains");
+    assert!(
+        !persisted
+            .players
+            .get(&create_success.player_id)
+            .expect("persisted player exists")
+            .is_connected,
+        "failed realtime claim should not persist reconnect state"
     );
 
     server_handle.abort();
@@ -4610,12 +7598,28 @@ async fn workshop_ws_failed_reattach_restores_replaced_registration() {
     );
     assert_eq!(registrations[0].connection_id, replacement_connection_id);
 
+    let persisted_registrations = state
+        .store
+        .list_realtime_connections(&create_success.session_code)
+        .await
+        .expect("list persisted realtime registrations");
+    assert_eq!(
+        persisted_registrations.len(),
+        1,
+        "failed re-attach should restore the prior distributed registration"
+    );
+    assert_eq!(
+        persisted_registrations[0].connection_id,
+        replacement_connection_id,
+        "failed re-attach must not orphan the previous distributed owner"
+    );
+
     let _ = second_socket.close(None).await;
     server_handle.abort();
 }
 
 #[tokio::test]
-async fn reconnect_join_keeps_cache_state_when_touch_fails_after_save() {
+async fn reconnect_join_restores_cache_state_when_grouped_reconnect_persist_fails() {
     let store = Arc::new(FaultyStore::new());
     let state = test_state_with_store(store.clone());
     let session_code = "123456";
@@ -4662,7 +7666,7 @@ async fn reconnect_join_keeps_cache_state_when_touch_fails_after_save() {
         .lock()
         .await
         .insert(session_code.to_string(), session.clone());
-    store.fail_touches();
+    store.fail_replace_identity_and_save_with_artifact();
 
     let app = build_app(state.clone());
     let response = app
@@ -4685,13 +7689,347 @@ async fn reconnect_join_keeps_cache_state_when_touch_fails_after_save() {
     let cached = sessions.get(session_code).expect("session remains cached");
     let player = cached.players.get(&player_id).expect("player exists");
     assert!(
-        player.is_connected,
-        "cache should keep the committed reconnect state"
+        !player.is_connected,
+        "cache should roll back when grouped reconnect persistence fails"
     );
 }
 
 #[tokio::test]
-async fn fresh_join_keeps_cache_state_when_identity_create_fails_after_save() {
+async fn websocket_reconnect_persistence_does_not_store_connected_presence() {
+    let state = test_state();
+    let session_code = "123456";
+    let player_id = "player-1".to_string();
+    let reconnect_token = "token-1".to_string();
+    let timestamp = Utc::now();
+
+    let mut session = WorkshopSession::new(
+        Uuid::new_v4(),
+        SessionCode(session_code.into()),
+        timestamp,
+        protocol::WorkshopCreateConfig::default(),
+    );
+    session.add_player(SessionPlayer {
+        id: player_id.clone(),
+        name: "Alice".to_string(),
+        pet_description: Some("Alice's workshop dragon".to_string()),
+        is_host: true,
+        is_connected: false,
+        is_ready: false,
+        score: 0,
+        current_dragon_id: None,
+        achievements: Vec::new(),
+        joined_at: timestamp,
+    });
+    state
+        .store
+        .save_session(&session)
+        .await
+        .expect("seed session");
+    state
+        .store
+        .create_player_identity(&persistence::PlayerIdentity {
+            session_id: session.id.to_string(),
+            player_id: player_id.clone(),
+            reconnect_token: reconnect_token.clone(),
+            created_at: timestamp.to_rfc3339(),
+            last_seen_at: timestamp.to_rfc3339(),
+        })
+        .await
+        .expect("seed identity");
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(session_code.to_string(), session.clone());
+
+    let app = build_app(state.clone());
+    let (addr, server_handle) = spawn_test_server(app).await;
+    let (mut socket, _) = connect_async(ws_request(addr)).await.expect("connect ws");
+    let attach_message = ClientWsMessage::AttachSession(SessionEnvelope {
+        session_code: session_code.to_string(),
+        player_id: player_id.clone(),
+        reconnect_token: reconnect_token.clone(),
+        coordinator_type: Some(CoordinatorType::Rust),
+    });
+    socket
+        .send(WsMessage::Text(
+            serde_json::to_string(&attach_message)
+                .expect("encode attach")
+                .into(),
+        ))
+        .await
+        .expect("send attach");
+
+    let _ = socket
+        .next()
+        .await
+        .expect("state frame")
+        .expect("state message");
+
+    let persisted = state
+        .store
+        .load_session_by_code(session_code)
+        .await
+        .expect("load persisted session after reconnect")
+        .expect("persisted session remains");
+    assert!(
+        !persisted
+            .players
+            .get(&player_id)
+            .expect("persisted player exists")
+            .is_connected,
+        "successful reconnect persistence must not store durable live presence"
+    );
+
+    let _ = socket.close(None).await;
+    server_handle.abort();
+}
+
+#[tokio::test]
+async fn websocket_disconnect_restores_cache_state_when_grouped_disconnect_persist_fails() {
+    let store = Arc::new(FaultyStore::new());
+    let state = test_state_with_store(store.clone());
+    let session_code = "123456";
+    let player_id = "player-1".to_string();
+    let reconnect_token = "token-1".to_string();
+    let timestamp = Utc::now();
+
+    let mut session = WorkshopSession::new(
+        Uuid::new_v4(),
+        SessionCode(session_code.into()),
+        timestamp,
+        protocol::WorkshopCreateConfig::default(),
+    );
+    session.add_player(SessionPlayer {
+        id: player_id.clone(),
+        name: "Alice".to_string(),
+        pet_description: Some("Alice's workshop dragon".to_string()),
+        is_host: true,
+        is_connected: true,
+        is_ready: false,
+        score: 0,
+        current_dragon_id: None,
+        achievements: Vec::new(),
+        joined_at: timestamp,
+    });
+    store
+        .inner
+        .save_session(&session)
+        .await
+        .expect("seed session");
+    store
+        .inner
+        .create_player_identity(&persistence::PlayerIdentity {
+            session_id: session.id.to_string(),
+            player_id: player_id.clone(),
+            reconnect_token: reconnect_token.clone(),
+            created_at: timestamp.to_rfc3339(),
+            last_seen_at: timestamp.to_rfc3339(),
+        })
+        .await
+        .expect("seed identity");
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(session_code.to_string(), session.clone());
+    state
+        .realtime
+        .lock()
+        .await
+        .attach(session_code, &player_id, "conn-1");
+    store
+        .inner
+        .claim_realtime_connection(&RealtimeConnectionRegistration {
+            session_code: session_code.to_string(),
+            player_id: player_id.clone(),
+            connection_id: "conn-1".to_string(),
+            replica_id: state.replica_id.clone(),
+        })
+        .await
+        .expect("seed realtime registration");
+    store.fail_grouped_session_artifact_persist();
+
+    super::ws::sync_ws_disconnect(&state, "conn-1").await;
+
+    let sessions = state.sessions.lock().await;
+    let cached = sessions.get(session_code).expect("session remains cached");
+    let player = cached.players.get(&player_id).expect("player exists");
+    assert!(
+        player.is_connected,
+        "cache should roll back when grouped disconnect persistence fails"
+    );
+    drop(sessions);
+
+    let registrations = state.realtime.lock().await.session_registrations(session_code);
+    assert!(registrations.is_empty(), "disconnect should still detach runtime registration");
+}
+
+#[tokio::test]
+async fn replaced_connection_close_before_notification_does_not_persist_false_disconnect() {
+    let pg = PostgresAppTestStore::new(
+        "replaced_connection_close_before_notification_does_not_persist_false_disconnect",
+    )
+    .await;
+    let state = test_state_with_store(pg.store.clone() as Arc<dyn SessionStore>);
+    let timestamp = Utc::now();
+    let session_code = "123456";
+    let player_id = "player-1".to_string();
+
+    let mut session = WorkshopSession::new(
+        Uuid::new_v4(),
+        SessionCode(session_code.to_string()),
+        timestamp,
+        protocol::WorkshopCreateConfig::default(),
+    );
+    session.add_player(SessionPlayer {
+        id: player_id.clone(),
+        name: "Alice".to_string(),
+        pet_description: Some("Alice's workshop dragon".to_string()),
+        is_host: true,
+        is_connected: true,
+        is_ready: false,
+        score: 0,
+        current_dragon_id: None,
+        achievements: Vec::new(),
+        joined_at: timestamp,
+    });
+    pg.store.save_session(&session).await.expect("persist session");
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(session_code.to_string(), session.clone());
+    state
+        .realtime
+        .lock()
+        .await
+        .attach(session_code, &player_id, "conn-1");
+    pg.store
+        .claim_realtime_connection(&RealtimeConnectionRegistration {
+            session_code: session_code.to_string(),
+            player_id: player_id.clone(),
+            connection_id: "conn-1".to_string(),
+            replica_id: state.replica_id.clone(),
+        })
+        .await
+        .expect("claim initial distributed registration");
+
+    let remote_store = pg.reconnect().await;
+    remote_store
+        .claim_realtime_connection(&RealtimeConnectionRegistration {
+            session_code: session_code.to_string(),
+            player_id: player_id.clone(),
+            connection_id: "conn-remote".to_string(),
+            replica_id: "replica-remote".to_string(),
+        })
+        .await
+        .expect("remote replica replaces local connection");
+
+    super::ws::sync_ws_disconnect(&state, "conn-1").await;
+
+    let cached = state
+        .sessions
+        .lock()
+        .await
+        .get(session_code)
+        .expect("cached session remains")
+        .clone();
+    assert!(
+        cached.players.get(&player_id).expect("cached player exists").is_connected,
+        "stale replaced close must not persist a false disconnect before notification arrives"
+    );
+
+    let artifacts = pg
+        .store
+        .list_session_artifacts(&session.id.to_string())
+        .await
+        .expect("list artifacts");
+    assert!(
+        !artifacts.iter().any(|artifact| artifact.kind == SessionArtifactKind::PlayerLeft),
+        "stale replaced close must not emit a PlayerLeft artifact"
+    );
+
+    let registrations = pg
+        .store
+        .list_realtime_connections(session_code)
+        .await
+        .expect("list distributed registrations after stale close");
+    assert_eq!(registrations.len(), 1);
+    assert_eq!(registrations[0].connection_id, "conn-remote");
+
+    drop(remote_store);
+    pg.cleanup().await;
+}
+
+#[tokio::test]
+async fn workshop_command_rejects_expired_reconnect_token() {
+    let state = test_state_with_reconnect_ttl(std::time::Duration::from_secs(60));
+    let app = build_app(state.clone());
+    let create_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops")
+                .header("content-type", "application/json")
+                .body(Body::from(create_workshop_body("Alice")))
+                .expect("build create request"),
+        )
+        .await
+        .expect("call create workshop");
+    let create_body = to_bytes(create_response.into_body(), usize::MAX)
+        .await
+        .expect("read create body");
+    let create_result: WorkshopJoinResult =
+        serde_json::from_slice(&create_body).expect("parse create result");
+    let create_success = match create_result {
+        WorkshopJoinResult::Success(success) => success,
+        WorkshopJoinResult::Error(error) => {
+            panic!("expected create success, got error: {}", error.error)
+        }
+    };
+
+    overwrite_identity_last_seen_at(
+        state.store.as_ref(),
+        &create_success.state.session.id,
+        &create_success.player_id,
+        &create_success.reconnect_token,
+        Utc::now() - ChronoDuration::seconds(61),
+    )
+    .await;
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops/command")
+                .header("content-type", "application/json")
+                .body(Body::from(format!(
+                    r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"startPhase1"}}"#,
+                    create_success.session_code, create_success.reconnect_token
+                )))
+                .expect("build command request"),
+        )
+        .await
+        .expect("call command endpoint");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read command body");
+    let result: WorkshopCommandResult =
+        serde_json::from_slice(&body).expect("parse command result");
+    match result {
+        WorkshopCommandResult::Error(error) => {
+            assert_eq!(error.error, "Session identity is invalid or expired.");
+        }
+        WorkshopCommandResult::Success(_) => panic!("expected command error response"),
+    }
+}
+
+#[tokio::test]
+async fn fresh_join_restores_cache_state_when_grouped_join_persist_fails() {
     let store = Arc::new(FaultyStore::new());
     let state = test_state_with_store(store.clone());
     let session_code = "123456";
@@ -4725,7 +8063,7 @@ async fn fresh_join_keeps_cache_state_when_identity_create_fails_after_save() {
         .lock()
         .await
         .insert(session_code.to_string(), session.clone());
-    store.fail_identity_creates();
+    store.fail_save_with_identity_and_artifact();
 
     let app = build_app(state.clone());
     let response = app
@@ -4748,8 +8086,8 @@ async fn fresh_join_keeps_cache_state_when_identity_create_fails_after_save() {
     let cached = sessions.get(session_code).expect("session remains cached");
     assert_eq!(
         cached.players.len(),
-        2,
-        "cache should keep the committed join state after save succeeds"
+        1,
+        "cache should roll back when grouped join persistence fails"
     );
 }
 
@@ -4779,6 +8117,187 @@ async fn workshop_ws_replies_with_pong_for_ping_message() {
     let server_message: ServerWsMessage =
         serde_json::from_str(&payload).expect("parse server ws message");
     assert_eq!(server_message, ServerWsMessage::Pong);
+
+    let _ = socket.close(None).await;
+    server_handle.abort();
+}
+
+#[tokio::test]
+async fn workshop_ws_upgrade_is_rate_limited_for_repeated_connections() {
+    let mut state = test_state();
+    state.config = Arc::new(AppConfig {
+        websocket_rate_limit: 1,
+        ..state.config.as_ref().clone()
+    });
+    state.websocket_limiter = Arc::new(tokio::sync::Mutex::new(
+        security::FixedWindowRateLimiter::new(1, 60_000),
+    ));
+    let app = build_app(state);
+    let (addr, server_handle) = spawn_test_server(app).await;
+
+    let (socket, _) = connect_async(ws_request(addr))
+        .await
+        .expect("connect first ws");
+    drop(socket);
+
+    let second = connect_async(ws_request(addr)).await;
+    let error = second.expect_err("second websocket upgrade should be rate limited");
+    let response = match error {
+        tokio_tungstenite::tungstenite::Error::Http(response) => response,
+        other => panic!("expected websocket http error, got {other:?}"),
+    };
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+
+    server_handle.abort();
+}
+
+#[tokio::test]
+async fn workshop_ws_upgrade_uses_forwarded_for_when_trusted() {
+    let mut state = test_state();
+    state.config = Arc::new(AppConfig {
+        trust_forwarded_for: true,
+        websocket_rate_limit: 1,
+        ..state.config.as_ref().clone()
+    });
+    state.websocket_limiter = Arc::new(tokio::sync::Mutex::new(
+        security::FixedWindowRateLimiter::new(1, 60_000),
+    ));
+    let app = build_app(state);
+    let (addr, server_handle) = spawn_test_server(app).await;
+
+    let mut first_request = ws_request(addr);
+    first_request
+        .headers_mut()
+        .insert("x-forwarded-for", HeaderValue::from_static("10.0.0.1"));
+    let (first_socket, _) = connect_async(first_request)
+        .await
+        .expect("connect first ws");
+    drop(first_socket);
+
+    let mut second_request = ws_request(addr);
+    second_request
+        .headers_mut()
+        .insert("x-forwarded-for", HeaderValue::from_static("203.0.113.99"));
+    let second = connect_async(second_request).await;
+    assert!(
+        second.is_ok(),
+        "trusted forwarded-for should separate websocket client identity"
+    );
+
+    if let Ok((socket, _)) = second {
+        drop(socket);
+    }
+    server_handle.abort();
+}
+
+#[tokio::test]
+async fn workshop_ws_messages_are_rate_limited_after_attach() {
+    let mut state = test_state();
+    state.config = Arc::new(AppConfig {
+        websocket_rate_limit: 3,
+        ..state.config.as_ref().clone()
+    });
+    state.websocket_limiter = Arc::new(tokio::sync::Mutex::new(
+        security::FixedWindowRateLimiter::new(3, 60_000),
+    ));
+    let app = build_app(state.clone());
+
+    let create_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops")
+                .header("content-type", "application/json")
+                .body(Body::from(create_workshop_body("Alice")))
+                .expect("build create request"),
+        )
+        .await
+        .expect("call create workshop");
+    let create_body = to_bytes(create_response.into_body(), usize::MAX)
+        .await
+        .expect("read create body");
+    let create_result: WorkshopJoinResult =
+        serde_json::from_slice(&create_body).expect("parse create result");
+    let create_success = match create_result {
+        WorkshopJoinResult::Success(success) => success,
+        WorkshopJoinResult::Error(error) => {
+            panic!("expected create success, got error: {}", error.error)
+        }
+    };
+
+    let (addr, server_handle) = spawn_test_server(app).await;
+    let (mut socket, _) = connect_async(ws_request(addr)).await.expect("connect ws");
+    let attach_message = ClientWsMessage::AttachSession(SessionEnvelope {
+        session_code: create_success.session_code.clone(),
+        player_id: create_success.player_id.clone(),
+        reconnect_token: create_success.reconnect_token.clone(),
+        coordinator_type: Some(CoordinatorType::Rust),
+    });
+    socket
+        .send(WsMessage::Text(
+            serde_json::to_string(&attach_message)
+                .expect("encode attach")
+                .into(),
+        ))
+        .await
+        .expect("send attach");
+
+    let _ = socket
+        .next()
+        .await
+        .expect("initial state update frame")
+        .expect("initial state update message");
+
+    socket
+        .send(WsMessage::Text(
+            serde_json::to_string(&ClientWsMessage::Ping)
+                .expect("encode first ping")
+                .into(),
+        ))
+        .await
+        .expect("send first ping");
+    let first = socket
+        .next()
+        .await
+        .expect("first pong frame")
+        .expect("first pong message");
+    let first_payload = match first {
+        WsMessage::Text(payload) => payload,
+        other => panic!("expected text frame, got {other:?}"),
+    };
+    let first_server_message: ServerWsMessage =
+        serde_json::from_str(&first_payload).expect("parse first server ws message");
+    assert_eq!(first_server_message, ServerWsMessage::Pong);
+
+    socket
+        .send(WsMessage::Text(
+            serde_json::to_string(&ClientWsMessage::Ping)
+                .expect("encode second ping")
+                .into(),
+        ))
+        .await
+        .expect("send second ping");
+    let second = socket
+        .next()
+        .await
+        .expect("rate limited frame")
+        .expect("rate limited message");
+    let second_payload = match second {
+        WsMessage::Text(payload) => payload,
+        other => panic!("expected text frame, got {other:?}"),
+    };
+    let second_server_message: ServerWsMessage =
+        serde_json::from_str(&second_payload).expect("parse rate limited server ws message");
+    match second_server_message {
+        ServerWsMessage::Error { message } => {
+            assert_eq!(
+                message,
+                "Too many requests. Please slow down and try again."
+            );
+        }
+        other => panic!("expected error message, got {other:?}"),
+    }
 
     let _ = socket.close(None).await;
     server_handle.abort();
@@ -5045,10 +8564,17 @@ fn to_client_game_state_includes_dragons_and_voting_details() {
     session.begin_phase1(&assignments).expect("begin phase1");
     session.record_discovery_observation("p1", "Calms down at dusk");
     session.record_discovery_observation("p2", "Rejects fruit at night");
-    session.transition_to(protocol::Phase::Handover)
+    session
+        .transition_to(protocol::Phase::Handover)
         .expect("enter handover");
-    session.save_handover_tags("p1", vec!["Rule 1".into(), "Rule 2".into(), "Rule 3".into()]);
-    session.save_handover_tags("p2", vec!["Rule A".into(), "Rule B".into(), "Rule C".into()]);
+    session.save_handover_tags(
+        "p1",
+        vec!["Rule 1".into(), "Rule 2".into(), "Rule 3".into()],
+    );
+    session.save_handover_tags(
+        "p2",
+        vec!["Rule A".into(), "Rule B".into(), "Rule C".into()],
+    );
     session.enter_phase2().expect("enter phase2");
     session
         .apply_action("p1", domain::PlayerAction::Sleep)
@@ -5077,26 +8603,44 @@ fn to_client_game_state_includes_dragons_and_voting_details() {
         .dragons
         .get(&alice_current_dragon_id)
         .expect("alice current dragon details");
-    assert!(!alice_current_dragon
-        .condition_hint
-        .as_deref()
-        .unwrap_or_default()
-        .is_empty());
+    assert!(
+        !alice_current_dragon
+            .condition_hint
+            .as_deref()
+            .unwrap_or_default()
+            .is_empty()
+    );
     assert_eq!(alice_current_dragon.handover_tags.len(), 3);
-    assert_eq!(alice_current_dragon.last_action, protocol::DragonAction::Idle);
-    assert_eq!(alice_current_dragon.last_emotion, protocol::DragonEmotion::Angry);
-    let original_dragon = client_state.dragons.get("dragon-p1").expect("original dragon");
+    assert_eq!(
+        alice_current_dragon.last_action,
+        protocol::DragonAction::Idle
+    );
+    assert_eq!(
+        alice_current_dragon.last_emotion,
+        protocol::DragonEmotion::Angry
+    );
+    let original_dragon = client_state
+        .dragons
+        .get("dragon-p1")
+        .expect("original dragon");
     assert_eq!(original_dragon.discovery_observations.len(), 1);
-    assert!(client_state
-        .voting
-        .as_ref()
-        .is_some_and(|voting| voting.eligible_count == 2));
-    assert!(client_state
-        .voting
-        .as_ref()
-        .is_some_and(|voting| voting.submitted_count == 1));
-    assert!(client_state
-        .voting
-        .as_ref()
-        .is_some_and(|voting| voting.current_player_vote_dragon_id.as_deref() == Some(bob_dragon_id.as_str())));
+    assert!(
+        client_state
+            .voting
+            .as_ref()
+            .is_some_and(|voting| voting.eligible_count == 2)
+    );
+    assert!(
+        client_state
+            .voting
+            .as_ref()
+            .is_some_and(|voting| voting.submitted_count == 1)
+    );
+    assert!(
+        client_state
+            .voting
+            .as_ref()
+            .is_some_and(|voting| voting.current_player_vote_dragon_id.as_deref()
+                == Some(bob_dragon_id.as_str()))
+    );
 }

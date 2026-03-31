@@ -1,27 +1,41 @@
 use axum::{
-    extract::State,
     extract::ws::{Message, WebSocket, WebSocketUpgrade},
+    extract::{ConnectInfo, State},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
 };
 use chrono::Utc;
+use persistence::{RealtimeConnectionRegistration, SessionUpdateNotification};
 use protocol::{
     ClientWsMessage, NoticeLevel, ServerWsMessage, SessionArtifactKind, SessionArtifactRecord,
     SessionEnvelope,
 };
 use serde_json::json;
+use tokio::task::JoinHandle;
 use tokio::sync::mpsc;
 use tracing::info;
+#[cfg(test)]
+use std::sync::atomic::Ordering;
 
 use crate::app::AppState;
-use crate::cache::{ensure_session_cached, session_write_lock};
+use crate::cache::{SessionWriteLease, ensure_session_cached, reload_cached_session};
 use crate::helpers::{phase_label, phase_step, random_prefixed_id, to_client_game_state};
+use crate::http::{
+    MaybeConnectInfo, authorize_reconnect_identity, client_key, is_rate_limited,
+    refresh_reconnect_identity,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct WsAttachOutcome {
     session_code: String,
     replaced_connection_id: Option<String>,
     state_changed: bool,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum WsOutbound {
+    Message(ServerWsMessage),
+    Close,
 }
 
 pub(crate) async fn emit_phase_warning_notices(state: &AppState) {
@@ -67,11 +81,10 @@ async fn broadcast_notice(
     title: &str,
     message: &str,
 ) {
-    let registrations = state
-        .realtime
-        .lock()
-        .await
-        .session_registrations(session_code);
+    let registrations = match state.store.list_realtime_connections(session_code).await {
+        Ok(registrations) => registrations,
+        Err(_) => return,
+    };
     if registrations.is_empty() {
         return;
     }
@@ -86,10 +99,11 @@ async fn broadcast_notice(
         let senders = state.realtime_senders.lock().await;
         registrations
             .into_iter()
+            .filter(|registration| registration.replica_id == state.replica_id)
             .filter_map(|registration| {
                 senders.get(&registration.connection_id).and_then(|sender| {
                     sender
-                        .send(notice.clone())
+                        .send(WsOutbound::Message(notice.clone()))
                         .err()
                         .map(|_| registration.connection_id)
                 })
@@ -107,6 +121,7 @@ async fn broadcast_notice(
 
 pub(crate) async fn workshop_ws(
     State(state): State<AppState>,
+    ConnectInfo(connect_info): ConnectInfo<std::net::SocketAddr>,
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
@@ -116,12 +131,20 @@ pub(crate) async fn workshop_ws(
     ) {
         return (StatusCode::FORBIDDEN, "Origin is not allowed.").into_response();
     }
+    let client_key = client_key(&state, MaybeConnectInfo(Some(connect_info)), &headers);
+    if is_rate_limited(&state.websocket_limiter, &client_key).await {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            "Too many requests. Please slow down and try again.",
+        )
+            .into_response();
+    }
 
-    ws.on_upgrade(move |socket| handle_workshop_ws(state, socket))
+    ws.on_upgrade(move |socket| handle_workshop_ws(state, socket, client_key))
         .into_response()
 }
 
-async fn handle_workshop_ws(state: AppState, mut socket: WebSocket) {
+async fn handle_workshop_ws(state: AppState, mut socket: WebSocket, client_key: String) {
     let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel();
     let mut attached_connection_id: Option<String> = None;
 
@@ -131,8 +154,13 @@ async fn handle_workshop_ws(state: AppState, mut socket: WebSocket) {
                 let Some(outbound_message) = outbound_message else {
                     break;
                 };
-                if send_ws_message(&mut socket, &outbound_message).await.is_err() {
-                    break;
+                match outbound_message {
+                    WsOutbound::Message(outbound_message) => {
+                        if send_ws_message(&state, &mut socket, &outbound_message).await.is_err() {
+                            break;
+                        }
+                    }
+                    WsOutbound::Close => break,
                 }
             }
             message_result = socket.recv() => {
@@ -143,6 +171,22 @@ async fn handle_workshop_ws(state: AppState, mut socket: WebSocket) {
                     break;
                 };
 
+                if is_rate_limited(&state.websocket_limiter, &client_key).await {
+                    if send_ws_message(
+                        &state,
+                        &mut socket,
+                        &ServerWsMessage::Error {
+                            message: "Too many requests. Please slow down and try again.".to_string(),
+                        },
+                    )
+                    .await
+                    .is_err()
+                    {
+                        break;
+                    }
+                    continue;
+                }
+
                 match message {
                     Message::Text(text) => match serde_json::from_str::<ClientWsMessage>(&text) {
                         Ok(ClientWsMessage::AttachSession(envelope)) => {
@@ -150,26 +194,62 @@ async fn handle_workshop_ws(state: AppState, mut socket: WebSocket) {
                             let connection_id = attached_connection_id
                                 .clone()
                                 .unwrap_or_else(|| random_prefixed_id("conn"));
+                            if !is_new_connection {
+                                let current_registration = state
+                                    .realtime
+                                    .lock()
+                                    .await
+                                    .connection_registration(&connection_id);
+                                if let Some(current_registration) = current_registration
+                                    && (current_registration.session_code != envelope.session_code.trim()
+                                        || current_registration.player_id != envelope.player_id.trim())
+                                {
+                                if send_ws_message(&state, &mut socket, &ServerWsMessage::Error {
+                                    message: "WebSocket is already attached to a different player.".to_string(),
+                                })
+                                .await
+                                .is_err()
+                                {
+                                    break;
+                                }
+                                continue;
+                            }
+                            }
+                            if state
+                                .retired_realtime_connections
+                                .lock()
+                                .await
+                                .contains_key(&connection_id)
+                            {
+                                if is_new_connection {
+                                    unregister_ws_sender(&state, &connection_id).await;
+                                }
+                                if send_ws_message(&state, &mut socket, &ServerWsMessage::Error {
+                                    message: "connection is closed".to_string(),
+                                })
+                                .await
+                                .is_err()
+                                {
+                                    break;
+                                }
+                                let _ = outbound_tx.send(WsOutbound::Close);
+                                continue;
+                            }
                             if is_new_connection {
                                 register_ws_sender(&state, &connection_id, outbound_tx.clone()).await;
                             }
                             match attach_ws_session(&state, &mut socket, &envelope, &connection_id, is_new_connection).await {
                                 Ok(outcome) => {
-                                    if let Some(replaced_connection_id) = outcome.replaced_connection_id.as_deref() {
-                                        if replaced_connection_id != connection_id.as_str() {
-                                            unregister_ws_sender(&state, replaced_connection_id).await;
-                                        }
-                                    }
-                                    if outcome.state_changed {
-                                        broadcast_session_state(&state, &outcome.session_code, Some(connection_id.as_str())).await;
-                                    }
+                                      if outcome.state_changed {
+                                          broadcast_session_state(&state, &outcome.session_code, Some(connection_id.as_str())).await;
+                                      }
                                     attached_connection_id = Some(connection_id);
                                 }
                                 Err(error_message) => {
                                     if is_new_connection {
                                         unregister_ws_sender(&state, &connection_id).await;
                                     }
-                                    if send_ws_message(&mut socket, &ServerWsMessage::Error { message: error_message })
+                                    if send_ws_message(&state, &mut socket, &ServerWsMessage::Error { message: error_message })
                                         .await
                                         .is_err()
                                     {
@@ -179,12 +259,13 @@ async fn handle_workshop_ws(state: AppState, mut socket: WebSocket) {
                             }
                         }
                         Ok(ClientWsMessage::Ping) => {
-                            if send_ws_message(&mut socket, &ServerWsMessage::Pong).await.is_err() {
+                            if send_ws_message(&state, &mut socket, &ServerWsMessage::Pong).await.is_err() {
                                 break;
                             }
                         }
                         Err(_) => {
                             if send_ws_message(
+                                &state,
                                 &mut socket,
                                 &ServerWsMessage::Error {
                                     message: "Invalid WebSocket payload.".to_string(),
@@ -210,15 +291,21 @@ async fn handle_workshop_ws(state: AppState, mut socket: WebSocket) {
     }
 
     if let Some(connection_id) = attached_connection_id {
+        stop_realtime_heartbeat(&state, &connection_id).await;
         unregister_ws_sender(&state, &connection_id).await;
         sync_ws_disconnect(&state, &connection_id).await;
+        state
+            .retired_realtime_connections
+            .lock()
+            .await
+            .remove(&connection_id);
     }
 }
 
 async fn register_ws_sender(
     state: &AppState,
     connection_id: &str,
-    sender: mpsc::UnboundedSender<ServerWsMessage>,
+    sender: mpsc::UnboundedSender<WsOutbound>,
 ) {
     state
         .realtime_senders
@@ -229,6 +316,93 @@ async fn register_ws_sender(
 
 async fn unregister_ws_sender(state: &AppState, connection_id: &str) {
     state.realtime_senders.lock().await.remove(connection_id);
+}
+
+async fn replace_realtime_heartbeat(
+    state: &AppState,
+    connection_id: &str,
+    heartbeat: JoinHandle<()>,
+) {
+    let previous = state
+        .realtime_heartbeats
+        .lock()
+        .await
+        .insert(connection_id.to_string(), heartbeat);
+    if let Some(previous) = previous {
+        previous.abort();
+    }
+}
+
+async fn stop_realtime_heartbeat(state: &AppState, connection_id: &str) {
+    if let Some(heartbeat) = state.realtime_heartbeats.lock().await.remove(connection_id) {
+        heartbeat.abort();
+    }
+}
+
+async fn retire_local_realtime_connection(state: &AppState, connection_id: &str) {
+    state
+        .retired_realtime_connections
+        .lock()
+        .await
+        .insert(connection_id.to_string(), ());
+    state.realtime.lock().await.detach(connection_id);
+}
+
+pub(crate) async fn clear_local_realtime_connection(state: &AppState, connection_id: &str) {
+    stop_realtime_heartbeat(state, connection_id).await;
+    retire_local_realtime_connection(state, connection_id).await;
+}
+
+async fn restore_replaced_registration(
+    state: &AppState,
+    replaced: &RealtimeConnectionRegistration,
+) -> Result<(), String> {
+    let restored = state
+        .store
+        .restore_realtime_connection(replaced)
+        .await
+        .map_err(|error| format!("failed to restore replaced realtime connection: {error}"))?;
+    if restored.restored && replaced.replica_id == state.replica_id {
+        state.realtime.lock().await.attach(
+            &replaced.session_code,
+            &replaced.player_id,
+            &replaced.connection_id,
+        );
+        replace_realtime_heartbeat(
+            state,
+            &replaced.connection_id,
+            spawn_realtime_heartbeat(state.clone(), replaced.connection_id.clone()),
+        )
+        .await;
+    }
+    Ok(())
+}
+
+fn spawn_realtime_heartbeat(state: AppState, connection_id: String) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let heartbeat_interval = persistence::REALTIME_CONNECTION_TTL / 2;
+        loop {
+            tokio::time::sleep(heartbeat_interval).await;
+            match state
+                .store
+                .renew_realtime_connection(&connection_id, &state.replica_id)
+                .await
+            {
+                Ok(true) => {}
+                Ok(false) | Err(_) => {
+                    retire_local_realtime_connection(&state, &connection_id).await;
+                    close_local_connection(&state, &connection_id).await;
+                    break;
+                }
+            }
+        }
+    })
+}
+
+pub(crate) async fn close_local_connection(state: &AppState, connection_id: &str) {
+    if let Some(sender) = state.realtime_senders.lock().await.get(connection_id).cloned() {
+        let _ = sender.send(WsOutbound::Close);
+    }
 }
 
 pub(crate) async fn broadcast_session_state(
@@ -243,11 +417,10 @@ pub(crate) async fn broadcast_session_state(
         return;
     }
 
-    let registrations = state
-        .realtime
-        .lock()
-        .await
-        .session_registrations(session_code);
+    let registrations = match state.store.list_realtime_connections(session_code).await {
+        Ok(registrations) => registrations,
+        Err(_) => return,
+    };
     if registrations.is_empty() {
         return;
     }
@@ -261,6 +434,8 @@ pub(crate) async fn broadcast_session_state(
         registrations
             .into_iter()
             .filter(|registration| {
+                registration.replica_id == state.replica_id
+                    &&
                 Some(registration.connection_id.as_str()) != excluded_connection_id
             })
             .map(|registration| {
@@ -285,7 +460,10 @@ pub(crate) async fn broadcast_session_state(
             .into_iter()
             .filter_map(
                 |(connection_id, message)| match senders.get(&connection_id) {
-                    Some(sender) => sender.send(message).err().map(|_| connection_id),
+                    Some(sender) => sender
+                        .send(WsOutbound::Message(message))
+                        .err()
+                        .map(|_| connection_id),
                     None => None,
                 },
             )
@@ -300,16 +478,69 @@ pub(crate) async fn broadcast_session_state(
     }
 }
 
-async fn sync_ws_disconnect(state: &AppState, connection_id: &str) {
-    let Some(registration) = state.realtime.lock().await.detach(connection_id) else {
+pub(crate) async fn sync_ws_disconnect(state: &AppState, connection_id: &str) {
+    let persisted_registration = state
+        .store
+        .release_realtime_connection(connection_id, &state.replica_id)
+        .await
+        .ok()
+        .flatten();
+    if persisted_registration.is_none()
+        && state
+            .store
+            .take_retired_realtime_connection(connection_id, &state.replica_id)
+            .await
+            .ok()
+            .flatten()
+            .is_some()
+    {
+        state.realtime.lock().await.detach(connection_id);
+        return;
+    }
+    let local_registration = state.realtime.lock().await.detach(connection_id).map(|registration| {
+        RealtimeConnectionRegistration {
+            session_code: registration.session_code,
+            player_id: registration.player_id,
+            connection_id: registration.connection_id,
+            replica_id: state.replica_id.clone(),
+        }
+    });
+    let Some(registration) = persisted_registration.or(local_registration) else {
         return;
     };
 
     let timestamp = Utc::now();
     let session_code = registration.session_code;
     let player_id = registration.player_id;
-    let write_lock = session_write_lock(state, &session_code).await;
-    let _write_guard = write_lock.lock().await;
+    let cached_session_before_reload = {
+        state.sessions.lock().await.get(&session_code).cloned()
+    };
+    let was_connected_before_reload = cached_session_before_reload
+        .as_ref()
+        .and_then(|session| session.players.get(player_id.as_str()))
+        .map(|player| player.is_connected)
+        .unwrap_or(true);
+    let (_, _write_guard, write_lease) = match SessionWriteLease::acquire(state, &session_code).await {
+        Ok(guard) => guard,
+        Err(error) => {
+            info!(session_code = %session_code, player_id = %player_id, error = %error, "failed to acquire websocket disconnect lease");
+            return;
+        }
+    };
+    if let Err(error) = write_lease.ensure_active() {
+        info!(session_code = %session_code, player_id = %player_id, error = %error, "lost websocket disconnect lease before reload");
+        return;
+    }
+    if !reload_cached_session(state, &session_code)
+        .await
+        .unwrap_or(false)
+    {
+        return;
+    }
+    if let Err(error) = write_lease.ensure_active() {
+        info!(session_code = %session_code, player_id = %player_id, error = %error, "lost websocket disconnect lease before mutation");
+        return;
+    }
     let disconnect_payload = json!({
         "sessionCode": session_code.clone(),
         "playerId": player_id.clone(),
@@ -318,42 +549,67 @@ async fn sync_ws_disconnect(state: &AppState, connection_id: &str) {
     let disconnect_state = {
         let mut sessions = state.sessions.lock().await;
         match sessions.get_mut(session_code.as_str()) {
-            Some(session) => match session.players.get_mut(player_id.as_str()) {
-                Some(player) if player.is_connected => {
-                    player.is_connected = false;
-                    session.ensure_host_assigned(true);
-                    session.updated_at = timestamp;
-                    Some((session.clone(), phase_step(session.phase)))
+            Some(session) => {
+                let Some(player) = session.players.get(player_id.as_str()) else {
+                    return;
+                };
+                if !player.is_connected && !was_connected_before_reload {
+                    return;
                 }
-                _ => None,
-            },
+
+                let session_before = session.clone();
+                let step = phase_step(session.phase);
+
+                if let Some(player) = session.players.get_mut(player_id.as_str()) {
+                    player.is_connected = false;
+                }
+                session.ensure_host_assigned(true);
+                session.updated_at = timestamp;
+                Some((session_before, session.clone(), step))
+            }
             None => None,
         }
     };
 
-    let Some((session, step)) = disconnect_state else {
+    let Some((session_before, session, step)) = disconnect_state else {
         return;
     };
 
-    if let Err(error) = state.store.save_session(&session).await {
-        info!(session_code = %session.code.0, player_id = %player_id, error = %error, "failed to persist websocket disconnect session state");
+    let disconnect_artifact = SessionArtifactRecord {
+        id: random_prefixed_id("artifact"),
+        session_id: session.id.to_string(),
+        phase: session.phase,
+        step,
+        kind: SessionArtifactKind::PlayerLeft,
+        player_id: Some(player_id.clone()),
+        created_at: timestamp.to_rfc3339(),
+        payload: disconnect_payload,
+    };
+
+    if let Err(error) = write_lease.ensure_active() {
+        let mut sessions = state.sessions.lock().await;
+        if let Some(previous_session) = cached_session_before_reload.clone() {
+            sessions.insert(session.code.0.clone(), previous_session);
+        } else {
+            sessions.insert(session.code.0.clone(), session_before);
+        }
+        info!(session_code = %session.code.0, player_id = %player_id, error = %error, "lost websocket disconnect lease before persist");
+        return;
     }
 
     if let Err(error) = state
         .store
-        .append_session_artifact(&SessionArtifactRecord {
-            id: random_prefixed_id("artifact"),
-            session_id: session.id.to_string(),
-            phase: session.phase,
-            step,
-            kind: SessionArtifactKind::PlayerLeft,
-            player_id: Some(player_id.clone()),
-            created_at: timestamp.to_rfc3339(),
-            payload: disconnect_payload,
-        })
+        .save_session_with_artifact(&session, &disconnect_artifact)
         .await
     {
-        info!(session_code = %session.code.0, player_id = %player_id, error = %error, "failed to append websocket disconnect artifact");
+        let mut sessions = state.sessions.lock().await;
+        if let Some(previous_session) = cached_session_before_reload {
+            sessions.insert(session.code.0.clone(), previous_session);
+        } else {
+            sessions.insert(session.code.0.clone(), session_before);
+        }
+        info!(session_code = %session.code.0, player_id = %player_id, error = %error, "failed to persist websocket disconnect state");
+        return;
     }
 
     broadcast_session_state(state, &session.code.0, None).await;
@@ -377,9 +633,7 @@ async fn attach_ws_session(
         return Err("Missing workshop credentials.".to_string());
     }
 
-    let identity = state
-        .store
-        .find_player_identity(session_code, reconnect_token)
+    let identity = authorize_reconnect_identity(state, session_code, reconnect_token)
         .await
         .map_err(|error| format!("failed to lookup identity: {error}"))?
         .ok_or_else(|| "Session identity is invalid or expired.".to_string())?;
@@ -387,12 +641,23 @@ async fn attach_ws_session(
         return Err("Session identity is invalid or expired.".to_string());
     }
 
-    let write_lock = session_write_lock(state, session_code).await;
-    let _write_guard = write_lock.lock().await;
+    if let Err(error) = refresh_reconnect_identity(state, reconnect_token, Utc::now()).await {
+        return Err(format!("failed to touch player identity: {error}"));
+    }
 
-    if !ensure_session_cached(state, session_code).await? {
+    let (_, _write_guard, write_lease) = SessionWriteLease::acquire(state, session_code)
+        .await
+        .map_err(|error| format!("failed to acquire session lease: {error}"))?;
+    write_lease
+        .ensure_active()
+        .map_err(|error| format!("lost session lease before websocket load: {error}"))?;
+
+    if !reload_cached_session(state, session_code).await? {
         return Err("Workshop not found.".to_string());
     }
+    write_lease
+        .ensure_active()
+        .map_err(|error| format!("lost session lease before websocket mutation: {error}"))?;
 
     let mut reconnect_artifact: Option<SessionArtifactRecord> = None;
 
@@ -443,8 +708,20 @@ async fn attach_ws_session(
         (client_state, session_before, session_clone)
     };
 
-    if let Some(ref session_clone) = session_clone {
-        if let Err(error) = state.store.save_session(session_clone).await {
+    let state_changed = reconnect_artifact.is_some();
+
+    let attach_result = match state
+        .store
+        .claim_realtime_connection(&RealtimeConnectionRegistration {
+            session_code: session_code.to_string(),
+            player_id: identity.player_id.clone(),
+            connection_id: connection_id.to_string(),
+            replica_id: state.replica_id.clone(),
+        })
+        .await
+    {
+        Ok(attach_result) => attach_result,
+        Err(error) => {
             if let Some(session_before) = session_before {
                 state
                     .sessions
@@ -452,41 +729,63 @@ async fn attach_ws_session(
                     .await
                     .insert(session_code.to_string(), session_before);
             }
-            return Err(format!("failed to save session: {error}"));
+            if is_new_connection {
+                unregister_ws_sender(state, connection_id).await;
+            }
+            return Err(format!("failed to claim realtime connection: {error}"));
         }
+    };
+    if let Some(replaced) = attach_result.replaced.as_ref()
+        && replaced.replica_id == state.replica_id
+    {
+        // Stop the displaced local heartbeat before any further awaited work so
+        // it cannot observe the temporary missing-row window and self-close.
+        stop_realtime_heartbeat(state, &replaced.connection_id).await;
     }
+    let local_attach_result = state
+        .realtime
+        .lock()
+        .await
+        .attach(session_code, &identity.player_id, connection_id);
+    let local_replaced_registration = local_attach_result.replaced_connection_id.as_ref().map(|connection_id| {
+        RealtimeConnectionRegistration {
+            session_code: session_code.to_string(),
+            player_id: identity.player_id.clone(),
+            connection_id: connection_id.clone(),
+            replica_id: state.replica_id.clone(),
+        }
+    });
 
-    let state_changed = reconnect_artifact.is_some();
-
-    if let Some(artifact) = reconnect_artifact {
-        state
-            .store
-            .append_session_artifact(&artifact)
-            .await
-            .map_err(|error| format!("failed to append reconnect artifact: {error}"))?;
-    }
-
-    let attach_result =
-        state
-            .realtime
-            .lock()
-            .await
-            .attach(session_code, &identity.player_id, connection_id);
-
-    drop(_write_guard);
-
-    if send_ws_message(socket, &ServerWsMessage::StateUpdate(client_state))
+    if send_ws_message(state, socket, &ServerWsMessage::StateUpdate(client_state))
         .await
         .is_err()
     {
-        let mut realtime = state.realtime.lock().await;
-        realtime.detach(connection_id);
-        if let Some(replaced_connection_id) = attach_result.replaced_connection_id.as_deref() {
-            if replaced_connection_id != connection_id {
-                realtime.attach(session_code, &identity.player_id, replaced_connection_id);
+        let _ = state
+            .store
+            .release_realtime_connection(connection_id, &state.replica_id)
+            .await;
+        stop_realtime_heartbeat(state, connection_id).await;
+        state.realtime.lock().await.detach(connection_id);
+        if let Some(replaced) = attach_result
+            .replaced
+            .as_ref()
+            .or(local_replaced_registration.as_ref())
+        {
+            if let Err(error) = restore_replaced_registration(state, replaced).await {
+                if is_new_connection {
+                    unregister_ws_sender(state, connection_id).await;
+                }
+                return Err(error);
             }
         }
-        drop(realtime);
+
+        if let Some(session_before) = session_before {
+            state
+                .sessions
+                .lock()
+                .await
+                .insert(session_code.to_string(), session_before);
+        }
 
         if is_new_connection {
             unregister_ws_sender(state, connection_id).await;
@@ -494,14 +793,118 @@ async fn attach_ws_session(
         return Err("connection is closed".to_string());
     }
 
+    if let (Some(session_clone), Some(artifact)) = (session_clone.as_ref(), reconnect_artifact.as_ref()) {
+        if let Err(error) = write_lease.ensure_active() {
+            let _ = state
+                .store
+                .release_realtime_connection(connection_id, &state.replica_id)
+                .await;
+            stop_realtime_heartbeat(state, connection_id).await;
+            state.realtime.lock().await.detach(connection_id);
+            if let Some(replaced) = attach_result
+                .replaced
+                .as_ref()
+                .or(local_replaced_registration.as_ref())
+            {
+                if let Err(error) = restore_replaced_registration(state, replaced).await {
+                    if is_new_connection {
+                        unregister_ws_sender(state, connection_id).await;
+                    }
+                    return Err(error);
+                }
+            }
+            if let Some(session_before) = session_before {
+                state
+                    .sessions
+                    .lock()
+                    .await
+                    .insert(session_code.to_string(), session_before);
+            }
+            if is_new_connection {
+                unregister_ws_sender(state, connection_id).await;
+            }
+            return Err(format!("lost session lease before websocket persist: {error}"));
+        }
+        if let Err(error) = state
+            .store
+            .save_session_with_artifact(session_clone, artifact)
+            .await
+        {
+            let _ = state
+                .store
+                .release_realtime_connection(connection_id, &state.replica_id)
+                .await;
+            stop_realtime_heartbeat(state, connection_id).await;
+            state.realtime.lock().await.detach(connection_id);
+            if let Some(replaced) = attach_result
+                .replaced
+                .as_ref()
+                .or(local_replaced_registration.as_ref())
+            {
+                if let Err(error) = restore_replaced_registration(state, replaced).await {
+                    if is_new_connection {
+                        unregister_ws_sender(state, connection_id).await;
+                    }
+                    return Err(error);
+                }
+            }
+
+            if let Some(session_before) = session_before {
+                state
+                    .sessions
+                    .lock()
+                    .await
+                    .insert(session_code.to_string(), session_before);
+            }
+            if is_new_connection {
+                unregister_ws_sender(state, connection_id).await;
+            }
+            return Err(format!("failed to persist websocket reconnect: {error}"));
+        }
+    }
+
+    if let Some(replaced) = attach_result.replaced.as_ref() {
+        if replaced.replica_id == state.replica_id {
+            clear_local_realtime_connection(state, &replaced.connection_id).await;
+        }
+        let notification = SessionUpdateNotification::realtime_connection_replaced(replaced);
+        let _ = state.store.publish_session_notification(&notification).await;
+        if replaced.replica_id == state.replica_id {
+            close_local_connection(state, &replaced.connection_id).await;
+        }
+    }
+
+    replace_realtime_heartbeat(
+        state,
+        connection_id,
+        spawn_realtime_heartbeat(state.clone(), connection_id.to_string()),
+    )
+    .await;
+
     Ok(WsAttachOutcome {
         session_code: session_code.to_string(),
-        replaced_connection_id: attach_result.replaced_connection_id,
+        replaced_connection_id: attach_result
+            .replaced
+            .or(local_replaced_registration)
+            .map(|registration| registration.connection_id),
         state_changed,
     })
 }
 
-async fn send_ws_message(socket: &mut WebSocket, message: &ServerWsMessage) -> Result<(), ()> {
+async fn send_ws_message(
+    state: &AppState,
+    socket: &mut WebSocket,
+    message: &ServerWsMessage,
+) -> Result<(), ()> {
+    #[cfg(test)]
+    if matches!(message, ServerWsMessage::StateUpdate(_))
+        && state
+            .fail_next_initial_state_send
+            .swap(false, Ordering::SeqCst)
+    {
+        return Err(());
+    }
+
     let encoded = serde_json::to_string(message).map_err(|_| ())?;
     socket
         .send(Message::Text(encoded.into()))
