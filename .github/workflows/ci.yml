@@ -59,6 +59,9 @@ jobs:
       - name: Install wasm-bindgen-cli
         run: cargo install wasm-bindgen-cli --version 0.2.115 --locked
 
+      - name: Install binaryen
+        run: sudo apt-get update && sudo apt-get install -y binaryen
+
       - name: Build web bundle
         run: cargo run --locked -p xtask -- build-web --out-dir /tmp/app-web-dist
 
@@ -104,6 +107,9 @@ jobs:
       - name: Install wasm-bindgen-cli
         run: cargo install wasm-bindgen-cli --version 0.2.115 --locked
         working-directory: platform
+
+      - name: Install binaryen
+        run: sudo apt-get update && sudo apt-get install -y binaryen
 
       - name: Build app-web bundle
         run: cargo run --locked -p xtask -- build-web --out-dir app-web/dist
