@@ -34,6 +34,24 @@ This document explains how the Rust-only `platform` runtime writes workshop stat
 - voting
 - reset
 
+## Atomicity and restore policy
+
+The runtime now treats some persistence writes as logical groups rather than unrelated best-effort operations.
+
+- workshop creation persists session snapshot, reconnect identity, and creation artifact together
+- player join persists session snapshot, reconnect identity, and join artifact together
+- reconnect rotation persists updated session snapshot, rotated reconnect identity, revocation of the previous token, and reconnect artifact together
+- command/disconnect paths that produce a session mutation and artifact persist those together
+
+For Postgres, those grouped operations are executed inside one SQL transaction.
+
+Restore-time transient-state rule:
+
+- persisted `WorkshopSession` payload may still contain transient fields such as `SessionPlayer.is_connected`
+- those fields are not authoritative after restart/reload
+- when a session is reloaded into cache, all restored player connectivity is normalized back to `false`
+- live connectivity is rebuilt only from current runtime activity such as reconnect or websocket attach
+
 ## Local verification
 
 1. Start Postgres.

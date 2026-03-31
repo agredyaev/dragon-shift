@@ -1,22 +1,21 @@
 use futures_util::{SinkExt, StreamExt};
-use sqlx::PgPool;
 use protocol::{
-    ClientWsMessage, CreateWorkshopRequest, JudgeBundle, JoinWorkshopRequest, Phase,
+    ClientWsMessage, CreateWorkshopRequest, JoinWorkshopRequest, JudgeBundle, Phase,
     ServerWsMessage, SessionCommand, SessionEnvelope, WorkshopCommandRequest,
-    WorkshopCommandResult, WorkshopJudgeBundleRequest, WorkshopJudgeBundleResult,
-    WorkshopJoinResult, WorkshopJoinSuccess,
+    WorkshopCommandResult, WorkshopJoinResult, WorkshopJoinSuccess, WorkshopJudgeBundleRequest,
+    WorkshopJudgeBundleResult,
 };
 use serde_json::json;
-use std::fs;
+use sqlx::PgPool;
 use std::env;
+use std::fs;
 use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, Command, ExitStatus, Stdio};
 use tokio::net::TcpStream;
 use tokio_tungstenite::{
-    connect_async,
-    tungstenite::{client::IntoClientRequest, http::HeaderValue, Message as WsMessage},
-    MaybeTlsStream, WebSocketStream,
+    MaybeTlsStream, WebSocketStream, connect_async,
+    tungstenite::{Message as WsMessage, client::IntoClientRequest, http::HeaderValue},
 };
 
 type SmokeWebSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
@@ -25,6 +24,13 @@ type SmokeWebSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 struct PersistenceSmokeConfig {
     base_url: String,
     database_url: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RestoreSmokeConfig {
+    base_url: String,
+    database_url: String,
+    restart_timeout_seconds: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,17 +67,105 @@ fn run(args: Vec<String>) -> Result<(), String> {
         "check" => run_tool("cargo", &["check", "--workspace", "--all-targets"]),
         "test" => run_tool("cargo", &["test", "--workspace"]),
         "fmt" => run_tool("cargo", &["fmt", "--all"]),
-        "clippy" => run_tool("cargo", &["clippy", "--workspace", "--all-targets", "--", "-D", "warnings"]),
+        "clippy" => run_tool(
+            "cargo",
+            &[
+                "clippy",
+                "--workspace",
+                "--all-targets",
+                "--",
+                "-D",
+                "warnings",
+            ],
+        ),
         "app-web-test" => run_tool("cargo", &["test", "-p", "app-web"]),
         "app-server-test" => run_tool("cargo", &["test", "-p", "app-server"]),
         "build-web" => build_web_bundle(build_web_config(&forwarded)?),
-        "server" | "dev-server" => run_tool_owned("cargo", cargo_run_package_args("app-server", &forwarded)),
+        "server" | "dev-server" => {
+            run_tool_owned("cargo", cargo_run_package_args("app-server", &forwarded))
+        }
         "smoke-phase1" => run_async(smoke_phase1(smoke_base_url(&forwarded)?)),
         "smoke-join-load" => run_async(smoke_join_load(join_load_config(&forwarded)?)),
         "smoke-judge-bundle" => run_async(smoke_judge_bundle(smoke_base_url(&forwarded)?)),
         "smoke-offline-failover" => run_async(smoke_offline_failover(smoke_base_url(&forwarded)?)),
         "smoke-persistence" => run_async(smoke_persistence(persistence_smoke_config(&forwarded)?)),
+        "smoke-persistence-restart" => run_async(smoke_persistence_restart(
+            persistence_smoke_config(&forwarded)?,
+        )),
+        "smoke-restore-reconnect" => {
+            run_async(smoke_restore_reconnect(restore_smoke_config(&forwarded)?))
+        }
         unknown => Err(format!("unknown xtask command: {unknown}")),
+    }
+}
+
+struct AppServerProcess {
+    child: Option<Child>,
+}
+
+impl AppServerProcess {
+    fn spawn(base_url: &str, database_url: &str) -> Result<Self, String> {
+        let child = Command::new(app_server_binary_path())
+            .current_dir(workspace_root())
+            .env("APP_SERVER_BIND_ADDR", app_server_bind_addr(base_url)?)
+            .env("DATABASE_URL", database_url)
+            .env(
+                "APP_SERVER_STATIC_DIR",
+                workspace_root().join("app-web/dist"),
+            )
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|error| format!("failed to start app-server: {error}"))?;
+
+        Ok(Self { child: Some(child) })
+    }
+
+    fn try_wait(&mut self) -> Result<Option<ExitStatus>, String> {
+        self.child
+            .as_mut()
+            .expect("app-server child process")
+            .try_wait()
+            .map_err(|error| format!("failed to check app-server status: {error}"))
+    }
+
+    fn shutdown(&mut self) -> Result<(), String> {
+        let Some(mut child) = self.child.take() else {
+            return Ok(());
+        };
+
+        match child.try_wait() {
+            Ok(Some(_)) => return Ok(()),
+            Ok(None) => {}
+            Err(error) => {
+                return Err(format!(
+                    "failed to check app-server status before shutdown: {error}"
+                ));
+            }
+        }
+
+        child
+            .kill()
+            .map_err(|error| format!("failed to stop app-server: {error}"))?;
+        child
+            .wait()
+            .map_err(|error| format!("failed to wait for app-server shutdown: {error}"))?;
+        Ok(())
+    }
+}
+
+impl Drop for AppServerProcess {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            match child.try_wait() {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+                Err(_) => {}
+            }
+        }
     }
 }
 
@@ -201,6 +295,58 @@ fn persistence_smoke_config(forwarded: &[String]) -> Result<PersistenceSmokeConf
     })
 }
 
+fn restore_smoke_config(forwarded: &[String]) -> Result<RestoreSmokeConfig, String> {
+    let mut base_url = env::var("XTASK_SMOKE_BASE_URL")
+        .or_else(|_| env::var("SMOKE_TEST_BASE_URL"))
+        .unwrap_or_else(|_| "http://127.0.0.1:4100".to_string());
+    let mut database_url = env::var("XTASK_PERSISTENCE_DATABASE_URL")
+        .or_else(|_| env::var("DATABASE_URL"))
+        .ok();
+    let mut restart_timeout_seconds = 300u64;
+    let mut args = forwarded.iter();
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--base-url" => {
+                base_url = args
+                    .next()
+                    .ok_or_else(|| "missing value for --base-url".to_string())?
+                    .clone();
+            }
+            "--database-url" => {
+                database_url = Some(
+                    args.next()
+                        .ok_or_else(|| "missing value for --database-url".to_string())?
+                        .clone(),
+                );
+            }
+            "--restart-timeout-seconds" => {
+                restart_timeout_seconds = args
+                    .next()
+                    .ok_or_else(|| "missing value for --restart-timeout-seconds".to_string())?
+                    .parse::<u64>()
+                    .map_err(|error| {
+                        format!("invalid value for --restart-timeout-seconds: {error}")
+                    })?;
+            }
+            unknown => return Err(format!("unknown restore smoke arg: {unknown}")),
+        }
+    }
+
+    if restart_timeout_seconds == 0 {
+        return Err("--restart-timeout-seconds must be greater than 0".to_string());
+    }
+
+    let database_url = database_url
+        .ok_or_else(|| "smoke-restore-reconnect requires --database-url or XTASK_PERSISTENCE_DATABASE_URL or DATABASE_URL".to_string())?;
+
+    Ok(RestoreSmokeConfig {
+        base_url: normalize_base_url(&base_url),
+        database_url: database_url.trim().to_string(),
+        restart_timeout_seconds,
+    })
+}
+
 fn smoke_ws_url(base_url: &str) -> String {
     let normalized = normalize_base_url(base_url);
     let ws_base = if let Some(rest) = normalized.strip_prefix("https://") {
@@ -212,6 +358,35 @@ fn smoke_ws_url(base_url: &str) -> String {
     };
 
     format!("{ws_base}/api/workshops/ws")
+}
+
+fn app_server_binary_path() -> PathBuf {
+    workspace_root().join("target/debug/app-server")
+}
+
+fn app_server_bind_addr(base_url: &str) -> Result<String, String> {
+    let url = reqwest::Url::parse(base_url)
+        .map_err(|error| format!("invalid base url for managed app-server: {error}"))?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err("managed app-server requires an http or https base url".to_string());
+    }
+    if url.path() != "/" && !url.path().is_empty() {
+        return Err("managed app-server base url must not include a path".to_string());
+    }
+
+    let host = url
+        .host_str()
+        .ok_or_else(|| "managed app-server base url is missing a host".to_string())?;
+    let port = url
+        .port_or_known_default()
+        .ok_or_else(|| "managed app-server base url is missing a port".to_string())?;
+    let bind_host = if host.starts_with('[') || !host.contains(':') {
+        host.to_string()
+    } else {
+        format!("[{host}]")
+    };
+
+    Ok(format!("{bind_host}:{port}"))
 }
 
 fn cargo_run_package_args(package: &str, forwarded: &[String]) -> Vec<String> {
@@ -248,16 +423,31 @@ fn build_web_config(forwarded: &[String]) -> Result<WebBuildConfig, String> {
 }
 
 fn run_tool(program: &str, args: &[&str]) -> Result<(), String> {
-    run_tool_owned(program, args.iter().map(|value| value.to_string()).collect())
+    run_tool_owned(
+        program,
+        args.iter().map(|value| value.to_string()).collect(),
+    )
 }
 
 fn build_web_bundle(config: WebBuildConfig) -> Result<(), String> {
-    fs::create_dir_all(&config.out_dir)
-        .map_err(|error| format!("failed to create app-web output dir {}: {error}", config.out_dir.display()))?;
+    fs::create_dir_all(&config.out_dir).map_err(|error| {
+        format!(
+            "failed to create app-web output dir {}: {error}",
+            config.out_dir.display()
+        )
+    })?;
 
     run_tool(
         "cargo",
-        &["build", "--locked", "--release", "-p", "app-web", "--target", "wasm32-unknown-unknown"],
+        &[
+            "build",
+            "--locked",
+            "--release",
+            "-p",
+            "app-web",
+            "--target",
+            "wasm32-unknown-unknown",
+        ],
     )?;
 
     let wasm_input = workspace_root().join("target/wasm32-unknown-unknown/release/app-web.wasm");
@@ -273,7 +463,7 @@ fn build_web_bundle(config: WebBuildConfig) -> Result<(), String> {
     ];
     run_tool_owned("wasm-bindgen", wasm_bindgen_args).map_err(|error| {
         format!(
-            "{error}. Install wasm-bindgen-cli with `cargo install wasm-bindgen-cli --version 0.2.114 --locked` to use `cargo xtask build-web`."
+            "{error}. Install wasm-bindgen-cli with `cargo install wasm-bindgen-cli --version 0.2.115 --locked` to use `cargo xtask build-web`."
         )
     })?;
 
@@ -318,9 +508,7 @@ fn build_web_bundle(config: WebBuildConfig) -> Result<(), String> {
 
     // ── WASM bundle size gate ──────────────────────────────────────────
     let wasm_output = config.out_dir.join("app-web_bg.wasm");
-    let wasm_size_bytes = fs::metadata(&wasm_output)
-        .map(|m| m.len())
-        .unwrap_or(0);
+    let wasm_size_bytes = fs::metadata(&wasm_output).map(|m| m.len()).unwrap_or(0);
     let wasm_size_kb = wasm_size_bytes / 1024;
     const WASM_SIZE_WARN_KB: u64 = 2048; // 2 MB — warn threshold
     const WASM_SIZE_FAIL_KB: u64 = 3072; // 3 MB — hard fail threshold
@@ -362,7 +550,12 @@ fn build_web_bundle(config: WebBuildConfig) -> Result<(), String> {
 fn env_flag_enabled(name: &str) -> bool {
     env::var(name)
         .ok()
-        .map(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
         .unwrap_or(false)
 }
 
@@ -404,7 +597,10 @@ fn run_tool_owned(program: &str, args: Vec<String>) -> Result<(), String> {
     if status.success() {
         Ok(())
     } else {
-        Err(format!("`{program} {}` exited with status {status}", args.join(" ")))
+        Err(format!(
+            "`{program} {}` exited with status {status}",
+            args.join(" ")
+        ))
     }
 }
 
@@ -435,7 +631,10 @@ fn ensure_phase(session: &WorkshopJoinSuccess, expected: Phase, label: &str) -> 
     if session.state.phase == expected {
         Ok(())
     } else {
-        Err(format!("{label}: expected {:?}, got {:?}", expected, session.state.phase))
+        Err(format!(
+            "{label}: expected {:?}, got {:?}",
+            expected, session.state.phase
+        ))
     }
 }
 
@@ -545,7 +744,12 @@ async fn smoke_judge_bundle(base_url: String) -> Result<(), String> {
     let host = create_workshop(&client, &base_url, "XtaskJudgeHost").await?;
     let guest = join_workshop(&client, &base_url, &host.session_code, "XtaskJudgeGuest").await?;
 
-    send_command(&client, &base_url, command_request(&host, SessionCommand::StartPhase1, None)).await?;
+    send_command(
+        &client,
+        &base_url,
+        command_request(&host, SessionCommand::StartPhase1, None),
+    )
+    .await?;
     let host_phase1 = reconnect_workshop(&client, &base_url, &host).await?;
     let guest_phase1 = reconnect_workshop(&client, &base_url, &guest).await?;
     ensure_phase(&host_phase1, Phase::Phase1, "host phase1")?;
@@ -554,39 +758,74 @@ async fn smoke_judge_bundle(base_url: String) -> Result<(), String> {
     send_command(
         &client,
         &base_url,
-        command_request(&host, SessionCommand::SubmitObservation, Some(json!({ "text": "Calms down at dusk" }))),
+        command_request(
+            &host,
+            SessionCommand::SubmitObservation,
+            Some(json!({ "text": "Calms down at dusk" })),
+        ),
     )
     .await?;
     send_command(
         &client,
         &base_url,
-        command_request(&guest, SessionCommand::SubmitObservation, Some(json!({ "text": "Rejects fruit at night" }))),
-    )
-    .await?;
-    send_command(&client, &base_url, command_request(&host, SessionCommand::StartHandover, None)).await?;
-    send_command(
-        &client,
-        &base_url,
-        command_request(&host, SessionCommand::SubmitTags, Some(json!(["Rule 1", "Rule 2", "Rule 3"]))),
+        command_request(
+            &guest,
+            SessionCommand::SubmitObservation,
+            Some(json!({ "text": "Rejects fruit at night" })),
+        ),
     )
     .await?;
     send_command(
         &client,
         &base_url,
-        command_request(&guest, SessionCommand::SubmitTags, Some(json!(["Rule A", "Rule B", "Rule C"]))),
+        command_request(&host, SessionCommand::StartHandover, None),
     )
     .await?;
-    send_command(&client, &base_url, command_request(&host, SessionCommand::StartPhase2, None)).await?;
+    send_command(
+        &client,
+        &base_url,
+        command_request(
+            &host,
+            SessionCommand::SubmitTags,
+            Some(json!(["Rule 1", "Rule 2", "Rule 3"])),
+        ),
+    )
+    .await?;
+    send_command(
+        &client,
+        &base_url,
+        command_request(
+            &guest,
+            SessionCommand::SubmitTags,
+            Some(json!(["Rule A", "Rule B", "Rule C"])),
+        ),
+    )
+    .await?;
+    send_command(
+        &client,
+        &base_url,
+        command_request(&host, SessionCommand::StartPhase2, None),
+    )
+    .await?;
 
     let host_phase2 = reconnect_workshop(&client, &base_url, &host).await?;
     ensure_phase(&host_phase2, Phase::Phase2, "host phase2")?;
     send_command(
         &client,
         &base_url,
-        command_request(&host, SessionCommand::Action, Some(json!({ "type": "sleep" }))),
+        command_request(
+            &host,
+            SessionCommand::Action,
+            Some(json!({ "type": "sleep" })),
+        ),
     )
     .await?;
-    send_command(&client, &base_url, command_request(&host, SessionCommand::EndGame, None)).await?;
+    send_command(
+        &client,
+        &base_url,
+        command_request(&host, SessionCommand::EndGame, None),
+    )
+    .await?;
 
     let host_voting = reconnect_workshop(&client, &base_url, &host).await?;
     let guest_voting = reconnect_workshop(&client, &base_url, &guest).await?;
@@ -598,13 +837,21 @@ async fn smoke_judge_bundle(base_url: String) -> Result<(), String> {
     send_command(
         &client,
         &base_url,
-        command_request(&host, SessionCommand::SubmitVote, Some(json!({ "dragonId": host_vote_target }))),
+        command_request(
+            &host,
+            SessionCommand::SubmitVote,
+            Some(json!({ "dragonId": host_vote_target })),
+        ),
     )
     .await?;
     send_command(
         &client,
         &base_url,
-        command_request(&guest, SessionCommand::SubmitVote, Some(json!({ "dragonId": guest_vote_target }))),
+        command_request(
+            &guest,
+            SessionCommand::SubmitVote,
+            Some(json!({ "dragonId": guest_vote_target })),
+        ),
     )
     .await?;
     send_command(
@@ -622,16 +869,32 @@ async fn smoke_judge_bundle(base_url: String) -> Result<(), String> {
     if bundle.artifact_count <= 0 {
         return Err("judge bundle did not include artifacts".to_string());
     }
-    if !bundle.dragons.iter().any(|dragon| !dragon.handover_chain.creator_instructions.is_empty()) {
+    if !bundle
+        .dragons
+        .iter()
+        .any(|dragon| !dragon.handover_chain.creator_instructions.is_empty())
+    {
         return Err("judge bundle is missing creator instructions".to_string());
     }
-    if !bundle.dragons.iter().any(|dragon| !dragon.handover_chain.discovery_observations.is_empty()) {
+    if !bundle
+        .dragons
+        .iter()
+        .any(|dragon| !dragon.handover_chain.discovery_observations.is_empty())
+    {
         return Err("judge bundle is missing discovery observations".to_string());
     }
-    if !bundle.dragons.iter().any(|dragon| dragon.handover_chain.handover_tags.len() == 3) {
+    if !bundle
+        .dragons
+        .iter()
+        .any(|dragon| dragon.handover_chain.handover_tags.len() == 3)
+    {
         return Err("judge bundle is missing completed handover tags".to_string());
     }
-    if !bundle.dragons.iter().any(|dragon| !dragon.phase2_actions.is_empty()) {
+    if !bundle
+        .dragons
+        .iter()
+        .any(|dragon| !dragon.phase2_actions.is_empty())
+    {
         return Err("judge bundle is missing captured phase2 actions".to_string());
     }
 
@@ -735,8 +998,12 @@ async fn smoke_persistence(config: PersistenceSmokeConfig) -> Result<(), String>
     )
     .await?;
 
-    let report = query_persistence_report(&config.database_url, &host.session_code, &host.reconnect_token)
-        .await?;
+    let report = query_persistence_report(
+        &config.database_url,
+        &host.session_code,
+        &host.reconnect_token,
+    )
+    .await?;
     if report.persisted_phase != "phase1" {
         return Err(format!(
             "expected persisted workshop phase to be phase1, got {}",
@@ -767,6 +1034,302 @@ async fn smoke_persistence(config: PersistenceSmokeConfig) -> Result<(), String>
     }))
 }
 
+async fn smoke_persistence_restart(config: PersistenceSmokeConfig) -> Result<(), String> {
+    run_tool("cargo", &["build", "-p", "app-server"])?;
+
+    let client = reqwest::Client::new();
+    let smoke_start = std::time::Instant::now();
+    let mut server = AppServerProcess::spawn(&config.base_url, &config.database_url)?;
+    wait_for_server_ready(&client, &config.base_url, &mut server).await?;
+
+    let host = create_workshop(&client, &config.base_url, "XtaskPersistenceRestartHost").await?;
+    send_command(
+        &client,
+        &config.base_url,
+        command_request(&host, SessionCommand::StartPhase1, None),
+    )
+    .await?;
+
+    let initial_report = query_persistence_report(
+        &config.database_url,
+        &host.session_code,
+        &host.reconnect_token,
+    )
+    .await?;
+    if initial_report.persisted_phase != "phase1" {
+        return Err(format!(
+            "expected persisted workshop phase before restart to be phase1, got {}",
+            initial_report.persisted_phase
+        ));
+    }
+    if initial_report.identity_player_id != host.player_id {
+        return Err(format!(
+            "persisted identity player mismatch before restart: expected {}, got {}",
+            host.player_id, initial_report.identity_player_id
+        ));
+    }
+
+    server.shutdown()?;
+    let mut restarted = AppServerProcess::spawn(&config.base_url, &config.database_url)?;
+    wait_for_server_ready(&client, &config.base_url, &mut restarted).await?;
+
+    let recovered = reconnect_workshop(&client, &config.base_url, &host).await?;
+    ensure_phase(
+        &recovered,
+        Phase::Phase1,
+        "smoke-persistence-restart reconnect",
+    )?;
+    if recovered.player_id != host.player_id {
+        return Err(format!(
+            "restart reconnect returned player {}, expected {}",
+            recovered.player_id, host.player_id
+        ));
+    }
+    if recovered.state.session.id != host.state.session.id {
+        return Err(format!(
+            "restart reconnect returned session {}, expected {}",
+            recovered.state.session.id, host.state.session.id
+        ));
+    }
+    if recovered.state.current_player_id.as_deref() != Some(host.player_id.as_str()) {
+        return Err(
+            "restart reconnect returned a different current player than the host".to_string(),
+        );
+    }
+
+    let recovered_dragon_id = assigned_dragon_id(&recovered)?;
+    let observation_text = "Recovered after restart";
+    send_command(
+        &client,
+        &config.base_url,
+        command_request(
+            &host,
+            SessionCommand::SubmitObservation,
+            Some(json!({ "text": observation_text })),
+        ),
+    )
+    .await?;
+
+    let continued = reconnect_workshop(&client, &config.base_url, &host).await?;
+    ensure_phase(
+        &continued,
+        Phase::Phase1,
+        "smoke-persistence-restart continuity reconnect",
+    )?;
+    let continued_dragon = continued
+        .state
+        .dragons
+        .get(&recovered_dragon_id)
+        .ok_or_else(|| {
+            format!("recovered dragon {recovered_dragon_id} missing after restart continuity check")
+        })?;
+    if !continued_dragon
+        .discovery_observations
+        .iter()
+        .any(|observation| observation == observation_text)
+    {
+        return Err("post-restart observation was not present after reconnect".to_string());
+    }
+
+    let continued_report = query_persistence_report(
+        &config.database_url,
+        &host.session_code,
+        &host.reconnect_token,
+    )
+    .await?;
+    if continued_report.artifact_count <= initial_report.artifact_count {
+        return Err(format!(
+            "expected post-restart persistence artifact count to grow beyond {}, got {}",
+            initial_report.artifact_count, continued_report.artifact_count
+        ));
+    }
+
+    restarted.shutdown()?;
+
+    print_json(json!({
+        "ok": true,
+        "baseUrl": config.base_url,
+        "sessionCode": host.session_code,
+        "persistedPhaseAfterRestart": continued_report.persisted_phase,
+        "identityPlayerId": continued_report.identity_player_id,
+        "artifactCountBeforeRestart": initial_report.artifact_count,
+        "artifactCountAfterRestart": continued_report.artifact_count,
+        "continuityObservation": observation_text,
+        "tablesChecked": ["workshop_sessions", "session_artifacts", "player_identities"],
+        "timing": {
+            "totalMs": smoke_start.elapsed().as_millis() as u64,
+        },
+    }))
+}
+
+async fn smoke_restore_reconnect(config: RestoreSmokeConfig) -> Result<(), String> {
+    let client = reqwest::Client::new();
+    let smoke_start = std::time::Instant::now();
+    let host = create_workshop(&client, &config.base_url, "XtaskRestoreHost").await?;
+    send_command(
+        &client,
+        &config.base_url,
+        command_request(&host, SessionCommand::StartPhase1, None),
+    )
+    .await?;
+
+    let initial_report = query_persistence_report(
+        &config.database_url,
+        &host.session_code,
+        &host.reconnect_token,
+    )
+    .await?;
+    if initial_report.persisted_phase != "phase1" {
+        return Err(format!(
+            "expected persisted workshop phase before restore to be phase1, got {}",
+            initial_report.persisted_phase
+        ));
+    }
+    if initial_report.artifact_count < 2 {
+        return Err(format!(
+            "expected at least 2 persisted artifacts before restore, got {}",
+            initial_report.artifact_count
+        ));
+    }
+    if initial_report.identity_player_id != host.player_id {
+        return Err(format!(
+            "persisted identity player mismatch before restore: expected {}, got {}",
+            host.player_id, initial_report.identity_player_id
+        ));
+    }
+
+    eprintln!(
+        "staging restore checkpoint ready for session {}; trigger database restore and app restart now (waiting up to {} seconds for /api/ready outage and recovery)",
+        host.session_code, config.restart_timeout_seconds
+    );
+
+    wait_for_observed_restart_and_ready(
+        &client,
+        &config.base_url,
+        std::time::Duration::from_secs(config.restart_timeout_seconds),
+    )
+    .await?;
+    assert_health_endpoint(&client, &config.base_url, "/api/live").await?;
+    assert_health_endpoint(&client, &config.base_url, "/api/ready").await?;
+
+    let recovered = reconnect_workshop(&client, &config.base_url, &host).await?;
+    ensure_phase(
+        &recovered,
+        Phase::Phase1,
+        "smoke-restore-reconnect reconnect",
+    )?;
+    if recovered.player_id != host.player_id {
+        return Err(format!(
+            "restore reconnect returned player {}, expected {}",
+            recovered.player_id, host.player_id
+        ));
+    }
+    if recovered.state.session.id != host.state.session.id {
+        return Err(format!(
+            "restore reconnect returned session {}, expected {}",
+            recovered.state.session.id, host.state.session.id
+        ));
+    }
+    if recovered.state.current_player_id.as_deref() != Some(host.player_id.as_str()) {
+        return Err(
+            "restore reconnect returned a different current player than the host".to_string(),
+        );
+    }
+
+    let mut restored_socket = attach_ws_session(&config.base_url, &recovered).await?;
+    restored_socket
+        .close(None)
+        .await
+        .map_err(|error| format!("failed to close restore validation websocket: {error}"))?;
+
+    let recovered_dragon_id = assigned_dragon_id(&recovered)?;
+    let observation_text = "Recovered after staging restore";
+    send_command(
+        &client,
+        &config.base_url,
+        command_request(
+            &recovered,
+            SessionCommand::SubmitObservation,
+            Some(json!({ "text": observation_text })),
+        ),
+    )
+    .await?;
+
+    let continued = reconnect_workshop(&client, &config.base_url, &recovered).await?;
+    ensure_phase(
+        &continued,
+        Phase::Phase1,
+        "smoke-restore-reconnect continuity reconnect",
+    )?;
+    if continued.player_id != host.player_id {
+        return Err(format!(
+            "continuity reconnect returned player {}, expected {}",
+            continued.player_id, host.player_id
+        ));
+    }
+    if continued.state.session.id != host.state.session.id {
+        return Err(format!(
+            "continuity reconnect returned session {}, expected {}",
+            continued.state.session.id, host.state.session.id
+        ));
+    }
+    let continued_dragon = continued
+        .state
+        .dragons
+        .get(&recovered_dragon_id)
+        .ok_or_else(|| {
+            format!("recovered dragon {recovered_dragon_id} missing after restore continuity check")
+        })?;
+    if !continued_dragon
+        .discovery_observations
+        .iter()
+        .any(|observation| observation == observation_text)
+    {
+        return Err("post-restore observation was not present after reconnect".to_string());
+    }
+
+    let continued_report = query_persistence_report(
+        &config.database_url,
+        &host.session_code,
+        &continued.reconnect_token,
+    )
+    .await?;
+    if continued_report.persisted_phase != "phase1" {
+        return Err(format!(
+            "expected persisted workshop phase after restore to remain phase1, got {}",
+            continued_report.persisted_phase
+        ));
+    }
+    if continued_report.artifact_count <= initial_report.artifact_count {
+        return Err(format!(
+            "expected post-restore persistence artifact count to grow beyond {}, got {}",
+            initial_report.artifact_count, continued_report.artifact_count
+        ));
+    }
+    if continued_report.identity_player_id != host.player_id {
+        return Err(format!(
+            "persisted identity player mismatch after restore: expected {}, got {}",
+            host.player_id, continued_report.identity_player_id
+        ));
+    }
+
+    print_json(json!({
+        "ok": true,
+        "baseUrl": config.base_url,
+        "sessionCode": host.session_code,
+        "persistedPhaseAfterRestore": continued_report.persisted_phase,
+        "identityPlayerId": continued_report.identity_player_id,
+        "artifactCountBeforeRestore": initial_report.artifact_count,
+        "artifactCountAfterRestore": continued_report.artifact_count,
+        "continuityObservation": observation_text,
+        "websocketReattachVerified": true,
+        "tablesChecked": ["workshop_sessions", "session_artifacts", "player_identities"],
+        "timing": {
+            "totalMs": smoke_start.elapsed().as_millis() as u64,
+        },
+    }))
+}
+
 struct PersistenceReport {
     persisted_phase: String,
     artifact_count: i64,
@@ -782,43 +1345,143 @@ async fn query_persistence_report(
         .await
         .map_err(|error| format!("failed to connect to persistence database: {error}"))?;
 
-    let (session_id, payload): (String, serde_json::Value) = sqlx::query_as(
-            "SELECT session_id, payload FROM workshop_sessions WHERE session_code = $1",
-        )
-        .bind(session_code)
-        .fetch_optional(&pool)
-        .await
-        .map_err(|error| format!("failed to query workshop_sessions: {error}"))?
-        .ok_or_else(|| format!("no persisted workshop_sessions row found for session code {session_code}"))?;
+    let (session_id, payload): (String, serde_json::Value) =
+        sqlx::query_as("SELECT session_id, payload FROM workshop_sessions WHERE session_code = $1")
+            .bind(session_code)
+            .fetch_optional(&pool)
+            .await
+            .map_err(|error| format!("failed to query workshop_sessions: {error}"))?
+            .ok_or_else(|| {
+                format!("no persisted workshop_sessions row found for session code {session_code}")
+            })?;
     let persisted_phase = payload
         .get("phase")
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| format!("persisted workshop payload is missing string phase: {payload}"))?
         .to_string();
 
-    let (artifact_count,): (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM session_artifacts WHERE session_id = $1",
-        )
-        .bind(&session_id)
-        .fetch_one(&pool)
-        .await
-        .map_err(|error| format!("failed to query session_artifacts: {error}"))?;
+    let (artifact_count,): (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM session_artifacts WHERE session_id = $1")
+            .bind(&session_id)
+            .fetch_one(&pool)
+            .await
+            .map_err(|error| format!("failed to query session_artifacts: {error}"))?;
 
     let (identity_player_id,): (String,) = sqlx::query_as(
-            "SELECT player_id FROM player_identities WHERE reconnect_token = $1 AND session_id = $2",
-        )
-        .bind(reconnect_token)
-        .bind(&session_id)
-        .fetch_optional(&pool)
-        .await
-        .map_err(|error| format!("failed to query player_identities: {error}"))?
-        .ok_or_else(|| format!("no persisted player_identities row found for reconnect token {reconnect_token}"))?;
+        "SELECT player_id FROM player_identities WHERE reconnect_token = $1 AND session_id = $2",
+    )
+    .bind(reconnect_token)
+    .bind(&session_id)
+    .fetch_optional(&pool)
+    .await
+    .map_err(|error| format!("failed to query player_identities: {error}"))?
+    .ok_or_else(|| {
+        format!("no persisted player_identities row found for reconnect token {reconnect_token}")
+    })?;
 
     Ok(PersistenceReport {
         persisted_phase,
         artifact_count,
         identity_player_id,
     })
+}
+
+async fn wait_for_server_ready(
+    client: &reqwest::Client,
+    base_url: &str,
+    server: &mut AppServerProcess,
+) -> Result<(), String> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+
+    loop {
+        if let Some(status) = server.try_wait()? {
+            return Err(format!("app-server exited before becoming ready: {status}"));
+        }
+
+        if let Ok(response) = client
+            .get(format!("{base_url}/api/ready"))
+            .header("Origin", base_url)
+            .send()
+            .await
+        {
+            if response.status().is_success() {
+                return Ok(());
+            }
+        }
+
+        if std::time::Instant::now() >= deadline {
+            return Err(format!(
+                "timed out waiting for app-server readiness at {base_url}/api/ready"
+            ));
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+}
+
+async fn wait_for_observed_restart_and_ready(
+    client: &reqwest::Client,
+    base_url: &str,
+    timeout: std::time::Duration,
+) -> Result<(), String> {
+    let deadline = std::time::Instant::now() + timeout;
+    let mut saw_outage = false;
+
+    loop {
+        let ready = client
+            .get(format!("{base_url}/api/ready"))
+            .header("Origin", base_url)
+            .send()
+            .await
+            .map(|response| response.status().is_success())
+            .unwrap_or(false);
+
+        if ready {
+            if saw_outage {
+                return Ok(());
+            }
+        } else {
+            saw_outage = true;
+        }
+
+        if std::time::Instant::now() >= deadline {
+            return Err(if saw_outage {
+                format!(
+                    "observed app outage during restore at {base_url}, but readiness did not recover within {} seconds",
+                    timeout.as_secs()
+                )
+            } else {
+                format!(
+                    "did not observe a readiness outage at {base_url} within {} seconds; rerun the restore with an explicit app restart or longer timeout",
+                    timeout.as_secs()
+                )
+            });
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+}
+
+async fn assert_health_endpoint(
+    client: &reqwest::Client,
+    base_url: &str,
+    path: &str,
+) -> Result<(), String> {
+    let response = client
+        .get(format!("{base_url}{path}"))
+        .header("Origin", base_url)
+        .send()
+        .await
+        .map_err(|error| format!("failed to reach {path}: {error}"))?;
+
+    if response.status().is_success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "expected {path} to succeed after restore, got {}",
+            response.status()
+        ))
+    }
 }
 
 async fn create_workshop(
@@ -848,13 +1511,18 @@ async fn create_workshop(
     parse_join_response(response).await
 }
 
-async fn attach_ws_session(base_url: &str, identity: &WorkshopJoinSuccess) -> Result<SmokeWebSocket, String> {
+async fn attach_ws_session(
+    base_url: &str,
+    identity: &WorkshopJoinSuccess,
+) -> Result<SmokeWebSocket, String> {
     let mut request = smoke_ws_url(base_url)
         .into_client_request()
         .map_err(|error| format!("failed to build smoke websocket request: {error}"))?;
-    request
-        .headers_mut()
-        .insert("origin", HeaderValue::from_str(base_url).map_err(|error| format!("invalid websocket origin: {error}"))?);
+    request.headers_mut().insert(
+        "origin",
+        HeaderValue::from_str(base_url)
+            .map_err(|error| format!("invalid websocket origin: {error}"))?,
+    );
 
     let (mut socket, _) = connect_async(request)
         .await
@@ -875,7 +1543,9 @@ async fn attach_ws_session(base_url: &str, identity: &WorkshopJoinSuccess) -> Re
         .next()
         .await
         .ok_or_else(|| "smoke websocket closed before sending initial state".to_string())
-        .and_then(|message| message.map_err(|error| format!("failed to read smoke websocket frame: {error}")))?;
+        .and_then(|message| {
+            message.map_err(|error| format!("failed to read smoke websocket frame: {error}"))
+        })?;
     let payload = match message {
         WsMessage::Text(text) => text,
         other => return Err(format!("unexpected smoke websocket frame: {other:?}")),
@@ -1009,7 +1679,9 @@ fn print_help() {
   cargo xtask smoke-join-load -- [--base-url http://127.0.0.1:4100] [--clients 30]
   cargo xtask smoke-judge-bundle -- [--base-url http://127.0.0.1:4100]
   cargo xtask smoke-offline-failover -- [--base-url http://127.0.0.1:4100]
-  cargo xtask smoke-persistence -- [--base-url http://127.0.0.1:4100] [--database-url postgres://...]"
+  cargo xtask smoke-persistence -- [--base-url http://127.0.0.1:4100] [--database-url postgres://...]
+  cargo xtask smoke-persistence-restart -- [--base-url http://127.0.0.1:4100] [--database-url postgres://...]
+  cargo xtask smoke-restore-reconnect -- [--base-url http://127.0.0.1:4100] [--database-url postgres://...] [--restart-timeout-seconds 300]"
     );
 }
 
@@ -1020,21 +1692,32 @@ mod tests {
     #[test]
     fn normalize_forwarded_args_drops_separator() {
         assert_eq!(
-            normalize_forwarded_args(vec!["--".to_string(), "--port".to_string(), "4100".to_string()]),
+            normalize_forwarded_args(vec![
+                "--".to_string(),
+                "--port".to_string(),
+                "4100".to_string()
+            ]),
             vec!["--port".to_string(), "4100".to_string()]
         );
     }
 
     #[test]
     fn normalize_base_url_trims_slashes_and_whitespace() {
-        assert_eq!(normalize_base_url(" http://127.0.0.1:4100/ "), "http://127.0.0.1:4100");
+        assert_eq!(
+            normalize_base_url(" http://127.0.0.1:4100/ "),
+            "http://127.0.0.1:4100"
+        );
         assert_eq!(normalize_base_url("   "), "http://127.0.0.1:4100");
     }
 
     #[test]
     fn smoke_base_url_uses_forwarded_flag() {
         assert_eq!(
-            smoke_base_url(&["--base-url".to_string(), "http://localhost:4200/".to_string()]).expect("base url"),
+            smoke_base_url(&[
+                "--base-url".to_string(),
+                "http://localhost:4200/".to_string()
+            ])
+            .expect("base url"),
             "http://localhost:4200"
         );
     }
@@ -1061,15 +1744,36 @@ mod tests {
 
     #[test]
     fn smoke_ws_url_converts_http_and_https_schemes() {
-        assert_eq!(smoke_ws_url("http://127.0.0.1:4100/"), "ws://127.0.0.1:4100/api/workshops/ws");
-        assert_eq!(smoke_ws_url("https://dragon-switch.dev"), "wss://dragon-switch.dev/api/workshops/ws");
+        assert_eq!(
+            smoke_ws_url("http://127.0.0.1:4100/"),
+            "ws://127.0.0.1:4100/api/workshops/ws"
+        );
+        assert_eq!(
+            smoke_ws_url("https://dragon-switch.dev"),
+            "wss://dragon-switch.dev/api/workshops/ws"
+        );
+    }
+
+    #[test]
+    fn app_server_bind_addr_uses_base_url_host_and_port() {
+        assert_eq!(
+            app_server_bind_addr("http://127.0.0.1:4300/").expect("bind addr"),
+            "127.0.0.1:4300"
+        );
+        assert_eq!(
+            app_server_bind_addr("https://[::1]:4400").expect("ipv6 bind addr"),
+            "[::1]:4400"
+        );
     }
 
     #[test]
     fn persistence_smoke_config_uses_forwarded_flag() {
         let previous = env::var("XTASK_PERSISTENCE_DATABASE_URL").ok();
         unsafe {
-            env::set_var("XTASK_PERSISTENCE_DATABASE_URL", "postgres://env-user:env-pass@env-host:5432/env-db");
+            env::set_var(
+                "XTASK_PERSISTENCE_DATABASE_URL",
+                "postgres://env-user:env-pass@env-host:5432/env-db",
+            );
         }
 
         let config = persistence_smoke_config(&[
@@ -1081,7 +1785,46 @@ mod tests {
         .expect("persistence config");
 
         assert_eq!(config.base_url, "http://localhost:4300");
-        assert_eq!(config.database_url, "postgres://cli-user:cli-pass@cli-host:5432/cli-db");
+        assert_eq!(
+            config.database_url,
+            "postgres://cli-user:cli-pass@cli-host:5432/cli-db"
+        );
+
+        unsafe {
+            if let Some(value) = previous {
+                env::set_var("XTASK_PERSISTENCE_DATABASE_URL", value);
+            } else {
+                env::remove_var("XTASK_PERSISTENCE_DATABASE_URL");
+            }
+        }
+    }
+
+    #[test]
+    fn restore_smoke_config_uses_forwarded_flags() {
+        let previous = env::var("XTASK_PERSISTENCE_DATABASE_URL").ok();
+        unsafe {
+            env::set_var(
+                "XTASK_PERSISTENCE_DATABASE_URL",
+                "postgres://env-user:env-pass@env-host:5432/env-db",
+            );
+        }
+
+        let config = restore_smoke_config(&[
+            "--base-url".to_string(),
+            "http://localhost:4400/".to_string(),
+            "--database-url".to_string(),
+            "postgres://cli-user:cli-pass@cli-host:5432/cli-db".to_string(),
+            "--restart-timeout-seconds".to_string(),
+            "420".to_string(),
+        ])
+        .expect("restore config");
+
+        assert_eq!(config.base_url, "http://localhost:4400");
+        assert_eq!(
+            config.database_url,
+            "postgres://cli-user:cli-pass@cli-host:5432/cli-db"
+        );
+        assert_eq!(config.restart_timeout_seconds, 420);
 
         unsafe {
             if let Some(value) = previous {
@@ -1096,7 +1839,11 @@ mod tests {
     fn cargo_run_package_args_include_separator_only_when_needed() {
         assert_eq!(
             cargo_run_package_args("app-server", &[]),
-            vec!["run".to_string(), "-p".to_string(), "app-server".to_string()]
+            vec![
+                "run".to_string(),
+                "-p".to_string(),
+                "app-server".to_string()
+            ]
         );
         assert_eq!(
             cargo_run_package_args("app-server", &["--port".to_string(), "4100".to_string()]),
@@ -1121,9 +1868,6 @@ mod tests {
     fn build_web_config_uses_forwarded_out_dir() {
         let config = build_web_config(&["--out-dir".to_string(), "custom-dist".to_string()])
             .expect("forwarded build web config");
-        assert_eq!(
-            config.out_dir,
-            workspace_root().join("custom-dist")
-        );
+        assert_eq!(config.out_dir, workspace_root().join("custom-dist"));
     }
 }

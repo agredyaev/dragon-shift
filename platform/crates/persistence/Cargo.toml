@@ -7,7 +7,7 @@ authors.workspace = true
 
 [dependencies]
 chrono.workspace = true
-sqlx.workspace = true
+sqlx = { workspace = true, features = ["migrate"] }
 thiserror.workspace = true
 domain.workspace = true
 protocol.workspace = true
