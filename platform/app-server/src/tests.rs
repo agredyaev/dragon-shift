@@ -28,6 +28,7 @@ use protocol::{
 use security::{DEFAULT_RUST_SESSION_CODE_PREFIX, OriginPolicyOptions, create_origin_policy};
 use sqlx::PgPool;
 use std::{
+    fs,
     future::Future,
     net::SocketAddr,
     pin::Pin,
@@ -35,6 +36,7 @@ use std::{
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
+        LazyLock, Mutex as StdMutex, MutexGuard,
     },
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -43,6 +45,7 @@ use tokio_tungstenite::{
     tungstenite::{Message as WsMessage, client::IntoClientRequest},
 };
 use tower::util::ServiceExt;
+use tempfile::NamedTempFile;
 use uuid::Uuid;
 
 fn postgres_test_database_url() -> Option<String> {
@@ -229,6 +232,12 @@ async fn wait_for_postgres(database_url: &str) {
 struct ScopedEnvVar {
     key: &'static str,
     original: Option<String>,
+}
+
+static ENV_TEST_MUTEX: LazyLock<StdMutex<()>> = LazyLock::new(|| StdMutex::new(()));
+
+fn lock_env() -> MutexGuard<'static, ()> {
+    ENV_TEST_MUTEX.lock().expect("lock env test mutex")
 }
 
 impl ScopedEnvVar {
@@ -812,6 +821,7 @@ async fn ready_endpoint_returns_ok_when_store_is_healthy() {
 
 #[test]
 fn load_config_parses_trust_x_forwarded_for() {
+    let _env_lock = lock_env();
     let _bind = ScopedEnvVar::set("APP_SERVER_BIND_ADDR", "127.0.0.1:4100");
     let _app_url = ScopedEnvVar::set("VITE_APP_URL", "http://127.0.0.1:4100");
     let _origins = ScopedEnvVar::set("ALLOWED_ORIGINS", "http://127.0.0.1:4100");
@@ -826,6 +836,7 @@ fn load_config_parses_trust_x_forwarded_for() {
 
 #[test]
 fn load_config_parses_database_pool_size() {
+    let _env_lock = lock_env();
     let _bind = ScopedEnvVar::set("APP_SERVER_BIND_ADDR", "127.0.0.1:4100");
     let _app_url = ScopedEnvVar::set("VITE_APP_URL", "http://127.0.0.1:4100");
     let _origins = ScopedEnvVar::set("ALLOWED_ORIGINS", "http://127.0.0.1:4100");
@@ -840,6 +851,7 @@ fn load_config_parses_database_pool_size() {
 
 #[test]
 fn load_config_parses_rate_limits() {
+    let _env_lock = lock_env();
     let _bind = ScopedEnvVar::set("APP_SERVER_BIND_ADDR", "127.0.0.1:4100");
     let _app_url = ScopedEnvVar::set("VITE_APP_URL", "http://127.0.0.1:4100");
     let _origins = ScopedEnvVar::set("ALLOWED_ORIGINS", "http://127.0.0.1:4100");
@@ -856,6 +868,54 @@ fn load_config_parses_rate_limits() {
     assert_eq!(config.join_rate_limit, 22);
     assert_eq!(config.command_rate_limit, 33);
     assert_eq!(config.websocket_rate_limit, 44);
+}
+
+#[test]
+fn load_config_reads_database_url_from_file() {
+    let _env_lock = lock_env();
+    let _bind = ScopedEnvVar::set("APP_SERVER_BIND_ADDR", "127.0.0.1:4100");
+    let _app_url = ScopedEnvVar::set("VITE_APP_URL", "http://127.0.0.1:4100");
+    let _origins = ScopedEnvVar::set("ALLOWED_ORIGINS", "http://127.0.0.1:4100");
+    let _node_env = ScopedEnvVar::set("NODE_ENV", "production");
+    let _database = ScopedEnvVar::set("DATABASE_URL", "");
+    let temp = NamedTempFile::new().expect("create temp database url file");
+    fs::write(temp.path(), "  postgres://user:pass@localhost:5432/db  \n")
+        .expect("write temp database url file");
+    let _database_file = ScopedEnvVar::set(
+        "DATABASE_URL_FILE",
+        temp.path().to_str().expect("temp file path utf-8"),
+    );
+
+    let config = crate::app::load_config().expect("load config");
+
+    assert_eq!(
+        config.database_url.as_deref(),
+        Some("postgres://user:pass@localhost:5432/db")
+    );
+}
+
+#[test]
+fn load_config_prefers_database_url_over_file() {
+    let _env_lock = lock_env();
+    let _bind = ScopedEnvVar::set("APP_SERVER_BIND_ADDR", "127.0.0.1:4100");
+    let _app_url = ScopedEnvVar::set("VITE_APP_URL", "http://127.0.0.1:4100");
+    let _origins = ScopedEnvVar::set("ALLOWED_ORIGINS", "http://127.0.0.1:4100");
+    let _node_env = ScopedEnvVar::set("NODE_ENV", "production");
+    let _database = ScopedEnvVar::set("DATABASE_URL", "postgres://inline:pass@localhost:5432/db");
+    let temp = NamedTempFile::new().expect("create temp database url file");
+    fs::write(temp.path(), "postgres://file:pass@localhost:5432/db")
+        .expect("write temp database url file");
+    let _database_file = ScopedEnvVar::set(
+        "DATABASE_URL_FILE",
+        temp.path().to_str().expect("temp file path utf-8"),
+    );
+
+    let config = crate::app::load_config().expect("load config");
+
+    assert_eq!(
+        config.database_url.as_deref(),
+        Some("postgres://inline:pass@localhost:5432/db")
+    );
 }
 
 #[tokio::test]

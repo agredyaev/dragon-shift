@@ -12,6 +12,7 @@ service:
   port: 80
   targetPort: 3000
   nodePort: null
+  annotations: {}
 
 ingress:
   enabled: false
@@ -39,6 +40,13 @@ database:
   url: ""
   existingSecretName: ""
   existingSecretKey: DATABASE_URL
+  existingSecretFile: ""
+
+secretManager:
+  enabled: false
+  secretProviderClassName: ""
+  mountPath: /var/run/secrets/dragon-shift
+  fileName: DATABASE_URL
 
 postgresql:
   # Bundled Postgres is the local/dev default. For cloud production, prefer an

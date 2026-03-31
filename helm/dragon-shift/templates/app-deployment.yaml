@@ -92,8 +92,11 @@ spec:
             - name: DATABASE_URL
               valueFrom:
                 secretKeyRef:
-                  name: {{ .Values.database.existingSecretName | quote }}
-                  key: {{ .Values.database.existingSecretKey | quote }}
+                   name: {{ .Values.database.existingSecretName | quote }}
+                   key: {{ .Values.database.existingSecretKey | quote }}
+            {{- else if .Values.database.existingSecretFile }}
+            - name: DATABASE_URL_FILE
+              value: {{ .Values.database.existingSecretFile | quote }}
             {{- else if .Values.postgresql.enabled }}
             - name: DATABASE_URL
               value: {{ include "dragon-shift.databaseUrl" . | quote }}
@@ -121,11 +124,24 @@ spec:
           volumeMounts:
             - name: tmp
               mountPath: /tmp
+            {{- if .Values.secretManager.enabled }}
+            - name: secret-manager
+              mountPath: {{ .Values.secretManager.mountPath | quote }}
+              readOnly: true
+            {{- end }}
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
       volumes:
         - name: tmp
           emptyDir: {}
+        {{- if .Values.secretManager.enabled }}
+        - name: secret-manager
+          csi:
+            driver: secrets-store-gke.csi.k8s.io
+            readOnly: true
+            volumeAttributes:
+              secretProviderClass: {{ required "secretManager.secretProviderClassName is required when secretManager.enabled=true" .Values.secretManager.secretProviderClassName | quote }}
+        {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

@@ -29,6 +29,7 @@ tower-http = { version = "0.6", features = ["cors", "trace", "fs", "set-header"]
 uuid = { version = "1", features = ["serde", "v4"] }
 chrono = { version = "0.4", features = ["clock", "serde"] }
 sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "json"] }
+tempfile = "3"
 dioxus = "0.7.0"
 dioxus-web = "0.7.0"
 protocol = { path = "crates/protocol" }

@@ -191,12 +191,11 @@ pub(crate) fn load_config() -> Result<AppConfig, String> {
                 .expect("workspace root")
                 .join("app-web/dist")
         });
-    let database_url = env::var("DATABASE_URL")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty());
+    let database_url = load_database_url()?;
     if is_production && database_url.is_none() {
-        return Err("DATABASE_URL is required when NODE_ENV=production".to_string());
+        return Err(
+            "DATABASE_URL or DATABASE_URL_FILE is required when NODE_ENV=production".to_string(),
+        );
     }
     Ok(AppConfig {
         bind_addr,
@@ -212,6 +211,34 @@ pub(crate) fn load_config() -> Result<AppConfig, String> {
         static_assets_dir,
         database_url,
     })
+}
+
+fn load_database_url() -> Result<Option<String>, String> {
+    if let Some(value) = env::var("DATABASE_URL")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
+        return Ok(Some(value));
+    }
+
+    let Some(path) = env::var("DATABASE_URL_FILE")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+
+    let value = std::fs::read_to_string(&path)
+        .map_err(|error| format!("read DATABASE_URL_FILE {path}: {error}"))?;
+
+    let value = value.trim().to_string();
+    if value.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(value))
+    }
 }
 
 fn load_rate_limit_env(key: &str, default: u32) -> Result<u32, String> {
