@@ -20,7 +20,15 @@ It ships as a browser client and Rust backend, persists game state in PostgreSQL
 - Packages the runtime and deployment stack for reproducible cloud releases.
 
 ## Core Stack
-- `platform/` for the Rust workspace, frontend, server, shared crates, tests, and build automation.
+- `platform/` is a Rust workspace with these modules:
+  - `app-server` - Axum HTTP and WebSocket entrypoint, request handling, runtime config, and serving the built frontend assets.
+  - `app-web` - Dioxus frontend and browser-side UI state.
+  - `crates/domain` - game rules, core types, and domain validation.
+  - `crates/persistence` - Postgres schema, migrations, and database access.
+  - `crates/protocol` - API payloads and realtime message types.
+  - `crates/realtime` - session ownership and realtime coordination.
+  - `crates/security` - token and identity helpers.
+  - `xtask` - build, packaging, and smoke-test automation.
 - `helm/dragon-shift` for the Kubernetes deployment, ingress, secrets, and certificate wiring.
 - `terraform/` for GCP bootstrap, network, GKE, Cloud SQL, and platform infrastructure.
 
