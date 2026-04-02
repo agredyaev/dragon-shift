@@ -25,6 +25,7 @@ Terraform here provisions the GCP production path for Dragon Shift.
 - It waits for ingress and Secret Manager CSI surfaces before dependent resources.
 - `managed_dns` creates a Cloud DNS zone and A record.
 - `nip_io` derives a public hostname from the reserved global IP and avoids parent-zone delegation.
+- Production `terraform.tfvars` files are operator-local and should not be committed; use the `terraform.tfvars.example` files as the shared template.
 - Terraform 1.14+ is required.
 
 ## Validation

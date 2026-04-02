@@ -1,11 +1,11 @@
-project_id    = "my-production-project"
-region        = "europe-west4"
+project_id   = "my-production-project"
+region       = "europe-west4"
 cluster_name  = "dragon-shift-prod"
 
-hostname_mode     = "managed_dns"
-hostname          = "dragon-shift.example.com"
-dns_zone_name     = "dragon-shift-example-com"
-dns_zone_dns_name = "example.com."
+hostname_mode      = "managed_dns"
+hostname           = "dragon-shift.example.com"
+dns_zone_name      = "dragon-shift-example-com"
+dns_zone_dns_name  = "example.com."
 
 # For an ephemeral public test URL without a parent DNS zone, switch to:
 # hostname_mode = "nip_io"
@@ -14,9 +14,9 @@ dns_zone_dns_name = "example.com."
 # dns_zone_dns_name = ""
 # nip_io_label  = "dragon-shift"
 
-image_repository = "ghcr.io/your-org/dragon-switch"
-image_digest     = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-enable_uptime_checks = false
+image_repository      = "ghcr.io/your-org/dragon-switch"
+image_digest          = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+enable_uptime_checks  = false
 # notification_channel_id = "projects/my-production-project/notificationChannels/1234567890"
 # kubeconfig_path    = "/Users/example/.kube/config"
 # kubeconfig_context = "gke_my-production-project_europe-west4_dragon-shift-prod"
