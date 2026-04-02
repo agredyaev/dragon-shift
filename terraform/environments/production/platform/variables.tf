@@ -33,18 +33,33 @@ variable "namespace" {
 }
 
 variable "hostname" {
-  description = "Public production hostname."
+  description = "Public production hostname. Required when hostname_mode is managed_dns or external_dns."
   type        = string
+  default     = ""
+}
+
+variable "hostname_mode" {
+  description = "Hostname strategy for production: managed_dns creates a Cloud DNS zone/record, external_dns expects an externally managed hostname, and nip_io derives a public hostname from the reserved global IP."
+  type        = string
+  default     = "managed_dns"
 }
 
 variable "dns_zone_name" {
-  description = "Cloud DNS managed zone name."
+  description = "Cloud DNS managed zone name. Required only when hostname_mode=managed_dns."
   type        = string
+  default     = ""
 }
 
 variable "dns_zone_dns_name" {
-  description = "Cloud DNS zone DNS suffix, e.g. example.com."
+  description = "Cloud DNS zone DNS suffix, e.g. example.com. Required only when hostname_mode=managed_dns."
   type        = string
+  default     = ""
+}
+
+variable "nip_io_label" {
+  description = "Leftmost DNS label to use when hostname_mode=nip_io."
+  type        = string
+  default     = "dragon-shift"
 }
 
 variable "image_repository" {
@@ -128,6 +143,12 @@ variable "cloud_armor_rate_limit_interval_sec" {
   description = "Cloud Armor rate limit interval seconds."
   type        = number
   default     = 60
+}
+
+variable "enable_cloud_armor" {
+  description = "Whether to create and attach the Cloud Armor security policy. Disable when the project has no Cloud Armor quota."
+  type        = bool
+  default     = true
 }
 
 variable "notification_channel_id" {

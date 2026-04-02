@@ -7,8 +7,10 @@ resource "google_sql_database_instance" "this" {
   deletion_protection = var.deletion_protection
 
   settings {
+    edition           = "ENTERPRISE"
     tier              = var.tier
     availability_type = var.availability_type
+    activation_policy = var.activation_policy
     disk_type         = "PD_SSD"
     disk_size         = var.disk_size_gb
     disk_autoresize   = true

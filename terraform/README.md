@@ -18,10 +18,13 @@ Terraform here provisions the GCP production path for Dragon Shift.
 - Cloud SQL uses private IP only.
 - `postgresql.enabled=false` in cloud production.
 - Use `master_authorized_networks` or `kubeconfig_path` for cluster access.
+- Choose a platform hostname strategy explicitly: `managed_dns`, `external_dns`, or `nip_io`.
 
 ## Notes
 - The platform stack reads the cluster from Google APIs.
 - It waits for ingress and Secret Manager CSI surfaces before dependent resources.
+- `managed_dns` creates a Cloud DNS zone and A record.
+- `nip_io` derives a public hostname from the reserved global IP and avoids parent-zone delegation.
 - Terraform 1.14+ is required.
 
 ## Validation

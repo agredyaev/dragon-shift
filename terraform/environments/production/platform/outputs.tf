@@ -1,6 +1,6 @@
 output "hostname" {
   description = "Production hostname."
-  value       = var.hostname
+  value       = local.app_hostname
 }
 
 output "global_ip_address" {
@@ -10,7 +10,12 @@ output "global_ip_address" {
 
 output "dns_name_servers" {
   description = "Authoritative name servers for the created public DNS zone."
-  value       = google_dns_managed_zone.public.name_servers
+  value       = local.managed_dns_enabled ? google_dns_managed_zone.public[0].name_servers : []
+}
+
+output "verify_url" {
+  description = "Public base URL for deploy verification and smoke checks."
+  value       = format("https://%s", local.app_hostname)
 }
 
 output "namespace" {
@@ -30,5 +35,5 @@ output "database_secret_provider_class_name" {
 
 output "cloud_armor_policy_name" {
   description = "Cloud Armor policy attached to the ingress backend."
-  value       = google_compute_security_policy.app.name
+  value       = var.enable_cloud_armor ? google_compute_security_policy.app[0].name : ""
 }

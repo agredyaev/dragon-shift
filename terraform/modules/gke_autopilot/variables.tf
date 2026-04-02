@@ -33,11 +33,6 @@ variable "services_secondary_range_name" {
   type        = string
 }
 
-variable "master_ipv4_cidr_block" {
-  description = "Private control plane CIDR."
-  type        = string
-}
-
 variable "release_channel" {
   description = "GKE release channel."
   type        = string

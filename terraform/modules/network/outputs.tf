@@ -32,8 +32,3 @@ output "private_service_access_connection" {
   description = "Private service access connection resource name."
   value       = google_service_networking_connection.private_service_access.id
 }
-
-output "master_ipv4_cidr_block" {
-  description = "Reserved private control plane CIDR."
-  value       = var.master_ipv4_cidr_block
-}

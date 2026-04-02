@@ -31,6 +31,12 @@ variable "availability_type" {
   default     = "REGIONAL"
 }
 
+variable "activation_policy" {
+  description = "Cloud SQL activation policy. Use ALWAYS for normal runtime and NEVER to stop instance compute while retaining data."
+  type        = string
+  default     = "ALWAYS"
+}
+
 variable "network_id" {
   description = "VPC network self link for private IP."
   type        = string

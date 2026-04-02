@@ -19,12 +19,6 @@ resource "google_container_cluster" "this" {
     services_secondary_range_name = var.services_secondary_range_name
   }
 
-  private_cluster_config {
-    enable_private_nodes    = true
-    enable_private_endpoint = false
-    master_ipv4_cidr_block  = var.master_ipv4_cidr_block
-  }
-
   master_authorized_networks_config {
     gcp_public_cidrs_access_enabled = false
 

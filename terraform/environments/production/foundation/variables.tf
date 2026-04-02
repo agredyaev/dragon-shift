@@ -44,12 +44,6 @@ variable "services_cidr" {
   default     = "10.28.0.0/20"
 }
 
-variable "master_ipv4_cidr_block" {
-  description = "GKE private control plane CIDR."
-  type        = string
-  default     = "172.16.0.0/28"
-}
-
 variable "db_instance_name" {
   description = "Cloud SQL instance name."
   type        = string
@@ -96,6 +90,18 @@ variable "db_disk_size_gb" {
   description = "Initial Cloud SQL disk size in GB."
   type        = number
   default     = 50
+}
+
+variable "db_activation_policy" {
+  description = "Cloud SQL activation policy. Set to NEVER to pause instance compute while retaining data."
+  type        = string
+  default     = "ALWAYS"
+}
+
+variable "database_url_secret_id" {
+  description = "Secret Manager secret ID that stores the runtime DATABASE_URL."
+  type        = string
+  default     = "dragon-shift-production-database-url"
 }
 
 variable "release_channel" {

@@ -5,16 +5,16 @@ This document defines what the repo owns and what operators own in production.
 ## Repo-owned
 - application image and runtime config
 - Helm chart in `helm/dragon-shift`
-- Terraform under `terraform/`
+- Terraform under `terraform/` for network, GKE, Cloud SQL, ingress edge, Cloud Armor, Secret Manager wiring, and monitoring
 - manual deploy, promote, and rollback workflow
 - health endpoints and deploy smoke checks
 
 ## Operator-owned
-- cluster, namespaces, ingress, and network policy
-- DNS, TLS, and certificate rotation
-- Cloud SQL lifecycle and backup policy
-- runtime secrets and secret rotation
-- monitoring, alerts, and on-call response
+- project/account access, Terraform inputs, and state access
+- parent-zone or registrar delegation when `hostname_mode=managed_dns`
+- notification-channel email verification and on-call response
+- Cloud SQL start/stop decisions, backup retention decisions, and restore execution
+- secret payload rotation inputs and restore sign-off
 - restore execution and restore sign-off
 
 ## External Requirements

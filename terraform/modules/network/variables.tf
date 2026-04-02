@@ -28,11 +28,6 @@ variable "services_cidr" {
   type        = string
 }
 
-variable "master_ipv4_cidr_block" {
-  description = "Private control plane CIDR for the GKE cluster."
-  type        = string
-}
-
 variable "cloud_sql_allocated_ip_range" {
   description = "CIDR size base for private service access range."
   type        = number

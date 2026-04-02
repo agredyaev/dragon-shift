@@ -22,3 +22,8 @@ output "database_user" {
   description = "Application database user."
   value       = google_sql_user.app.name
 }
+
+output "activation_policy" {
+  description = "Cloud SQL activation policy."
+  value       = google_sql_database_instance.this.settings[0].activation_policy
+}

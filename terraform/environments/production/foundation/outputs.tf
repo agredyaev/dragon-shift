@@ -69,6 +69,11 @@ output "database_url_secret_id" {
   value       = google_secret_manager_secret.database_url.secret_id
 }
 
+output "cloud_sql_activation_policy" {
+  description = "Cloud SQL activation policy."
+  value       = module.cloud_sql.activation_policy
+}
+
 output "workload_identity_pool" {
   description = "Workload Identity pool for the cluster."
   value       = module.gke.workload_pool

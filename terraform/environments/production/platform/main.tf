@@ -1,5 +1,7 @@
 locals {
   notification_channel_id = trimspace(var.notification_channel_id)
+  managed_dns_enabled     = var.hostname_mode == "managed_dns"
+  app_hostname            = var.hostname_mode == "nip_io" ? format("%s.%s.nip.io", trimspace(var.nip_io_label), google_compute_global_address.ingress.address) : trimspace(var.hostname)
 
   common_labels = merge(
     {
@@ -23,6 +25,34 @@ check "uptime_alert_channel_configured" {
   }
 }
 
+check "hostname_mode_supported" {
+  assert {
+    condition     = contains(["managed_dns", "external_dns", "nip_io"], var.hostname_mode)
+    error_message = "hostname_mode must be one of: managed_dns, external_dns, nip_io."
+  }
+}
+
+check "hostname_present_when_required" {
+  assert {
+    condition     = var.hostname_mode == "nip_io" || trimspace(var.hostname) != ""
+    error_message = "hostname must be set when hostname_mode is managed_dns or external_dns."
+  }
+}
+
+check "managed_dns_inputs_present" {
+  assert {
+    condition     = var.hostname_mode != "managed_dns" || (trimspace(var.dns_zone_name) != "" && trimspace(var.dns_zone_dns_name) != "")
+    error_message = "dns_zone_name and dns_zone_dns_name must be set when hostname_mode=managed_dns."
+  }
+}
+
+check "nip_io_label_present" {
+  assert {
+    condition     = var.hostname_mode != "nip_io" || trimspace(var.nip_io_label) != ""
+    error_message = "nip_io_label must be set when hostname_mode=nip_io."
+  }
+}
+
 resource "google_compute_global_address" "ingress" {
   project    = var.project_id
   name       = "dragon-shift-production-ip"
@@ -30,6 +60,8 @@ resource "google_compute_global_address" "ingress" {
 }
 
 resource "google_compute_security_policy" "app" {
+  count = var.enable_cloud_armor ? 1 : 0
+
   project = var.project_id
   name    = "dragon-shift-production"
 
@@ -75,6 +107,8 @@ resource "google_compute_security_policy" "app" {
 }
 
 resource "google_dns_managed_zone" "public" {
+  count = local.managed_dns_enabled ? 1 : 0
+
   project       = var.project_id
   name          = var.dns_zone_name
   dns_name      = var.dns_zone_dns_name
@@ -85,9 +119,11 @@ resource "google_dns_managed_zone" "public" {
 }
 
 resource "google_dns_record_set" "app" {
+  count = local.managed_dns_enabled ? 1 : 0
+
   project      = var.project_id
-  managed_zone = google_dns_managed_zone.public.name
-  name         = format("%s.", var.hostname)
+  managed_zone = google_dns_managed_zone.public[0].name
+  name         = format("%s.", local.app_hostname)
   type         = "A"
   ttl          = 300
   rrdatas      = [google_compute_global_address.ingress.address]
@@ -229,27 +265,35 @@ resource "kubernetes_manifest" "backend_config" {
       name      = "dragon-shift-backend-config"
       namespace = kubernetes_namespace.app.metadata[0].name
     }
-    spec = {
-      timeoutSec = 3600
-      healthCheck = {
-        type               = "HTTP"
-        requestPath        = "/api/ready"
-        port               = 3000
-        checkIntervalSec   = 15
-        timeoutSec         = 5
-        healthyThreshold   = 2
-        unhealthyThreshold = 3
-      }
-      securityPolicy = {
-        name = google_compute_security_policy.app.name
-      }
-      connectionDraining = {
-        drainingTimeoutSec = 30
-      }
-    }
+    spec = merge(
+      {
+        timeoutSec = 3600
+        healthCheck = {
+          type               = "HTTP"
+          requestPath        = "/api/ready"
+          port               = 3000
+          checkIntervalSec   = 15
+          timeoutSec         = 5
+          healthyThreshold   = 2
+          unhealthyThreshold = 3
+        }
+        connectionDraining = {
+          drainingTimeoutSec = 30
+        }
+      },
+      var.enable_cloud_armor ? {
+        securityPolicy = {
+          name = google_compute_security_policy.app[0].name
+        }
+      } : {},
+    )
   }
 
-  depends_on = [kubernetes_namespace.app, terraform_data.wait_for_cluster_apis]
+  depends_on = [
+    kubernetes_namespace.app,
+    terraform_data.wait_for_cluster_apis,
+    google_compute_security_policy.app,
+  ]
 }
 
 resource "kubernetes_manifest" "managed_certificate" {
@@ -261,7 +305,7 @@ resource "kubernetes_manifest" "managed_certificate" {
       namespace = kubernetes_namespace.app.metadata[0].name
     }
     spec = {
-      domains = [var.hostname]
+      domains = [local.app_hostname]
     }
   }
 
@@ -288,7 +332,7 @@ resource "helm_release" "app" {
     ingress = {
       enabled   = true
       className = "gce"
-      host      = var.hostname
+      host      = local.app_hostname
       annotations = {
         "kubernetes.io/ingress.global-static-ip-name" = google_compute_global_address.ingress.name
         "networking.gke.io/managed-certificates"      = kubernetes_manifest.managed_certificate.manifest.metadata.name
@@ -309,8 +353,8 @@ resource "helm_release" "app" {
       }
     }
     app = {
-      allowedOrigins        = format("https://%s", var.hostname)
-      viteAppUrl            = format("https://%s", var.hostname)
+      allowedOrigins        = format("https://%s", local.app_hostname)
+      viteAppUrl            = format("https://%s", local.app_hostname)
       rustSessionCodePrefix = var.rust_session_code_prefix
       trustForwardedFor     = var.trust_forwarded_for
       databasePoolSize      = var.database_pool_size
@@ -349,6 +393,7 @@ resource "helm_release" "app" {
     kubernetes_manifest.managed_certificate,
     kubernetes_service_account.app,
     google_secret_manager_secret_iam_member.database_url_accessor,
+    terraform_data.wait_for_cluster_apis,
   ]
 }
 
@@ -363,7 +408,7 @@ resource "google_monitoring_uptime_check_config" "live" {
   monitored_resource {
     type = "uptime_url"
     labels = {
-      host       = var.hostname
+      host       = local.app_hostname
       project_id = var.project_id
     }
   }
@@ -393,7 +438,7 @@ resource "google_monitoring_uptime_check_config" "ready" {
   monitored_resource {
     type = "uptime_url"
     labels = {
-      host       = var.hostname
+      host       = local.app_hostname
       project_id = var.project_id
     }
   }
