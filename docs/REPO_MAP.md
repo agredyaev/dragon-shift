@@ -29,7 +29,7 @@
 - `README.md` - project overview and canonical usage
 - `docs/VARIABLE_CATALOG.md` - runtime, Helm, and Terraform input catalog
 - `.env.example` - local environment variable reference
-- `operations/CLOUD_OPERABILITY.md` - operator-owned cloud boundaries
+- `docs/CLOUD_OPERABILITY.md` - operator-owned cloud boundaries
 - `platform/ARCHITECTURE.md` - runtime architecture notes
 - `platform/rust-toolchain.toml` - pinned Rust toolchain and wasm target
 - `platform/Cargo.toml` - workspace manifest and dependency versions
