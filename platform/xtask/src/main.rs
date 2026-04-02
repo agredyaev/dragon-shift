@@ -105,14 +105,13 @@ struct AppServerProcess {
 
 impl AppServerProcess {
     fn spawn(base_url: &str, database_url: &str) -> Result<Self, String> {
+        ensure_default_app_web_bundle()?;
+
         let child = Command::new(app_server_binary_path())
             .current_dir(workspace_root())
             .env("APP_SERVER_BIND_ADDR", app_server_bind_addr(base_url)?)
             .env("DATABASE_URL", database_url)
-            .env(
-                "APP_SERVER_STATIC_DIR",
-                workspace_root().join("app-web/dist"),
-            )
+            .env("APP_SERVER_STATIC_DIR", app_web_dist_dir())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -174,6 +173,31 @@ fn workspace_root() -> PathBuf {
         .parent()
         .expect("xtask workspace root")
         .to_path_buf()
+}
+
+fn app_web_static_dir() -> PathBuf {
+    workspace_root().join("app-web/static")
+}
+
+fn app_web_dist_dir() -> PathBuf {
+    workspace_root().join("app-web/dist")
+}
+
+fn ensure_default_app_web_bundle() -> Result<(), String> {
+    let out_dir = app_web_dist_dir();
+    let required_paths = [
+        out_dir.join("index.html"),
+        out_dir.join("app-web.js"),
+        out_dir.join("app-web_bg.wasm"),
+        out_dir.join("style.css"),
+        out_dir.join("fonts"),
+    ];
+
+    if required_paths.iter().all(|path| path.exists()) {
+        return Ok(());
+    }
+
+    build_web_bundle(WebBuildConfig { out_dir })
 }
 
 fn run_async<F>(future: F) -> Result<(), String>
@@ -430,6 +454,15 @@ fn run_tool(program: &str, args: &[&str]) -> Result<(), String> {
 }
 
 fn build_web_bundle(config: WebBuildConfig) -> Result<(), String> {
+    if config.out_dir.exists() {
+        fs::remove_dir_all(&config.out_dir).map_err(|error| {
+            format!(
+                "failed to clear app-web output dir {}: {error}",
+                config.out_dir.display()
+            )
+        })?;
+    }
+
     fs::create_dir_all(&config.out_dir).map_err(|error| {
         format!(
             "failed to create app-web output dir {}: {error}",
@@ -505,6 +538,7 @@ fn build_web_bundle(config: WebBuildConfig) -> Result<(), String> {
     };
 
     write_app_web_index_html(&config.out_dir)?;
+    copy_app_web_static_assets(&config.out_dir)?;
 
     // ── WASM bundle size gate ──────────────────────────────────────────
     let wasm_output = config.out_dir.join("app-web_bg.wasm");
@@ -585,6 +619,92 @@ fn write_app_web_index_html(out_dir: &Path) -> Result<(), String> {
 "#,
     )
     .map_err(|error| format!("failed to write {}: {error}", index_path.display()))
+}
+
+fn copy_app_web_static_assets(out_dir: &Path) -> Result<(), String> {
+    let static_dir = app_web_static_dir();
+    if !static_dir.is_dir() {
+        return Err(format!(
+            "app-web static assets directory is missing: {}",
+            static_dir.display()
+        ));
+    }
+
+    copy_dir_contents(&static_dir, out_dir)
+}
+
+fn copy_dir_contents(source: &Path, destination: &Path) -> Result<(), String> {
+    fs::create_dir_all(destination).map_err(|error| {
+        format!(
+            "failed to create static asset dir {}: {error}",
+            destination.display()
+        )
+    })?;
+
+    for entry in fs::read_dir(source)
+        .map_err(|error| format!("failed to read {}: {error}", source.display()))?
+    {
+        let entry = entry.map_err(|error| {
+            format!("failed to read entry under {}: {error}", source.display())
+        })?;
+        let source_path = entry.path();
+        let destination_path = destination.join(entry.file_name());
+
+        if entry
+            .file_type()
+            .map_err(|error| format!("failed to inspect {}: {error}", source_path.display()))?
+            .is_dir()
+        {
+            copy_dir_recursive(&source_path, &destination_path)?;
+        } else {
+            copy_file(&source_path, &destination_path)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn copy_file(source: &Path, destination: &Path) -> Result<(), String> {
+    fs::copy(source, destination).map_err(|error| {
+        format!(
+            "failed to copy {} to {}: {error}",
+            source.display(),
+            destination.display()
+        )
+    })?;
+
+    Ok(())
+}
+
+fn copy_dir_recursive(source: &Path, destination: &Path) -> Result<(), String> {
+    fs::create_dir_all(destination).map_err(|error| {
+        format!(
+            "failed to create static asset dir {}: {error}",
+            destination.display()
+        )
+    })?;
+
+    for entry in fs::read_dir(source)
+        .map_err(|error| format!("failed to read {}: {error}", source.display()))?
+    {
+        let entry = entry.map_err(|error| {
+            format!("failed to read entry under {}: {error}", source.display())
+        })?;
+        let source_path = entry.path();
+        let destination_path = destination.join(entry.file_name());
+
+        if entry
+            .file_type()
+            .map_err(|error| format!("failed to inspect {}: {error}", source_path.display()))?
+            .is_dir()
+        {
+            copy_dir_recursive(&source_path, &destination_path)?;
+        } else {
+            copy_file(&source_path, &destination_path)?;
+        }
+    }
+
+    Ok(())
 }
 
 fn run_tool_owned(program: &str, args: Vec<String>) -> Result<(), String> {
@@ -1869,5 +1989,10 @@ mod tests {
         let config = build_web_config(&["--out-dir".to_string(), "custom-dist".to_string()])
             .expect("forwarded build web config");
         assert_eq!(config.out_dir, workspace_root().join("custom-dist"));
+    }
+
+    #[test]
+    fn app_web_static_dir_points_to_source_assets() {
+        assert_eq!(app_web_static_dir(), workspace_root().join("app-web/static"));
     }
 }

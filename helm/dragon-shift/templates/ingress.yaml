@@ -1,16 +1,32 @@
 {{- if .Values.ingress.enabled }}
+{{- $annotations := dict -}}
+{{- range $key, $value := .Values.ingress.annotations }}
+{{- $_ := set $annotations $key $value }}
+{{- end }}
+{{- if or (eq .Values.ingress.className "gce") (eq .Values.ingress.className "gce-internal") }}
+{{- $_ := set $annotations "kubernetes.io/ingress.class" .Values.ingress.className }}
+{{- end }}
+{{- with .Values.ingress.gke.staticIpName }}
+{{- $_ := set $annotations "kubernetes.io/ingress.global-static-ip-name" . }}
+{{- end }}
+{{- if .Values.ingress.gke.allowHttpSet }}
+{{- $_ := set $annotations "kubernetes.io/ingress.allow-http" (ternary "true" "false" .Values.ingress.gke.allowHttp) }}
+{{- end }}
+{{- if .Values.ingress.gke.managedCertificate.enabled }}
+{{- $_ := set $annotations "networking.gke.io/managed-certificates" (include "dragon-shift.ingress.managedCertificateName" .) }}
+{{- end }}
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
   name: {{ include "dragon-shift.fullname" . }}
   labels:
     {{- include "dragon-shift.labels" . | nindent 4 }}
-  {{- with .Values.ingress.annotations }}
+  {{- if $annotations }}
   annotations:
-    {{- toYaml . | nindent 4 }}
+    {{- toYaml $annotations | nindent 4 }}
   {{- end }}
 spec:
-  {{- if .Values.ingress.className }}
+  {{- if and .Values.ingress.className (ne .Values.ingress.className "gce") (ne .Values.ingress.className "gce-internal") }}
   ingressClassName: {{ .Values.ingress.className }}
   {{- end }}
   rules:

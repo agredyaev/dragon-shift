@@ -28,6 +28,10 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- include "dragon-shift.fullname" . -}}
 {{- end -}}
 
+{{- define "dragon-shift.ingress.managedCertificateName" -}}
+{{- default (printf "%s-cert" (include "dragon-shift.fullname" .)) .Values.ingress.gke.managedCertificate.name -}}
+{{- end -}}
+
 {{- define "dragon-shift.app.labels" -}}
 {{ include "dragon-shift.labels" . }}
 app.kubernetes.io/component: app-server

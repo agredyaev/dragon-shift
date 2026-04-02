@@ -10,6 +10,14 @@ ingress:
   # Public traffic should terminate TLS at the trusted ingress/gateway or an
   # upstream load balancer in front of it. Do not expose the app directly.
   annotations: {}
+  gke:
+    staticIpName: ""
+    allowHttpSet: false
+    allowHttp: false
+    managedCertificate:
+      enabled: false
+      name: ""
+      domains: []
   tls:
     enabled: false
     secretName: ""

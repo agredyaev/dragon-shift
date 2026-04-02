@@ -19,6 +19,14 @@ ingress:
   className: ""
   host: dragon-shift.example.com
   annotations: {}
+  gke:
+    staticIpName: ""
+    allowHttpSet: false
+    allowHttp: false
+    managedCertificate:
+      enabled: false
+      name: ""
+      domains: []
   tls:
     enabled: false
     secretName: ""

@@ -1,0 +1,15 @@
+{{- if and .Values.ingress.enabled .Values.ingress.gke.managedCertificate.enabled }}
+apiVersion: networking.gke.io/v1
+kind: ManagedCertificate
+metadata:
+  name: {{ include "dragon-shift.ingress.managedCertificateName" . }}
+  labels:
+    {{- include "dragon-shift.labels" . | nindent 4 }}
+spec:
+  domains:
+    {{- if .Values.ingress.gke.managedCertificate.domains }}
+    {{- toYaml .Values.ingress.gke.managedCertificate.domains | nindent 4 }}
+    {{- else }}
+    - {{ .Values.ingress.host }}
+    {{- end }}
+{{- end }}
