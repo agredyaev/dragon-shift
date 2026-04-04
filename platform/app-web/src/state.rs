@@ -1,3 +1,5 @@
+#![allow(clippy::too_many_arguments)]
+
 use protocol::{
     ClientGameState, ClientSessionSnapshot, CoordinatorType, JudgeBundle, NoticeLevel, Phase,
     ServerWsMessage, SessionCommand, SessionNotice as ProtocolSessionNotice, WorkshopJoinSuccess,

@@ -1,9 +1,12 @@
+#![allow(clippy::bool_assert_comparison, clippy::useless_conversion)]
+
 use crate::{
     app::{AppConfig, AppState, build_app},
     cache::ensure_session_cached,
+    handle_session_update_notification,
     helpers::{build_judge_action_traces, to_client_game_state},
     http::allocate_session_code,
-    handle_session_update_notification, parse_session_update_notification,
+    parse_session_update_notification,
     ws::emit_phase_warning_notices,
 };
 use axum::{
@@ -17,8 +20,7 @@ use futures_util::{SinkExt, StreamExt};
 use persistence::{
     InMemorySessionStore, PersistenceError, PlayerIdentityMatch, PostgresSessionStore,
     RealtimeConnectionClaim, RealtimeConnectionRegistration, RealtimeConnectionRestore,
-    SessionStore,
-    SessionUpdateNotification,
+    SessionStore, SessionUpdateNotification,
 };
 use protocol::{
     ClientWsMessage, CoordinatorType, DragonStats, JoinWorkshopRequest, NoticeLevel,
@@ -34,18 +36,17 @@ use std::{
     pin::Pin,
     process::Command,
     sync::{
-        Arc,
+        Arc, LazyLock, Mutex as StdMutex, MutexGuard,
         atomic::{AtomicBool, AtomicUsize, Ordering},
-        LazyLock, Mutex as StdMutex, MutexGuard,
     },
 };
+use tempfile::NamedTempFile;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_tungstenite::{
     connect_async,
     tungstenite::{Message as WsMessage, client::IntoClientRequest},
 };
 use tower::util::ServiceExt;
-use tempfile::NamedTempFile;
 use uuid::Uuid;
 
 fn postgres_test_database_url() -> Option<String> {
@@ -149,7 +150,10 @@ impl PostgresAppTestStore {
                 ])
                 .status()
                 .expect("start ephemeral Postgres container");
-            assert!(status.success(), "docker run for Postgres test container failed");
+            assert!(
+                status.success(),
+                "docker run for Postgres test container failed"
+            );
 
             let url = format!(
                 "postgres://postgres:postgres@127.0.0.1:{}/dragon_shift_test",
@@ -205,7 +209,10 @@ impl PostgresAppTestStore {
                 .args(["stop", &container_name])
                 .status()
                 .expect("stop ephemeral Postgres container");
-            assert!(status.success(), "docker stop for Postgres test container failed");
+            assert!(
+                status.success(),
+                "docker stop for Postgres test container failed"
+            );
         }
     }
 }
@@ -324,7 +331,8 @@ impl FaultyStore {
     }
 
     fn fail_realtime_claims(&self) {
-        self.fail_claim_realtime_connection.store(true, Ordering::SeqCst);
+        self.fail_claim_realtime_connection
+            .store(true, Ordering::SeqCst);
     }
 
     fn load_calls(&self) -> usize {
@@ -535,8 +543,9 @@ impl SessionStore for FaultyStore {
     fn restore_realtime_connection(
         &self,
         registration: &RealtimeConnectionRegistration,
-    ) -> Pin<Box<dyn Future<Output = Result<RealtimeConnectionRestore, PersistenceError>> + Send + '_>>
-    {
+    ) -> Pin<
+        Box<dyn Future<Output = Result<RealtimeConnectionRestore, PersistenceError>> + Send + '_>,
+    > {
         self.inner.restore_realtime_connection(registration)
     }
 
@@ -1451,7 +1460,10 @@ async fn session_update_notification_skip_does_not_evict_cache_or_broadcast() {
         state.sessions.lock().await.contains_key("123456"),
         "matching updated_at should preserve cached session"
     );
-    assert!(receiver.try_recv().is_err(), "skip path should not broadcast");
+    assert!(
+        receiver.try_recv().is_err(),
+        "skip path should not broadcast"
+    );
 }
 
 #[tokio::test]
@@ -1504,7 +1516,11 @@ async fn session_update_notification_without_local_interest_does_not_reload_or_b
 
     handle_session_update_notification(&state, &notification).await;
 
-    assert_eq!(store.load_calls(), 0, "uninterested replica should not reload session");
+    assert_eq!(
+        store.load_calls(),
+        0,
+        "uninterested replica should not reload session"
+    );
     assert!(
         !state.sessions.lock().await.contains_key("123456"),
         "uninterested replica should not populate cache"
@@ -1512,7 +1528,8 @@ async fn session_update_notification_without_local_interest_does_not_reload_or_b
 }
 
 #[tokio::test]
-async fn session_update_notification_typed_payload_without_local_interest_does_not_reload_or_broadcast() {
+async fn session_update_notification_typed_payload_without_local_interest_does_not_reload_or_broadcast()
+ {
     let store = Arc::new(FaultyStore::new());
     let state = test_state_with_store(store.clone());
     let notification = parse_session_update_notification(
@@ -1527,7 +1544,11 @@ async fn session_update_notification_typed_payload_without_local_interest_does_n
 
     handle_session_update_notification(&state, &notification).await;
 
-    assert_eq!(store.load_calls(), 0, "typed uninterested replica should not reload session");
+    assert_eq!(
+        store.load_calls(),
+        0,
+        "typed uninterested replica should not reload session"
+    );
     assert!(
         !state.sessions.lock().await.contains_key("123456"),
         "typed uninterested replica should not populate cache"
@@ -1555,7 +1576,11 @@ async fn session_update_notification_cached_without_registrations_evicts_without
 
     handle_session_update_notification(&state, &notification).await;
 
-    assert_eq!(store.load_calls(), 0, "cache-only replica should not reload session");
+    assert_eq!(
+        store.load_calls(),
+        0,
+        "cache-only replica should not reload session"
+    );
     assert!(
         !state.sessions.lock().await.contains_key("123456"),
         "cache-only replica should evict stale cache without repopulating it"
@@ -1620,7 +1645,10 @@ async fn typed_notification_followed_by_legacy_notification_does_not_rebroadcast
     handle_session_update_notification(&state, &typed_notification).await;
     handle_session_update_notification(&state, &legacy_notification).await;
 
-    assert!(receiver.try_recv().is_err(), "duplicate legacy follow-up should not rebroadcast");
+    assert!(
+        receiver.try_recv().is_err(),
+        "duplicate legacy follow-up should not rebroadcast"
+    );
     assert!(
         state.sessions.lock().await.contains_key("123456"),
         "typed notification should keep matched cache hot"
@@ -1718,18 +1746,19 @@ async fn realtime_replaced_notification_clears_local_registration_without_persis
         .await
         .insert("conn-1".to_string(), sender);
 
-    let notification = SessionUpdateNotification::realtime_connection_replaced(
-        &RealtimeConnectionRegistration {
+    let notification =
+        SessionUpdateNotification::realtime_connection_replaced(&RealtimeConnectionRegistration {
             session_code: session.code.0.clone(),
             player_id: "player-1".to_string(),
             connection_id: "conn-1".to_string(),
             replica_id: state.replica_id.clone(),
-        },
-    );
+        });
 
     handle_session_update_notification(&state, &notification).await;
 
-    let close_message = receiver.try_recv().expect("close message sent to replaced connection");
+    let close_message = receiver
+        .try_recv()
+        .expect("close message sent to replaced connection");
     assert!(matches!(close_message, crate::ws::WsOutbound::Close));
     assert!(
         state
@@ -1789,7 +1818,9 @@ async fn realtime_replaced_notification_clears_local_registration_without_persis
         .await
         .expect("list artifacts");
     assert!(
-        !artifacts.iter().any(|artifact| artifact.kind == SessionArtifactKind::PlayerLeft),
+        !artifacts
+            .iter()
+            .any(|artifact| artifact.kind == SessionArtifactKind::PlayerLeft),
         "takeover notification must not emit a PlayerLeft artifact"
     );
 }
@@ -1842,7 +1873,9 @@ async fn clearing_local_realtime_before_close_prevents_false_disconnect_fallback
     super::ws::clear_local_realtime_connection(&state, "conn-1").await;
     super::ws::close_local_connection(&state, "conn-1").await;
 
-    let close_message = receiver.try_recv().expect("close message sent to stale connection");
+    let close_message = receiver
+        .try_recv()
+        .expect("close message sent to stale connection");
     assert!(matches!(close_message, crate::ws::WsOutbound::Close));
 
     super::ws::sync_ws_disconnect(&state, "conn-1").await;
@@ -1870,7 +1903,9 @@ async fn clearing_local_realtime_before_close_prevents_false_disconnect_fallback
         .await
         .expect("list artifacts");
     assert!(
-        !artifacts.iter().any(|artifact| artifact.kind == SessionArtifactKind::PlayerLeft),
+        !artifacts
+            .iter()
+            .any(|artifact| artifact.kind == SessionArtifactKind::PlayerLeft),
         "fallback close path must not emit a PlayerLeft artifact"
     );
 }
@@ -1992,7 +2027,11 @@ async fn same_replica_replaced_connection_is_retired_before_close_signal() {
             .lock()
             .await
             .session_registrations(&create_success.session_code);
-        assert_eq!(registrations.len(), 1, "first attach should register connection");
+        assert_eq!(
+            registrations.len(),
+            1,
+            "first attach should register connection"
+        );
         registrations[0].connection_id.clone()
     };
 
@@ -2021,10 +2060,13 @@ async fn same_replica_replaced_connection_is_retired_before_close_signal() {
         .lock()
         .await
         .session_registrations(&create_success.session_code);
-    assert_eq!(registrations.len(), 1, "replaced socket must not reclaim ownership");
+    assert_eq!(
+        registrations.len(),
+        1,
+        "replaced socket must not reclaim ownership"
+    );
     assert_ne!(
-        registrations[0].connection_id,
-        first_connection_id,
+        registrations[0].connection_id, first_connection_id,
         "replacement owner must remain active"
     );
 
@@ -2085,10 +2127,13 @@ async fn same_socket_cannot_attach_to_different_player_after_already_attached() 
     let join_body = to_bytes(join_response.into_body(), usize::MAX)
         .await
         .expect("read join body");
-    let join_result: WorkshopJoinResult = serde_json::from_slice(&join_body).expect("parse join result");
+    let join_result: WorkshopJoinResult =
+        serde_json::from_slice(&join_body).expect("parse join result");
     let join_success = match join_result {
         WorkshopJoinResult::Success(success) => success,
-        WorkshopJoinResult::Error(error) => panic!("expected join success, got error: {}", error.error),
+        WorkshopJoinResult::Error(error) => {
+            panic!("expected join success, got error: {}", error.error)
+        }
     };
 
     let first_attach = ClientWsMessage::AttachSession(SessionEnvelope {
@@ -2108,7 +2153,9 @@ async fn same_socket_cannot_attach_to_different_player_after_already_attached() 
     let (mut socket, _) = connect_async(ws_request(addr)).await.expect("connect ws");
     socket
         .send(WsMessage::Text(
-            serde_json::to_string(&first_attach).expect("encode first attach").into(),
+            serde_json::to_string(&first_attach)
+                .expect("encode first attach")
+                .into(),
         ))
         .await
         .expect("send first attach");
@@ -2120,7 +2167,9 @@ async fn same_socket_cannot_attach_to_different_player_after_already_attached() 
 
     socket
         .send(WsMessage::Text(
-            serde_json::to_string(&second_attach).expect("encode second attach").into(),
+            serde_json::to_string(&second_attach)
+                .expect("encode second attach")
+                .into(),
         ))
         .await
         .expect("send second attach");
@@ -2148,7 +2197,11 @@ async fn same_socket_cannot_attach_to_different_player_after_already_attached() 
         .lock()
         .await
         .session_registrations(&create_success.session_code);
-    assert_eq!(registrations.len(), 1, "original ownership must remain intact");
+    assert_eq!(
+        registrations.len(),
+        1,
+        "original ownership must remain intact"
+    );
     assert_eq!(registrations[0].player_id, create_success.player_id);
 
     let _ = socket.close(None).await;
@@ -3538,9 +3591,10 @@ async fn restart_reload_and_reconnect_keep_presence_runtime_only() {
 
 #[tokio::test]
 async fn postgres_restart_reload_and_reconnect_keep_presence_runtime_only() {
-    let pg =
-        PostgresAppTestStore::new("postgres_restart_reload_and_reconnect_keep_presence_runtime_only")
-            .await;
+    let pg = PostgresAppTestStore::new(
+        "postgres_restart_reload_and_reconnect_keep_presence_runtime_only",
+    )
+    .await;
 
     let state1 = test_state_with_store(pg.store.clone() as Arc<dyn SessionStore>);
     let app1 = build_app(state1.clone());
@@ -3642,7 +3696,9 @@ async fn postgres_restart_reload_and_reconnect_keep_presence_runtime_only() {
     };
 
     let (addr, server_handle) = spawn_test_server(app2.clone()).await;
-    let (mut socket, _) = connect_async(ws_request(addr)).await.expect("connect ws after restart");
+    let (mut socket, _) = connect_async(ws_request(addr))
+        .await
+        .expect("connect ws after restart");
     let attach_message = ClientWsMessage::AttachSession(SessionEnvelope {
         session_code: reconnect_success.session_code.clone(),
         player_id: reconnect_success.player_id.clone(),
@@ -3798,16 +3854,22 @@ async fn reload_cached_session_clears_stale_cached_presence_without_realtime_reg
         .expect("persist session");
 
     let mut stale_cached = session.clone();
-    stale_cached.players.get_mut(&player_id).expect("player exists").is_connected = true;
+    stale_cached
+        .players
+        .get_mut(&player_id)
+        .expect("player exists")
+        .is_connected = true;
     state
         .sessions
         .lock()
         .await
         .insert(session_code.to_string(), stale_cached);
 
-    assert!(crate::cache::reload_cached_session(&state, session_code)
-        .await
-        .expect("reload cached session"));
+    assert!(
+        crate::cache::reload_cached_session(&state, session_code)
+            .await
+            .expect("reload cached session")
+    );
 
     let sessions = state.sessions.lock().await;
     let reloaded = sessions.get(session_code).expect("reloaded session exists");
@@ -3823,7 +3885,9 @@ async fn reload_cached_session_clears_stale_cached_presence_without_realtime_reg
 
 #[tokio::test]
 async fn postgres_reload_ignores_stale_distributed_realtime_presence() {
-    let pg = PostgresAppTestStore::new("postgres_reload_ignores_stale_distributed_realtime_presence").await;
+    let pg =
+        PostgresAppTestStore::new("postgres_reload_ignores_stale_distributed_realtime_presence")
+            .await;
     let timestamp = Utc::now();
     let session_code = "654321";
     let player_id = "player-1".to_string();
@@ -3846,7 +3910,10 @@ async fn postgres_reload_ignores_stale_distributed_realtime_presence() {
         achievements: Vec::new(),
         joined_at: timestamp,
     });
-    pg.store.save_session(&session).await.expect("persist session");
+    pg.store
+        .save_session(&session)
+        .await
+        .expect("persist session");
     pg.store
         .claim_realtime_connection(&RealtimeConnectionRegistration {
             session_code: session_code.to_string(),
@@ -3879,7 +3946,10 @@ async fn postgres_reload_ignores_stale_distributed_realtime_presence() {
 
     let sessions = state.sessions.lock().await;
     let reloaded = sessions.get(session_code).expect("reloaded session exists");
-    let player = reloaded.players.get(&player_id).expect("reloaded player exists");
+    let player = reloaded
+        .players
+        .get(&player_id)
+        .expect("reloaded player exists");
     assert!(
         !player.is_connected,
         "stale distributed realtime ownership must not resurrect live presence"
@@ -3973,7 +4043,11 @@ async fn postgres_replaced_connection_cannot_reclaim_before_notification_is_proc
         .list_realtime_connections(&create_success.session_code)
         .await
         .expect("list distributed registrations after stale reclaim attempt");
-    assert_eq!(registrations.len(), 1, "stale socket must not reclaim distributed ownership");
+    assert_eq!(
+        registrations.len(),
+        1,
+        "stale socket must not reclaim distributed ownership"
+    );
     assert_eq!(registrations[0].connection_id, "conn-remote");
     assert_eq!(registrations[0].replica_id, remote_replica_id);
 
@@ -3990,9 +4064,10 @@ async fn session_write_lease_detects_renewal_loss_before_another_writer_can_proc
     let state = test_state_with_store(store.clone());
     let session_code = "123456";
 
-    let (_, _write_guard, write_lease) = crate::cache::SessionWriteLease::acquire(&state, session_code)
-        .await
-        .expect("acquire write lease");
+    let (_, _write_guard, write_lease) =
+        crate::cache::SessionWriteLease::acquire(&state, session_code)
+            .await
+            .expect("acquire write lease");
 
     store.fail_lease_renewal();
     tokio::time::sleep(std::time::Duration::from_secs(6)).await;
@@ -4003,11 +4078,13 @@ async fn session_write_lease_detects_renewal_loss_before_another_writer_can_proc
     );
 
     let replacement_expires_at = (Utc::now() + ChronoDuration::seconds(5)).to_rfc3339();
-    assert!(store
-        .inner
-        .acquire_session_lease(session_code, "replacement-lease", &replacement_expires_at)
-        .await
-        .expect("replacement writer should acquire expired lease after fence trips"));
+    assert!(
+        store
+            .inner
+            .acquire_session_lease(session_code, "replacement-lease", &replacement_expires_at)
+            .await
+            .expect("replacement writer should acquire expired lease after fence trips")
+    );
 }
 
 #[tokio::test]
@@ -6844,7 +6921,9 @@ async fn workshop_ws_close_marks_player_offline_and_reassigns_host() {
         .await
         .expect("state update frame")
         .expect("state update message");
-    let (mut guest_socket, _) = connect_async(ws_request(addr)).await.expect("connect guest ws");
+    let (mut guest_socket, _) = connect_async(ws_request(addr))
+        .await
+        .expect("connect guest ws");
     let guest_attach_message = ClientWsMessage::AttachSession(SessionEnvelope {
         session_code: join_success.session_code.clone(),
         player_id: join_success.player_id.clone(),
@@ -7669,8 +7748,7 @@ async fn workshop_ws_failed_reattach_restores_replaced_registration() {
         "failed re-attach should restore the prior distributed registration"
     );
     assert_eq!(
-        persisted_registrations[0].connection_id,
-        replacement_connection_id,
+        persisted_registrations[0].connection_id, replacement_connection_id,
         "failed re-attach must not orphan the previous distributed owner"
     );
 
@@ -7921,8 +7999,15 @@ async fn websocket_disconnect_restores_cache_state_when_grouped_disconnect_persi
     );
     drop(sessions);
 
-    let registrations = state.realtime.lock().await.session_registrations(session_code);
-    assert!(registrations.is_empty(), "disconnect should still detach runtime registration");
+    let registrations = state
+        .realtime
+        .lock()
+        .await
+        .session_registrations(session_code);
+    assert!(
+        registrations.is_empty(),
+        "disconnect should still detach runtime registration"
+    );
 }
 
 #[tokio::test]
@@ -7954,7 +8039,10 @@ async fn replaced_connection_close_before_notification_does_not_persist_false_di
         achievements: Vec::new(),
         joined_at: timestamp,
     });
-    pg.store.save_session(&session).await.expect("persist session");
+    pg.store
+        .save_session(&session)
+        .await
+        .expect("persist session");
     state
         .sessions
         .lock()
@@ -7996,7 +8084,11 @@ async fn replaced_connection_close_before_notification_does_not_persist_false_di
         .expect("cached session remains")
         .clone();
     assert!(
-        cached.players.get(&player_id).expect("cached player exists").is_connected,
+        cached
+            .players
+            .get(&player_id)
+            .expect("cached player exists")
+            .is_connected,
         "stale replaced close must not persist a false disconnect before notification arrives"
     );
 
@@ -8006,7 +8098,9 @@ async fn replaced_connection_close_before_notification_does_not_persist_false_di
         .await
         .expect("list artifacts");
     assert!(
-        !artifacts.iter().any(|artifact| artifact.kind == SessionArtifactKind::PlayerLeft),
+        !artifacts
+            .iter()
+            .any(|artifact| artifact.kind == SessionArtifactKind::PlayerLeft),
         "stale replaced close must not emit a PlayerLeft artifact"
     );
 

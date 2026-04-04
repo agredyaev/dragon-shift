@@ -347,31 +347,29 @@ impl WorkshopSession {
                     }
                 }
             }
-        } else if let Some(player_id) = player_ids.first() {
-            if let Some(dragon_id) = self
+        } else if let Some(player_id) = player_ids.first()
+            && let Some(dragon_id) = self
                 .players
                 .get(player_id)
                 .and_then(|player| player.current_dragon_id.clone())
-            {
-                if let Some(dragon) = self.dragons.get_mut(&dragon_id) {
-                    dragon.hunger = 100;
-                    dragon.energy = 100;
-                    dragon.happiness = 100;
-                    dragon.food_tries = 0;
-                    dragon.play_tries = 0;
-                    dragon.action_cooldown = 0;
-                    dragon.sleep_shield_ticks = 0;
-                    dragon.phase2_ticks = 0;
-                    dragon.phase2_lowest_happiness = 100;
-                    dragon.last_action = DragonAction::Idle;
-                    dragon.last_emotion = DragonEmotion::Neutral;
-                    dragon.speech = Some(
-                        "New shift, same dragon. Time to document and support your own handoff."
-                            .to_string(),
-                    );
-                    dragon.speech_timer = 5;
-                }
-            }
+            && let Some(dragon) = self.dragons.get_mut(&dragon_id)
+        {
+            dragon.hunger = 100;
+            dragon.energy = 100;
+            dragon.happiness = 100;
+            dragon.food_tries = 0;
+            dragon.play_tries = 0;
+            dragon.action_cooldown = 0;
+            dragon.sleep_shield_ticks = 0;
+            dragon.phase2_ticks = 0;
+            dragon.phase2_lowest_happiness = 100;
+            dragon.last_action = DragonAction::Idle;
+            dragon.last_emotion = DragonEmotion::Neutral;
+            dragon.speech = Some(
+                "New shift, same dragon. Time to document and support your own handoff."
+                    .to_string(),
+            );
+            dragon.speech_timer = 5;
         }
 
         self.touch();
@@ -726,13 +724,12 @@ impl WorkshopSession {
     }
 
     pub fn ensure_host_assigned(&mut self, prefer_connected: bool) -> Option<String> {
-        if let Some(current_host_id) = self.host_player_id.clone() {
-            if let Some(current_host) = self.players.get(&current_host_id) {
-                if !prefer_connected || current_host.is_connected {
-                    self.reconcile_host_flags(Some(current_host_id.clone()));
-                    return Some(current_host_id.clone());
-                }
-            }
+        if let Some(current_host_id) = self.host_player_id.clone()
+            && let Some(current_host) = self.players.get(&current_host_id)
+            && (!prefer_connected || current_host.is_connected)
+        {
+            self.reconcile_host_flags(Some(current_host_id.clone()));
+            return Some(current_host_id.clone());
         }
 
         let next_host = self
@@ -803,7 +800,7 @@ fn fallback_handover_tags() -> Vec<String> {
 }
 
 fn is_daytime(hour: i32) -> bool {
-    hour >= 6 && hour < 18
+    (6..18).contains(&hour)
 }
 
 fn default_pet_description(player_name: &str) -> String {

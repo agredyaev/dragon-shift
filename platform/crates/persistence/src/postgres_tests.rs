@@ -1,4 +1,5 @@
 #[cfg(test)]
+#[allow(clippy::module_inception)]
 mod postgres_tests {
     use crate::{PlayerIdentity, PostgresSessionStore, SessionStore};
     use chrono::Utc;
@@ -126,7 +127,10 @@ mod postgres_tests {
                     .args(["stop", &container_name])
                     .status()
                     .expect("stop ephemeral Postgres container");
-                assert!(status.success(), "docker stop for Postgres test container failed");
+                assert!(
+                    status.success(),
+                    "docker stop for Postgres test container failed"
+                );
             }
         }
     }
@@ -136,7 +140,8 @@ mod postgres_tests {
         let (container_name, url) = if let Some(url) = database_url() {
             (None, url)
         } else {
-            let container_name = format!("dragon-switch-persistence-pg-{}", Uuid::new_v4().simple());
+            let container_name =
+                format!("dragon-switch-persistence-pg-{}", Uuid::new_v4().simple());
             let host_port = allocate_local_port();
             let status = Command::new("docker")
                 .args([
@@ -157,7 +162,10 @@ mod postgres_tests {
                 ])
                 .status()
                 .expect("start ephemeral Postgres container");
-            assert!(status.success(), "docker run for Postgres test container failed");
+            assert!(
+                status.success(),
+                "docker run for Postgres test container failed"
+            );
 
             let url = format!(
                 "postgres://postgres:postgres@127.0.0.1:{}/dragon_switch_test",
@@ -369,7 +377,10 @@ mod postgres_tests {
             .find_player_identity("INTEG00012", &identity.reconnect_token)
             .await
             .expect("find rolled back identity");
-        assert!(found_identity.is_none(), "identity write should have rolled back");
+        assert!(
+            found_identity.is_none(),
+            "identity write should have rolled back"
+        );
 
         let artifacts = store
             .list_session_artifacts(&target_session.id.to_string())
@@ -452,8 +463,16 @@ mod postgres_tests {
             achievements: Vec::new(),
             joined_at: Utc::now(),
         });
-        session.players.get_mut("player_1").expect("player exists").is_connected = true;
-        session.players.get_mut("player_2").expect("player exists").is_connected = true;
+        session
+            .players
+            .get_mut("player_1")
+            .expect("player exists")
+            .is_connected = true;
+        session
+            .players
+            .get_mut("player_2")
+            .expect("player exists")
+            .is_connected = true;
 
         store.save_session(&session).await.expect("save session");
 
@@ -481,7 +500,10 @@ mod postgres_tests {
         let mut stale = current.clone();
         current.phase = Phase::Phase1;
         current.updated_at = Utc::now();
-        store.save_session(&current).await.expect("save newer session");
+        store
+            .save_session(&current)
+            .await
+            .expect("save newer session");
 
         stale.phase = Phase::Handover;
         let error = store
@@ -489,7 +511,10 @@ mod postgres_tests {
             .await
             .expect_err("stale write should fail");
 
-        assert!(matches!(error, crate::PersistenceError::StaleSessionWrite { .. }));
+        assert!(matches!(
+            error,
+            crate::PersistenceError::StaleSessionWrite { .. }
+        ));
 
         let loaded = store
             .load_session_by_code("INTEG00002")
@@ -504,10 +529,8 @@ mod postgres_tests {
     #[tokio::test]
     #[ignore]
     async fn same_updated_at_writes_converge_to_same_state_regardless_of_arrival_order() {
-        let forward_store =
-            setup_store("same_updated_at_writes_converge_forward_order").await;
-        let reverse_store =
-            setup_store("same_updated_at_writes_converge_reverse_order").await;
+        let forward_store = setup_store("same_updated_at_writes_converge_forward_order").await;
+        let reverse_store = setup_store("same_updated_at_writes_converge_reverse_order").await;
 
         let timestamp = fixed_timestamp(1_704_067_200);
         let session_id = Uuid::new_v4();
@@ -572,25 +595,32 @@ mod postgres_tests {
     async fn session_lease_renewal_preserves_exclusive_ownership() {
         let store = setup_store("session_lease_renewal_preserves_exclusive_ownership").await;
 
-        assert!(store
-            .acquire_session_lease("INTEGLEASE", "lease-a", "2099-01-01T00:00:05Z")
-            .await
-            .expect("acquire initial lease"));
-        assert!(store
-            .renew_session_lease("INTEGLEASE", "lease-a", "2099-01-01T00:00:05Z")
-            .await
-            .expect("renew owned lease"));
-        assert!(!store
-            .acquire_session_lease("INTEGLEASE", "lease-b", "2099-01-01T00:00:06Z")
-            .await
-            .expect("reject concurrent lease while renewed lease is active"));
+        assert!(
+            store
+                .acquire_session_lease("INTEGLEASE", "lease-a", "2099-01-01T00:00:05Z")
+                .await
+                .expect("acquire initial lease")
+        );
+        assert!(
+            store
+                .renew_session_lease("INTEGLEASE", "lease-a", "2099-01-01T00:00:05Z")
+                .await
+                .expect("renew owned lease")
+        );
+        assert!(
+            !store
+                .acquire_session_lease("INTEGLEASE", "lease-b", "2099-01-01T00:00:06Z")
+                .await
+                .expect("reject concurrent lease while renewed lease is active")
+        );
 
         store.cleanup().await;
     }
 
     #[tokio::test]
     async fn stale_realtime_connections_are_filtered_from_postgres_reads() {
-        let store = setup_store("stale_realtime_connections_are_filtered_from_postgres_reads").await;
+        let store =
+            setup_store("stale_realtime_connections_are_filtered_from_postgres_reads").await;
 
         store
             .claim_realtime_connection(&crate::RealtimeConnectionRegistration {
@@ -613,14 +643,18 @@ mod postgres_tests {
             .list_realtime_connections("INTEGRT1")
             .await
             .expect("list realtime registrations");
-        assert!(registrations.is_empty(), "stale realtime registrations must not be treated as live presence");
+        assert!(
+            registrations.is_empty(),
+            "stale realtime registrations must not be treated as live presence"
+        );
 
         store.cleanup().await;
     }
 
     #[tokio::test]
     async fn retired_postgres_realtime_connection_cannot_reclaim_until_restored() {
-        let store = setup_store("retired_postgres_realtime_connection_cannot_reclaim_until_restored").await;
+        let store =
+            setup_store("retired_postgres_realtime_connection_cannot_reclaim_until_restored").await;
 
         store
             .claim_realtime_connection(&crate::RealtimeConnectionRegistration {
@@ -693,7 +727,8 @@ mod postgres_tests {
 
     #[tokio::test]
     async fn restore_postgres_realtime_connection_does_not_override_newer_owner() {
-        let store = setup_store("restore_postgres_realtime_connection_does_not_override_newer_owner").await;
+        let store =
+            setup_store("restore_postgres_realtime_connection_does_not_override_newer_owner").await;
 
         store
             .claim_realtime_connection(&crate::RealtimeConnectionRegistration {
@@ -781,11 +816,13 @@ mod postgres_tests {
                 replica_id: "replica-a".to_string(),
             })
         );
-        assert!(store
-            .take_retired_realtime_connection("conn-1", "replica-a")
-            .await
-            .expect("retired fence is consumed")
-            .is_none());
+        assert!(
+            store
+                .take_retired_realtime_connection("conn-1", "replica-a")
+                .await
+                .expect("retired fence is consumed")
+                .is_none()
+        );
 
         store.cleanup().await;
     }

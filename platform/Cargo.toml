@@ -37,3 +37,11 @@ domain = { path = "crates/domain" }
 persistence = { path = "crates/persistence" }
 security = { path = "crates/security" }
 realtime = { path = "crates/realtime" }
+
+[profile.wasm-release]
+inherits = "release"
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"

@@ -12,13 +12,16 @@ use security::{
     DEFAULT_RUST_SESSION_CODE_PREFIX, FixedWindowRateLimiter, OriginPolicy, OriginPolicyOptions,
     create_origin_policy,
 };
+#[cfg(test)]
+use std::sync::atomic::AtomicBool;
 use std::{
     collections::BTreeMap, env, net::SocketAddr, path::PathBuf, str::FromStr, sync::Arc,
     time::Duration,
 };
-#[cfg(test)]
-use std::sync::atomic::AtomicBool;
-use tokio::{sync::{Mutex, mpsc}, task::JoinHandle};
+use tokio::{
+    sync::{Mutex, mpsc},
+    task::JoinHandle,
+};
 use tower_http::{
     services::{ServeDir, ServeFile},
     set_header::SetResponseHeaderLayer,

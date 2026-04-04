@@ -22,6 +22,7 @@ use state::{apply_realtime_bootstrap_error, bootstrap_state};
 
 #[cfg(target_arch = "wasm32")]
 fn main() {
+    #[cfg(debug_assertions)]
     console_error_panic_hook::set_once();
     dioxus_web::launch::launch_cfg(App, dioxus_web::Config::default());
 }
@@ -66,14 +67,14 @@ fn App() -> Element {
     let mut effect_ops = ops;
 
     use_effect(move || {
-        if should_bootstrap_realtime {
-            if let Err(error) = bootstrap_realtime(identity, game_state, ops, judge_bundle) {
-                effect_identity.with_mut(|id| {
-                    effect_ops.with_mut(|o| {
-                        apply_realtime_bootstrap_error(id, o, error);
-                    });
+        if should_bootstrap_realtime
+            && let Err(error) = bootstrap_realtime(identity, game_state, ops, judge_bundle)
+        {
+            effect_identity.with_mut(|id| {
+                effect_ops.with_mut(|o| {
+                    apply_realtime_bootstrap_error(id, o, error);
                 });
-            }
+            });
         }
     });
 

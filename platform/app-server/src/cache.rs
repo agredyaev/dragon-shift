@@ -1,4 +1,7 @@
-use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
 use chrono::Utc;
 use domain::WorkshopSession;
@@ -133,15 +136,16 @@ impl SessionWriteLease {
     pub(crate) async fn acquire(
         state: &AppState,
         session_code: &str,
-    ) -> Result<(Arc<Mutex<()>>, tokio::sync::OwnedMutexGuard<()> , Self), PersistenceError> {
+    ) -> Result<(Arc<Mutex<()>>, tokio::sync::OwnedMutexGuard<()>, Self), PersistenceError> {
         let local_lock = session_write_lock(state, session_code).await;
         let local_guard = local_lock.clone().lock_owned().await;
         let lease_id = format!("{}:{}", state.replica_id, Uuid::new_v4());
         let deadline = Instant::now() + SESSION_LEASE_TIMEOUT;
 
         loop {
-            let expires_at = (chrono::Utc::now() + chrono::Duration::from_std(SESSION_LEASE_TTL).expect("lease ttl"))
-                .to_rfc3339();
+            let expires_at = (chrono::Utc::now()
+                + chrono::Duration::from_std(SESSION_LEASE_TTL).expect("lease ttl"))
+            .to_rfc3339();
             if state
                 .store
                 .acquire_session_lease(session_code, &lease_id, &expires_at)

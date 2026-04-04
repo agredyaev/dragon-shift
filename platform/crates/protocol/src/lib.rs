@@ -545,6 +545,7 @@ pub enum ClientWsMessage {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[allow(clippy::large_enum_variant)]
 pub enum ServerWsMessage {
     StateUpdate(ClientGameState),
     Notice(SessionNotice),
@@ -554,6 +555,7 @@ pub enum ServerWsMessage {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
+#[allow(clippy::large_enum_variant)]
 pub enum WorkshopJoinResult {
     Success(WorkshopJoinSuccess),
     Error(WorkshopError),

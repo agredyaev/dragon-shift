@@ -14,7 +14,7 @@ RUN cargo install wasm-bindgen-cli --version 0.2.115 --locked
 
 COPY platform ./
 
-RUN XTASK_SKIP_WASM_OPT=1 cargo run --locked -p xtask -- build-web --out-dir /tmp/app-web-dist
+RUN cargo run --locked -p xtask -- build-web --out-dir /tmp/app-web-dist
 RUN test "$TARGETPLATFORM" = "linux/amd64"
 ENV CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=x86_64-linux-gnu-gcc
 RUN cargo build --release -p app-server --locked --target x86_64-unknown-linux-gnu

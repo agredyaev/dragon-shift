@@ -1,3 +1,5 @@
+#![allow(clippy::too_many_arguments)]
+
 use dioxus::prelude::*;
 use protocol::{ClientGameState, JoinWorkshopRequest, JudgeBundle, SessionCommand};
 
@@ -113,14 +115,14 @@ pub async fn submit_create_flow(
                 });
             });
             let persisted_snapshot = { identity.read().session_snapshot.clone() };
-            if let Some(snapshot) = persisted_snapshot {
-                if let Err(error) = persist_browser_session_snapshot(&snapshot) {
-                    ops.with_mut(|o| {
-                        o.notice = Some(error_notice(&format!(
-                            "Workshop created, but session persistence failed: {error}"
-                        )))
-                    });
-                }
+            if let Some(snapshot) = persisted_snapshot
+                && let Err(error) = persist_browser_session_snapshot(&snapshot)
+            {
+                ops.with_mut(|o| {
+                    o.notice = Some(error_notice(&format!(
+                        "Workshop created, but session persistence failed: {error}"
+                    )))
+                });
             }
             if let Err(error) = bootstrap_realtime(identity, game_state, ops, judge_bundle) {
                 identity.with_mut(|id| {
@@ -212,14 +214,14 @@ pub async fn submit_join_flow(
                 });
             });
             let persisted_snapshot = { identity.read().session_snapshot.clone() };
-            if let Some(snapshot) = persisted_snapshot {
-                if let Err(error) = persist_browser_session_snapshot(&snapshot) {
-                    ops.with_mut(|o| {
-                        o.notice = Some(error_notice(&format!(
-                            "Joined workshop, but session persistence failed: {error}"
-                        )))
-                    });
-                }
+            if let Some(snapshot) = persisted_snapshot
+                && let Err(error) = persist_browser_session_snapshot(&snapshot)
+            {
+                ops.with_mut(|o| {
+                    o.notice = Some(error_notice(&format!(
+                        "Joined workshop, but session persistence failed: {error}"
+                    )))
+                });
             }
             if let Err(error) = bootstrap_realtime(identity, game_state, ops, judge_bundle) {
                 identity.with_mut(|id| {
@@ -305,14 +307,14 @@ pub async fn submit_reconnect_flow(
                 });
             });
             let persisted_snapshot = { identity.read().session_snapshot.clone() };
-            if let Some(snapshot) = persisted_snapshot {
-                if let Err(error) = persist_browser_session_snapshot(&snapshot) {
-                    ops.with_mut(|o| {
-                        o.notice = Some(error_notice(&format!(
-                            "Reconnected, but session persistence failed: {error}"
-                        )))
-                    });
-                }
+            if let Some(snapshot) = persisted_snapshot
+                && let Err(error) = persist_browser_session_snapshot(&snapshot)
+            {
+                ops.with_mut(|o| {
+                    o.notice = Some(error_notice(&format!(
+                        "Reconnected, but session persistence failed: {error}"
+                    )))
+                });
             }
             if let Err(error) = bootstrap_realtime(identity, game_state, ops, judge_bundle) {
                 identity.with_mut(|id| {
@@ -327,6 +329,129 @@ pub async fn submit_reconnect_flow(
                 ops.with_mut(|o| {
                     apply_request_error(id, o, error);
                 });
+            });
+        }
+    }
+}
+
+pub async fn submit_workshop_command(
+    mut identity: Signal<IdentityState>,
+    mut ops: Signal<OperationState>,
+    mut handover_tags_input: Signal<String>,
+    mut judge_bundle: Signal<Option<JudgeBundle>>,
+    command: SessionCommand,
+    payload: Option<serde_json::Value>,
+) {
+    let (base_url, snapshot) = {
+        let id = identity.read();
+        (id.api_base_url.clone(), id.session_snapshot.clone())
+    };
+
+    let Some(snapshot) = snapshot else {
+        ops.with_mut(|o| {
+            o.notice = Some(error_notice(
+                "Connect to a workshop before sending commands.",
+            ))
+        });
+        return;
+    };
+
+    ops.with_mut(|o| {
+        o.pending_command = Some(command);
+        o.notice = Some(info_notice(pending_command_label(command)));
+    });
+
+    let api = AppWebApi::new(base_url);
+    match api
+        .send_command(build_command_request(&snapshot, command, payload))
+        .await
+    {
+        Ok(()) => {
+            identity.with_mut(|id| {
+                ops.with_mut(|o| {
+                    handover_tags_input.with_mut(|tags| {
+                        judge_bundle.with_mut(|jb| {
+                            apply_successful_command(id, o, tags, jb, command);
+                        });
+                    });
+                });
+            });
+        }
+        Err(error) => {
+            ops.with_mut(|o| {
+                apply_command_error(o, error);
+            });
+        }
+    }
+}
+
+pub async fn submit_handover_tags_command(
+    identity: Signal<IdentityState>,
+    mut ops: Signal<OperationState>,
+    handover_tags_input: Signal<String>,
+    judge_bundle: Signal<Option<JudgeBundle>>,
+) {
+    let tags = {
+        let tags_input = handover_tags_input.read();
+        parse_tags_input(&tags_input)
+    };
+
+    if tags.is_empty() {
+        ops.with_mut(|o| o.notice = Some(error_notice("Enter at least one handover tag.")));
+        return;
+    }
+
+    submit_workshop_command(
+        identity,
+        ops,
+        handover_tags_input,
+        judge_bundle,
+        SessionCommand::SubmitTags,
+        Some(serde_json::json!(tags)),
+    )
+    .await;
+}
+
+pub async fn submit_judge_bundle_request(
+    identity: Signal<IdentityState>,
+    _game_state: Signal<Option<ClientGameState>>,
+    mut ops: Signal<OperationState>,
+    mut judge_bundle: Signal<Option<JudgeBundle>>,
+) {
+    let (base_url, snapshot) = {
+        let id = identity.read();
+        (id.api_base_url.clone(), id.session_snapshot.clone())
+    };
+
+    let Some(snapshot) = snapshot else {
+        ops.with_mut(|o| {
+            o.notice = Some(error_notice(
+                "Connect to a workshop before building the archive.",
+            ))
+        });
+        return;
+    };
+
+    ops.with_mut(|o| {
+        o.pending_judge_bundle = true;
+        o.notice = Some(info_notice("Building workshop archive…"));
+    });
+
+    let api = AppWebApi::new(base_url);
+    match api
+        .fetch_judge_bundle(build_judge_bundle_request(&snapshot))
+        .await
+    {
+        Ok(bundle) => {
+            ops.with_mut(|o| {
+                judge_bundle.with_mut(|jb| {
+                    apply_judge_bundle_success(o, jb, bundle);
+                });
+            });
+        }
+        Err(error) => {
+            ops.with_mut(|o| {
+                apply_judge_bundle_error(o, error);
             });
         }
     }
@@ -471,128 +596,5 @@ mod tests {
                 Some("Reconnected to workshop.")
             );
         });
-    }
-}
-
-pub async fn submit_workshop_command(
-    mut identity: Signal<IdentityState>,
-    mut ops: Signal<OperationState>,
-    mut handover_tags_input: Signal<String>,
-    mut judge_bundle: Signal<Option<JudgeBundle>>,
-    command: SessionCommand,
-    payload: Option<serde_json::Value>,
-) {
-    let (base_url, snapshot) = {
-        let id = identity.read();
-        (id.api_base_url.clone(), id.session_snapshot.clone())
-    };
-
-    let Some(snapshot) = snapshot else {
-        ops.with_mut(|o| {
-            o.notice = Some(error_notice(
-                "Connect to a workshop before sending commands.",
-            ))
-        });
-        return;
-    };
-
-    ops.with_mut(|o| {
-        o.pending_command = Some(command);
-        o.notice = Some(info_notice(pending_command_label(command)));
-    });
-
-    let api = AppWebApi::new(base_url);
-    match api
-        .send_command(build_command_request(&snapshot, command, payload))
-        .await
-    {
-        Ok(()) => {
-            identity.with_mut(|id| {
-                ops.with_mut(|o| {
-                    handover_tags_input.with_mut(|tags| {
-                        judge_bundle.with_mut(|jb| {
-                            apply_successful_command(id, o, tags, jb, command);
-                        });
-                    });
-                });
-            });
-        }
-        Err(error) => {
-            ops.with_mut(|o| {
-                apply_command_error(o, error);
-            });
-        }
-    }
-}
-
-pub async fn submit_handover_tags_command(
-    identity: Signal<IdentityState>,
-    mut ops: Signal<OperationState>,
-    handover_tags_input: Signal<String>,
-    judge_bundle: Signal<Option<JudgeBundle>>,
-) {
-    let tags = {
-        let tags_input = handover_tags_input.read();
-        parse_tags_input(&tags_input)
-    };
-
-    if tags.is_empty() {
-        ops.with_mut(|o| o.notice = Some(error_notice("Enter at least one handover tag.")));
-        return;
-    }
-
-    submit_workshop_command(
-        identity,
-        ops,
-        handover_tags_input,
-        judge_bundle,
-        SessionCommand::SubmitTags,
-        Some(serde_json::json!(tags)),
-    )
-    .await;
-}
-
-pub async fn submit_judge_bundle_request(
-    identity: Signal<IdentityState>,
-    _game_state: Signal<Option<ClientGameState>>,
-    mut ops: Signal<OperationState>,
-    mut judge_bundle: Signal<Option<JudgeBundle>>,
-) {
-    let (base_url, snapshot) = {
-        let id = identity.read();
-        (id.api_base_url.clone(), id.session_snapshot.clone())
-    };
-
-    let Some(snapshot) = snapshot else {
-        ops.with_mut(|o| {
-            o.notice = Some(error_notice(
-                "Connect to a workshop before building the archive.",
-            ))
-        });
-        return;
-    };
-
-    ops.with_mut(|o| {
-        o.pending_judge_bundle = true;
-        o.notice = Some(info_notice("Building workshop archive…"));
-    });
-
-    let api = AppWebApi::new(base_url);
-    match api
-        .fetch_judge_bundle(build_judge_bundle_request(&snapshot))
-        .await
-    {
-        Ok(bundle) => {
-            ops.with_mut(|o| {
-                judge_bundle.with_mut(|jb| {
-                    apply_judge_bundle_success(o, jb, bundle);
-                });
-            });
-        }
-        Err(error) => {
-            ops.with_mut(|o| {
-                apply_judge_bundle_error(o, error);
-            });
-        }
     }
 }

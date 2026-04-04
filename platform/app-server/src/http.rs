@@ -265,14 +265,18 @@ pub(crate) async fn join_workshop(
             }
         };
 
-        let (_, _write_guard, write_lease) = match SessionWriteLease::acquire(&state, session_code).await {
+        let (_, _write_guard, write_lease) = match SessionWriteLease::acquire(&state, session_code)
+            .await
+        {
             Ok(guard) => guard,
             Err(error) => {
                 return internal_join_error(format!("failed to acquire session lease: {error}"));
             }
         };
         if let Err(error) = write_lease.ensure_active() {
-            return internal_join_error(format!("lost session lease before reconnect load: {error}"));
+            return internal_join_error(format!(
+                "lost session lease before reconnect load: {error}"
+            ));
         }
 
         match reload_cached_session(&state, session_code).await {
@@ -281,7 +285,9 @@ pub(crate) async fn join_workshop(
             Err(error) => return internal_join_error(format!("failed to load session: {error}")),
         }
         if let Err(error) = write_lease.ensure_active() {
-            return internal_join_error(format!("lost session lease before reconnect mutation: {error}"));
+            return internal_join_error(format!(
+                "lost session lease before reconnect mutation: {error}"
+            ));
         }
 
         let timestamp = Utc::now();
@@ -307,7 +313,7 @@ pub(crate) async fn join_workshop(
                     internal_join_error(format!("failed to rotate player identity: {error}"))
                 });
         let Ok(next_reconnect_token) = next_reconnect_token else {
-            return next_reconnect_token.err().expect("identity rotation error");
+            return next_reconnect_token.expect_err("identity rotation error");
         };
         let next_identity = persistence::PlayerIdentity {
             session_id: identity.session_id.clone(),
@@ -336,7 +342,9 @@ pub(crate) async fn join_workshop(
         if let Err(error) = write_lease.ensure_active() {
             let mut sessions = state.sessions.lock().await;
             sessions.insert(session_code.to_string(), session_before);
-            return internal_join_error(format!("lost session lease before reconnect persist: {error}"));
+            return internal_join_error(format!(
+                "lost session lease before reconnect persist: {error}"
+            ));
         }
 
         if let Err(error) = state
@@ -373,12 +381,13 @@ pub(crate) async fn join_workshop(
         return bad_join_request("Please enter a player name.");
     }
 
-    let (_, _write_guard, write_lease) = match SessionWriteLease::acquire(&state, session_code).await {
-        Ok(guard) => guard,
-        Err(error) => {
-            return internal_join_error(format!("failed to acquire session lease: {error}"));
-        }
-    };
+    let (_, _write_guard, write_lease) =
+        match SessionWriteLease::acquire(&state, session_code).await {
+            Ok(guard) => guard,
+            Err(error) => {
+                return internal_join_error(format!("failed to acquire session lease: {error}"));
+            }
+        };
     if let Err(error) = write_lease.ensure_active() {
         return internal_join_error(format!("lost session lease before join load: {error}"));
     }
@@ -511,12 +520,13 @@ pub(crate) async fn workshop_command(
         return internal_command_error(format!("failed to touch player identity: {error}"));
     }
 
-    let (_, _write_guard, write_lease) = match SessionWriteLease::acquire(&state, session_code).await {
-        Ok(guard) => guard,
-        Err(error) => {
-            return internal_command_error(format!("failed to acquire session lease: {error}"));
-        }
-    };
+    let (_, _write_guard, write_lease) =
+        match SessionWriteLease::acquire(&state, session_code).await {
+            Ok(guard) => guard,
+            Err(error) => {
+                return internal_command_error(format!("failed to acquire session lease: {error}"));
+            }
+        };
     if let Err(error) = write_lease.ensure_active() {
         return internal_command_error(format!("lost session lease before command load: {error}"));
     }
@@ -527,7 +537,9 @@ pub(crate) async fn workshop_command(
         Err(error) => return internal_command_error(format!("failed to load session: {error}")),
     }
     if let Err(error) = write_lease.ensure_active() {
-        return internal_command_error(format!("lost session lease before command mutation: {error}"));
+        return internal_command_error(format!(
+            "lost session lease before command mutation: {error}"
+        ));
     }
 
     let (response, should_broadcast, session_before, session_to_persist, artifact_to_append) = {
@@ -598,7 +610,7 @@ pub(crate) async fn workshop_command(
                     .and_then(|player| player.current_dragon_id.clone())
                     .ok_or_else(|| bad_command_request("Player is not assigned to a dragon."));
                 let Ok(dragon_id) = dragon_id else {
-                    return dragon_id.err().expect("dragon assignment error");
+                    return dragon_id.expect_err("dragon assignment error");
                 };
 
                 session.record_discovery_observation(&identity.player_id, text.to_string());
@@ -662,29 +674,28 @@ pub(crate) async fn workshop_command(
                     "actionType": action_type,
                     "actionValue": action_value,
                 });
-                if let Some(dragon) = session.dragons.get(&dragon_id) {
-                    if let Some(payload_map) = artifact_payload.as_object_mut() {
-                        match outcome {
-                            domain::ActionOutcome::Applied { .. } => {
-                                payload_map.insert("hunger".to_string(), json!(dragon.hunger));
-                                payload_map.insert("energy".to_string(), json!(dragon.energy));
-                                payload_map
-                                    .insert("happiness".to_string(), json!(dragon.happiness));
-                            }
-                            domain::ActionOutcome::Blocked { reason } => {
-                                payload_map.insert(
-                                    "blockedReason".to_string(),
-                                    json!(match reason {
-                                        domain::ActionBlockReason::AlreadyFull => "already_full",
-                                        domain::ActionBlockReason::TooHungryToPlay =>
-                                            "too_hungry_to_play",
-                                        domain::ActionBlockReason::TooTiredToPlay =>
-                                            "too_tired_to_play",
-                                        domain::ActionBlockReason::TooAwakeToSleep =>
-                                            "too_awake_to_sleep",
-                                    }),
-                                );
-                            }
+                if let Some(dragon) = session.dragons.get(&dragon_id)
+                    && let Some(payload_map) = artifact_payload.as_object_mut()
+                {
+                    match outcome {
+                        domain::ActionOutcome::Applied { .. } => {
+                            payload_map.insert("hunger".to_string(), json!(dragon.hunger));
+                            payload_map.insert("energy".to_string(), json!(dragon.energy));
+                            payload_map.insert("happiness".to_string(), json!(dragon.happiness));
+                        }
+                        domain::ActionOutcome::Blocked { reason } => {
+                            payload_map.insert(
+                                "blockedReason".to_string(),
+                                json!(match reason {
+                                    domain::ActionBlockReason::AlreadyFull => "already_full",
+                                    domain::ActionBlockReason::TooHungryToPlay =>
+                                        "too_hungry_to_play",
+                                    domain::ActionBlockReason::TooTiredToPlay =>
+                                        "too_tired_to_play",
+                                    domain::ActionBlockReason::TooAwakeToSleep =>
+                                        "too_awake_to_sleep",
+                                }),
+                            );
                         }
                     }
                 }
@@ -813,10 +824,8 @@ pub(crate) async fn workshop_command(
                     Ok(immediate_finalize) => immediate_finalize,
                     Err(error) => return bad_command_request(&error.to_string()),
                 };
-                if immediate_finalize {
-                    if let Err(error) = session.finalize_voting() {
-                        return bad_command_request(&error.to_string());
-                    }
+                if immediate_finalize && let Err(error) = session.finalize_voting() {
+                    return bad_command_request(&error.to_string());
                 }
                 session_to_persist = Some(session.clone());
                 artifact_to_append = Some(SessionArtifactRecord {
@@ -882,10 +891,10 @@ pub(crate) async fn workshop_command(
                 if session.phase != protocol::Phase::Voting {
                     return bad_command_request("Results can only be revealed during voting.");
                 }
-                if let Some(voting) = session.voting.as_ref() {
-                    if voting.votes_by_player_id.len() < voting.eligible_player_ids.len() {
-                        return bad_command_request("Wait until every eligible player has voted.");
-                    }
+                if let Some(voting) = session.voting.as_ref()
+                    && voting.votes_by_player_id.len() < voting.eligible_player_ids.len()
+                {
+                    return bad_command_request("Wait until every eligible player has voted.");
                 }
                 if let Err(error) = session.finalize_voting() {
                     return bad_command_request(&error.to_string());
@@ -1281,16 +1290,15 @@ pub(crate) fn client_key(
     connect_info: MaybeConnectInfo,
     headers: &HeaderMap,
 ) -> String {
-    if state.config.trust_forwarded_for {
-        if let Some(forwarded_for) = headers
+    if state.config.trust_forwarded_for
+        && let Some(forwarded_for) = headers
             .get("x-forwarded-for")
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.split(',').next())
             .map(str::trim)
             .filter(|value| !value.is_empty())
-        {
-            return forwarded_for.to_string();
-        }
+    {
+        return forwarded_for.to_string();
     }
 
     connect_info

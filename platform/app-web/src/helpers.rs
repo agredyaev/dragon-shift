@@ -1,4 +1,3 @@
-use chrono::{DateTime, Utc};
 use protocol::{
     ClientDragon, ClientGameState, DragonAction, DragonEmotion, JudgeBundle, Phase, Player,
     SessionCommand,
@@ -171,13 +170,57 @@ pub fn phase_duration_seconds(state: &ClientGameState) -> Option<i32> {
         .filter(|seconds| *seconds > 0)
 }
 
-pub fn phase_remaining_seconds(state: &ClientGameState, now: DateTime<Utc>) -> Option<i32> {
+pub fn phase_remaining_seconds(state: &ClientGameState, now_epoch_seconds: i64) -> Option<i32> {
     let duration_seconds = phase_duration_seconds(state)?;
-    let phase_started_at = DateTime::parse_from_rfc3339(&state.session.phase_started_at)
-        .ok()?
-        .with_timezone(&Utc);
-    let elapsed = (now - phase_started_at).num_seconds().max(0) as i32;
+    let phase_started_at = parse_rfc3339_epoch_seconds(&state.session.phase_started_at)?;
+    let elapsed = (now_epoch_seconds - phase_started_at).max(0) as i32;
     Some((duration_seconds - elapsed).max(0))
+}
+
+fn parse_rfc3339_epoch_seconds(value: &str) -> Option<i64> {
+    let trimmed = value.trim();
+    let normalized = trimmed
+        .strip_suffix('Z')
+        .or_else(|| trimmed.strip_suffix("+00:00"))?;
+    let (date, time) = normalized.split_once('T')?;
+    let (year, month, day) = parse_date(date)?;
+    let (hour, minute, second) = parse_time(time)?;
+
+    Some(seconds_from_civil(year, month, day)? + i64::from(hour * 3600 + minute * 60 + second))
+}
+
+fn parse_date(value: &str) -> Option<(i32, u32, u32)> {
+    let mut parts = value.split('-');
+    Some((
+        parts.next()?.parse().ok()?,
+        parts.next()?.parse().ok()?,
+        parts.next()?.parse().ok()?,
+    ))
+}
+
+fn parse_time(value: &str) -> Option<(u32, u32, u32)> {
+    let main = value.split_once('.').map(|(head, _)| head).unwrap_or(value);
+    let mut parts = main.split(':');
+    Some((
+        parts.next()?.parse().ok()?,
+        parts.next()?.parse().ok()?,
+        parts.next()?.parse().ok()?,
+    ))
+}
+
+fn seconds_from_civil(year: i32, month: u32, day: u32) -> Option<i64> {
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+
+    let year = i64::from(year) - if month <= 2 { 1 } else { 0 };
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let yoe = year - era * 400;
+    let month = i64::from(month);
+    let day = i64::from(day);
+    let doy = (153 * (month + if month > 2 { -3 } else { 9 }) + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    Some((era * 146097 + doe - 719468) * 86_400)
 }
 
 pub fn format_remaining_duration(total_seconds: i32) -> String {
@@ -1381,5 +1424,33 @@ pub mod tests {
             elapsed < BUDGET_BUDGET_MS,
             "judge_bundle_*_rows took {elapsed}ms (budget: {BUDGET_BUDGET_MS}ms)"
         );
+    }
+
+    #[test]
+    fn phase_remaining_seconds_supports_zulu_and_offset_timestamps() {
+        let state = mock_join_success().state;
+        let started_at =
+            parse_rfc3339_epoch_seconds(&state.session.phase_started_at).expect("zulu");
+
+        assert_eq!(phase_remaining_seconds(&state, started_at), Some(480));
+
+        let mut offset_state = state.clone();
+        offset_state.session.phase_started_at = "2026-01-01T00:00:00+00:00".to_string();
+        let offset_started_at =
+            parse_rfc3339_epoch_seconds(&offset_state.session.phase_started_at).expect("offset");
+        assert_eq!(
+            phase_remaining_seconds(&offset_state, offset_started_at + 60),
+            Some(420)
+        );
+    }
+
+    #[test]
+    fn phase_remaining_seconds_handles_fractional_seconds() {
+        let mut state = mock_join_success().state;
+        state.session.phase_started_at = "2026-01-01T00:00:00.500Z".to_string();
+        let started_at =
+            parse_rfc3339_epoch_seconds(&state.session.phase_started_at).expect("fractional");
+
+        assert_eq!(phase_remaining_seconds(&state, started_at + 1), Some(479));
     }
 }

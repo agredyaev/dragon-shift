@@ -475,7 +475,8 @@ fn build_web_bundle(config: WebBuildConfig) -> Result<(), String> {
         &[
             "build",
             "--locked",
-            "--release",
+            "--profile",
+            "wasm-release",
             "-p",
             "app-web",
             "--target",
@@ -483,7 +484,8 @@ fn build_web_bundle(config: WebBuildConfig) -> Result<(), String> {
         ],
     )?;
 
-    let wasm_input = workspace_root().join("target/wasm32-unknown-unknown/release/app-web.wasm");
+    let wasm_input =
+        workspace_root().join("target/wasm32-unknown-unknown/wasm-release/app-web.wasm");
     let wasm_bindgen_args = vec![
         "--target".to_string(),
         "web".to_string(),
@@ -501,17 +503,21 @@ fn build_web_bundle(config: WebBuildConfig) -> Result<(), String> {
     })?;
 
     let wasm_bg = config.out_dir.join("app-web_bg.wasm");
-    let pre_opt_bytes = fs::metadata(&wasm_bg).map(|m| m.len()).unwrap_or(0);
+    let raw_wasm_bytes = fs::metadata(&wasm_input).map(|m| m.len()).unwrap_or(0);
+    let bindgen_wasm_bytes = fs::metadata(&wasm_bg).map(|m| m.len()).unwrap_or(0);
     let skip_wasm_opt = env_flag_enabled("XTASK_SKIP_WASM_OPT");
-    let (_post_opt_bytes, saved_pct) = if skip_wasm_opt {
+    let post_opt_bytes = if skip_wasm_opt {
         eprintln!("wasm-opt skipped because XTASK_SKIP_WASM_OPT is set");
-        (pre_opt_bytes, 0)
+        bindgen_wasm_bytes
     } else {
         run_tool_owned(
             "wasm-opt",
             vec![
                 "-Oz".to_string(),
                 "--enable-bulk-memory".to_string(),
+                "--enable-nontrapping-float-to-int".to_string(),
+                "--strip-debug".to_string(),
+                "--strip-producers".to_string(),
                 "-o".to_string(),
                 wasm_bg.to_string_lossy().into_owned(),
                 wasm_bg.to_string_lossy().into_owned(),
@@ -523,19 +529,17 @@ fn build_web_bundle(config: WebBuildConfig) -> Result<(), String> {
             )
         })?;
         let post_opt_bytes = fs::metadata(&wasm_bg).map(|m| m.len()).unwrap_or(0);
-        let saved_pct = if pre_opt_bytes > 0 {
-            ((pre_opt_bytes as f64 - post_opt_bytes as f64) / pre_opt_bytes as f64 * 100.0) as u64
-        } else {
-            0
-        };
         eprintln!(
-            "wasm-opt: {} KB -> {} KB (-{}%)",
-            pre_opt_bytes / 1024,
+            "wasm-opt: {} KB -> {} KB",
+            bindgen_wasm_bytes / 1024,
             post_opt_bytes / 1024,
-            saved_pct
         );
-        (post_opt_bytes, saved_pct)
+        post_opt_bytes
     };
+
+    let bindgen_saved_pct = saved_percent(raw_wasm_bytes, bindgen_wasm_bytes);
+    let opt_saved_pct = saved_percent(bindgen_wasm_bytes, post_opt_bytes);
+    let total_saved_pct = saved_percent(raw_wasm_bytes, post_opt_bytes);
 
     write_app_web_index_html(&config.out_dir)?;
     copy_app_web_static_assets(&config.out_dir)?;
@@ -568,9 +572,12 @@ fn build_web_bundle(config: WebBuildConfig) -> Result<(), String> {
         "entryHtml": config.out_dir.join("index.html").display().to_string(),
         "entryJs": config.out_dir.join("app-web.js").display().to_string(),
         "entryWasm": config.out_dir.join("app-web_bg.wasm").display().to_string(),
+        "wasmRawKb": raw_wasm_bytes / 1024,
+        "wasmBindgenKb": bindgen_wasm_bytes / 1024,
         "wasmSizeKb": wasm_size_kb,
-        "wasmPreOptKb": pre_opt_bytes / 1024,
-        "wasmOptSavedPct": saved_pct,
+        "wasmBindgenSavedPct": bindgen_saved_pct,
+        "wasmOptSavedPct": opt_saved_pct,
+        "wasmTotalSavedPct": total_saved_pct,
         "wasmOptSkipped": skip_wasm_opt,
         "jsSizeKb": js_size_bytes / 1024,
     });
@@ -579,6 +586,14 @@ fn build_web_bundle(config: WebBuildConfig) -> Result<(), String> {
     }
 
     print_json(result)
+}
+
+fn saved_percent(before: u64, after: u64) -> u64 {
+    if before == 0 {
+        0
+    } else {
+        ((before as f64 - after as f64) / before as f64 * 100.0) as u64
+    }
 }
 
 fn env_flag_enabled(name: &str) -> bool {
@@ -644,9 +659,8 @@ fn copy_dir_contents(source: &Path, destination: &Path) -> Result<(), String> {
     for entry in fs::read_dir(source)
         .map_err(|error| format!("failed to read {}: {error}", source.display()))?
     {
-        let entry = entry.map_err(|error| {
-            format!("failed to read entry under {}: {error}", source.display())
-        })?;
+        let entry = entry
+            .map_err(|error| format!("failed to read entry under {}: {error}", source.display()))?;
         let source_path = entry.path();
         let destination_path = destination.join(entry.file_name());
 
@@ -687,9 +701,8 @@ fn copy_dir_recursive(source: &Path, destination: &Path) -> Result<(), String> {
     for entry in fs::read_dir(source)
         .map_err(|error| format!("failed to read {}: {error}", source.display()))?
     {
-        let entry = entry.map_err(|error| {
-            format!("failed to read entry under {}: {error}", source.display())
-        })?;
+        let entry = entry
+            .map_err(|error| format!("failed to read entry under {}: {error}", source.display()))?;
         let source_path = entry.path();
         let destination_path = destination.join(entry.file_name());
 
@@ -1523,10 +1536,9 @@ async fn wait_for_server_ready(
             .header("Origin", base_url)
             .send()
             .await
+            && response.status().is_success()
         {
-            if response.status().is_success() {
-                return Ok(());
-            }
+            return Ok(());
         }
 
         if std::time::Instant::now() >= deadline {
@@ -1655,7 +1667,7 @@ async fn attach_ws_session(
     }))
     .map_err(|error| format!("failed to encode smoke websocket attach payload: {error}"))?;
     socket
-        .send(WsMessage::Text(attach_payload.into()))
+        .send(WsMessage::Text(attach_payload))
         .await
         .map_err(|error| format!("failed to send smoke websocket attach payload: {error}"))?;
 
@@ -1993,6 +2005,9 @@ mod tests {
 
     #[test]
     fn app_web_static_dir_points_to_source_assets() {
-        assert_eq!(app_web_static_dir(), workspace_root().join("app-web/static"));
+        assert_eq!(
+            app_web_static_dir(),
+            workspace_root().join("app-web/static")
+        );
     }
 }

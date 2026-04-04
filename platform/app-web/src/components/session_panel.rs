@@ -1,4 +1,3 @@
-use chrono::Utc;
 use dioxus::prelude::*;
 use protocol::ClientGameState;
 use protocol::JudgeBundle;
@@ -26,7 +25,7 @@ pub fn SessionPanel(
     handover_tags_input: Signal<String>,
     judge_bundle: Signal<Option<JudgeBundle>>,
 ) -> Element {
-    let now_tick = use_signal(Utc::now);
+    let now_tick = use_signal(current_time_seconds);
 
     #[cfg(target_arch = "wasm32")]
     {
@@ -34,7 +33,7 @@ pub fn SessionPanel(
             let mut now_tick = now_tick;
             if let Some(window) = web_sys::window() {
                 let callback = wasm_bindgen::closure::Closure::wrap(Box::new(move || {
-                    now_tick.set(Utc::now());
+                    now_tick.set(current_time_seconds());
                 })
                     as Box<dyn FnMut()>);
                 let _ = window.set_interval_with_callback_and_timeout_and_arguments_0(
@@ -172,4 +171,14 @@ pub fn SessionPanel(
             p { class: "meta", "This browser remembers your last workshop so you can reconnect without retyping everything." }
         }
     }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn current_time_seconds() -> i64 {
+    (js_sys::Date::now() / 1000.0).floor() as i64
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn current_time_seconds() -> i64 {
+    0
 }

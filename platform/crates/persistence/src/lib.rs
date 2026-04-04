@@ -1,5 +1,5 @@
-use domain::WorkshopSession;
 use chrono::{DateTime, Utc};
+use domain::WorkshopSession;
 use protocol::SessionArtifactRecord;
 use std::collections::HashMap;
 use std::future::Future;
@@ -110,7 +110,10 @@ impl SessionUpdateNotification {
 
     pub fn to_payload(&self) -> Result<String, PersistenceError> {
         let mut payload = serde_json::Map::new();
-        payload.insert("kind".to_string(), serde_json::Value::String(self.kind.clone()));
+        payload.insert(
+            "kind".to_string(),
+            serde_json::Value::String(self.kind.clone()),
+        );
         payload.insert(
             "sessionCode".to_string(),
             serde_json::Value::String(self.session_code.clone()),
@@ -269,7 +272,9 @@ pub trait SessionStore: Send + Sync {
     fn restore_realtime_connection(
         &self,
         registration: &RealtimeConnectionRegistration,
-    ) -> Pin<Box<dyn Future<Output = Result<RealtimeConnectionRestore, PersistenceError>> + Send + '_>>;
+    ) -> Pin<
+        Box<dyn Future<Output = Result<RealtimeConnectionRestore, PersistenceError>> + Send + '_>,
+    >;
     fn release_realtime_connection(
         &self,
         connection_id: &str,
@@ -315,7 +320,8 @@ pub struct InMemorySessionStore {
     artifacts_by_session_id: RwLock<HashMap<String, Vec<SessionArtifactRecord>>>,
     identities_by_token: RwLock<HashMap<String, PlayerIdentity>>,
     session_leases: RwLock<HashMap<String, (String, String)>>,
-    realtime_connections_by_id: RwLock<HashMap<String, (RealtimeConnectionRegistration, DateTime<Utc>)>>,
+    realtime_connections_by_id:
+        RwLock<HashMap<String, (RealtimeConnectionRegistration, DateTime<Utc>)>>,
     realtime_connection_by_session_player: RwLock<HashMap<(String, String), String>>,
     retired_realtime_connections: RwLock<HashMap<String, String>>,
 }
@@ -333,7 +339,10 @@ pub struct PostgresSessionStore {
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!();
 
 impl PostgresSessionStore {
-    pub async fn connect(database_url: &str, max_connections: u32) -> Result<Self, PersistenceError> {
+    pub async fn connect(
+        database_url: &str,
+        max_connections: u32,
+    ) -> Result<Self, PersistenceError> {
         let pool = sqlx::postgres::PgPoolOptions::new()
             .max_connections(max_connections)
             .connect(database_url)
@@ -363,10 +372,10 @@ impl PostgresSessionStore {
                     )
                 ",
         )
-        .bind(&sanitized_session.id.to_string())
+        .bind(sanitized_session.id.to_string())
         .bind(&sanitized_session.code.0)
         .bind(sqlx::types::Json(&payload))
-        .bind(&sanitized_session.updated_at.to_rfc3339())
+        .bind(sanitized_session.updated_at.to_rfc3339())
         .execute(&mut **tx)
         .await?;
 
@@ -487,7 +496,7 @@ impl PostgresSessionStore {
             .bind(session_code)
             .bind(lease_id)
             .execute(&mut **tx)
-        .await?;
+            .await?;
         Ok(())
     }
 
@@ -569,8 +578,12 @@ impl PostgresSessionStore {
         use sqlx::Row;
 
         Self::cleanup_realtime_runtime_state_in_tx(tx).await?;
-        Self::lock_realtime_session_player_in_tx(tx, &registration.session_code, &registration.player_id)
-            .await?;
+        Self::lock_realtime_session_player_in_tx(
+            tx,
+            &registration.session_code,
+            &registration.player_id,
+        )
+        .await?;
 
         if allow_retired_connection {
             sqlx::query(
@@ -581,13 +594,12 @@ impl PostgresSessionStore {
             .execute(&mut **tx)
             .await?;
         } else {
-            let fenced = sqlx::query(
-                "SELECT 1 FROM retired_realtime_connections WHERE connection_id = $1",
-            )
-            .bind(&registration.connection_id)
-            .fetch_optional(&mut **tx)
-            .await?
-            .is_some();
+            let fenced =
+                sqlx::query("SELECT 1 FROM retired_realtime_connections WHERE connection_id = $1")
+                    .bind(&registration.connection_id)
+                    .fetch_optional(&mut **tx)
+                    .await?
+                    .is_some();
             if fenced {
                 return Err(PersistenceError::RetiredRealtimeConnection {
                     connection_id: registration.connection_id.clone(),
@@ -950,7 +962,8 @@ impl SessionStore for PostgresSessionStore {
         let registration = registration.clone();
         Box::pin(async move {
             let mut tx = self.pool.begin().await?;
-            let claim = Self::claim_realtime_connection_in_tx(&mut tx, &registration, false).await?;
+            let claim =
+                Self::claim_realtime_connection_in_tx(&mut tx, &registration, false).await?;
             tx.commit().await?;
             Ok(claim)
         })
@@ -959,8 +972,9 @@ impl SessionStore for PostgresSessionStore {
     fn restore_realtime_connection(
         &self,
         registration: &RealtimeConnectionRegistration,
-    ) -> Pin<Box<dyn Future<Output = Result<RealtimeConnectionRestore, PersistenceError>> + Send + '_>>
-    {
+    ) -> Pin<
+        Box<dyn Future<Output = Result<RealtimeConnectionRestore, PersistenceError>> + Send + '_>,
+    > {
         let registration = registration.clone();
         Box::pin(async move {
             let mut tx = self.pool.begin().await?;
@@ -1094,12 +1108,10 @@ impl SessionStore for PostgresSessionStore {
 
             let cutoff = active_realtime_connection_cutoff();
 
-            sqlx::query(
-                "DELETE FROM realtime_connections WHERE updated_at <= $1::timestamptz",
-            )
-            .bind(cutoff.to_rfc3339())
-            .execute(&self.pool)
-            .await?;
+            sqlx::query("DELETE FROM realtime_connections WHERE updated_at <= $1::timestamptz")
+                .bind(cutoff.to_rfc3339())
+                .execute(&self.pool)
+                .await?;
 
             let rows = sqlx::query(
                 "
@@ -1190,8 +1202,9 @@ impl SessionStore for InMemorySessionStore {
                     .is_some_and(|existing| {
                         existing.updated_at > session.updated_at
                             || (existing.updated_at == session.updated_at
-                                && serde_json::to_string(existing)
-                                    .is_ok_and(|existing_payload| existing_payload >= candidate_payload))
+                                && serde_json::to_string(existing).is_ok_and(|existing_payload| {
+                                    existing_payload >= candidate_payload
+                                }))
                     })
                 {
                     return Err(PersistenceError::StaleSessionWrite {
@@ -1212,8 +1225,9 @@ impl SessionStore for InMemorySessionStore {
                     .is_some_and(|existing| {
                         existing.updated_at > session.updated_at
                             || (existing.updated_at == session.updated_at
-                                && serde_json::to_string(existing)
-                                    .is_ok_and(|existing_payload| existing_payload >= candidate_payload))
+                                && serde_json::to_string(existing).is_ok_and(|existing_payload| {
+                                    existing_payload >= candidate_payload
+                                }))
                     })
                 {
                     return Err(PersistenceError::StaleSessionWrite {
@@ -1417,7 +1431,13 @@ impl SessionStore for InMemorySessionStore {
             self.save_session(&session).await?;
             self.create_player_identity(&identity).await?;
             if let Err(error) = self.append_session_artifact(&artifact).await {
-                rollback_in_memory_identity(self, &identity.reconnect_token, previous_identity, &session).await?;
+                rollback_in_memory_identity(
+                    self,
+                    &identity.reconnect_token,
+                    previous_identity,
+                    &session,
+                )
+                .await?;
                 rollback_in_memory_session(self, &session, previous_session).await?;
                 return Err(error);
             }
@@ -1529,7 +1549,8 @@ impl SessionStore for InMemorySessionStore {
                 .session_leases
                 .write()
                 .map_err(|_| PersistenceError::LockPoisoned)?;
-            let Some((existing_lease_id, existing_expires_at)) = leases.get_mut(&session_code) else {
+            let Some((existing_lease_id, existing_expires_at)) = leases.get_mut(&session_code)
+            else {
                 return Ok(false);
             };
             if existing_lease_id != &lease_id {
@@ -1590,7 +1611,9 @@ impl SessionStore for InMemorySessionStore {
                 .map(|(connection_id, _)| connection_id.clone())
                 .collect::<Vec<_>>();
             for stale_connection_id in stale_connection_ids {
-                if let Some((stale_registration, _)) = connections_by_id.remove(&stale_connection_id) {
+                if let Some((stale_registration, _)) =
+                    connections_by_id.remove(&stale_connection_id)
+                {
                     by_session_player.remove(&(
                         stale_registration.session_code,
                         stale_registration.player_id,
@@ -1608,7 +1631,8 @@ impl SessionStore for InMemorySessionStore {
                 registration.session_code.clone(),
                 registration.player_id.clone(),
             );
-            if let Some((existing_registration, _)) = connections_by_id.get(&registration.connection_id)
+            if let Some((existing_registration, _)) =
+                connections_by_id.get(&registration.connection_id)
                 && (existing_registration.session_code != key.0
                     || existing_registration.player_id != key.1)
             {
@@ -1630,13 +1654,14 @@ impl SessionStore for InMemorySessionStore {
                 });
 
             if let Some(replaced) = replaced.as_ref() {
-                retired_connections.insert(
-                    replaced.connection_id.clone(),
-                    replaced.replica_id.clone(),
-                );
+                retired_connections
+                    .insert(replaced.connection_id.clone(), replaced.replica_id.clone());
             }
 
-            connections_by_id.insert(registration.connection_id.clone(), (registration, Utc::now()));
+            connections_by_id.insert(
+                registration.connection_id.clone(),
+                (registration, Utc::now()),
+            );
             Ok(RealtimeConnectionClaim { replaced })
         })
     }
@@ -1644,8 +1669,9 @@ impl SessionStore for InMemorySessionStore {
     fn restore_realtime_connection(
         &self,
         registration: &RealtimeConnectionRegistration,
-    ) -> Pin<Box<dyn Future<Output = Result<RealtimeConnectionRestore, PersistenceError>> + Send + '_>>
-    {
+    ) -> Pin<
+        Box<dyn Future<Output = Result<RealtimeConnectionRestore, PersistenceError>> + Send + '_>,
+    > {
         let registration = registration.clone();
         Box::pin(async move {
             let mut connections_by_id = self
@@ -1668,8 +1694,13 @@ impl SessionStore for InMemorySessionStore {
                 .map(|(connection_id, _)| connection_id.clone())
                 .collect::<Vec<_>>();
             for stale_connection_id in stale_connection_ids {
-                if let Some((stale_registration, _)) = connections_by_id.remove(&stale_connection_id) {
-                    by_session_player.remove(&(stale_registration.session_code, stale_registration.player_id));
+                if let Some((stale_registration, _)) =
+                    connections_by_id.remove(&stale_connection_id)
+                {
+                    by_session_player.remove(&(
+                        stale_registration.session_code,
+                        stale_registration.player_id,
+                    ));
                 }
             }
 
@@ -1686,7 +1717,9 @@ impl SessionStore for InMemorySessionStore {
                 });
             }
 
-            if retired_connections.get(&registration.connection_id) != Some(&registration.replica_id) {
+            if retired_connections.get(&registration.connection_id)
+                != Some(&registration.replica_id)
+            {
                 return Ok(RealtimeConnectionRestore {
                     restored: false,
                     replaced: None,
@@ -1694,7 +1727,8 @@ impl SessionStore for InMemorySessionStore {
             }
             retired_connections.remove(&registration.connection_id);
 
-            if let Some((existing_registration, _)) = connections_by_id.get(&registration.connection_id)
+            if let Some((existing_registration, _)) =
+                connections_by_id.get(&registration.connection_id)
                 && (existing_registration.session_code != key.0
                     || existing_registration.player_id != key.1)
             {
@@ -1716,13 +1750,14 @@ impl SessionStore for InMemorySessionStore {
                 });
 
             if let Some(replaced) = replaced.as_ref() {
-                retired_connections.insert(
-                    replaced.connection_id.clone(),
-                    replaced.replica_id.clone(),
-                );
+                retired_connections
+                    .insert(replaced.connection_id.clone(), replaced.replica_id.clone());
             }
 
-            connections_by_id.insert(registration.connection_id.clone(), (registration, Utc::now()));
+            connections_by_id.insert(
+                registration.connection_id.clone(),
+                (registration, Utc::now()),
+            );
             Ok(RealtimeConnectionRestore {
                 restored: true,
                 replaced,
@@ -2154,7 +2189,11 @@ mod tests {
     async fn grouped_in_memory_write_keeps_identity_and_artifact_atomic() {
         let store = InMemorySessionStore::new();
         let existing_session = session("111111", Phase::Lobby, 1);
-        let conflicting_artifact = artifact(&existing_session.id.to_string(), "a1", "2026-01-01T00:00:01Z");
+        let conflicting_artifact = artifact(
+            &existing_session.id.to_string(),
+            "a1",
+            "2026-01-01T00:00:01Z",
+        );
         let target_session = session("222222", Phase::Lobby, 2);
         let identity = identity(&target_session.id.to_string(), "player-1", "token-1");
         let artifact = artifact(&target_session.id.to_string(), "a1", "2026-01-01T00:00:02Z");
@@ -2306,7 +2345,8 @@ mod tests {
     fn session_update_notification_serializes_legacy_payload_for_rollout_compatibility() {
         let session = session("123456", Phase::Phase1, 42);
 
-        let payload = SessionUpdateNotification::session_state_changed(&session).to_legacy_payload();
+        let payload =
+            SessionUpdateNotification::session_state_changed(&session).to_legacy_payload();
 
         assert_eq!(payload, "123456");
     }
@@ -2318,7 +2358,8 @@ mod tests {
         let payload = SessionUpdateNotification::session_state_changed(&session)
             .to_payload()
             .expect("serialize notification");
-        let payload: serde_json::Value = serde_json::from_str(&payload).expect("parse payload json");
+        let payload: serde_json::Value =
+            serde_json::from_str(&payload).expect("parse payload json");
 
         assert_eq!(payload["kind"], "session_state_changed");
         assert_eq!(payload["sessionCode"], "123456");
@@ -2367,22 +2408,30 @@ mod tests {
     async fn in_memory_session_lease_is_exclusive() {
         let store = InMemorySessionStore::new();
 
-        assert!(store
-            .acquire_session_lease("123456", "lease-a", "2099-01-01T00:00:05Z")
-            .await
-            .expect("acquire first lease"));
-        assert!(!store
-            .acquire_session_lease("123456", "lease-b", "2099-01-01T00:00:04Z")
-            .await
-            .expect("reject overlapping lease"));
-        assert!(!store
-            .acquire_session_lease("123456", "lease-b", "2099-01-01T00:00:06Z")
-            .await
-            .expect("reject later overlapping lease"));
-        assert!(store
-            .renew_session_lease("123456", "lease-a", "2099-01-01T00:00:06Z")
-            .await
-            .expect("renew existing lease"));
+        assert!(
+            store
+                .acquire_session_lease("123456", "lease-a", "2099-01-01T00:00:05Z")
+                .await
+                .expect("acquire first lease")
+        );
+        assert!(
+            !store
+                .acquire_session_lease("123456", "lease-b", "2099-01-01T00:00:04Z")
+                .await
+                .expect("reject overlapping lease")
+        );
+        assert!(
+            !store
+                .acquire_session_lease("123456", "lease-b", "2099-01-01T00:00:06Z")
+                .await
+                .expect("reject later overlapping lease")
+        );
+        assert!(
+            store
+                .renew_session_lease("123456", "lease-a", "2099-01-01T00:00:06Z")
+                .await
+                .expect("renew existing lease")
+        );
     }
 
     #[tokio::test]
@@ -2446,15 +2495,21 @@ mod tests {
                 .realtime_connections_by_id
                 .write()
                 .expect("lock realtime connections");
-            let (_, updated_at) = connections.get_mut("conn-1").expect("stored connection exists");
-            *updated_at = Utc::now() - chrono::Duration::seconds(REALTIME_CONNECTION_TTL_SECONDS + 1);
+            let (_, updated_at) = connections
+                .get_mut("conn-1")
+                .expect("stored connection exists");
+            *updated_at =
+                Utc::now() - chrono::Duration::seconds(REALTIME_CONNECTION_TTL_SECONDS + 1);
         }
 
         let registrations = store
             .list_realtime_connections("123456")
             .await
             .expect("list realtime registrations");
-        assert!(registrations.is_empty(), "stale realtime registrations must not remain visible");
+        assert!(
+            registrations.is_empty(),
+            "stale realtime registrations must not remain visible"
+        );
     }
 
     #[tokio::test]

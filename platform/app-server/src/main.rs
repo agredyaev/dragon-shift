@@ -16,7 +16,9 @@ use ws::{
     emit_phase_warning_notices,
 };
 
-pub(crate) fn parse_session_update_notification(payload: &str) -> Option<SessionUpdateNotification> {
+pub(crate) fn parse_session_update_notification(
+    payload: &str,
+) -> Option<SessionUpdateNotification> {
     let payload = payload.trim();
     if payload.is_empty() {
         return None;
@@ -213,8 +215,11 @@ async fn main() {
                                     else {
                                         continue;
                                     };
-                                    handle_session_update_notification(&listener_state, &notification)
-                                        .await;
+                                    handle_session_update_notification(
+                                        &listener_state,
+                                        &notification,
+                                    )
+                                    .await;
                                 }
                                 Err(error) => {
                                     tracing::warn!(%error, "PgListener recv error, reconnecting in 5s");

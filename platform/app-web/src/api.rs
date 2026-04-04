@@ -4,6 +4,17 @@ use protocol::{
     WorkshopJoinResult, WorkshopJoinSuccess, WorkshopJudgeBundleRequest, WorkshopJudgeBundleResult,
 };
 
+use serde::de::DeserializeOwned;
+
+#[cfg(target_arch = "wasm32")]
+use js_sys::Promise;
+
+#[cfg(target_arch = "wasm32")]
+use wasm_bindgen::{JsCast, JsValue};
+
+#[cfg(target_arch = "wasm32")]
+use wasm_bindgen_futures::JsFuture;
+
 use crate::state::default_api_base_url;
 
 // ---------------------------------------------------------------------------
@@ -13,14 +24,12 @@ use crate::state::default_api_base_url;
 #[derive(Clone)]
 pub struct AppWebApi {
     pub base_url: String,
-    pub client: reqwest::Client,
 }
 
 impl AppWebApi {
     pub fn new(base_url: impl Into<String>) -> Self {
         Self {
             base_url: normalize_api_base_url(&base_url.into()),
-            client: reqwest::Client::new(),
         }
     }
 
@@ -29,30 +38,17 @@ impl AppWebApi {
         name: String,
         config: WorkshopCreateConfig,
     ) -> Result<WorkshopJoinSuccess, String> {
-        let response = self
-            .client
-            .post(format!("{}/api/workshops", self.base_url))
-            .json(&CreateWorkshopRequest { name, config })
-            .send()
-            .await
-            .map_err(|error| format!("failed to reach backend: {error}"))?;
-
-        Self::parse_join_response(response).await
+        Self::parse_join_response(
+            self.post_json("/api/workshops", &CreateWorkshopRequest { name, config })
+                .await?,
+        )
     }
 
     pub async fn join_workshop(
         &self,
         request: JoinWorkshopRequest,
     ) -> Result<WorkshopJoinSuccess, String> {
-        let response = self
-            .client
-            .post(format!("{}/api/workshops/join", self.base_url))
-            .json(&request)
-            .send()
-            .await
-            .map_err(|error| format!("failed to reach backend: {error}"))?;
-
-        Self::parse_join_response(response).await
+        Self::parse_join_response(self.post_json("/api/workshops/join", &request).await?)
     }
 
     pub async fn reconnect_workshop(
@@ -65,18 +61,8 @@ impl AppWebApi {
     }
 
     pub async fn send_command(&self, request: WorkshopCommandRequest) -> Result<(), String> {
-        let response = self
-            .client
-            .post(format!("{}/api/workshops/command", self.base_url))
-            .json(&request)
-            .send()
-            .await
-            .map_err(|error| format!("failed to reach backend: {error}"))?;
-
-        let payload = response
-            .json::<WorkshopCommandResult>()
-            .await
-            .map_err(|error| format!("failed to parse backend response: {error}"))?;
+        let payload: WorkshopCommandResult =
+            self.post_json("/api/workshops/command", &request).await?;
 
         match payload {
             WorkshopCommandResult::Success(_) => Ok(()),
@@ -88,18 +74,9 @@ impl AppWebApi {
         &self,
         request: WorkshopJudgeBundleRequest,
     ) -> Result<JudgeBundle, String> {
-        let response = self
-            .client
-            .post(format!("{}/api/workshops/judge-bundle", self.base_url))
-            .json(&request)
-            .send()
-            .await
-            .map_err(|error| format!("failed to reach backend: {error}"))?;
-
-        let payload = response
-            .json::<WorkshopJudgeBundleResult>()
-            .await
-            .map_err(|error| format!("failed to parse backend response: {error}"))?;
+        let payload: WorkshopJudgeBundleResult = self
+            .post_json("/api/workshops/judge-bundle", &request)
+            .await?;
 
         match payload {
             WorkshopJudgeBundleResult::Success(success) => Ok(success.bundle),
@@ -107,19 +84,111 @@ impl AppWebApi {
         }
     }
 
-    async fn parse_join_response(
-        response: reqwest::Response,
-    ) -> Result<WorkshopJoinSuccess, String> {
-        let payload = response
-            .json::<WorkshopJoinResult>()
-            .await
-            .map_err(|error| format!("failed to parse backend response: {error}"))?;
-
+    fn parse_join_response(payload: WorkshopJoinResult) -> Result<WorkshopJoinSuccess, String> {
         match payload {
             WorkshopJoinResult::Success(success) => Ok(success),
             WorkshopJoinResult::Error(error) => Err(error.error),
         }
     }
+
+    #[cfg(target_arch = "wasm32")]
+    async fn post_json<Req, Res>(&self, path: &str, body: &Req) -> Result<Res, String>
+    where
+        Req: serde::Serialize,
+        Res: DeserializeOwned,
+    {
+        let body_json = serde_json::to_string(body)
+            .map_err(|error| format!("failed to encode request body: {error}"))?;
+
+        let init = web_sys::RequestInit::new();
+        init.set_method("POST");
+        init.set_body(&JsValue::from_str(&body_json));
+
+        let headers =
+            web_sys::Headers::new().map_err(|_| "failed to prepare request headers".to_string())?;
+        headers
+            .set("Content-Type", "application/json")
+            .map_err(|_| "failed to set request headers".to_string())?;
+        init.set_headers_headers(&headers);
+
+        let url = format!("{}{}", self.base_url, path);
+        let request = web_sys::Request::new_with_str_and_init(&url, &init)
+            .map_err(|_| "failed to prepare browser request".to_string())?;
+        let window = web_sys::window().ok_or_else(|| "window is unavailable".to_string())?;
+        let response = JsFuture::from(window.fetch_with_request(&request))
+            .await
+            .map_err(js_error_message)?;
+        let response: web_sys::Response = response
+            .dyn_into()
+            .map_err(|_| "failed to read browser response".to_string())?;
+        let text = js_future_string(
+            response
+                .text()
+                .map_err(|_| "failed to read backend response".to_string())?,
+        )
+        .await?;
+
+        if !response.ok() {
+            return Err(extract_backend_error(&text).unwrap_or_else(|| {
+                format!("backend request failed with status {}", response.status())
+            }));
+        }
+
+        serde_json::from_str(&text)
+            .map_err(|error| format!("failed to parse backend response: {error}"))
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    async fn post_json<Req, Res>(&self, path: &str, body: &Req) -> Result<Res, String>
+    where
+        Req: serde::Serialize,
+        Res: DeserializeOwned,
+    {
+        let response = reqwest::Client::new()
+            .post(format!("{}{}", self.base_url, path))
+            .json(body)
+            .send()
+            .await
+            .map_err(|error| format!("failed to reach backend: {error}"))?;
+
+        response
+            .json::<Res>()
+            .await
+            .map_err(|error| format!("failed to parse backend response: {error}"))
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn js_future_string(promise: Promise) -> Result<String, String> {
+    let value = JsFuture::from(promise).await.map_err(js_error_message)?;
+    value
+        .as_string()
+        .ok_or_else(|| "backend response was not text".to_string())
+}
+
+#[cfg(target_arch = "wasm32")]
+fn js_error_message(error: JsValue) -> String {
+    error
+        .as_string()
+        .or_else(|| {
+            js_sys::Reflect::get(&error, &JsValue::from_str("message"))
+                .ok()?
+                .as_string()
+        })
+        .unwrap_or_else(|| "failed to reach backend".to_string())
+}
+
+#[cfg(target_arch = "wasm32")]
+fn extract_backend_error(text: &str) -> Option<String> {
+    serde_json::from_str::<WorkshopErrorEnvelope>(text)
+        .ok()
+        .map(|payload| payload.error)
+}
+
+#[cfg(target_arch = "wasm32")]
+#[derive(serde::Deserialize)]
+struct WorkshopErrorEnvelope {
+    error: String,
 }
 
 // ---------------------------------------------------------------------------

@@ -125,7 +125,7 @@ pub fn create_origin_policy(
         .filter(|value| !value.is_empty())
         .collect::<Vec<_>>();
 
-    let allow_any_origin = configured_origins.iter().any(|origin| *origin == "*");
+    let allow_any_origin = configured_origins.contains(&"*");
     if allow_any_origin && options.is_production {
         return Err(SecurityError::WildcardOriginInProduction);
     }
