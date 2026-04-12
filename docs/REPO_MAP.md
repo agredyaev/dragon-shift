@@ -15,8 +15,9 @@
 - `Dockerfile` - production image build
 - `helm/dragon-shift` - Kubernetes deployment chart
 - `.github/workflows/ci.yml` - repo checks and chart validation
-- `.github/workflows/publish-image.yml` - GHCR image publishing
+- `.github/workflows/publish-image.yml` - GHCR image publishing plus automatic Terraform apply on `main`
 - `.github/workflows/deploy.yml` - manual deploy, promote, and rollback flow
+- `operations/terraform-apply.sh` - bootstrap, apply, and verify the cloud deployment locally or in CI
 - `e2e/` - deployed browser smoke and local restart proofs
 
 ## Infrastructure
@@ -27,6 +28,7 @@
 
 ## Supporting Docs
 - `README.md` - project overview and canonical usage
+- `docs/AUTOMATED_TERRAFORM_DEPLOY.md` - GitHub OIDC bootstrap and automatic Terraform deploy inputs
 - `docs/VARIABLE_CATALOG.md` - runtime, Helm, and Terraform input catalog
 - `.env.example` - local environment variable reference
 - `docs/CLOUD_OPERABILITY.md` - operator-owned cloud boundaries

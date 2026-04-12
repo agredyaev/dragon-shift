@@ -13,15 +13,21 @@ on:
     tags:
       - "v*"
     paths:
+      - ".dockerignore"
       - "platform/**"
+      - "e2e/**"
       - "helm/**"
+      - "terraform/**"
+      - "operations/**"
       - "Dockerfile"
       - ".github/workflows/**"
-      - "README.md"
 
 permissions:
   contents: read
-  packages: write
+
+concurrency:
+  group: publish-image-${{ github.ref }}
+  cancel-in-progress: false
 
 env:
   REGISTRY: ghcr.io
@@ -29,11 +35,73 @@ env:
 
 jobs:
   publish:
-    name: Publish GHCR image
+    name: Publish or reuse GHCR image
     runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+      packages: write
+    outputs:
+      image_digest: ${{ steps.selected_digest.outputs.value }}
+      image_repository: ${{ env.IMAGE_NAME }}
+      image_tag: ${{ steps.vars.outputs.version }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          fetch-depth: 0
+
+      - name: Wait for CI workflow success
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for attempt in {1..60}; do
+            run_line="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs?event=push&head_sha=${GITHUB_SHA}" --jq 'first(.workflow_runs[]? | select(.name == "CI") | [.status, (.conclusion // ""), .html_url] | @tsv) // empty')"
+            if [[ -z "${run_line}" ]]; then
+              sleep 10
+              continue
+            fi
+
+            IFS=$'\t' read -r status conclusion url <<< "${run_line}"
+            if [[ "${status}" != "completed" ]]; then
+              sleep 10
+              continue
+            fi
+
+            if [[ "${conclusion}" != "success" ]]; then
+              printf 'CI workflow did not succeed: %s\n' "${url}" >&2
+              exit 1
+            fi
+
+            exit 0
+          done
+
+          printf 'Timed out waiting for the CI workflow for %s\n' "${GITHUB_SHA}" >&2
+          exit 1
+
+      - name: Determine image source
+        id: image_source
+        env:
+          BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          should_build=true
+          if [[ "${GITHUB_EVENT_NAME}" == "push" && "${GITHUB_REF}" == "refs/heads/main" ]]; then
+            should_build=false
+            if [[ -z "${BEFORE_SHA}" || "${BEFORE_SHA}" == "0000000000000000000000000000000000000000" ]]; then
+              should_build=true
+            else
+              while IFS= read -r changed_path; do
+                case "${changed_path}" in
+                  platform/*|Dockerfile|.dockerignore|.github/workflows/publish-image.yml)
+                    should_build=true
+                    break
+                    ;;
+                esac
+              done < <(git diff --name-only "${BEFORE_SHA}" "${GITHUB_SHA}")
+            fi
+          fi
+          echo "should_build=${should_build}" >> "${GITHUB_OUTPUT}"
 
       - name: Compute tags
         id: vars
@@ -51,34 +119,216 @@ jobs:
             VERSION="manual-${SHORT_SHA}"
           fi
           {
-            echo "version=${VERSION}"
-            echo "short_sha=${SHORT_SHA}"
-            echo "tags<<EOF"
-            echo "${IMAGE_NAME}:${VERSION}"
-            echo "${IMAGE_NAME}:sha-${SHORT_SHA}"
-            if [[ "${GITHUB_REF_TYPE}" == "tag" || ( "${GITHUB_EVENT_NAME}" == "push" && "${GITHUB_REF_NAME}" == "main" ) ]]; then
-              echo "${IMAGE_NAME}:latest"
-            fi
-            echo "EOF"
-          } >> "${GITHUB_OUTPUT}"
+             echo "version=${VERSION}"
+             echo "short_sha=${SHORT_SHA}"
+             echo "tags<<EOF"
+             echo "${IMAGE_NAME}:${VERSION}"
+             echo "${IMAGE_NAME}:sha-${SHORT_SHA}"
+             if [[ "${GITHUB_EVENT_NAME}" == "push" && "${GITHUB_REF_NAME}" == "main" ]]; then
+               echo "${IMAGE_NAME}:latest"
+             fi
+             echo "EOF"
+           } >> "${GITHUB_OUTPUT}"
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
 
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and push image
-        uses: docker/build-push-action@v6
+        id: build
+        if: steps.image_source.outputs.should_build == 'true'
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8
         with:
           context: .
           file: ./Dockerfile
+          platforms: linux/amd64
           push: true
           tags: ${{ steps.vars.outputs.tags }}
           labels: |
             org.opencontainers.image.source=https://github.com/agredyaev/dragon-shift
             org.opencontainers.image.revision=${{ github.sha }}
+
+      - name: Resolve reusable image digest
+        id: current_image
+        if: steps.image_source.outputs.should_build != 'true'
+        env:
+          BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          test -n "${BEFORE_SHA}"
+          reusable_tag=""
+          reusable_digest=""
+          reusable_revision=""
+
+          while IFS= read -r candidate_sha; do
+            candidate_tag="sha-${candidate_sha::7}"
+            if docker pull "${IMAGE_NAME}:${candidate_tag}" >/dev/null 2>&1; then
+              reusable_revision="$(docker image inspect "${IMAGE_NAME}:${candidate_tag}" --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' 2>/dev/null || true)"
+              if [[ "${reusable_revision}" == "${candidate_sha}" ]]; then
+                reusable_digest="$(docker buildx imagetools inspect "${IMAGE_NAME}:${candidate_tag}" --format '{{.Manifest.Digest}}')"
+                reusable_tag="${candidate_tag}"
+                break
+              fi
+            fi
+          done < <(git rev-list --first-parent "${BEFORE_SHA}")
+
+          if [[ -z "${reusable_digest}" ]]; then
+            printf 'No previously published reusable image digest was found before %s.\n' "${BEFORE_SHA}" >&2
+            exit 1
+          fi
+
+          echo "tag=${reusable_tag}" >> "${GITHUB_OUTPUT}"
+          echo "digest=${reusable_digest}" >> "${GITHUB_OUTPUT}"
+
+      - name: Select deployment digest
+        id: selected_digest
+        run: |
+          digest="${{ steps.build.outputs.digest }}"
+          if [[ -z "${digest}" ]]; then
+            digest="${{ steps.current_image.outputs.digest }}"
+          fi
+          test -n "${digest}"
+          echo "value=${digest}" >> "${GITHUB_OUTPUT}"
+
+  deploy:
+    name: Apply Terraform production
+    runs-on: ubuntu-latest
+    needs: publish
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    environment: production
+    concurrency:
+      group: deploy-production
+      cancel-in-progress: false
+    permissions:
+      actions: read
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+
+      - name: Wait for CI workflow success
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for attempt in {1..60}; do
+            run_line="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs?event=push&head_sha=${GITHUB_SHA}" --jq 'first(.workflow_runs[]? | select(.name == "CI") | [.status, (.conclusion // ""), .html_url] | @tsv) // empty')"
+            if [[ -z "${run_line}" ]]; then
+              sleep 10
+              continue
+            fi
+
+            IFS=$'\t' read -r status conclusion url <<< "${run_line}"
+            if [[ "${status}" != "completed" ]]; then
+              sleep 10
+              continue
+            fi
+
+            if [[ "${conclusion}" != "success" ]]; then
+              printf 'CI workflow did not succeed: %s\n' "${url}" >&2
+              exit 1
+            fi
+
+            exit 0
+          done
+
+          printf 'Timed out waiting for the CI workflow for %s\n' "${GITHUB_SHA}" >&2
+          exit 1
+
+      - name: Check current main head
+        id: head_check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          current_main="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/main" --jq '.object.sha')"
+          if [[ "${current_main}" == "${GITHUB_SHA}" ]]; then
+            echo "should_deploy=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "should_deploy=false" >> "${GITHUB_OUTPUT}"
+            printf 'Skipping superseded deploy for %s because main now points to %s.\n' "${GITHUB_SHA}" "${current_main}"
+          fi
+
+      - name: Set up Node.js
+        if: steps.head_check.outputs.should_deploy == 'true'
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: e2e/package-lock.json
+
+      - name: Install e2e dependencies
+        if: steps.head_check.outputs.should_deploy == 'true'
+        run: npm --prefix e2e ci
+
+      - name: Install Playwright browsers
+        if: steps.head_check.outputs.should_deploy == 'true'
+        run: npm --prefix e2e run install:browsers
+
+      - name: Authenticate to Google Cloud
+        if: steps.head_check.outputs.should_deploy == 'true'
+        uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT_EMAIL }}
+          create_credentials_file: true
+
+      - name: Set up gcloud
+        if: steps.head_check.outputs.should_deploy == 'true'
+        uses: google-github-actions/setup-gcloud@e427ad8a34f8676edf47cf7d7925499adf3eb74f
+        with:
+          install_components: gke-gcloud-auth-plugin
+
+      - name: Set up Terraform
+        if: steps.head_check.outputs.should_deploy == 'true'
+        uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd
+
+      - name: Install kubectl
+        if: steps.head_check.outputs.should_deploy == 'true'
+        uses: azure/setup-kubectl@776406bce94f63e41d621b960d78ee25c8b76ede
+
+      - name: Install Helm
+        if: steps.head_check.outputs.should_deploy == 'true'
+        uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4
+
+      - name: Check current main head before apply
+        id: final_head_check
+        if: steps.head_check.outputs.should_deploy == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          current_main="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/main" --jq '.object.sha')"
+          if [[ "${current_main}" == "${GITHUB_SHA}" ]]; then
+            echo "should_deploy=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "should_deploy=false" >> "${GITHUB_OUTPUT}"
+            printf 'Skipping superseded deploy for %s because main now points to %s before apply.\n' "${GITHUB_SHA}" "${current_main}"
+          fi
+
+      - name: Apply Terraform stacks and verify deployment
+        if: steps.final_head_check.outputs.should_deploy == 'true'
+        env:
+          GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          GCP_REGION: ${{ vars.GCP_REGION }}
+          TF_SUPPORT_EMAIL: ${{ vars.TF_SUPPORT_EMAIL }}
+          TF_STATE_BUCKET_NAME: ${{ vars.TF_STATE_BUCKET_NAME }}
+          TF_HOSTNAME_MODE: ${{ vars.TF_HOSTNAME_MODE }}
+          TF_HOSTNAME: ${{ vars.TF_HOSTNAME }}
+          TF_DNS_ZONE_NAME: ${{ vars.TF_DNS_ZONE_NAME }}
+          TF_DNS_ZONE_DNS_NAME: ${{ vars.TF_DNS_ZONE_DNS_NAME }}
+          TF_NIP_IO_LABEL: ${{ vars.TF_NIP_IO_LABEL }}
+          TF_ENABLE_CLOUD_ARMOR: ${{ vars.TF_ENABLE_CLOUD_ARMOR }}
+          TF_ENABLE_UPTIME_CHECKS: ${{ vars.TF_ENABLE_UPTIME_CHECKS }}
+          TF_NOTIFICATION_CHANNEL_ID: ${{ vars.TF_NOTIFICATION_CHANNEL_ID }}
+          TF_EXTRA_MASTER_AUTHORIZED_CIDRS: ${{ vars.TF_EXTRA_MASTER_AUTHORIZED_CIDRS }}
+          TF_VERIFY_PUBLIC_EDGE: ${{ vars.TF_VERIFY_PUBLIC_EDGE }}
+          TF_PRODUCTION_DB_PASSWORD: ${{ secrets.TF_PRODUCTION_DB_PASSWORD }}
+          IMAGE_REPOSITORY: ${{ needs.publish.outputs.image_repository }}
+          IMAGE_DIGEST: ${{ needs.publish.outputs.image_digest }}
+          IMAGE_TAG: ${{ needs.publish.outputs.image_tag }}
+          RUN_DEPLOYED_SMOKE: "true"
+        run: bash ./operations/terraform-apply.sh

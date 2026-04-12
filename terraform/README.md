@@ -3,12 +3,12 @@
 Terraform here provisions the GCP production path for Dragon Shift.
 
 ## Layout
-- `bootstrap/` - remote-state bucket
+- `bootstrap/` - remote-state bucket and optional GitHub Actions Workload Identity bootstrap
 - `environments/production/foundation/` - project services, network, GKE, Cloud SQL
 - `environments/production/platform/` - DNS, ingress edge, monitoring, Helm release
 
 ## Order
-1. Bootstrap remote state.
+1. Bootstrap remote state with a local backend path for the bootstrap module itself.
 2. Apply `foundation`.
 3. Apply `platform`.
 

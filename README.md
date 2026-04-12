@@ -11,6 +11,7 @@
 
 Dragon Shift is a real-time multiplayer workshop game built in Rust.
 It ships as a browser client and Rust backend, persists game state in PostgreSQL, and is deployed on Google Cloud through Terraform and Helm.
+ Pushes to `main` can publish the container image when app build inputs change and can apply the Terraform stacks automatically through GitHub Actions with Google Cloud Workload Identity Federation.
 
 ## What it does
 - Serves the game UI in the browser and the game API from one container image.
@@ -39,5 +40,6 @@ It ships as a browser client and Rust backend, persists game state in PostgreSQL
 
 ## Docs
 - Cloud ownership and operator responsibilities: `docs/CLOUD_OPERABILITY.md`
+- Automated Terraform deploy bootstrap and repo config: `docs/AUTOMATED_TERRAFORM_DEPLOY.md`
 - Terraform stack and apply order: `terraform/README.md`
 - Repo map: `docs/REPO_MAP.md`

@@ -3,28 +3,34 @@ name: CI
 on:
   pull_request:
     paths:
+      - ".dockerignore"
       - "platform/**"
+      - "e2e/**"
       - "helm/**"
+      - "operations/**"
       - "terraform/**"
       - "Dockerfile"
       - ".github/workflows/**"
-      - "README.md"
   push:
     branches:
       - main
     paths:
+      - ".dockerignore"
       - "platform/**"
+      - "e2e/**"
       - "helm/**"
+      - "operations/**"
       - "terraform/**"
       - "Dockerfile"
       - ".github/workflows/**"
-      - "README.md"
   workflow_dispatch:
 
 permissions:
   contents: read
 
 env:
+  BINARYEN_SHA256_X86_64_LINUX: 50b9fa62b9abea752da92ec57e0c555fee578760cd237c40107957715d2976ba
+  BINARYEN_VERSION: 129
   CARGO_TERM_COLOR: always
 
 jobs:
@@ -61,9 +67,10 @@ jobs:
 
       - name: Install binaryen
         run: |
-          curl -fsSL -o /tmp/binaryen.tar.gz https://github.com/WebAssembly/binaryen/releases/download/version_128/binaryen-version_128-x86_64-linux.tar.gz
+          curl -fsSL -o /tmp/binaryen.tar.gz "https://github.com/WebAssembly/binaryen/releases/download/version_${BINARYEN_VERSION}/binaryen-version_${BINARYEN_VERSION}-x86_64-linux.tar.gz"
+          echo "${BINARYEN_SHA256_X86_64_LINUX}  /tmp/binaryen.tar.gz" | sha256sum -c -
           tar -xzf /tmp/binaryen.tar.gz -C /tmp
-          echo "/tmp/binaryen-version_128/bin" >> "$GITHUB_PATH"
+          echo "/tmp/binaryen-version_${BINARYEN_VERSION}/bin" >> "$GITHUB_PATH"
 
       - name: Build web bundle
         run: cargo run --locked -p xtask -- build-web --out-dir /tmp/app-web-dist
@@ -113,9 +120,10 @@ jobs:
 
       - name: Install binaryen
         run: |
-          curl -fsSL -o /tmp/binaryen.tar.gz https://github.com/WebAssembly/binaryen/releases/download/version_128/binaryen-version_128-x86_64-linux.tar.gz
+          curl -fsSL -o /tmp/binaryen.tar.gz "https://github.com/WebAssembly/binaryen/releases/download/version_${BINARYEN_VERSION}/binaryen-version_${BINARYEN_VERSION}-x86_64-linux.tar.gz"
+          echo "${BINARYEN_SHA256_X86_64_LINUX}  /tmp/binaryen.tar.gz" | sha256sum -c -
           tar -xzf /tmp/binaryen.tar.gz -C /tmp
-          echo "/tmp/binaryen-version_128/bin" >> "$GITHUB_PATH"
+          echo "/tmp/binaryen-version_${BINARYEN_VERSION}/bin" >> "$GITHUB_PATH"
 
       - name: Build app-web bundle
         run: cargo run --locked -p xtask -- build-web --out-dir app-web/dist
@@ -200,6 +208,9 @@ jobs:
         run: terraform init -backend=false && terraform validate
         working-directory: terraform/environments/production/platform
 
+      - name: Validate deployment automation script syntax
+        run: bash -n operations/terraform-apply.sh
+
   docker:
     name: Docker image build
     runs-on: ubuntu-latest
@@ -210,4 +221,4 @@ jobs:
       - name: Build production image
         env:
           DOCKER_BUILDKIT: "1"
-        run: docker build --tag dragon-shift:ci .
+        run: docker build --platform linux/amd64 --tag dragon-shift:ci .
