@@ -18,7 +18,21 @@
 - `image.tag` - mutable image reference when explicitly requested
 - `app.allowedOrigins` - runtime origin allowlist
 - `app.viteAppUrl` - runtime frontend URL
+- `app.googleCloudProject` - optional runtime GCP project id for server-side model access
+- `app.googleCloudLocation` - optional runtime GCP region/location for server-side model access
+- `app.judgeProviders` - ordered provider pool for the judge LLM; each entry has `type` (`vertex_ai` or `api_key`), `model`, and optional `apiKeySecretName`/`apiKeySecretKey`
+- `app.imageProviders` - ordered provider pool for image generation; same entry schema as `judgeProviders`
+- `app.extraEnv` - extra container env entries
+- `serviceAccount.create` - create a Kubernetes service account for the app pod
+- `serviceAccount.automountServiceAccountToken` - enable projected service account tokens for Workload Identity / in-cluster auth
+- `serviceAccount.annotations` - Kubernetes service account annotations such as `iam.gke.io/gcp-service-account`
 - `database.url` - inline database URL
 - `database.existingSecretName` - Kubernetes secret name for `DATABASE_URL`
 - `database.existingSecretKey` - Kubernetes secret key name
-- `database.existingSecretFile` - mounted secret file path
+
+## Notes
+- LLM provider pools are configured as ordered arrays. Failover happens left-to-right on 429 or provider failure.
+- `vertex_ai` providers use Application Default Credentials (GCE metadata server) and need no API key.
+- `api_key` providers read their key from a Kubernetes Secret referenced in the provider entry.
+- GKE Workload Identity also requires the matching IAM binding (`roles/iam.workloadIdentityUser`) from the Kubernetes service account to the target Google service account.
+- Browser local/dev API routing can be overridden without rebuilding by using the Advanced panel or `?apiBaseUrl=https://...` in the page URL.

@@ -3,8 +3,7 @@
 ## Application Environment
 - `APP_SERVER_BIND_ADDR` - Axum bind address
 - `VITE_APP_URL` - public app URL used for same-origin bootstrap
-- `DATABASE_URL` - Postgres connection string; required unless `DATABASE_URL_FILE` is set
-- `DATABASE_URL_FILE` - path to a file containing the database URL
+- `DATABASE_URL` - Postgres connection string; required in production
 - `ALLOWED_ORIGINS` - comma-separated origin allowlist
 - `RUST_SESSION_CODE_PREFIX` - optional single-digit workshop code prefix
 - `TRUST_X_FORWARDED_FOR` - trust forwarded client IPs only behind a trusted edge
@@ -14,7 +13,10 @@
 - `WEBSOCKET_RATE_LIMIT_MAX` - websocket upgrade and message rate limit
 - `RECONNECT_TOKEN_TTL_SECONDS` - reconnect token inactivity TTL
 - `DATABASE_POOL_SIZE` - Postgres connection pool size
-- `VITE_GEMINI_API_KEY` - browser-side Gemini key for sprite generation
+- `LLM_JUDGE_PROVIDERS` - JSON array of judge provider pool entries
+- `LLM_IMAGE_PROVIDERS` - JSON array of image provider pool entries
+- `LLM_JUDGE_API_KEY_0`, `LLM_JUDGE_API_KEY_1`, … - API keys for judge providers (positional, injected from Kubernetes Secrets)
+- `LLM_IMAGE_API_KEY_0`, `LLM_IMAGE_API_KEY_1`, … - API keys for image providers (positional, injected from Kubernetes Secrets)
 
 ## Helm Values
 - `image.repository` - image repository
@@ -22,12 +24,23 @@
 - `image.digest` - immutable image digest
 - `app.allowedOrigins` - runtime origin allowlist
 - `app.viteAppUrl` - runtime base URL
+- `app.googleCloudProject` - optional GCP project for server-side Google API calls
+- `app.googleCloudLocation` - optional GCP region/location for model routing
+- `app.judgeProviders` - ordered provider pool for the judge LLM; each entry has `type` (`vertex_ai` or `api_key`), `model`, and optional `apiKeySecretName`/`apiKeySecretKey`
+- `app.imageProviders` - ordered provider pool for image generation; same entry schema as `judgeProviders`
+- `app.extraEnv` - additional runtime env entries appended to the container
+- `serviceAccount.create` - create a dedicated Kubernetes service account for the app pod
+- `serviceAccount.automountServiceAccountToken` - enable projected tokens for Workload Identity / in-cluster auth
+- `serviceAccount.annotations` - Kubernetes service account annotations including `iam.gke.io/gcp-service-account`
 - `database.url` - inline database URL
 - `database.existingSecretName` - Kubernetes secret name for `DATABASE_URL`
-- `database.existingSecretFile` - file path for mounted secret workflows
-- `secretManager.enabled` - enable Secret Manager CSI mount
-- `secretManager.secretProviderClassName` - CSI provider class name
-- `secretManager.mountPath` - secret mount path
+
+## Notes
+- LLM provider pools are configured as ordered arrays in Helm values (`judgeProviders` / `imageProviders`). Failover happens left-to-right on 429 or provider failure.
+- `vertex_ai` providers use Application Default Credentials (GCE metadata server) and require no API key secret.
+- `api_key` providers read their key from a Kubernetes Secret referenced by `apiKeySecretName` / `apiKeySecretKey` in the provider entry.
+- GKE Workload Identity additionally requires the corresponding Google IAM binding for the Kubernetes service account principal.
+- Browser local/dev API routing can be overridden without code changes by setting the saved Advanced panel address or passing `?apiBaseUrl=https://...` in the page URL.
 - `postgresql.enabled` - bundled Postgres toggle
 
 ## Terraform Foundation

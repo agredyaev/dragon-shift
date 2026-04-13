@@ -30,7 +30,6 @@
 - `README.md` - project overview and canonical usage
 - `docs/AUTOMATED_TERRAFORM_DEPLOY.md` - GitHub OIDC bootstrap and automatic Terraform deploy inputs
 - `docs/VARIABLE_CATALOG.md` - runtime, Helm, and Terraform input catalog
-- `.env.example` - local environment variable reference
 - `docs/CLOUD_OPERABILITY.md` - operator-owned cloud boundaries
 - `platform/ARCHITECTURE.md` - runtime architecture notes
 - `platform/rust-toolchain.toml` - pinned Rust toolchain and wasm target
