@@ -75,6 +75,11 @@ pub struct OperationState {
     pub pending_command: Option<SessionCommand>,
     pub pending_judge_bundle: bool,
     pub notice: Option<ShellNotice>,
+    /// Notice to show on the first realtime attach instead of the default
+    /// "Session synced." message.  Set by `apply_join_success` for
+    /// flow-specific notices (e.g. "Reconnected to workshop.") that would
+    /// otherwise be overwritten by the realtime bootstrap sequence.
+    pub pending_realtime_notice: Option<ShellNotice>,
 }
 
 // ---------------------------------------------------------------------------
@@ -154,6 +159,7 @@ pub fn default_operation_state() -> OperationState {
         pending_command: None,
         pending_judge_bundle: false,
         notice: None,
+        pending_realtime_notice: None,
     }
 }
 
@@ -448,6 +454,10 @@ pub fn apply_join_success(
     ops.pending_flow = None;
     ops.pending_judge_bundle = false;
     ops.notice = Some(success_notice(success_message));
+    ops.pending_realtime_notice = match flow {
+        PendingFlow::Reconnect => Some(success_notice(success_message)),
+        _ => None,
+    };
 }
 
 pub fn apply_request_error(identity: &mut IdentityState, ops: &mut OperationState, error: String) {
@@ -545,7 +555,11 @@ pub fn apply_server_ws_message(
                 ops.pending_judge_bundle = false;
             }
             if first_attach {
-                ops.notice = Some(info_notice("Session synced."));
+                ops.notice = Some(
+                    ops.pending_realtime_notice
+                        .take()
+                        .unwrap_or_else(|| info_notice("Session synced.")),
+                );
             }
         }
         ServerWsMessage::Notice(ProtocolSessionNotice {
@@ -867,6 +881,66 @@ mod tests {
         assert_eq!(
             ops.notice.as_ref().map(|n| n.message.as_str()),
             Some("Session synced.")
+        );
+    }
+
+    #[test]
+    fn server_ws_first_attach_after_reconnect_preserves_reconnect_notice() {
+        let mut identity = default_identity_state();
+        let mut game_state = None;
+        let mut ops = default_operation_state();
+        let mut join_session_code = String::new();
+        let mut reconnect_session_code = String::new();
+        let mut reconnect_token = String::new();
+        let mut judge_bundle = None;
+
+        apply_join_success(
+            &mut identity,
+            &mut game_state,
+            &mut ops,
+            &mut join_session_code,
+            &mut reconnect_session_code,
+            &mut reconnect_token,
+            &mut judge_bundle,
+            mock_join_success(),
+            PendingFlow::Reconnect,
+        );
+
+        assert_eq!(
+            ops.notice.as_ref().map(|n| n.message.as_str()),
+            Some("Reconnected to workshop.")
+        );
+        assert!(
+            ops.pending_realtime_notice.is_some(),
+            "reconnect flow must queue a pending realtime notice"
+        );
+
+        // Simulate realtime bootstrap overwriting the notice.
+        apply_realtime_connecting(&mut identity, &mut ops);
+        assert_eq!(identity.connection_status, ConnectionStatus::Connecting);
+
+        // First WS attach should use the pending reconnect notice, not
+        // the default "Session synced." message.
+        apply_server_ws_message(
+            &mut identity,
+            &mut game_state,
+            &mut ops,
+            &mut judge_bundle,
+            ServerWsMessage::StateUpdate(mock_join_success().state),
+        );
+
+        assert_eq!(identity.connection_status, ConnectionStatus::Connected);
+        assert_eq!(
+            ops.notice.as_ref().map(|n| n.message.as_str()),
+            Some("Reconnected to workshop.")
+        );
+        assert_eq!(
+            ops.notice.as_ref().map(|n| n.tone),
+            Some(NoticeTone::Success)
+        );
+        assert!(
+            ops.pending_realtime_notice.is_none(),
+            "pending realtime notice must be consumed after first attach"
         );
     }
 
