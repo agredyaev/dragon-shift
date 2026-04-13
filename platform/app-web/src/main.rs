@@ -22,7 +22,6 @@ use state::{ShellScreen, apply_realtime_bootstrap_error, bootstrap_state};
 
 #[cfg(target_arch = "wasm32")]
 fn main() {
-    #[cfg(debug_assertions)]
     console_error_panic_hook::set_once();
     dioxus_web::launch::launch_cfg(App, dioxus_web::Config::default());
 }

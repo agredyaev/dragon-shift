@@ -8,7 +8,7 @@ use wasm_bindgen::JsCast;
 
 use crate::helpers::*;
 use crate::realtime::bootstrap_realtime;
-use crate::state::{IdentityState, OperationState, apply_realtime_bootstrap_error};
+use crate::state::{apply_realtime_bootstrap_error, IdentityState, OperationState};
 
 use super::end_view::EndView;
 use super::handover_view::HandoverView;
@@ -29,18 +29,29 @@ pub fn SessionPanel(
 
     #[cfg(target_arch = "wasm32")]
     {
-        use_effect(move || {
-            let mut now_tick = now_tick;
-            if let Some(window) = web_sys::window() {
+        let interval_id = use_hook(|| {
+            let mut tick = now_tick;
+            web_sys::window().and_then(|window| {
                 let callback = wasm_bindgen::closure::Closure::wrap(Box::new(move || {
-                    now_tick.set(current_time_seconds());
+                    tick.set(current_time_seconds());
                 })
                     as Box<dyn FnMut()>);
-                let _ = window.set_interval_with_callback_and_timeout_and_arguments_0(
-                    callback.as_ref().unchecked_ref(),
-                    1000,
-                );
+                let id = window
+                    .set_interval_with_callback_and_timeout_and_arguments_0(
+                        callback.as_ref().unchecked_ref(),
+                        1000,
+                    )
+                    .ok();
                 callback.forget();
+                id
+            })
+        });
+
+        use_drop(move || {
+            if let Some(id) = interval_id {
+                if let Some(window) = web_sys::window() {
+                    window.clear_interval_with_handle(id);
+                }
             }
         });
     }
