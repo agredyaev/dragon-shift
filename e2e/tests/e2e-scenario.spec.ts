@@ -1,5 +1,6 @@
 import { expect, test, type Browser, type BrowserContext, type Page } from '@playwright/test'
 import * as path from 'node:path'
+import { fileURLToPath } from 'node:url'
 
 import { getProjectContextOptions } from '../project-profiles'
 import { ScenarioLogger, type Role, type Kind, type EntryStatus } from './e2e-scenario-logger'
@@ -7,6 +8,9 @@ import { ScenarioLogger, type Role, type Kind, type EntryStatus } from './e2e-sc
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
+
+const __filename = fileURLToPath(import.meta.url)
+const __dirname = path.dirname(__filename)
 
 const BASE_URL = process.env.E2E_BASE_URL ?? 'https://dragon-shift.34.54.200.112.nip.io'
 const BUILD_ID = process.env.E2E_BUILD_ID ?? 'ca0870d'
