@@ -9,6 +9,7 @@
     "test:mobile": "playwright test --project=mobile-safari",
     "test:restart-local": "playwright test --config=playwright.local-restart.config.ts",
     "test:deployed": "bash ./run-deployed.sh",
+    "test:scenario": "playwright test --config=e2e-scenario.config.ts",
     "install:browsers": "playwright install --with-deps chromium webkit"
   },
   "devDependencies": {
