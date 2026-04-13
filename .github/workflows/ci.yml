@@ -166,9 +166,8 @@ jobs:
           --set app.allowedOrigins=https://dragon-shift.example.com
           --set app.viteAppUrl=https://dragon-shift.example.com
           --set postgresql.enabled=false
-          --set database.existingSecretFile=/var/run/secrets/dragon-shift/DATABASE_URL
-          --set secretManager.enabled=true
-          --set secretManager.secretProviderClassName=dragon-shift-database-url
+          --set database.existingSecretName=dragon-shift-app
+          --set database.existingSecretKey=DATABASE_URL
 
       - name: Helm template
         run: >-
@@ -178,9 +177,8 @@ jobs:
           --set app.allowedOrigins=https://dragon-shift.example.com
           --set app.viteAppUrl=https://dragon-shift.example.com
           --set postgresql.enabled=false
-          --set database.existingSecretFile=/var/run/secrets/dragon-shift/DATABASE_URL
-          --set secretManager.enabled=true
-          --set secretManager.secretProviderClassName=dragon-shift-database-url
+          --set database.existingSecretName=dragon-shift-app
+          --set database.existingSecretKey=DATABASE_URL
           > /tmp/dragon-shift-rendered.yaml
 
   terraform:
