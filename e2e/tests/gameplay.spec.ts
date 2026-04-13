@@ -36,10 +36,10 @@ test.describe('dragon shift deployed gameplay', () => {
       await host.page.getByTestId('reveal-results-button').click()
       await waitForNotice(host.page, 'Voting results revealed.')
       await expect(host.page.getByTestId('session-panel')).toContainText('Workshop results')
-      await expect(host.page.getByTestId('session-panel')).toContainText('Creative pet awards')
-      await expect(host.page.getByTestId('session-panel')).toContainText('Final player standings')
+      await expect(host.page.getByTestId('session-panel')).toContainText('Creativity Leaderboard')
+      await expect(host.page.getByTestId('session-panel')).toContainText('Mechanics Leaderboard')
       await expect(guest.page.getByTestId('session-panel')).toContainText('Workshop results')
-      await expect(guest.page.getByTestId('session-panel')).toContainText('Creative pet awards')
+      await expect(guest.page.getByTestId('session-panel')).toContainText('Creativity Leaderboard')
 
       await expect(host.page.getByTestId('archive-panel')).toContainText('Build the workshop archive')
       await host.page.getByTestId('build-archive-button').click()
