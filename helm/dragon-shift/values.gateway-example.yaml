@@ -34,6 +34,15 @@ app:
   joinRateLimitMax: 180
   commandRateLimitMax: 180
   socketRateLimitMax: 500
+  googleCloudProject: my-gcp-project
+  googleCloudLocation: us-central1
+  judgeProviders:
+    - type: vertex_ai
+      model: gemini-2.5-flash
+  imageProviders:
+    - type: vertex_ai
+      model: imagen-4.0-generate-001
+  extraEnv: []
 
 database:
   url: ""
@@ -46,3 +55,10 @@ postgresql:
 replicaCount: 1
 # Keep production at a single app replica; horizontal scaling/autoscaling are
 # unsupported until the runtime gains distributed coordination.
+
+serviceAccount:
+  create: true
+  name: dragon-shift
+  automountServiceAccountToken: true
+  annotations:
+    iam.gke.io/gcp-service-account: dragon-shift@my-gcp-project.iam.gserviceaccount.com

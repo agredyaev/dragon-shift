@@ -43,18 +43,27 @@ app:
   joinRateLimitMax: 40
   commandRateLimitMax: 120
   socketRateLimitMax: 300
+  googleCloudProject: ""
+  googleCloudLocation: ""
+  # Provider pool arrays — ordered by preference; failover happens left-to-right.
+  # Each entry: type (vertex_ai | api_key), model, and optionally
+  # apiKeySecretName / apiKeySecretKey for api_key providers.
+  judgeProviders: []
+  # - type: vertex_ai
+  #   model: gemini-2.5-flash
+  # - type: api_key
+  #   model: gemini-2.5-flash
+  #   apiKeySecretName: dragon-shift-llm
+  #   apiKeySecretKey: LLM_JUDGE_API_KEY_0
+  imageProviders: []
+  # - type: vertex_ai
+  #   model: imagen-4.0-generate-001
+  extraEnv: []
 
 database:
   url: ""
   existingSecretName: ""
   existingSecretKey: DATABASE_URL
-  existingSecretFile: ""
-
-secretManager:
-  enabled: false
-  secretProviderClassName: ""
-  mountPath: /var/run/secrets/dragon-shift
-  fileName: DATABASE_URL
 
 postgresql:
   # Bundled Postgres is the local/dev default. For cloud production, prefer an

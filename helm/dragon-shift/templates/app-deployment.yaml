@@ -85,6 +85,40 @@ spec:
               value: {{ .Values.app.socketRateLimitMax | quote }}
             - name: DATABASE_POOL_SIZE
               value: {{ .Values.app.databasePoolSize | quote }}
+            {{- with .Values.app.googleCloudProject }}
+            - name: GOOGLE_CLOUD_PROJECT
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.app.googleCloudLocation }}
+            - name: GOOGLE_CLOUD_LOCATION
+              value: {{ . | quote }}
+            {{- end }}
+            {{- if .Values.app.judgeProviders }}
+            - name: LLM_JUDGE_PROVIDERS
+              value: {{ include "dragon-shift.llmProviderEntries" (dict "providers" .Values.app.judgeProviders "role" "JUDGE") | quote }}
+            {{- range $i, $p := .Values.app.judgeProviders }}
+            {{- if and (eq $p.type "api_key") $p.apiKeySecretName }}
+            - name: LLM_JUDGE_API_KEY_{{ $i }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $p.apiKeySecretName | quote }}
+                  key: {{ $p.apiKeySecretKey | default (printf "LLM_JUDGE_API_KEY_%d" $i) | quote }}
+            {{- end }}
+            {{- end }}
+            {{- end }}
+            {{- if .Values.app.imageProviders }}
+            - name: LLM_IMAGE_PROVIDERS
+              value: {{ include "dragon-shift.llmProviderEntries" (dict "providers" .Values.app.imageProviders "role" "IMAGE") | quote }}
+            {{- range $i, $p := .Values.app.imageProviders }}
+            {{- if and (eq $p.type "api_key") $p.apiKeySecretName }}
+            - name: LLM_IMAGE_API_KEY_{{ $i }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $p.apiKeySecretName | quote }}
+                  key: {{ $p.apiKeySecretKey | default (printf "LLM_IMAGE_API_KEY_%d" $i) | quote }}
+            {{- end }}
+            {{- end }}
+            {{- end }}
             {{- if .Values.database.url }}
             - name: DATABASE_URL
               value: {{ .Values.database.url | quote }}
@@ -94,12 +128,12 @@ spec:
                 secretKeyRef:
                    name: {{ .Values.database.existingSecretName | quote }}
                    key: {{ .Values.database.existingSecretKey | quote }}
-            {{- else if .Values.database.existingSecretFile }}
-            - name: DATABASE_URL_FILE
-              value: {{ .Values.database.existingSecretFile | quote }}
             {{- else if .Values.postgresql.enabled }}
             - name: DATABASE_URL
               value: {{ include "dragon-shift.databaseUrl" . | quote }}
+            {{- end }}
+            {{- with .Values.app.extraEnv }}
+{{ toYaml . | nindent 12 }}
             {{- end }}
           {{- if .Values.startupProbe.enabled }}
           startupProbe:
@@ -124,24 +158,11 @@ spec:
           volumeMounts:
             - name: tmp
               mountPath: /tmp
-            {{- if .Values.secretManager.enabled }}
-            - name: secret-manager
-              mountPath: {{ .Values.secretManager.mountPath | quote }}
-              readOnly: true
-            {{- end }}
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
       volumes:
         - name: tmp
           emptyDir: {}
-        {{- if .Values.secretManager.enabled }}
-        - name: secret-manager
-          csi:
-            driver: secrets-store-gke.csi.k8s.io
-            readOnly: true
-            volumeAttributes:
-              secretProviderClass: {{ required "secretManager.secretProviderClassName is required when secretManager.enabled=true" .Values.secretManager.secretProviderClassName | quote }}
-        {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

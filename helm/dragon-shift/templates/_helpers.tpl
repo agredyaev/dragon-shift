@@ -69,3 +69,22 @@ app.kubernetes.io/component: app-server
 {{- define "dragon-shift.databaseUrl" -}}
 {{- printf "postgres://%s:%s@%s:%v/%s" (.Values.postgresql.auth.username | urlquery) (.Values.postgresql.auth.password | urlquery) (include "dragon-shift.postgresql.fullname" .) (.Values.postgresql.primary.service.ports.postgresql | int) .Values.postgresql.auth.database -}}
 {{- end -}}
+
+{{/*
+Serialize a provider list to JSON suitable for LLM_JUDGE_PROVIDERS / LLM_IMAGE_PROVIDERS.
+Arguments: dict "providers" <list> "role" <"JUDGE"|"IMAGE">
+Each provider entry gets an apiKeyEnvVar computed from its index.
+*/}}
+{{- define "dragon-shift.llmProviderEntries" -}}
+{{- $role := .role -}}
+{{- $result := list -}}
+{{- range $i, $p := .providers -}}
+  {{- $entry := dict "type" $p.type "model" $p.model -}}
+  {{- if and (eq $p.type "api_key") $p.apiKeySecretName -}}
+    {{- $envVar := printf "LLM_%s_API_KEY_%d" $role $i -}}
+    {{- $entry = merge $entry (dict "apiKeyEnvVar" $envVar) -}}
+  {{- end -}}
+  {{- $result = append $result $entry -}}
+{{- end -}}
+{{- toJson $result -}}
+{{- end -}}
