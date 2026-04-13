@@ -767,12 +767,43 @@ fn build_judge_prompt(bundle: &JudgeBundle) -> String {
     let bundle_json = serde_json::to_string_pretty(bundle).unwrap_or_default();
 
     format!(
-        r#"You are the judge for a Dragon Care Workshop. Evaluate each dragon based on the care data below.
+        r#"You are the judge for a Dragon Care Workshop — a game where players create dragons with hidden preferences, observe them, and hand them over to a second caretaker.
 
-For each dragon, assess:
-1. Care quality (0-100): How well was the dragon cared for? Consider hunger, energy, happiness stats and the action history.
-2. Creativity (0-100): How creative were the handover tags and observations?
-3. Provide brief feedback (1-2 sentences) for each dragon.
+Each dragon has SECRET preferences that the Phase 1 player must discover through experimentation:
+- `actualActiveTime`: "day" or "night" — when the dragon is most active.
+- `actualDayFood` / `actualNightFood`: preferred food during day vs night ("meat", "fruit", or "fish").
+- `actualDayPlay` / `actualNightPlay`: preferred play activity during day vs night ("fetch", "puzzle", or "music").
+- `actualSleepRate`: how fast the dragon gets tired (1-3).
+
+## Scoring criteria
+
+For each dragon, produce TWO scores:
+
+### observationScore (0-100) — Phase 1 quality
+Awarded to the CREATOR (Phase 1 sitter). Evaluate:
+1. Did their `discoveryObservations` accurately identify the dragon's real preferences?
+2. Did their `handoverTags` contain useful, specific care instructions for the next sitter?
+3. Reward thoroughness: identifying active time, correct food for each period, correct play for each period.
+4. Penalize vague, incorrect, or missing observations.
+
+### careScore (0-100) — Phase 2 quality
+Awarded to the CURRENT OWNER (Phase 2 sitter). Evaluate:
+1. Did their `phase2Actions` follow the `handoverTags` instructions from the Phase 1 player?
+2. Did they feed the correct food, play the correct game, sleep at the right time?
+3. Consider the `finalStats` — are hunger, energy, happiness in good shape?
+4. If handover instructions were poor, give partial credit for reasonable independent care.
+5. Use the summary stats to assess care quality:
+   - `totalActions` vs `correctActions` — what percentage of actions were correct?
+   - `wrongFoodCount` / `wrongPlayCount` — how many wrong choices were made?
+   - `cooldownViolations` — did the player spam actions recklessly?
+   - `penaltyStacksAtEnd` — were there accumulated penalties at game end?
+   - `phase2LowestHappiness` — did happiness drop critically at any point?
+   - Each action trace has `wasCorrect` (bool) and `blockReason` if blocked.
+6. Penalize heavily for high cooldown violations (spam) and many wrong actions.
+7. Reward players who achieved high correct-action ratios with few mistakes.
+
+### creativityScore (0-100) — quality of descriptions
+How creative and entertaining were the observations and handover tags?
 
 Also write a 1-2 sentence overall summary of the workshop session.
 
@@ -783,6 +814,7 @@ Return ONLY valid JSON in this exact format:
     {{
       "dragonId": "dragon_id_here",
       "dragonName": "name_here",
+      "observationScore": 75,
       "careScore": 85,
       "creativityScore": 70,
       "feedback": "Brief feedback here."
@@ -811,6 +843,7 @@ struct RawJudgeResponse {
 struct RawDragonEvaluation {
     dragon_id: String,
     dragon_name: String,
+    observation_score: i32,
     care_score: i32,
     creativity_score: i32,
     feedback: String,
@@ -839,6 +872,7 @@ fn parse_judge_response(text: &str) -> Result<LlmJudgeEvaluation, String> {
             .map(|d| LlmDragonEvaluation {
                 dragon_id: d.dragon_id,
                 dragon_name: d.dragon_name,
+                observation_score: d.observation_score.clamp(0, 100),
                 care_score: d.care_score.clamp(0, 100),
                 creativity_score: d.creativity_score.clamp(0, 100),
                 feedback: d.feedback,
@@ -862,6 +896,7 @@ mod tests {
             "dragonEvaluations": [{
                 "dragonId": "dragon_1",
                 "dragonName": "Sparky",
+                "observationScore": 60,
                 "careScore": 85,
                 "creativityScore": 70,
                 "feedback": "Well cared for."
@@ -871,6 +906,7 @@ mod tests {
         let eval = parse_judge_response(json).expect("parse");
         assert_eq!(eval.summary, "Good session.");
         assert_eq!(eval.dragon_evaluations.len(), 1);
+        assert_eq!(eval.dragon_evaluations[0].observation_score, 60);
         assert_eq!(eval.dragon_evaluations[0].care_score, 85);
     }
 
@@ -894,6 +930,7 @@ mod tests {
             "dragonEvaluations": [{
                 "dragonId": "d1",
                 "dragonName": "X",
+                "observationScore": 200,
                 "careScore": 150,
                 "creativityScore": -10,
                 "feedback": "ok"
@@ -901,6 +938,7 @@ mod tests {
         }"#;
 
         let eval = parse_judge_response(json).expect("parse");
+        assert_eq!(eval.dragon_evaluations[0].observation_score, 100);
         assert_eq!(eval.dragon_evaluations[0].care_score, 100);
         assert_eq!(eval.dragon_evaluations[0].creativity_score, 0);
     }

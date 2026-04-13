@@ -652,27 +652,45 @@ pub(crate) async fn workshop_command(
                     "actionType": action_type,
                     "actionValue": action_value,
                 });
+                // Persist achievement before borrowing dragon immutably
+                if let domain::ActionOutcome::Applied {
+                    awarded_achievement: Some(achievement),
+                    ..
+                } = &outcome
+                {
+                    if let Some(player) = session.players.get_mut(&identity.player_id) {
+                        player.achievements.push(achievement.to_string());
+                    }
+                }
                 if let Some(dragon) = session.dragons.get(&dragon_id)
                     && let Some(payload_map) = artifact_payload.as_object_mut()
                 {
-                    match outcome {
-                        domain::ActionOutcome::Applied { .. } => {
+                    match &outcome {
+                        domain::ActionOutcome::Applied { was_correct, .. } => {
                             payload_map.insert("hunger".to_string(), json!(dragon.hunger));
                             payload_map.insert("energy".to_string(), json!(dragon.energy));
                             payload_map.insert("happiness".to_string(), json!(dragon.happiness));
+                            payload_map.insert("wasCorrect".to_string(), json!(was_correct));
                         }
                         domain::ActionOutcome::Blocked { reason } => {
+                            let reason_str = match reason {
+                                domain::ActionBlockReason::AlreadyFull => "already_full",
+                                domain::ActionBlockReason::TooHungryToPlay =>
+                                    "too_hungry_to_play",
+                                domain::ActionBlockReason::TooTiredToPlay =>
+                                    "too_tired_to_play",
+                                domain::ActionBlockReason::TooAwakeToSleep =>
+                                    "too_awake_to_sleep",
+                            };
                             payload_map.insert(
                                 "blockedReason".to_string(),
-                                json!(match reason {
-                                    domain::ActionBlockReason::AlreadyFull => "already_full",
-                                    domain::ActionBlockReason::TooHungryToPlay =>
-                                        "too_hungry_to_play",
-                                    domain::ActionBlockReason::TooTiredToPlay =>
-                                        "too_tired_to_play",
-                                    domain::ActionBlockReason::TooAwakeToSleep =>
-                                        "too_awake_to_sleep",
-                                }),
+                                json!(reason_str),
+                            );
+                        }
+                        domain::ActionOutcome::CooldownViolation => {
+                            payload_map.insert(
+                                "blockedReason".to_string(),
+                                json!("cooldown_violation"),
                             );
                         }
                     }
@@ -798,6 +816,8 @@ pub(crate) async fn workshop_command(
                 if session.phase != protocol::Phase::Phase2 {
                     return bad_command_request("Voting can only begin from Phase 2.");
                 }
+                // Award phase-end achievements before transitioning
+                session.award_phase_end_achievements();
                 let immediate_finalize = match session.enter_voting() {
                     Ok(immediate_finalize) => immediate_finalize,
                     Err(error) => return bad_command_request(&error.to_string()),
@@ -1382,6 +1402,27 @@ pub(crate) async fn llm_judge(
             return internal_llm_judge_error(format!("LLM judge failed: {error}"));
         }
     };
+
+    // Apply judge scores back to the session and persist + broadcast
+    {
+        let score_tuples: Vec<(String, i32, i32)> = evaluation
+            .dragon_evaluations
+            .iter()
+            .map(|d| (d.dragon_id.clone(), d.observation_score, d.care_score))
+            .collect();
+
+        let mut sessions = state.sessions.lock().await;
+        if let Some(session) = sessions.get_mut(session_code) {
+            session.apply_judge_scores(&score_tuples);
+            let session_snapshot = session.clone();
+            drop(sessions);
+
+            if let Err(error) = state.store.save_session(&session_snapshot).await {
+                tracing::warn!(%error, "failed to persist judge scores (non-fatal)");
+            }
+            broadcast_session_state(&state, session_code, None).await;
+        }
+    }
 
     if let Err(error) = state
         .store

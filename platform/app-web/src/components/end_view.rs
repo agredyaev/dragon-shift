@@ -24,7 +24,7 @@ pub fn EndView(game_state: Signal<Option<ClientGameState>>) -> Element {
             span { class: "roster__status roster__status--phase status-connected", "Final" }
         }
         if !vote_rows.is_empty() {
-            p { class: "meta", "Creative pet awards" }
+            p { class: "meta", "Creativity Leaderboard" }
             div { class: "roster",
                 for row in vote_rows {
                     article { class: "roster__item",
@@ -38,7 +38,7 @@ pub fn EndView(game_state: Signal<Option<ClientGameState>>) -> Element {
             }
         }
         if !score_rows.is_empty() {
-            p { class: "meta", "Final player standings" }
+            p { class: "meta", "Mechanics Leaderboard" }
             div { class: "roster",
                 for row in score_rows {
                     article { class: "roster__item",

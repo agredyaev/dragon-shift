@@ -8723,11 +8723,11 @@ fn to_client_game_state_includes_dragons_and_voting_details() {
     assert_eq!(alice_current_dragon.handover_tags.len(), 3);
     assert_eq!(
         alice_current_dragon.last_action,
-        protocol::DragonAction::Idle
+        protocol::DragonAction::Sleep
     );
     assert_eq!(
         alice_current_dragon.last_emotion,
-        protocol::DragonEmotion::Angry
+        protocol::DragonEmotion::Sleepy
     );
     let original_dragon = client_state
         .dragons

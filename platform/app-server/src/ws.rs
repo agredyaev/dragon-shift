@@ -928,3 +928,37 @@ async fn send_ws_message(
         .await
         .map_err(|_| ())
 }
+
+pub(crate) async fn advance_game_ticks(state: &AppState) {
+    let session_codes: Vec<String> = {
+        let sessions = state.sessions.lock().await;
+        sessions
+            .iter()
+            .filter(|(_, session)| {
+                session.phase == protocol::Phase::Phase1
+                    || session.phase == protocol::Phase::Phase2
+            })
+            .map(|(code, _)| code.clone())
+            .collect()
+    };
+
+    for session_code in session_codes {
+        {
+            let mut sessions = state.sessions.lock().await;
+            if let Some(session) = sessions.get_mut(&session_code) {
+                session.advance_tick();
+            }
+        }
+
+        // Persist asynchronously (best-effort; don't block the ticker)
+        {
+            let sessions = state.sessions.lock().await;
+            if let Some(session) = sessions.get(&session_code) {
+                let _ = state.store.save_session(session).await;
+            }
+        }
+
+        // Broadcast updated state to all connected players
+        broadcast_session_state(state, &session_code, None).await;
+    }
+}

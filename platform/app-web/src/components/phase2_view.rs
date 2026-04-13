@@ -24,6 +24,9 @@ pub fn Phase2View(game_state: Signal<Option<ClientGameState>>) -> Element {
             span { class: "roster__status roster__status--phase status-connected", "Care" }
         }
         p { class: "panel__body", {care} }
-        p { class: "meta", "Handover notes from previous caretaker: " {handover} }
+        div { class: "panel__body",
+            p { class: "meta", "Handover notes from previous caretaker:" }
+            p { {handover} }
+        }
     }
 }

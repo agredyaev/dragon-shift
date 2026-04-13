@@ -2,6 +2,7 @@ use chrono::{DateTime, Utc};
 use protocol::{
     ActiveTime, DragonAction, DragonEmotion, FoodType, Phase, PlayType, WorkshopCreateConfig,
 };
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use thiserror::Error;
@@ -56,6 +57,23 @@ pub struct SessionDragon {
     pub high_happiness_ticks: i32,
     pub phase2_ticks: i32,
     pub phase2_lowest_happiness: i32,
+    /// Counters for wrong/correct actions and penalty tracking.
+    pub wrong_food_count: i32,
+    pub wrong_play_count: i32,
+    pub cooldown_violations: i32,
+    pub total_actions: i32,
+    pub correct_actions: i32,
+    /// Accumulated penalty stacks — each wrong action adds 1, decays by 1 every 6 ticks.
+    /// Increases happiness decay while > 0.
+    pub penalty_stacks: i32,
+    pub penalty_decay_timer: i32,
+    /// Highest penalty_stacks ever reached (for chaos_gremlin achievement).
+    #[serde(default)]
+    pub peak_penalty_stacks: i32,
+    /// Whether the player has ever fed the correct food (for speed_learner achievement).
+    pub found_correct_food: bool,
+    /// Whether the player has ever played the correct game (for speed_learner achievement).
+    pub found_correct_play: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -69,10 +87,12 @@ pub enum PlayerAction {
 pub enum ActionOutcome {
     Applied {
         awarded_achievement: Option<&'static str>,
+        was_correct: bool,
     },
     Blocked {
         reason: ActionBlockReason,
     },
+    CooldownViolation,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -222,19 +242,19 @@ impl WorkshopSession {
                     assignment.dragon_id.clone(),
                     SessionDragon {
                         id: assignment.dragon_id.clone(),
-                        name: default_dragon_name(&player.name),
+                        name: random_dragon_name(),
                         original_owner_id: assignment.player_id.clone(),
                         current_owner_id: assignment.player_id.clone(),
                         creator_instructions,
-                        active_time: ActiveTime::Day,
-                        day_food: FoodType::Meat,
-                        night_food: FoodType::Fruit,
-                        day_play: PlayType::Fetch,
-                        night_play: PlayType::Music,
-                        sleep_rate: 1,
-                        hunger: 100,
-                        energy: 100,
-                        happiness: 100,
+                        active_time: random_active_time(),
+                        day_food: random_food_type(),
+                        night_food: random_food_type_excluding(None),
+                        day_play: random_play_type(),
+                        night_play: random_play_type_excluding(None),
+                        sleep_rate: rand::rng().random_range(1..=3),
+                        hunger: 50,
+                        energy: 50,
+                        happiness: 50,
                         discovery_observations: Vec::new(),
                         handover_tags: Vec::new(),
                         last_action: DragonAction::Idle,
@@ -248,6 +268,16 @@ impl WorkshopSession {
                         high_happiness_ticks: 0,
                         phase2_ticks: 0,
                         phase2_lowest_happiness: 100,
+                        wrong_food_count: 0,
+                        wrong_play_count: 0,
+                        cooldown_violations: 0,
+                        total_actions: 0,
+                        correct_actions: 0,
+                        penalty_stacks: 0,
+                        penalty_decay_timer: 0,
+                        peak_penalty_stacks: 0,
+                        found_correct_food: false,
+                        found_correct_play: false,
                     },
                 );
             }
@@ -330,15 +360,25 @@ impl WorkshopSession {
                     }
                     if let Some(dragon) = self.dragons.get_mut(dragon_id) {
                         dragon.current_owner_id = player_id.clone();
-                        dragon.hunger = 100;
-                        dragon.energy = 100;
-                        dragon.happiness = 100;
+                        dragon.hunger = 50;
+                        dragon.energy = 50;
+                        dragon.happiness = 50;
                         dragon.food_tries = 0;
                         dragon.play_tries = 0;
                         dragon.action_cooldown = 0;
                         dragon.sleep_shield_ticks = 0;
                         dragon.phase2_ticks = 0;
                         dragon.phase2_lowest_happiness = 100;
+                        dragon.wrong_food_count = 0;
+                        dragon.wrong_play_count = 0;
+                        dragon.cooldown_violations = 0;
+                        dragon.total_actions = 0;
+                        dragon.correct_actions = 0;
+                        dragon.penalty_stacks = 0;
+                        dragon.penalty_decay_timer = 0;
+                        dragon.peak_penalty_stacks = 0;
+                        dragon.found_correct_food = false;
+                        dragon.found_correct_play = false;
                         dragon.last_action = DragonAction::Idle;
                         dragon.last_emotion = DragonEmotion::Neutral;
                         dragon.speech = Some("Where am I? Who are you?".to_string());
@@ -353,15 +393,25 @@ impl WorkshopSession {
                 .and_then(|player| player.current_dragon_id.clone())
             && let Some(dragon) = self.dragons.get_mut(&dragon_id)
         {
-            dragon.hunger = 100;
-            dragon.energy = 100;
-            dragon.happiness = 100;
+            dragon.hunger = 50;
+            dragon.energy = 50;
+            dragon.happiness = 50;
             dragon.food_tries = 0;
             dragon.play_tries = 0;
             dragon.action_cooldown = 0;
             dragon.sleep_shield_ticks = 0;
             dragon.phase2_ticks = 0;
             dragon.phase2_lowest_happiness = 100;
+            dragon.wrong_food_count = 0;
+            dragon.wrong_play_count = 0;
+            dragon.cooldown_violations = 0;
+            dragon.total_actions = 0;
+            dragon.correct_actions = 0;
+            dragon.penalty_stacks = 0;
+            dragon.penalty_decay_timer = 0;
+            dragon.peak_penalty_stacks = 0;
+            dragon.found_correct_food = false;
+            dragon.found_correct_play = false;
             dragon.last_action = DragonAction::Idle;
             dragon.last_emotion = DragonEmotion::Neutral;
             dragon.speech = Some(
@@ -398,6 +448,12 @@ impl WorkshopSession {
             .get_mut(&dragon_id)
             .ok_or(DomainError::DragonNotAssigned)?;
 
+        if dragon.action_cooldown > 0 {
+            dragon.cooldown_violations += 1;
+            self.touch();
+            return Ok(ActionOutcome::CooldownViolation);
+        }
+
         let outcome = match action {
             PlayerAction::Feed(food) => {
                 if dragon.hunger >= 95 {
@@ -412,15 +468,27 @@ impl WorkshopSession {
                     dragon.action_cooldown = 3;
                     dragon.sleep_shield_ticks = 0;
                     dragon.food_tries += 1;
+                    dragon.total_actions += 1;
                     let favorite_food = if current_is_day {
                         dragon.day_food
                     } else {
                         dragon.night_food
                     };
                     let mut awarded = None;
+                    let was_correct;
                     if food == favorite_food {
+                        was_correct = true;
+                        dragon.correct_actions += 1;
+                        dragon.found_correct_food = true;
                         if dragon.food_tries == 1 {
                             awarded = Some("master_chef");
+                        }
+                        // speed_learner: found both correct food & play within 3 actions
+                        if awarded.is_none()
+                            && dragon.found_correct_play
+                            && dragon.total_actions <= 3
+                        {
+                            awarded = Some("speed_learner");
                         }
                         dragon.hunger = (dragon.hunger + 40).min(100);
                         dragon.happiness = (dragon.happiness + 15).min(100);
@@ -430,15 +498,26 @@ impl WorkshopSession {
                                 .to_lowercase()
                                 .replace("feed(", ""),
                         );
+                        // Correct action reduces penalty stacks
+                        dragon.penalty_stacks = (dragon.penalty_stacks - 1).max(0);
                     } else {
+                        was_correct = false;
+                        dragon.wrong_food_count += 1;
+                        // Escalating penalty: repeated wrong food hurts more
+                        let penalty = 20 + (dragon.wrong_food_count - 1).min(3) * 5;
                         dragon.hunger = (dragon.hunger + 5).min(100);
-                        dragon.happiness = (dragon.happiness - 20).max(0);
+                        dragon.happiness = (dragon.happiness - penalty).max(0);
                         dragon.last_emotion = DragonEmotion::Angry;
                         dragon.speech = Some("Eww... I don't want that right now.".to_string());
+                        dragon.penalty_stacks += 1;
+                        if dragon.penalty_stacks > dragon.peak_penalty_stacks {
+                            dragon.peak_penalty_stacks = dragon.penalty_stacks;
+                        }
                     }
                     dragon.speech_timer = 4;
                     ActionOutcome::Applied {
                         awarded_achievement: awarded,
+                        was_correct,
                     }
                 }
             }
@@ -462,29 +541,50 @@ impl WorkshopSession {
                     dragon.action_cooldown = 3;
                     dragon.sleep_shield_ticks = 0;
                     dragon.play_tries += 1;
+                    dragon.total_actions += 1;
                     let favorite_play = if current_is_day {
                         dragon.day_play
                     } else {
                         dragon.night_play
                     };
                     let mut awarded = None;
+                    let was_correct;
                     if play == favorite_play {
+                        was_correct = true;
+                        dragon.correct_actions += 1;
+                        dragon.found_correct_play = true;
                         if dragon.play_tries == 1 {
                             awarded = Some("playful_spirit");
+                        }
+                        // speed_learner: found both correct food & play within 3 actions
+                        if awarded.is_none()
+                            && dragon.found_correct_food
+                            && dragon.total_actions <= 3
+                        {
+                            awarded = Some("speed_learner");
                         }
                         dragon.energy = (dragon.energy - 20).max(0);
                         dragon.happiness = (dragon.happiness + 30).min(100);
                         dragon.last_emotion = DragonEmotion::Happy;
                         dragon.speech = Some("Yay! Favorite game!".to_string());
+                        dragon.penalty_stacks = (dragon.penalty_stacks - 1).max(0);
                     } else {
+                        was_correct = false;
+                        dragon.wrong_play_count += 1;
+                        let penalty = 20 + (dragon.wrong_play_count - 1).min(3) * 5;
                         dragon.energy = (dragon.energy - 15).max(0);
-                        dragon.happiness = (dragon.happiness - 20).max(0);
+                        dragon.happiness = (dragon.happiness - penalty).max(0);
                         dragon.last_emotion = DragonEmotion::Angry;
                         dragon.speech = Some("I don't want to play that...".to_string());
+                        dragon.penalty_stacks += 1;
+                        if dragon.penalty_stacks > dragon.peak_penalty_stacks {
+                            dragon.peak_penalty_stacks = dragon.penalty_stacks;
+                        }
                     }
                     dragon.speech_timer = 4;
                     ActionOutcome::Applied {
                         awarded_achievement: awarded,
+                        was_correct,
                     }
                 }
             }
@@ -499,12 +599,16 @@ impl WorkshopSession {
                 } else {
                     dragon.last_action = DragonAction::Sleep;
                     dragon.action_cooldown = 3;
+                    dragon.total_actions += 1;
                     dragon.energy = (dragon.energy + 50).min(100);
                     let is_correct_time = (dragon.active_time == ActiveTime::Day
                         && !current_is_day)
                         || (dragon.active_time == ActiveTime::Night && current_is_day);
+                    let was_correct = is_correct_time;
                     if is_correct_time {
+                        dragon.correct_actions += 1;
                         dragon.happiness = (dragon.happiness + 10).min(100);
+                        dragon.penalty_stacks = (dragon.penalty_stacks - 1).max(0);
                     }
                     dragon.sleep_shield_ticks = 1;
                     dragon.last_emotion = DragonEmotion::Sleepy;
@@ -512,6 +616,7 @@ impl WorkshopSession {
                     dragon.speech_timer = 5;
                     ActionOutcome::Applied {
                         awarded_achievement: None,
+                        was_correct,
                     }
                 }
             }
@@ -521,15 +626,18 @@ impl WorkshopSession {
         Ok(outcome)
     }
 
-    pub fn advance_tick(&mut self) {
+    /// Returns a list of (player_id, achievement_name) awarded during this tick.
+    pub fn advance_tick(&mut self) -> Vec<(String, &'static str)> {
         if self.phase != Phase::Phase1 && self.phase != Phase::Phase2 {
-            return;
+            return Vec::new();
         }
+
+        let mut awarded = Vec::new();
 
         self.time = (self.time + 1) % 24;
         let current_is_day = is_daytime(self.time);
         let previous_is_day = is_daytime((self.time + 23) % 24);
-        let decay_multiplier = if self.phase == Phase::Phase2 { 2 } else { 1 };
+        let decay_multiplier = if self.phase == Phase::Phase2 { 3 } else { 1 };
 
         for dragon in self.dragons.values_mut() {
             let Some(owner) = self.players.get(&dragon.current_owner_id) else {
@@ -538,6 +646,8 @@ impl WorkshopSession {
             if !owner.is_connected {
                 continue;
             }
+
+            let mut tick_achievements: Vec<&'static str> = Vec::new();
 
             let wrong_time = (dragon.active_time == ActiveTime::Day && !current_is_day)
                 || (dragon.active_time == ActiveTime::Night && current_is_day);
@@ -562,7 +672,25 @@ impl WorkshopSession {
             if wrong_time && dragon.sleep_shield_ticks == 0 {
                 happiness_decay += 1;
             }
+            // Penalty stacks add extra happiness decay
+            happiness_decay += dragon.penalty_stacks.min(4);
             dragon.happiness = (dragon.happiness - happiness_decay * decay_multiplier).max(0);
+
+            // "rock_bottom" — happiness reached 0 at any point
+            if dragon.happiness == 0 {
+                tick_achievements.push("rock_bottom");
+            }
+
+            // Decay penalty stacks over time (1 stack removed every 6 ticks)
+            if dragon.penalty_stacks > 0 {
+                dragon.penalty_decay_timer += 1;
+                if dragon.penalty_decay_timer >= 6 {
+                    dragon.penalty_stacks -= 1;
+                    dragon.penalty_decay_timer = 0;
+                }
+            } else {
+                dragon.penalty_decay_timer = 0;
+            }
 
             if dragon.speech_timer > 0 {
                 dragon.speech_timer -= 1;
@@ -596,10 +724,138 @@ impl WorkshopSession {
                 if dragon.happiness < dragon.phase2_lowest_happiness {
                     dragon.phase2_lowest_happiness = dragon.happiness;
                 }
+                // "steady_hand" — happiness >= 60 for 20+ consecutive ticks in Phase 2
+                if dragon.happiness >= 60 && dragon.phase2_ticks >= 20
+                    && dragon.phase2_lowest_happiness >= 60
+                {
+                    tick_achievements.push("steady_hand");
+                }
+            }
+
+            if !tick_achievements.is_empty() {
+                awarded.push((dragon.current_owner_id.clone(), tick_achievements));
+            }
+        }
+
+        // Deduplicate: only award if player doesn't already have it
+        let mut result = Vec::new();
+        for (player_id, achievements) in &awarded {
+            if let Some(player) = self.players.get_mut(player_id) {
+                for &ach in achievements {
+                    if !player.achievements.iter().any(|a| a == ach) {
+                        player.achievements.push(ach.to_string());
+                        result.push((player_id.clone(), ach));
+                    }
+                }
             }
         }
 
         self.touch();
+        result
+    }
+
+    /// Check and award end-of-phase achievements.
+    /// Call before entering voting to finalize Phase 2 achievements.
+    /// Returns (player_id, achievement_name) pairs.
+    pub fn award_phase_end_achievements(&mut self) -> Vec<(String, &'static str)> {
+        let mut result = Vec::new();
+
+        for dragon in self.dragons.values() {
+            let owner_id = &dragon.current_owner_id;
+            let creator_id = &dragon.original_owner_id;
+
+            // "no_mistakes" — 0 wrong actions and >= 5 total actions (Phase 2 sitter)
+            if dragon.wrong_food_count == 0
+                && dragon.wrong_play_count == 0
+                && dragon.total_actions >= 5
+            {
+                if let Some(player) = self.players.get(owner_id) {
+                    if !player.achievements.iter().any(|a| a == "no_mistakes") {
+                        result.push((owner_id.clone(), "no_mistakes"));
+                    }
+                }
+            }
+
+            // "zen_master" — 0 penalty stacks at end of Phase 2, >= 8 total actions
+            if dragon.penalty_stacks == 0 && dragon.total_actions >= 8 {
+                if let Some(player) = self.players.get(owner_id) {
+                    if !player.achievements.iter().any(|a| a == "zen_master") {
+                        result.push((owner_id.clone(), "zen_master"));
+                    }
+                }
+            }
+
+            // "button_masher" — 5+ cooldown violations (spammer award)
+            if dragon.cooldown_violations >= 5 {
+                if let Some(player) = self.players.get(owner_id) {
+                    if !player.achievements.iter().any(|a| a == "button_masher") {
+                        result.push((owner_id.clone(), "button_masher"));
+                    }
+                }
+            }
+
+            // "helicopter_parent" — 20+ total actions (over-attentive caretaker)
+            if dragon.total_actions >= 20 {
+                if let Some(player) = self.players.get(owner_id) {
+                    if !player.achievements.iter().any(|a| a == "helicopter_parent") {
+                        result.push((owner_id.clone(), "helicopter_parent"));
+                    }
+                }
+            }
+
+            // "comeback_kid" — lowest happiness <= 15 but ended >= 70 (epic recovery)
+            if dragon.phase2_lowest_happiness <= 15 && dragon.happiness >= 70 {
+                if let Some(player) = self.players.get(owner_id) {
+                    if !player.achievements.iter().any(|a| a == "comeback_kid") {
+                        result.push((owner_id.clone(), "comeback_kid"));
+                    }
+                }
+            }
+
+            // "chaos_gremlin" — peak penalty stacks reached 4+ (maximum chaos)
+            if dragon.peak_penalty_stacks >= 4 {
+                if let Some(player) = self.players.get(owner_id) {
+                    if !player.achievements.iter().any(|a| a == "chaos_gremlin") {
+                        result.push((owner_id.clone(), "chaos_gremlin"));
+                    }
+                }
+            }
+
+            // "perfectionist" — >= 80% correct action ratio with >= 10 total actions
+            if dragon.total_actions >= 10
+                && dragon.correct_actions * 100 >= dragon.total_actions * 80
+            {
+                if let Some(player) = self.players.get(owner_id) {
+                    if !player.achievements.iter().any(|a| a == "perfectionist") {
+                        result.push((owner_id.clone(), "perfectionist"));
+                    }
+                }
+            }
+
+            // "speed_learner" — found correct food AND play within first 3 total actions
+            // (Phase 1 only — check creator)
+            if dragon.original_owner_id == dragon.current_owner_id {
+                // Phase 1 still going, skip
+                continue;
+            }
+            // This was a Phase 1 thing — we check if creator's observations count is >= 2
+            // and food_tries/play_tries were low. But we already lost Phase 1 counters at
+            // phase2 reset. So speed_learner must be awarded inline during apply_action.
+            // Skip here.
+            let _ = creator_id;
+        }
+
+        // Apply awards
+        for (player_id, ach) in &result {
+            if let Some(player) = self.players.get_mut(player_id) {
+                if !player.achievements.iter().any(|a| a == *ach) {
+                    player.achievements.push(ach.to_string());
+                }
+            }
+        }
+
+        self.touch();
+        result
     }
 
     pub fn phase_duration_minutes(&self, phase: Phase) -> u32 {
@@ -687,22 +943,48 @@ impl WorkshopSession {
     pub fn finalize_voting(&mut self) -> Result<(), DomainError> {
         self.transition_to(Phase::End)?;
 
+        // Scores start at 0; the LLM judge will fill them via apply_judge_scores.
         for player in self.players.values_mut() {
-            let Some(dragon_id) = player.current_dragon_id.as_ref() else {
-                continue;
-            };
-            let Some(dragon) = self.dragons.get(dragon_id) else {
-                continue;
-            };
-
-            player.score = dragon.happiness
-                + dragon.hunger
-                + dragon.energy
-                + (player.achievements.len() as i32 * 50);
+            player.score = 0;
         }
 
         self.touch();
         Ok(())
+    }
+
+    /// Apply judge evaluation scores to player scores.
+    ///
+    /// For each dragon evaluation:
+    /// - `observation_score` is awarded to the dragon's **original owner** (Phase 1 sitter).
+    /// - `care_score` is awarded to the dragon's **current owner** (Phase 2 sitter).
+    ///
+    /// Each player creates exactly one dragon and cares for exactly one other dragon,
+    /// so the final score = observation_score + care_score.
+    pub fn apply_judge_scores(
+        &mut self,
+        evaluations: &[(String, i32, i32)], // (dragon_id, observation_score, care_score)
+    ) {
+        // Reset scores first
+        for player in self.players.values_mut() {
+            player.score = 0;
+        }
+
+        for (dragon_id, observation_score, care_score) in evaluations {
+            let Some(dragon) = self.dragons.get(dragon_id) else {
+                continue;
+            };
+            let creator_id = dragon.original_owner_id.clone();
+            let caretaker_id = dragon.current_owner_id.clone();
+
+            if let Some(creator) = self.players.get_mut(&creator_id) {
+                creator.score += observation_score;
+            }
+            if let Some(caretaker) = self.players.get_mut(&caretaker_id) {
+                caretaker.score += care_score;
+            }
+        }
+
+        self.touch();
     }
 
     pub fn reset_to_lobby(&mut self) -> Result<(), DomainError> {
@@ -806,8 +1088,53 @@ fn default_pet_description(player_name: &str) -> String {
     format!("{player_name}'s workshop dragon")
 }
 
-fn default_dragon_name(player_name: &str) -> String {
-    format!("{player_name}'s dragon")
+fn random_dragon_name() -> String {
+    const PREFIXES: &[&str] = &[
+        "Ember", "Frost", "Shadow", "Storm", "Blaze", "Thorn", "Ivy", "Coral",
+        "Ash", "Dusk", "Dawn", "Mist", "Flint", "Sage", "Onyx", "Pearl",
+        "Rune", "Gale", "Cobalt", "Crimson", "Jade", "Amber", "Slate", "Breeze",
+        "Cinder", "Spark", "Glimmer", "Dew", "Fern", "Vex",
+    ];
+    const SUFFIXES: &[&str] = &[
+        "wing", "claw", "scale", "fang", "tail", "heart", "eye", "flame",
+        "frost", "spark", "shade", "storm", "thorn", "bloom", "drift",
+    ];
+    let mut rng = rand::rng();
+    let prefix = PREFIXES[rng.random_range(0..PREFIXES.len())];
+    let suffix = SUFFIXES[rng.random_range(0..SUFFIXES.len())];
+    format!("{prefix}{suffix}")
+}
+
+fn random_active_time() -> ActiveTime {
+    if rand::rng().random_bool(0.5) {
+        ActiveTime::Day
+    } else {
+        ActiveTime::Night
+    }
+}
+
+fn random_food_type() -> FoodType {
+    match rand::rng().random_range(0..3u32) {
+        0 => FoodType::Meat,
+        1 => FoodType::Fruit,
+        _ => FoodType::Fish,
+    }
+}
+
+fn random_food_type_excluding(_: Option<FoodType>) -> FoodType {
+    random_food_type()
+}
+
+fn random_play_type() -> PlayType {
+    match rand::rng().random_range(0..3u32) {
+        0 => PlayType::Fetch,
+        1 => PlayType::Puzzle,
+        _ => PlayType::Music,
+    }
+}
+
+fn random_play_type_excluding(_: Option<PlayType>) -> PlayType {
+    random_play_type()
 }
 
 #[cfg(test)]
@@ -982,7 +1309,8 @@ mod tests {
                 .is_empty()
         );
         let dragon_a = session.dragons.get("dragon-a").expect("dragon a");
-        assert_eq!(dragon_a.name, "player-p1's dragon");
+        assert!(!dragon_a.name.contains("player-p1"), "Dragon name should not contain player name");
+        assert!(!dragon_a.name.is_empty(), "Dragon name should not be empty");
         assert_eq!(dragon_a.creator_instructions, "Curious cave dragon");
         assert!(dragon_a.discovery_observations.is_empty());
         let dragon_b = session.dragons.get("dragon-b").expect("dragon b");
@@ -1353,7 +1681,7 @@ mod tests {
     }
 
     #[test]
-    fn finalize_voting_sets_end_phase_and_computes_scores() {
+    fn finalize_voting_sets_end_phase_and_zeroes_scores() {
         let mut session = WorkshopSession::new(
             Uuid::new_v4(),
             SessionCode("123456".into()),
@@ -1379,30 +1707,74 @@ mod tests {
         session.save_handover_tags("p2", vec!["d".into(), "e".into(), "f".into()]);
         session.enter_phase2().expect("enter phase2");
         session.enter_voting().expect("enter voting");
-        {
-            let dragon_id = session
-                .players
-                .get("p1")
-                .and_then(|p| p.current_dragon_id.clone())
-                .expect("p1 dragon");
-            let dragon = session.dragons.get_mut(&dragon_id).expect("dragon stats");
-            dragon.happiness = 80;
-            dragon.hunger = 70;
-            dragon.energy = 60;
-        }
-        {
-            let player = session.players.get_mut("p1").expect("player p1");
-            player.achievements = vec!["smooth_transition".into(), "master_chef".into()];
-        }
 
         let result = session.finalize_voting();
 
         assert!(result.is_ok());
         assert_eq!(session.phase, Phase::End);
-        assert_eq!(
-            session.players.get("p1").map(|p| p.score),
-            Some(80 + 70 + 60 + 100)
+        // Scores start at 0; the LLM judge fills them via apply_judge_scores.
+        assert_eq!(session.players.get("p1").map(|p| p.score), Some(0));
+        assert_eq!(session.players.get("p2").map(|p| p.score), Some(0));
+    }
+
+    #[test]
+    fn apply_judge_scores_distributes_observation_and_care_scores() {
+        let mut session = WorkshopSession::new(
+            Uuid::new_v4(),
+            SessionCode("123456".into()),
+            ts(1),
+            config(),
         );
+        session.add_player(player("p1", true, 10));
+        session.add_player(player("p2", true, 20));
+        session
+            .begin_phase1(&[
+                Phase1Assignment {
+                    player_id: "p1".into(),
+                    dragon_id: "dragon-a".into(),
+                },
+                Phase1Assignment {
+                    player_id: "p2".into(),
+                    dragon_id: "dragon-b".into(),
+                },
+            ])
+            .expect("start phase1");
+        session.transition_to(Phase::Handover).expect("to handover");
+        session.save_handover_tags("p1", vec!["a".into(), "b".into(), "c".into()]);
+        session.save_handover_tags("p2", vec!["d".into(), "e".into(), "f".into()]);
+        session.enter_phase2().expect("enter phase2");
+        session.enter_voting().expect("enter voting");
+        session.finalize_voting().expect("finalize");
+
+        // dragon-a: created by p1 (observation_score=70), now owned by p2 (care_score=80)
+        // dragon-b: created by p2 (observation_score=60), now owned by p1 (care_score=90)
+        let dragon_a_owner = session.dragons.get("dragon-a").map(|d| d.current_owner_id.clone());
+        let dragon_b_owner = session.dragons.get("dragon-b").map(|d| d.current_owner_id.clone());
+
+        // After shuffle: p1 created dragon-a, p2 created dragon-b
+        // Phase 2 ownership is swapped (rotate-by-one)
+        assert_eq!(
+            session.dragons.get("dragon-a").map(|d| d.original_owner_id.clone()),
+            Some("p1".to_string())
+        );
+        assert_eq!(
+            session.dragons.get("dragon-b").map(|d| d.original_owner_id.clone()),
+            Some("p2".to_string())
+        );
+
+        // The current owners should differ from original owners
+        assert_ne!(dragon_a_owner.as_deref(), Some("p1"));
+        assert_ne!(dragon_b_owner.as_deref(), Some("p2"));
+
+        session.apply_judge_scores(&[
+            ("dragon-a".into(), 70, 80),  // obs→p1(+70), care→current_owner(+80)
+            ("dragon-b".into(), 60, 90),  // obs→p2(+60), care→current_owner(+90)
+        ]);
+
+        // p1 = observation_score for dragon-a (70) + care_score for dragon-b (90) = 160
+        // p2 = observation_score for dragon-b (60) + care_score for dragon-a (80) = 140
+        assert_eq!(session.players.get("p1").map(|p| p.score), Some(70 + 90));
+        assert_eq!(session.players.get("p2").map(|p| p.score), Some(60 + 80));
     }
 
     #[test]
@@ -1420,6 +1792,9 @@ mod tests {
                 dragon_id: "dragon-a".into(),
             }])
             .expect("start phase1");
+        // Set hunger high enough to trigger AlreadyFull block (>= 95)
+        let dragon = session.dragons.get_mut("dragon-a").expect("dragon-a");
+        dragon.hunger = 100;
 
         let outcome = session
             .apply_action("p1", PlayerAction::Feed(FoodType::Meat))
@@ -1478,6 +1853,9 @@ mod tests {
                 dragon_id: "dragon-a".into(),
             }])
             .expect("start phase1");
+        // Set energy high enough to trigger TooAwakeToSleep block (>= 90)
+        let dragon = session.dragons.get_mut("dragon-a").expect("dragon-a");
+        dragon.energy = 100;
 
         let outcome = session
             .apply_action("p1", PlayerAction::Sleep)
@@ -1520,8 +1898,12 @@ mod tests {
         session.advance_tick();
 
         let dragon = session.dragons.get("dragon-a").expect("dragon-a");
-        assert_eq!(dragon.hunger, 98);
-        assert_eq!(dragon.energy, 98);
-        assert_eq!(dragon.happiness, 98);
+        // decay_multiplier = 3 in Phase 2
+        // hunger: 100 - 3 = 97
+        // energy: 100 - (sleep_rate=1 * time_penalty=1 * 3) = 97
+        // happiness: 100 - (base_decay=1 * 3) = 97
+        assert_eq!(dragon.hunger, 97);
+        assert_eq!(dragon.energy, 97);
+        assert_eq!(dragon.happiness, 97);
     }
 }

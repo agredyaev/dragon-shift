@@ -13,8 +13,8 @@ use app::{AppState, build_app, build_session_store, load_config};
 use persistence::SessionUpdateNotification;
 use tracing::info;
 use ws::{
-    broadcast_session_state, clear_local_realtime_connection, close_local_connection,
-    emit_phase_warning_notices,
+    advance_game_ticks, broadcast_session_state, clear_local_realtime_connection,
+    close_local_connection, emit_phase_warning_notices,
 };
 
 pub(crate) fn parse_session_update_notification(
@@ -245,6 +245,7 @@ async fn main() {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
         loop {
             interval.tick().await;
+            advance_game_ticks(&ticker_state).await;
             emit_phase_warning_notices(&ticker_state).await;
         }
     });

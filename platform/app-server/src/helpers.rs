@@ -45,36 +45,51 @@ fn client_dragon_visuals(dragon: &SessionDragon) -> DragonVisuals {
     }
 }
 
-fn food_label(food: FoodType) -> &'static str {
-    match food {
-        FoodType::Meat => "meat",
-        FoodType::Fruit => "fruit",
-        FoodType::Fish => "fish",
-    }
-}
+fn condition_hint(dragon: &SessionDragon, time: i32) -> String {
+    let is_day = (6..=17).contains(&time);
 
-fn play_label(play: PlayType) -> &'static str {
-    match play {
-        PlayType::Fetch => "fetch",
-        PlayType::Puzzle => "puzzle",
-        PlayType::Music => "music",
-    }
-}
-
-fn condition_hint(dragon: &SessionDragon) -> String {
-    let active_time = match dragon.active_time {
-        ActiveTime::Day => "day",
-        ActiveTime::Night => "night",
+    // Mood / happiness hint
+    let mood = if dragon.happiness >= 80 {
+        "Your dragon looks cheerful and content."
+    } else if dragon.happiness >= 50 {
+        "Your dragon seems fairly relaxed."
+    } else if dragon.happiness >= 25 {
+        "Your dragon is grumpy and restless."
+    } else {
+        "Your dragon is visibly unhappy — something isn't right."
     };
 
-    format!(
-        "Active at {active_time}, prefers {} by day and {} by night, enjoys {} by day and {} by night, and tires at rate {}.",
-        food_label(dragon.day_food),
-        food_label(dragon.night_food),
-        play_label(dragon.day_play),
-        play_label(dragon.night_play),
-        dragon.sleep_rate,
-    )
+    // Hunger hint
+    let belly = if dragon.hunger >= 80 {
+        "Its belly is full."
+    } else if dragon.hunger >= 50 {
+        "It could probably eat something soon."
+    } else if dragon.hunger >= 25 {
+        "Its stomach growls audibly."
+    } else {
+        "It looks famished!"
+    };
+
+    // Energy hint
+    let energy = if dragon.energy >= 80 {
+        "It's brimming with energy."
+    } else if dragon.energy >= 50 {
+        "It seems moderately alert."
+    } else if dragon.energy >= 25 {
+        "Its eyes are drooping."
+    } else {
+        "It can barely keep its eyes open."
+    };
+
+    // Subtle time-of-day reactivity hint (does NOT reveal the preference directly)
+    let time_hint = match (is_day, dragon.active_time) {
+        (true, ActiveTime::Day) | (false, ActiveTime::Night) => {
+            "It seems especially lively right now."
+        }
+        _ => "It seems a bit sluggish at this hour.",
+    };
+
+    format!("{mood} {belly} {energy} {time_hint}")
 }
 
 fn client_voting_state(
@@ -155,7 +170,7 @@ pub(crate) fn to_client_game_state(
                         energy: dragon.energy,
                         happiness: dragon.happiness,
                     },
-                    condition_hint: Some(condition_hint(dragon)),
+                    condition_hint: Some(condition_hint(dragon, session.time)),
                     discovery_observations: dragon.discovery_observations.clone(),
                     handover_tags: dragon.handover_tags.clone(),
                     last_action: dragon.last_action,
@@ -299,6 +314,15 @@ pub(crate) fn build_judge_action_traces(
                 .map(str::to_string),
             created_at: artifact.created_at.clone(),
             resulting_stats,
+            was_correct: artifact
+                .payload
+                .get("wasCorrect")
+                .and_then(|value| value.as_bool()),
+            block_reason: artifact
+                .payload
+                .get("blockedReason")
+                .and_then(|value| value.as_str())
+                .map(str::to_string),
         };
 
         traces_by_dragon_id
@@ -363,12 +387,25 @@ pub(crate) fn build_judge_bundle(
                     energy: dragon.energy,
                     happiness: dragon.happiness,
                 },
+                actual_active_time: dragon.active_time,
+                actual_day_food: dragon.day_food,
+                actual_night_food: dragon.night_food,
+                actual_day_play: dragon.day_play,
+                actual_night_play: dragon.night_play,
+                actual_sleep_rate: dragon.sleep_rate,
                 handover_chain: JudgeHandoverChain {
                     creator_instructions: dragon.creator_instructions.clone(),
                     discovery_observations: dragon.discovery_observations.clone(),
                     handover_tags: dragon.handover_tags.clone(),
                 },
                 phase2_actions: phase2_actions.get(&dragon.id).cloned().unwrap_or_default(),
+                total_actions: dragon.total_actions,
+                correct_actions: dragon.correct_actions,
+                wrong_food_count: dragon.wrong_food_count,
+                wrong_play_count: dragon.wrong_play_count,
+                cooldown_violations: dragon.cooldown_violations,
+                penalty_stacks_at_end: dragon.penalty_stacks,
+                phase2_lowest_happiness: dragon.phase2_lowest_happiness,
             })
             .collect(),
     }

@@ -428,10 +428,13 @@ pub fn phase2_handover_summary(state: &ClientGameState) -> String {
     if dragon.handover_tags.is_empty() {
         "No handover notes yet.".to_string()
     } else {
-        format!(
-            "{} handover note(s) available from the previous caretaker.",
-            dragon.handover_tags.len()
-        )
+        dragon
+            .handover_tags
+            .iter()
+            .enumerate()
+            .map(|(i, tag)| format!("{}. {}", i + 1, tag))
+            .collect::<Vec<_>>()
+            .join(" | ")
     }
 }
 
@@ -505,9 +508,10 @@ pub fn voting_option_rows(state: &ClientGameState) -> Vec<VotingOptionRow> {
 
     dragons
         .into_iter()
-        .map(|dragon| VotingOptionRow {
+        .enumerate()
+        .map(|(index, dragon)| VotingOptionRow {
             dragon_id: dragon.id.clone(),
-            dragon_name: dragon.name.clone(),
+            dragon_name: format!("Dragon #{}", index + 1),
             is_selected: current_vote_dragon_id == Some(dragon.id.as_str()),
             is_current_players_dragon: current_player_dragon_id == Some(dragon.id.as_str()),
         })
@@ -553,7 +557,7 @@ pub fn end_vote_result_rows(state: &ClientGameState) -> Vec<EndVoteResultRow> {
         .map(|(index, result)| {
             let dragon = state.dragons.get(&result.dragon_id);
             EndVoteResultRow {
-                placement_label: format!("#{} Creative pick", index + 1),
+                placement_label: format!("#{} Creativity", index + 1),
                 dragon_name: dragon
                     .map(|d| d.name.clone())
                     .unwrap_or_else(|| "Unknown dragon".to_string()),
@@ -701,8 +705,8 @@ pub fn judge_bundle_dragon_rows(bundle: &JudgeBundle) -> Vec<JudgeBundleDragonRo
 pub mod tests {
     use super::*;
     use protocol::{
-        ClientDragon, ClientGameState, CoordinatorType, DragonAction, DragonEmotion, Phase, Player,
-        SessionMeta, WorkshopJoinSuccess, create_default_session_settings,
+        create_default_session_settings, ClientDragon, ClientGameState, CoordinatorType,
+        DragonAction, DragonEmotion, Phase, Player, SessionMeta, WorkshopJoinSuccess,
     };
     use std::collections::BTreeMap;
 
@@ -932,6 +936,12 @@ pub mod tests {
                         energy: 63,
                         happiness: 77,
                     },
+                    actual_active_time: protocol::ActiveTime::Day,
+                    actual_day_food: protocol::FoodType::Meat,
+                    actual_night_food: protocol::FoodType::Fruit,
+                    actual_day_play: protocol::PlayType::Fetch,
+                    actual_night_play: protocol::PlayType::Puzzle,
+                    actual_sleep_rate: 2,
                     handover_chain: protocol::JudgeHandoverChain {
                         creator_instructions: "Start with music".to_string(),
                         discovery_observations: vec!["Settles quickly after music".to_string()],
@@ -945,7 +955,16 @@ pub mod tests {
                         action_value: None,
                         created_at: "2026-01-01T10:00:00Z".to_string(),
                         resulting_stats: None,
+                        was_correct: Some(true),
+                        block_reason: None,
                     }],
+                    total_actions: 5,
+                    correct_actions: 3,
+                    wrong_food_count: 1,
+                    wrong_play_count: 1,
+                    cooldown_violations: 0,
+                    penalty_stacks_at_end: 0,
+                    phase2_lowest_happiness: 60,
                 },
                 protocol::JudgeDragonBundle {
                     dragon_id: "dragon-1".to_string(),
@@ -960,6 +979,12 @@ pub mod tests {
                         energy: 55,
                         happiness: 81,
                     },
+                    actual_active_time: protocol::ActiveTime::Night,
+                    actual_day_food: protocol::FoodType::Fish,
+                    actual_night_food: protocol::FoodType::Meat,
+                    actual_day_play: protocol::PlayType::Music,
+                    actual_night_play: protocol::PlayType::Fetch,
+                    actual_sleep_rate: 1,
                     handover_chain: protocol::JudgeHandoverChain {
                         creator_instructions: "Feed at dusk".to_string(),
                         discovery_observations: vec!["Loves food at dusk".to_string()],
@@ -969,6 +994,13 @@ pub mod tests {
                         ],
                     },
                     phase2_actions: vec![],
+                    total_actions: 3,
+                    correct_actions: 2,
+                    wrong_food_count: 0,
+                    wrong_play_count: 1,
+                    cooldown_violations: 0,
+                    penalty_stacks_at_end: 0,
+                    phase2_lowest_happiness: 70,
                 },
             ],
         }
@@ -1133,7 +1165,7 @@ pub mod tests {
         assert_eq!(phase2_creator_label(&state), "Creator: Alice");
         assert_eq!(
             phase2_handover_summary(&state),
-            "2 handover note(s) available from the previous caretaker."
+            "1. Feed at dusk | 2. Avoid long idle gaps"
         );
         assert!(phase2_care_copy(&state).contains("Phase 2 decay is stronger"));
     }
@@ -1159,14 +1191,12 @@ pub mod tests {
         );
         assert!(!voting_reveal_ready(&state));
         assert_eq!(rows.len(), 2);
-        assert!(
-            rows.iter()
-                .any(|row| row.dragon_name == "Comet" && row.is_current_players_dragon)
-        );
-        assert!(
-            rows.iter()
-                .any(|row| row.dragon_name == "Nova" && row.is_selected)
-        );
+        assert!(rows
+            .iter()
+            .any(|row| row.dragon_name.starts_with("Dragon #") && row.is_current_players_dragon));
+        assert!(rows
+            .iter()
+            .any(|row| row.dragon_name.starts_with("Dragon #") && row.is_selected));
     }
 
     #[test]
@@ -1339,6 +1369,12 @@ pub mod tests {
                     energy: 50,
                     happiness: 50,
                 },
+                actual_active_time: protocol::ActiveTime::Day,
+                actual_day_food: protocol::FoodType::Meat,
+                actual_night_food: protocol::FoodType::Fruit,
+                actual_day_play: protocol::PlayType::Fetch,
+                actual_night_play: protocol::PlayType::Puzzle,
+                actual_sleep_rate: 2,
                 handover_chain: protocol::JudgeHandoverChain {
                     creator_instructions: format!("Instructions {i}"),
                     discovery_observations: vec![format!("Obs {i}")],
@@ -1352,7 +1388,16 @@ pub mod tests {
                     action_value: None,
                     created_at: "2026-01-01T10:00:00Z".to_string(),
                     resulting_stats: None,
+                    was_correct: Some(true),
+                    block_reason: None,
                 }],
+                total_actions: 4,
+                correct_actions: 3,
+                wrong_food_count: 0,
+                wrong_play_count: 1,
+                cooldown_violations: 0,
+                penalty_stacks_at_end: 0,
+                phase2_lowest_happiness: 50,
             });
         }
         bundle

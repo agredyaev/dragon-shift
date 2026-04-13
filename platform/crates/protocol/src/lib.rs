@@ -189,6 +189,14 @@ pub struct Dragon {
     pub high_happiness_ticks: i32,
     pub phase2_ticks: i32,
     pub phase2_lowest_happiness: i32,
+    pub wrong_food_count: i32,
+    pub wrong_play_count: i32,
+    pub cooldown_violations: i32,
+    pub total_actions: i32,
+    pub correct_actions: i32,
+    pub penalty_stacks: i32,
+    #[serde(default)]
+    pub peak_penalty_stacks: i32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -433,6 +441,12 @@ pub struct JudgeActionTrace {
     pub created_at: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resulting_stats: Option<DragonStats>,
+    /// Whether the action matched the dragon's preference (None = blocked/sleep).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub was_correct: Option<bool>,
+    /// If the action was blocked, the reason (e.g. "already_full", "cooldown_violation").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub block_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -463,8 +477,22 @@ pub struct JudgeDragonBundle {
     pub current_owner_name: String,
     pub creative_vote_count: i32,
     pub final_stats: DragonStats,
+    pub actual_active_time: ActiveTime,
+    pub actual_day_food: FoodType,
+    pub actual_night_food: FoodType,
+    pub actual_day_play: PlayType,
+    pub actual_night_play: PlayType,
+    pub actual_sleep_rate: i32,
     pub handover_chain: JudgeHandoverChain,
     pub phase2_actions: Vec<JudgeActionTrace>,
+    /// Summary stats for the Phase 2 caretaker's performance.
+    pub total_actions: i32,
+    pub correct_actions: i32,
+    pub wrong_food_count: i32,
+    pub wrong_play_count: i32,
+    pub cooldown_violations: i32,
+    pub penalty_stacks_at_end: i32,
+    pub phase2_lowest_happiness: i32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -521,6 +549,7 @@ pub struct LlmJudgeEvaluation {
 pub struct LlmDragonEvaluation {
     pub dragon_id: String,
     pub dragon_name: String,
+    pub observation_score: i32,
     pub care_score: i32,
     pub creativity_score: i32,
     pub feedback: String,
