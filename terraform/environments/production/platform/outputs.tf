@@ -28,11 +28,6 @@ output "helm_release_name" {
   value       = helm_release.app.name
 }
 
-output "database_secret_provider_class_name" {
-  description = "SecretProviderClass name used to mount DATABASE_URL from Secret Manager."
-  value       = kubernetes_manifest.database_secret_provider_class.manifest.metadata.name
-}
-
 output "cloud_armor_policy_name" {
   description = "Cloud Armor policy attached to the ingress backend."
   value       = var.enable_cloud_armor ? google_compute_security_policy.app[0].name : ""

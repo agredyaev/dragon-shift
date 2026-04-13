@@ -12,10 +12,8 @@ locals {
     var.labels,
   )
 
-  database_secret_mount_path = "/var/run/secrets/dragon-shift"
-  database_secret_file_name  = "DATABASE_URL"
-  ksa_name                   = "dragon-shift-app"
-  use_image_digest           = trimspace(var.image_digest) != ""
+  ksa_name         = "dragon-shift-app"
+  use_image_digest = trimspace(var.image_digest) != ""
 }
 
 check "uptime_alert_channel_configured" {
@@ -156,17 +154,27 @@ resource "kubernetes_service_account" "app" {
   depends_on = [kubernetes_namespace.app, terraform_data.wait_for_cluster_apis]
 }
 
-resource "google_secret_manager_secret_iam_member" "database_url_accessor" {
-  project   = var.project_id
-  secret_id = var.database_url_secret_id
-  role      = "roles/secretmanager.secretAccessor"
-  member = format(
-    "principal://iam.googleapis.com/projects/%s/locations/global/workloadIdentityPools/%s.svc.id.goog/subject/ns/%s/sa/%s",
-    data.google_project.this.number,
-    var.project_id,
-    kubernetes_namespace.app.metadata[0].name,
-    kubernetes_service_account.app.metadata[0].name,
-  )
+data "google_secret_manager_secret_version" "database_url" {
+  project = var.project_id
+  secret  = var.database_url_secret_id
+}
+
+resource "kubernetes_secret" "database_url" {
+  metadata {
+    name      = "dragon-shift-database-url"
+    namespace = kubernetes_namespace.app.metadata[0].name
+
+    labels = {
+      "app.kubernetes.io/name"    = "dragon-shift"
+      "app.kubernetes.io/part-of" = "dragon-shift"
+    }
+  }
+
+  data = {
+    DATABASE_URL = data.google_secret_manager_secret_version.database_url.secret_data
+  }
+
+  depends_on = [kubernetes_namespace.app]
 }
 
 resource "terraform_data" "wait_for_cluster_apis" {
@@ -229,32 +237,8 @@ resource "terraform_data" "wait_for_cluster_apis" {
       wait_for_api readyz "Kubernetes API readiness"
       wait_for_api apis/cloud.google.com/v1 "BackendConfig API"
       wait_for_api apis/networking.gke.io/v1 "ManagedCertificate API"
-      wait_for_api apis/secrets-store.csi.x-k8s.io/v1 "SecretProviderClass API"
-      wait_for_api apis/storage.k8s.io/v1/csidrivers/secrets-store-gke.csi.k8s.io "Secret Manager CSI driver"
     EOT
   }
-}
-
-resource "kubernetes_manifest" "database_secret_provider_class" {
-  manifest = {
-    apiVersion = "secrets-store.csi.x-k8s.io/v1"
-    kind       = "SecretProviderClass"
-    metadata = {
-      name      = "dragon-shift-database-url"
-      namespace = kubernetes_namespace.app.metadata[0].name
-    }
-    spec = {
-      provider = "gke"
-      parameters = {
-        secrets = <<-EOT
-          - resourceName: "projects/${var.project_id}/secrets/${var.database_url_secret_id}/versions/latest"
-            path: "${local.database_secret_file_name}"
-        EOT
-      }
-    }
-  }
-
-  depends_on = [kubernetes_namespace.app, terraform_data.wait_for_cluster_apis]
 }
 
 resource "kubernetes_manifest" "backend_config" {
@@ -364,13 +348,8 @@ resource "helm_release" "app" {
       socketRateLimitMax    = var.websocket_rate_limit_max
     }
     database = {
-      existingSecretFile = format("%s/%s", local.database_secret_mount_path, local.database_secret_file_name)
-    }
-    secretManager = {
-      enabled                 = true
-      secretProviderClassName = kubernetes_manifest.database_secret_provider_class.manifest.metadata.name
-      mountPath               = local.database_secret_mount_path
-      fileName                = local.database_secret_file_name
+      existingSecretName = kubernetes_secret.database_url.metadata[0].name
+      existingSecretKey  = "DATABASE_URL"
     }
     postgresql = {
       enabled = false
@@ -389,10 +368,9 @@ resource "helm_release" "app" {
 
   depends_on = [
     kubernetes_manifest.backend_config,
-    kubernetes_manifest.database_secret_provider_class,
     kubernetes_manifest.managed_certificate,
+    kubernetes_secret.database_url,
     kubernetes_service_account.app,
-    google_secret_manager_secret_iam_member.database_url_accessor,
     terraform_data.wait_for_cluster_apis,
   ]
 }
