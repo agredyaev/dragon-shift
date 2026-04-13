@@ -83,3 +83,43 @@ Prerequisites for local use:
 - `kubectl`, `helm`, `npm`, and Playwright browser dependencies available
 
 The script resolves the current public IPv4 for `master_authorized_networks`, preserves extra operator CIDRs from `TF_EXTRA_MASTER_AUTHORIZED_CIDRS`, bootstraps the state bucket when needed, applies both Terraform stacks, verifies rollout health through the cluster, and optionally requires public HTTPS plus the deployed Playwright smoke when `TF_VERIFY_PUBLIC_EDGE=true`.
+
+## Deploy Workarounds
+
+This section documents configuration workarounds applied during the initial production deployment. Each item explains the problem, the fix, and how to revert when the underlying issue is resolved.
+
+### 1. Cloud Armor disabled — `TF_ENABLE_CLOUD_ARMOR=false`
+
+**Problem:** The GCP project `rna-workshop` has `SECURITY_POLICY_RULES` quota set to `0.0 globally`. Terraform fails with:
+```
+Error waiting for Creating SecurityPolicy "dragon-shift-production":
+Quota 'SECURITY_POLICY_RULES' exceeded. Limit: 0.0 globally.
+```
+
+**Workaround:** Set the repository variable `TF_ENABLE_CLOUD_ARMOR=false`. The Terraform platform stack uses `count = var.enable_cloud_armor ? 1 : 0` on the `google_compute_security_policy.app` resource and conditionally omits the `securityPolicy` block from the `BackendConfig` spec. All other infrastructure (Ingress, TLS, health checks, connection draining) continues to function.
+
+**Impact:** No per-IP rate limiting at the load-balancer edge. The application still enforces its own in-process rate limits (`createRateLimitMax`, `joinRateLimitMax`, etc.) via Helm values.
+
+**Revert:** Request a Cloud Armor quota increase in the GCP Console, then set `TF_ENABLE_CLOUD_ARMOR=true` and re-deploy.
+
+### 2. GKE Autopilot `WORKLOADS` monitoring component removed
+
+**Problem:** The `google_container_cluster` resource included `WORKLOADS` in `monitoring_config.enable_components`, which is not supported by GKE Autopilot. Terraform returned a generic `400 Bad Request: invalid argument`.
+
+**Fix (permanent):** Removed `WORKLOADS` from the list in `terraform/modules/gke_autopilot/main.tf`. Only `SYSTEM_COMPONENTS` and `STORAGE` remain. This is the correct configuration for Autopilot clusters and does not need to be reverted.
+
+### 3. Service Networking IAM role added to bootstrap
+
+**Problem:** The Terraform service account lacked permission to create VPC peering for Private Service Access. The apply failed with:
+```
+Error 403: Permission denied to add peering for service
+'servicenetworking.googleapis.com'
+```
+
+**Fix (permanent):** Added `roles/servicenetworking.networksAdmin` to the SA roles in `terraform/bootstrap/variables.tf`. After changing bootstrap IAM, the bootstrap stack was re-applied with the saved local state (see **Bootstrap Once** above).
+
+### 4. Workflow dispatch deploy support
+
+**Problem:** The `publish-image.yml` deploy job only ran for `push` events. Manual re-deploys via `workflow_dispatch` were impossible without creating empty commits.
+
+**Fix (permanent):** Updated the deploy job condition to `(github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main'`. Also gated the CI-wait step inside the deploy job with `if: github.event_name == 'push'` since manual dispatches are intentional operator actions that do not require gating on CI completion.
