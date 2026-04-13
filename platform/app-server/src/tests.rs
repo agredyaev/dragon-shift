@@ -6,6 +6,7 @@ use crate::{
     handle_session_update_notification,
     helpers::{build_judge_action_traces, to_client_game_state},
     http::allocate_session_code,
+    llm::LlmPoolConfig,
     parse_session_update_notification,
     ws::emit_phase_warning_notices,
 };
@@ -30,7 +31,6 @@ use protocol::{
 use security::{DEFAULT_RUST_SESSION_CODE_PREFIX, OriginPolicyOptions, create_origin_policy};
 use sqlx::PgPool;
 use std::{
-    fs,
     future::Future,
     net::SocketAddr,
     pin::Pin,
@@ -40,7 +40,6 @@ use std::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
 };
-use tempfile::NamedTempFile;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_tungstenite::{
     connect_async,
@@ -627,22 +626,6 @@ fn create_workshop_body(name: &str) -> String {
     .to_string()
 }
 
-fn create_workshop_body_with_tokens(name: &str) -> String {
-    serde_json::json!({
-        "name": name,
-        "config": {
-            "phase0Minutes": 5,
-            "phase1Minutes": 10,
-            "phase2Minutes": 10,
-            "imageGeneratorToken": "img-secret",
-            "imageGeneratorModel": "gemini-image",
-            "judgeToken": "judge-secret",
-            "judgeModel": "gemini-judge"
-        }
-    })
-    .to_string()
-}
-
 fn test_state() -> AppState {
     test_state_with_limits(20, 40)
 }
@@ -666,6 +649,12 @@ fn test_state_with_limits(create_limit: u32, join_limit: u32) -> AppState {
         .expect("create origin policy"),
         static_assets_dir: std::env::temp_dir().join("dragon-shift-test-static-missing"),
         database_url: None,
+        llm_pool: LlmPoolConfig {
+            google_cloud_project: None,
+            google_cloud_location: None,
+            judge_providers: Vec::new(),
+            image_providers: Vec::new(),
+        },
     });
 
     AppState::new(config, Arc::new(InMemorySessionStore::new()))
@@ -880,44 +869,27 @@ fn load_config_parses_rate_limits() {
 }
 
 #[test]
-fn load_config_reads_database_url_from_file() {
+fn load_config_requires_database_url_in_production() {
     let _env_lock = lock_env();
     let _bind = ScopedEnvVar::set("APP_SERVER_BIND_ADDR", "127.0.0.1:4100");
     let _app_url = ScopedEnvVar::set("VITE_APP_URL", "http://127.0.0.1:4100");
     let _origins = ScopedEnvVar::set("ALLOWED_ORIGINS", "http://127.0.0.1:4100");
     let _node_env = ScopedEnvVar::set("NODE_ENV", "production");
     let _database = ScopedEnvVar::set("DATABASE_URL", "");
-    let temp = NamedTempFile::new().expect("create temp database url file");
-    fs::write(temp.path(), "  postgres://user:pass@localhost:5432/db  \n")
-        .expect("write temp database url file");
-    let _database_file = ScopedEnvVar::set(
-        "DATABASE_URL_FILE",
-        temp.path().to_str().expect("temp file path utf-8"),
-    );
 
-    let config = crate::app::load_config().expect("load config");
-
-    assert_eq!(
-        config.database_url.as_deref(),
-        Some("postgres://user:pass@localhost:5432/db")
-    );
+    let result = crate::app::load_config();
+    assert!(result.is_err());
+    assert!(result.unwrap_err().contains("DATABASE_URL is required"));
 }
 
 #[test]
-fn load_config_prefers_database_url_over_file() {
+fn load_config_reads_database_url_directly() {
     let _env_lock = lock_env();
     let _bind = ScopedEnvVar::set("APP_SERVER_BIND_ADDR", "127.0.0.1:4100");
     let _app_url = ScopedEnvVar::set("VITE_APP_URL", "http://127.0.0.1:4100");
     let _origins = ScopedEnvVar::set("ALLOWED_ORIGINS", "http://127.0.0.1:4100");
     let _node_env = ScopedEnvVar::set("NODE_ENV", "production");
     let _database = ScopedEnvVar::set("DATABASE_URL", "postgres://inline:pass@localhost:5432/db");
-    let temp = NamedTempFile::new().expect("create temp database url file");
-    fs::write(temp.path(), "postgres://file:pass@localhost:5432/db")
-        .expect("write temp database url file");
-    let _database_file = ScopedEnvVar::set(
-        "DATABASE_URL_FILE",
-        temp.path().to_str().expect("temp file path utf-8"),
-    );
 
     let config = crate::app::load_config().expect("load config");
 
@@ -2814,46 +2786,34 @@ async fn create_workshop_endpoint_rejects_forbidden_origin() {
     }
 }
 
-#[tokio::test]
-async fn create_workshop_endpoint_rejects_browser_tokens_in_production() {
-    let mut state = test_state();
-    state.config = Arc::new(AppConfig {
-        origin_policy: create_origin_policy(OriginPolicyOptions {
-            allowed_origins: Some("https://dragon-shift.example.com"),
-            app_origin: None,
-            is_production: true,
-        })
-        .expect("create production origin policy"),
-        database_url: Some("postgres://prod.example/dragon_shift".into()),
-        ..state.config.as_ref().clone()
-    });
-    let app = build_app(state);
+#[test]
+fn load_config_reads_server_side_llm_settings() {
+    let _env_lock = lock_env();
+    let _bind = ScopedEnvVar::set("APP_SERVER_BIND_ADDR", "127.0.0.1:4100");
+    let _app_url = ScopedEnvVar::set("VITE_APP_URL", "http://127.0.0.1:4100");
+    let _origins = ScopedEnvVar::set("ALLOWED_ORIGINS", "http://127.0.0.1:4100");
+    let _node_env = ScopedEnvVar::set("NODE_ENV", "development");
+    let _database = ScopedEnvVar::set("DATABASE_URL", "postgres://user:pass@localhost:5432/db");
+    let _project = ScopedEnvVar::set("GOOGLE_CLOUD_PROJECT", "dragon-shift-prod");
+    let _location = ScopedEnvVar::set("GOOGLE_CLOUD_LOCATION", "us-central1");
+    let _judge_providers = ScopedEnvVar::set(
+        "LLM_JUDGE_PROVIDERS",
+        r#"[{"type":"api_key","model":"gemini-2.5-flash","apiKeyEnvVar":"LLM_JUDGE_API_KEY_0"}]"#,
+    );
+    let _image_providers = ScopedEnvVar::set(
+        "LLM_IMAGE_PROVIDERS",
+        r#"[{"type":"vertex_ai","model":"imagen-4.0-generate-001"}]"#,
+    );
+    let _judge_key = ScopedEnvVar::set("LLM_JUDGE_API_KEY_0", "judge-key");
 
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/api/workshops")
-                .header("content-type", "application/json")
-                .header("origin", "https://dragon-shift.example.com")
-                .body(Body::from(create_workshop_body_with_tokens("Alice")))
-                .expect("build request"),
-        )
-        .await
-        .expect("call create workshop");
+    let config = crate::app::load_config().expect("load config");
 
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    let body = to_bytes(response.into_body(), usize::MAX)
-        .await
-        .expect("read error body");
-    let result: WorkshopJoinResult = serde_json::from_slice(&body).expect("parse join result");
-    match result {
-        WorkshopJoinResult::Error(error) => assert_eq!(
-            error.error,
-            "Browser-supplied third-party tokens are disabled in production. Use local/dev only or move secrets to server-side configuration."
-        ),
-        WorkshopJoinResult::Success(_) => panic!("expected error response"),
-    }
+    assert_eq!(config.llm_pool.google_cloud_project.as_deref(), Some("dragon-shift-prod"));
+    assert_eq!(config.llm_pool.google_cloud_location.as_deref(), Some("us-central1"));
+    assert_eq!(config.llm_pool.judge_providers.len(), 1);
+    assert_eq!(config.llm_pool.judge_providers[0].model, "gemini-2.5-flash");
+    assert_eq!(config.llm_pool.image_providers.len(), 1);
+    assert_eq!(config.llm_pool.image_providers[0].model, "imagen-4.0-generate-001");
 }
 
 #[tokio::test]
@@ -8578,10 +8538,6 @@ fn build_judge_action_traces_groups_action_artifacts_by_dragon() {
             phase0_minutes: 5,
             phase1_minutes: 10,
             phase2_minutes: 10,
-            image_generator_token: None,
-            image_generator_model: None,
-            judge_token: None,
-            judge_model: None,
         },
     );
     session.add_player(session_player("p1", "Alice", 10));

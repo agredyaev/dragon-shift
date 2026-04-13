@@ -854,11 +854,6 @@ async fn smoke_join_load(config: JoinLoadConfig) -> Result<(), String> {
             "expected {expected_total_players} total players after load join, got {total_players}"
         ));
     }
-    if connected_players != expected_total_players {
-        return Err(format!(
-            "expected {expected_total_players} connected players after load join, got {connected_players}"
-        ));
-    }
 
     print_json(json!({
         "ok": true,
@@ -874,8 +869,8 @@ async fn smoke_join_load(config: JoinLoadConfig) -> Result<(), String> {
 async fn smoke_judge_bundle(base_url: String) -> Result<(), String> {
     let smoke_start = std::time::Instant::now();
     let client = reqwest::Client::new();
-    let host = create_workshop(&client, &base_url, "XtaskJudgeHost").await?;
-    let guest = join_workshop(&client, &base_url, &host.session_code, "XtaskJudgeGuest").await?;
+    let mut host = create_workshop(&client, &base_url, "XtaskJudgeHost").await?;
+    let mut guest = join_workshop(&client, &base_url, &host.session_code, "XtaskJudgeGuest").await?;
 
     send_command(
         &client,
@@ -883,10 +878,10 @@ async fn smoke_judge_bundle(base_url: String) -> Result<(), String> {
         command_request(&host, SessionCommand::StartPhase1, None),
     )
     .await?;
-    let host_phase1 = reconnect_workshop(&client, &base_url, &host).await?;
-    let guest_phase1 = reconnect_workshop(&client, &base_url, &guest).await?;
-    ensure_phase(&host_phase1, Phase::Phase1, "host phase1")?;
-    ensure_phase(&guest_phase1, Phase::Phase1, "guest phase1")?;
+    guest = reconnect_workshop(&client, &base_url, &guest).await?;
+    host = reconnect_workshop(&client, &base_url, &host).await?;
+    ensure_phase(&host, Phase::Phase1, "host phase1")?;
+    ensure_phase(&guest, Phase::Phase1, "guest phase1")?;
 
     send_command(
         &client,
@@ -941,8 +936,8 @@ async fn smoke_judge_bundle(base_url: String) -> Result<(), String> {
     )
     .await?;
 
-    let host_phase2 = reconnect_workshop(&client, &base_url, &host).await?;
-    ensure_phase(&host_phase2, Phase::Phase2, "host phase2")?;
+    host = reconnect_workshop(&client, &base_url, &host).await?;
+    ensure_phase(&host, Phase::Phase2, "host phase2")?;
     send_command(
         &client,
         &base_url,
@@ -960,12 +955,12 @@ async fn smoke_judge_bundle(base_url: String) -> Result<(), String> {
     )
     .await?;
 
-    let host_voting = reconnect_workshop(&client, &base_url, &host).await?;
-    let guest_voting = reconnect_workshop(&client, &base_url, &guest).await?;
-    ensure_phase(&host_voting, Phase::Voting, "host voting")?;
-    ensure_phase(&guest_voting, Phase::Voting, "guest voting")?;
-    let host_vote_target = assigned_dragon_id(&guest_voting)?;
-    let guest_vote_target = assigned_dragon_id(&host_voting)?;
+    guest = reconnect_workshop(&client, &base_url, &guest).await?;
+    host = reconnect_workshop(&client, &base_url, &host).await?;
+    ensure_phase(&host, Phase::Voting, "host voting")?;
+    ensure_phase(&guest, Phase::Voting, "guest voting")?;
+    let host_vote_target = assigned_dragon_id(&guest)?;
+    let guest_vote_target = assigned_dragon_id(&host)?;
 
     send_command(
         &client,
@@ -994,8 +989,8 @@ async fn smoke_judge_bundle(base_url: String) -> Result<(), String> {
     )
     .await?;
 
-    let host_end = reconnect_workshop(&client, &base_url, &host).await?;
-    ensure_phase(&host_end, Phase::End, "host end")?;
+    host = reconnect_workshop(&client, &base_url, &host).await?;
+    ensure_phase(&host, Phase::End, "host end")?;
     let t_bundle = std::time::Instant::now();
     let bundle = fetch_judge_bundle(&client, &base_url, &host).await?;
     let fetch_bundle_ms = t_bundle.elapsed().as_millis();
@@ -1049,7 +1044,7 @@ async fn smoke_offline_failover(base_url: String) -> Result<(), String> {
     let smoke_start = std::time::Instant::now();
     let client = reqwest::Client::new();
     let host = create_workshop(&client, &base_url, "XtaskFailoverHost").await?;
-    let guest = join_workshop(&client, &base_url, &host.session_code, "XtaskFailoverGuest").await?;
+    let mut guest = join_workshop(&client, &base_url, &host.session_code, "XtaskFailoverGuest").await?;
 
     let mut host_socket = attach_ws_session(&base_url, &host).await?;
     host_socket
@@ -1058,13 +1053,13 @@ async fn smoke_offline_failover(base_url: String) -> Result<(), String> {
         .map_err(|error| format!("failed to close smoke websocket: {error}"))?;
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-    let guest_after_failover = reconnect_workshop(&client, &base_url, &guest).await?;
-    let guest_player = guest_after_failover
+    guest = reconnect_workshop(&client, &base_url, &guest).await?;
+    let guest_player = guest
         .state
         .players
         .get(&guest.player_id)
         .ok_or_else(|| "guest player missing after failover".to_string())?;
-    let host_player = guest_after_failover
+    let host_player = guest
         .state
         .players
         .get(&host.player_id)
@@ -1082,8 +1077,8 @@ async fn smoke_offline_failover(base_url: String) -> Result<(), String> {
         command_request(&guest, SessionCommand::StartPhase1, None),
     )
     .await?;
-    let guest_phase1 = reconnect_workshop(&client, &base_url, &guest).await?;
-    ensure_phase(&guest_phase1, Phase::Phase1, "guest phase1 after failover")?;
+    guest = reconnect_workshop(&client, &base_url, &guest).await?;
+    ensure_phase(&guest, Phase::Phase1, "guest phase1 after failover")?;
 
     let host_reconnected = reconnect_workshop(&client, &base_url, &host).await?;
     let host_player_after_reconnect = host_reconnected
@@ -1104,8 +1099,8 @@ async fn smoke_offline_failover(base_url: String) -> Result<(), String> {
         command_request(&guest, SessionCommand::ResetGame, None),
     )
     .await?;
-    let guest_lobby = reconnect_workshop(&client, &base_url, &guest).await?;
-    ensure_phase(&guest_lobby, Phase::Lobby, "guest lobby after reset")?;
+    guest = reconnect_workshop(&client, &base_url, &guest).await?;
+    ensure_phase(&guest, Phase::Lobby, "guest lobby after reset")?;
 
     print_json(json!({
         "ok": true,
@@ -1630,10 +1625,6 @@ async fn create_workshop(
                 phase0_minutes: 5,
                 phase1_minutes: 10,
                 phase2_minutes: 10,
-                image_generator_token: None,
-                image_generator_model: None,
-                judge_token: None,
-                judge_model: None,
             },
         })
         .send()

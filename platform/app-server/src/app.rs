@@ -29,8 +29,10 @@ use tower_http::{
 };
 
 use crate::http::{
-    create_workshop, join_workshop, live, ready, workshop_command, workshop_judge_bundle,
+    create_workshop, join_workshop, live, llm_generate_image, llm_judge, ready, workshop_command,
+    workshop_judge_bundle,
 };
+use crate::llm::{LlmClient, LlmPoolConfig, load_llm_pool_config};
 use crate::ws::{WsOutbound, workshop_ws};
 
 #[derive(Debug, Clone)]
@@ -47,6 +49,7 @@ pub(crate) struct AppConfig {
     pub(crate) origin_policy: OriginPolicy,
     pub(crate) static_assets_dir: PathBuf,
     pub(crate) database_url: Option<String>,
+    pub(crate) llm_pool: LlmPoolConfig,
 }
 
 #[derive(Clone)]
@@ -54,6 +57,7 @@ pub(crate) struct AppState {
     pub(crate) config: Arc<AppConfig>,
     pub(crate) replica_id: String,
     pub(crate) store: Arc<dyn SessionStore>,
+    pub(crate) llm_client: Arc<LlmClient>,
     pub(crate) sessions: Arc<Mutex<BTreeMap<String, WorkshopSession>>>,
     pub(crate) session_cache_load_locks: Arc<Mutex<BTreeMap<String, Arc<Mutex<()>>>>>,
     pub(crate) session_write_locks: Arc<Mutex<BTreeMap<String, Arc<Mutex<()>>>>>,
@@ -76,10 +80,12 @@ impl AppState {
         let join_rate_limit = config.join_rate_limit;
         let command_rate_limit = config.command_rate_limit;
         let websocket_rate_limit = config.websocket_rate_limit;
+        let llm_client = Arc::new(LlmClient::new(config.llm_pool.clone()));
         Self {
             config,
             replica_id: uuid::Uuid::new_v4().to_string(),
             store,
+            llm_client,
             sessions: Arc::new(Mutex::new(BTreeMap::new())),
             session_cache_load_locks: Arc::new(Mutex::new(BTreeMap::new())),
             session_write_locks: Arc::new(Mutex::new(BTreeMap::new())),
@@ -120,6 +126,8 @@ pub(crate) fn build_app(state: AppState) -> Router {
         .route("/workshops/command", post(workshop_command))
         .route("/workshops/ws", get(workshop_ws))
         .route("/workshops/judge-bundle", post(workshop_judge_bundle))
+        .route("/llm/judge", post(llm_judge))
+        .route("/llm/images", post(llm_generate_image))
         .route("/live", get(live))
         .route("/ready", get(ready))
         .fallback(api_not_found);
@@ -194,11 +202,10 @@ pub(crate) fn load_config() -> Result<AppConfig, String> {
                 .expect("workspace root")
                 .join("app-web/dist")
         });
+    let llm_pool = load_llm_pool_config()?;
     let database_url = load_database_url()?;
     if is_production && database_url.is_none() {
-        return Err(
-            "DATABASE_URL or DATABASE_URL_FILE is required when NODE_ENV=production".to_string(),
-        );
+        return Err("DATABASE_URL is required when NODE_ENV=production".to_string());
     }
     Ok(AppConfig {
         bind_addr,
@@ -213,6 +220,7 @@ pub(crate) fn load_config() -> Result<AppConfig, String> {
         origin_policy,
         static_assets_dir,
         database_url,
+        llm_pool,
     })
 }
 
@@ -225,23 +233,7 @@ fn load_database_url() -> Result<Option<String>, String> {
         return Ok(Some(value));
     }
 
-    let Some(path) = env::var("DATABASE_URL_FILE")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-    else {
-        return Ok(None);
-    };
-
-    let value = std::fs::read_to_string(&path)
-        .map_err(|error| format!("read DATABASE_URL_FILE {path}: {error}"))?;
-
-    let value = value.trim().to_string();
-    if value.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(value))
-    }
+    Ok(None)
 }
 
 fn load_rate_limit_env(key: &str, default: u32) -> Result<u32, String> {

@@ -282,7 +282,7 @@ mod tests {
             normalize_api_base_url(" http://localhost:4100/ "),
             "http://localhost:4100"
         );
-        assert_eq!(normalize_api_base_url("   "), "http://127.0.0.1:4100");
+        assert_eq!(normalize_api_base_url("   "), "");
     }
 
     #[test]

@@ -18,7 +18,7 @@ use components::session_panel::SessionPanel;
 use components::workshop_brief::WorkshopBrief;
 
 use realtime::bootstrap_realtime;
-use state::{apply_realtime_bootstrap_error, bootstrap_state};
+use state::{ShellScreen, apply_realtime_bootstrap_error, bootstrap_state};
 
 #[cfg(target_arch = "wasm32")]
 fn main() {
@@ -42,10 +42,6 @@ fn App() -> Element {
     let phase0_minutes = use_signal(|| "8".to_string());
     let phase1_minutes = use_signal(|| "8".to_string());
     let phase2_minutes = use_signal(|| "8".to_string());
-    let image_generator_token = use_signal(String::new);
-    let image_generator_model = use_signal(String::new);
-    let judge_token = use_signal(String::new);
-    let judge_model = use_signal(String::new);
     let join_session_code = use_signal(|| bootstrap.join_session_code);
     let join_name = use_signal(|| bootstrap.join_name);
     let reconnect_session_code = use_signal(|| bootstrap.reconnect_session_code);
@@ -61,6 +57,10 @@ fn App() -> Element {
     let has_session_snapshot = {
         let id = identity.read();
         id.session_snapshot.is_some()
+    };
+    let render_session_panels_first = {
+        let id = identity.read();
+        id.screen == ShellScreen::Session
     };
 
     let mut effect_identity = identity;
@@ -86,6 +86,23 @@ fn App() -> Element {
                 Hero { identity, game_state }
                 NoticeBar { ops }
                 section { class: "grid",
+                    if render_session_panels && render_session_panels_first {
+                        SessionPanel {
+                            identity,
+                            game_state,
+                            ops,
+                            handover_tags_input,
+                            judge_bundle,
+                        }
+                        ControlsPanel {
+                            identity,
+                            game_state,
+                            ops,
+                            handover_tags_input,
+                            judge_bundle,
+                        }
+                        ArchivePanel { game_state, judge_bundle }
+                    }
                     WorkshopBrief {}
                     CreatePanel {
                         identity,
@@ -95,10 +112,6 @@ fn App() -> Element {
                         phase0_minutes,
                         phase1_minutes,
                         phase2_minutes,
-                        image_generator_token,
-                        image_generator_model,
-                        judge_token,
-                        judge_model,
                         join_session_code,
                         reconnect_session_code,
                         reconnect_token,
@@ -114,7 +127,7 @@ fn App() -> Element {
                         reconnect_token,
                         judge_bundle,
                     }
-                    if render_session_panels {
+                    if render_session_panels && !render_session_panels_first {
                         SessionPanel {
                             identity,
                             game_state,

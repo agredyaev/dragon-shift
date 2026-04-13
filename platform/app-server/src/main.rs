@@ -2,6 +2,7 @@ mod app;
 mod cache;
 mod helpers;
 mod http;
+mod llm;
 #[cfg(test)]
 mod tests;
 mod ws;

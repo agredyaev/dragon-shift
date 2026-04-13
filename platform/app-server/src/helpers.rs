@@ -1,10 +1,10 @@
 use chrono::Utc;
 use domain::{PlayerAction, SessionDragon, WorkshopSession};
 use protocol::{
-    ActionPayload, ActiveTime, ClientDragon, ClientGameState, ClientVotingState, DragonStats,
-    DragonVisuals, FoodType, JudgeActionTrace, JudgeBundle, JudgeDragonBundle, JudgeHandoverChain,
-    JudgePlayerSummary, PlayType, Player, SessionArtifactKind, SessionArtifactRecord, SessionMeta,
-    VoteResult, create_session_settings,
+    create_session_settings, ActionPayload, ActiveTime, ClientDragon, ClientGameState,
+    ClientVotingState, DragonStats, DragonVisuals, FoodType, JudgeActionTrace, JudgeBundle,
+    JudgeDragonBundle, JudgeHandoverChain, JudgePlayerSummary, PlayType, Player,
+    SessionArtifactKind, SessionArtifactRecord, SessionMeta, VoteResult,
 };
 use std::collections::BTreeMap;
 use uuid::Uuid;
@@ -376,16 +376,10 @@ pub(crate) fn build_judge_bundle(
 
 pub(crate) fn session_config_from_request(
     payload: &protocol::CreateWorkshopRequest,
-    is_production: bool,
 ) -> protocol::WorkshopCreateConfig {
-    let mut config = payload.config.clone();
-
-    // Do not allow long-lived third-party tokens to travel from browser to
-    // persisted session state in production.
-    if is_production {
-        config.image_generator_token = None;
-        config.judge_token = None;
+    protocol::WorkshopCreateConfig {
+        phase0_minutes: payload.config.phase0_minutes,
+        phase1_minutes: payload.config.phase1_minutes,
+        phase2_minutes: payload.config.phase2_minutes,
     }
-
-    config
 }

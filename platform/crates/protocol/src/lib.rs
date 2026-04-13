@@ -342,14 +342,6 @@ pub struct WorkshopCreateConfig {
     pub phase0_minutes: u32,
     pub phase1_minutes: u32,
     pub phase2_minutes: u32,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub image_generator_token: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub image_generator_model: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub judge_token: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub judge_model: Option<String>,
 }
 
 impl Default for WorkshopCreateConfig {
@@ -358,10 +350,6 @@ impl Default for WorkshopCreateConfig {
             phase0_minutes: 8,
             phase1_minutes: 8,
             phase2_minutes: 8,
-            image_generator_token: None,
-            image_generator_model: None,
-            judge_token: None,
-            judge_model: None,
         }
     }
 }
@@ -490,6 +478,97 @@ pub struct JudgeBundle {
     pub players: Vec<JudgePlayerSummary>,
     pub dragons: Vec<JudgeDragonBundle>,
 }
+
+// ---------------------------------------------------------------------------
+// LLM provider types
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LlmProviderKind {
+    VertexAi,
+    ApiKey,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LlmProviderEntry {
+    #[serde(rename = "type")]
+    pub provider_type: LlmProviderKind,
+    pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key_env_var: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LlmJudgeRequest {
+    pub session_code: String,
+    pub reconnect_token: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coordinator_type: Option<CoordinatorType>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LlmJudgeEvaluation {
+    pub summary: String,
+    pub dragon_evaluations: Vec<LlmDragonEvaluation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LlmDragonEvaluation {
+    pub dragon_id: String,
+    pub dragon_name: String,
+    pub care_score: i32,
+    pub creativity_score: i32,
+    pub feedback: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LlmJudgeSuccess {
+    pub ok: bool,
+    pub evaluation: LlmJudgeEvaluation,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum LlmJudgeResult {
+    Success(LlmJudgeSuccess),
+    Error(WorkshopError),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LlmImageRequest {
+    pub session_code: String,
+    pub reconnect_token: String,
+    pub dragon_id: String,
+    pub prompt: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coordinator_type: Option<CoordinatorType>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LlmImageSuccess {
+    pub ok: bool,
+    pub image_base64: String,
+    pub mime_type: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum LlmImageResult {
+    Success(LlmImageSuccess),
+    Error(WorkshopError),
+}
+
+// ---------------------------------------------------------------------------
+// Workshop command result types
+// ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -776,21 +855,17 @@ mod tests {
                 .step,
             0
         );
-        assert!(
-            settings
-                .phases
-                .get(&Phase::Lobby)
-                .expect("lobby phase")
-                .allowed_commands
-                .contains(&SessionCommand::Join)
-        );
-        assert!(
-            settings
-                .phases
-                .get(&Phase::Voting)
-                .expect("voting phase")
-                .allowed_commands
-                .contains(&SessionCommand::SubmitVote)
-        );
+        assert!(settings
+            .phases
+            .get(&Phase::Lobby)
+            .expect("lobby phase")
+            .allowed_commands
+            .contains(&SessionCommand::Join));
+        assert!(settings
+            .phases
+            .get(&Phase::Voting)
+            .expect("voting phase")
+            .allowed_commands
+            .contains(&SessionCommand::SubmitVote));
     }
 }

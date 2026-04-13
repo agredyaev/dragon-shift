@@ -7,10 +7,11 @@ use chrono::{DateTime, Utc};
 use domain::{DomainError, Phase1Assignment, SessionCode, SessionPlayer, WorkshopSession};
 use protocol::{
     ActionPayload, CoordinatorType, CreateWorkshopRequest, DiscoveryObservationRequest,
-    JoinWorkshopRequest, SessionArtifactKind, SessionArtifactRecord, SessionCommand, VotePayload,
-    WorkshopCommandRequest, WorkshopCommandResult, WorkshopCommandSuccess, WorkshopError,
-    WorkshopJoinResult, WorkshopJoinSuccess, WorkshopJudgeBundleRequest, WorkshopJudgeBundleResult,
-    WorkshopJudgeBundleSuccess,
+    JoinWorkshopRequest, LlmImageRequest, LlmImageResult, LlmImageSuccess, LlmJudgeRequest,
+    LlmJudgeResult, LlmJudgeSuccess, SessionArtifactKind, SessionArtifactRecord, SessionCommand,
+    VotePayload, WorkshopCommandRequest, WorkshopCommandResult, WorkshopCommandSuccess,
+    WorkshopError, WorkshopJoinResult, WorkshopJoinSuccess, WorkshopJudgeBundleRequest,
+    WorkshopJudgeBundleResult, WorkshopJudgeBundleSuccess,
 };
 use security::{FixedWindowRateLimiter, OriginPolicy};
 use serde_json::json;
@@ -129,29 +130,6 @@ pub(crate) async fn create_workshop(
             })),
         );
     }
-    if state.config.origin_policy.is_production
-        && (payload
-            .config
-            .image_generator_token
-            .as_deref()
-            .map(str::trim)
-            .is_some_and(|value| !value.is_empty())
-            || payload
-                .config
-                .judge_token
-                .as_deref()
-                .map(str::trim)
-                .is_some_and(|value| !value.is_empty()))
-    {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(WorkshopJoinResult::Error(WorkshopError {
-                ok: false,
-                error: "Browser-supplied third-party tokens are disabled in production. Use local/dev only or move secrets to server-side configuration.".to_string(),
-            })),
-        );
-    }
-
     let timestamp = Utc::now();
     let session_code = allocate_session_code(&state).await;
     let player_id = random_prefixed_id("player");
@@ -160,7 +138,7 @@ pub(crate) async fn create_workshop(
         Uuid::new_v4(),
         SessionCode(session_code.clone()),
         timestamp,
-        session_config_from_request(&payload, state.config.origin_policy.is_production),
+        session_config_from_request(&payload),
     );
     let host_player = SessionPlayer {
         id: player_id.clone(),
@@ -197,8 +175,8 @@ pub(crate) async fn create_workshop(
             "phase0Minutes": session.config.phase0_minutes,
             "phase1Minutes": session.config.phase1_minutes,
             "phase2Minutes": session.config.phase2_minutes,
-            "hasImageGeneratorToken": session.config.image_generator_token.is_some(),
-            "hasJudgeToken": session.config.judge_token.is_some(),
+            "imageModelConfigured": state.config.llm_pool.is_image_configured(),
+            "judgeModelConfigured": state.config.llm_pool.is_judge_configured(),
         }),
     };
 
@@ -1323,6 +1301,266 @@ fn too_many_command_requests() -> (StatusCode, Json<WorkshopCommandResult>) {
     (
         StatusCode::TOO_MANY_REQUESTS,
         Json(WorkshopCommandResult::Error(WorkshopError {
+            ok: false,
+            error: "Too many requests. Please slow down and try again.".to_string(),
+        })),
+    )
+}
+
+// ---------------------------------------------------------------------------
+// LLM endpoints
+// ---------------------------------------------------------------------------
+
+pub(crate) async fn llm_judge(
+    State(state): State<AppState>,
+    connect_info: MaybeConnectInfo,
+    headers: HeaderMap,
+    Json(request): Json<LlmJudgeRequest>,
+) -> (StatusCode, Json<LlmJudgeResult>) {
+    if let Some(response) = reject_disallowed_llm_origin(&headers, &state.config.origin_policy) {
+        return response;
+    }
+    let client_key = client_key(&state, connect_info, &headers);
+    if is_rate_limited(&state.command_limiter, &client_key).await {
+        return too_many_llm_judge_requests();
+    }
+
+    let session_code = request.session_code.trim();
+    let reconnect_token = request.reconnect_token.trim();
+    if session_code.is_empty()
+        || reconnect_token.is_empty()
+        || security::validate_session_code(session_code).is_err()
+    {
+        return bad_llm_judge_request("Missing workshop credentials.");
+    }
+
+    let identity = match authorize_reconnect_identity(&state, session_code, reconnect_token).await {
+        Ok(Some(identity)) => identity,
+        Ok(None) => return bad_llm_judge_request("Session identity is invalid or expired."),
+        Err(error) => {
+            return internal_llm_judge_error(format!("failed to lookup identity: {error}"));
+        }
+    };
+
+    if let Err(error) = refresh_reconnect_identity(&state, reconnect_token, Utc::now()).await {
+        return internal_llm_judge_error(format!("failed to touch player identity: {error}"));
+    }
+
+    let session = {
+        match ensure_session_cached(&state, session_code).await {
+            Ok(true) => {}
+            Ok(false) => return bad_llm_judge_request("Workshop not found."),
+            Err(error) => {
+                return internal_llm_judge_error(format!("failed to load session: {error}"));
+            }
+        }
+        let sessions = state.sessions.lock().await;
+        let Some(session) = sessions.get(session_code) else {
+            return bad_llm_judge_request("Workshop not found.");
+        };
+        session.clone()
+    };
+
+    let artifacts = match state
+        .store
+        .list_session_artifacts(&session.id.to_string())
+        .await
+    {
+        Ok(artifacts) => artifacts,
+        Err(error) => {
+            return internal_llm_judge_error(format!(
+                "failed to list session artifacts: {error}"
+            ));
+        }
+    };
+
+    let bundle = build_judge_bundle(&session, &artifacts);
+
+    let evaluation = match state.llm_client.judge(&bundle).await {
+        Ok(evaluation) => evaluation,
+        Err(error) => {
+            return internal_llm_judge_error(format!("LLM judge failed: {error}"));
+        }
+    };
+
+    if let Err(error) = state
+        .store
+        .append_session_artifact(&SessionArtifactRecord {
+            id: random_prefixed_id("artifact"),
+            session_id: session.id.to_string(),
+            phase: session.phase,
+            step: 4,
+            kind: SessionArtifactKind::JudgeBundleGenerated,
+            player_id: Some(identity.player_id.clone()),
+            created_at: Utc::now().to_rfc3339(),
+            payload: json!({
+                "dragonCount": bundle.dragons.len(),
+                "artifactCount": bundle.artifact_count,
+                "llmSummary": evaluation.summary,
+            }),
+        })
+        .await
+    {
+        tracing::warn!(%error, "failed to append judge artifact (non-fatal)");
+    }
+
+    (
+        StatusCode::OK,
+        Json(LlmJudgeResult::Success(LlmJudgeSuccess {
+            ok: true,
+            evaluation,
+        })),
+    )
+}
+
+pub(crate) async fn llm_generate_image(
+    State(state): State<AppState>,
+    connect_info: MaybeConnectInfo,
+    headers: HeaderMap,
+    Json(request): Json<LlmImageRequest>,
+) -> (StatusCode, Json<LlmImageResult>) {
+    if let Some(response) = reject_disallowed_llm_image_origin(&headers, &state.config.origin_policy) {
+        return response;
+    }
+    let client_key = client_key(&state, connect_info, &headers);
+    if is_rate_limited(&state.command_limiter, &client_key).await {
+        return too_many_llm_image_requests();
+    }
+
+    let session_code = request.session_code.trim();
+    let reconnect_token = request.reconnect_token.trim();
+    if session_code.is_empty()
+        || reconnect_token.is_empty()
+        || security::validate_session_code(session_code).is_err()
+    {
+        return bad_llm_image_request("Missing workshop credentials.");
+    }
+
+    let _identity = match authorize_reconnect_identity(&state, session_code, reconnect_token).await
+    {
+        Ok(Some(identity)) => identity,
+        Ok(None) => return bad_llm_image_request("Session identity is invalid or expired."),
+        Err(error) => {
+            return internal_llm_image_error(format!("failed to lookup identity: {error}"));
+        }
+    };
+
+    if let Err(error) = refresh_reconnect_identity(&state, reconnect_token, Utc::now()).await {
+        return internal_llm_image_error(format!("failed to touch player identity: {error}"));
+    }
+
+    let prompt = request.prompt.trim();
+    if prompt.is_empty() {
+        return bad_llm_image_request("Image prompt is required.");
+    }
+
+    let (image_base64, mime_type) = match state.llm_client.generate_image(prompt).await {
+        Ok(result) => result,
+        Err(error) => {
+            return internal_llm_image_error(format!("image generation failed: {error}"));
+        }
+    };
+
+    (
+        StatusCode::OK,
+        Json(LlmImageResult::Success(LlmImageSuccess {
+            ok: true,
+            image_base64,
+            mime_type,
+        })),
+    )
+}
+
+fn reject_disallowed_llm_origin(
+    headers: &HeaderMap,
+    policy: &OriginPolicy,
+) -> Option<(StatusCode, Json<LlmJudgeResult>)> {
+    let origin = headers.get("origin").and_then(|value| value.to_str().ok());
+    if security::is_origin_allowed(origin, policy) {
+        None
+    } else {
+        Some((
+            StatusCode::FORBIDDEN,
+            Json(LlmJudgeResult::Error(WorkshopError {
+                ok: false,
+                error: "Origin is not allowed.".to_string(),
+            })),
+        ))
+    }
+}
+
+fn reject_disallowed_llm_image_origin(
+    headers: &HeaderMap,
+    policy: &OriginPolicy,
+) -> Option<(StatusCode, Json<LlmImageResult>)> {
+    let origin = headers.get("origin").and_then(|value| value.to_str().ok());
+    if security::is_origin_allowed(origin, policy) {
+        None
+    } else {
+        Some((
+            StatusCode::FORBIDDEN,
+            Json(LlmImageResult::Error(WorkshopError {
+                ok: false,
+                error: "Origin is not allowed.".to_string(),
+            })),
+        ))
+    }
+}
+
+fn bad_llm_judge_request(message: &str) -> (StatusCode, Json<LlmJudgeResult>) {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(LlmJudgeResult::Error(WorkshopError {
+            ok: false,
+            error: message.to_string(),
+        })),
+    )
+}
+
+fn internal_llm_judge_error(message: String) -> (StatusCode, Json<LlmJudgeResult>) {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(LlmJudgeResult::Error(WorkshopError {
+            ok: false,
+            error: message,
+        })),
+    )
+}
+
+fn bad_llm_image_request(message: &str) -> (StatusCode, Json<LlmImageResult>) {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(LlmImageResult::Error(WorkshopError {
+            ok: false,
+            error: message.to_string(),
+        })),
+    )
+}
+
+fn internal_llm_image_error(message: String) -> (StatusCode, Json<LlmImageResult>) {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(LlmImageResult::Error(WorkshopError {
+            ok: false,
+            error: message,
+        })),
+    )
+}
+
+fn too_many_llm_judge_requests() -> (StatusCode, Json<LlmJudgeResult>) {
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        Json(LlmJudgeResult::Error(WorkshopError {
+            ok: false,
+            error: "Too many requests. Please slow down and try again.".to_string(),
+        })),
+    )
+}
+
+fn too_many_llm_image_requests() -> (StatusCode, Json<LlmImageResult>) {
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        Json(LlmImageResult::Error(WorkshopError {
             ok: false,
             error: "Too many requests. Please slow down and try again.".to_string(),
         })),

@@ -21,6 +21,7 @@ persistence.workspace = true
 sqlx = { workspace = true, features = ["postgres"] }
 security.workspace = true
 realtime.workspace = true
+reqwest.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]

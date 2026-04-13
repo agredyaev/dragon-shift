@@ -117,24 +117,13 @@ fn map_notice_tone(level: NoticeLevel) -> NoticeTone {
 // ---------------------------------------------------------------------------
 
 pub fn default_api_base_url() -> String {
-    browser_default_api_base_url().unwrap_or_else(|| "http://127.0.0.1:4100".to_string())
+    browser_default_api_base_url().unwrap_or_default()
 }
 
 #[cfg(target_arch = "wasm32")]
 fn browser_default_api_base_url() -> Option<String> {
     let window = web_sys::window()?;
-    let location = window.location();
-    let protocol = location.protocol().ok()?;
-    let hostname = location.hostname().ok()?;
-    let port = location.port().ok().unwrap_or_default();
-
-    if hostname == "127.0.0.1" || hostname == "localhost" {
-        if matches!(port.as_str(), "8080" | "8081" | "5173") {
-            return Some(format!("{protocol}//{hostname}:4100"));
-        }
-    }
-
-    let origin = location.origin().ok()?;
+    let origin = window.location().origin().ok()?;
     if origin.trim().is_empty() {
         None
     } else {
@@ -239,7 +228,7 @@ pub fn restore_bootstrap(snapshot: Option<ClientSessionSnapshot>) -> BootstrapRe
 }
 
 pub fn bootstrap_state() -> BootstrapResult {
-    match load_browser_session_snapshot() {
+    let mut result = match load_browser_session_snapshot() {
         Ok(snapshot) => restore_bootstrap(snapshot),
         Err(error) => {
             let mut result = restore_bootstrap(None);
@@ -248,7 +237,19 @@ pub fn bootstrap_state() -> BootstrapResult {
             )));
             result
         }
+    };
+
+    if let Ok(Some(api_base_url)) = load_browser_query_api_base_url() {
+        result.identity.api_base_url = api_base_url;
+        let _ = persist_browser_api_base_url(&result.identity.api_base_url);
+        return result;
     }
+
+    if let Ok(Some(api_base_url)) = load_browser_api_base_url() {
+        result.identity.api_base_url = api_base_url;
+    }
+
+    result
 }
 
 // ---------------------------------------------------------------------------
@@ -257,6 +258,9 @@ pub fn bootstrap_state() -> BootstrapResult {
 
 #[allow(dead_code)]
 pub const SESSION_SNAPSHOT_STORAGE_KEY: &str = "dragon-switch/platform/session-snapshot";
+
+#[allow(dead_code)]
+pub const API_BASE_URL_STORAGE_KEY: &str = "dragon-switch/platform/api-base-url";
 
 #[allow(dead_code)]
 pub fn encode_session_snapshot(snapshot: &ClientSessionSnapshot) -> Result<String, String> {
@@ -296,6 +300,65 @@ pub fn load_browser_session_snapshot() -> Result<Option<ClientSessionSnapshot>, 
 }
 
 #[cfg(target_arch = "wasm32")]
+pub fn load_browser_api_base_url() -> Result<Option<String>, String> {
+    let Some(window) = web_sys::window() else {
+        return Err("window is unavailable".to_string());
+    };
+    let storage = window
+        .local_storage()
+        .map_err(|_| "failed to access browser storage".to_string())?
+        .ok_or_else(|| "browser storage is unavailable".to_string())?;
+
+    let Some(value) = storage
+        .get_item(API_BASE_URL_STORAGE_KEY)
+        .map_err(|_| "failed to read browser storage".to_string())?
+    else {
+        return Ok(None);
+    };
+
+    let value = value.trim().to_string();
+    if value.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(value))
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn load_browser_api_base_url() -> Result<Option<String>, String> {
+    Ok(None)
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn load_browser_query_api_base_url() -> Result<Option<String>, String> {
+    let Some(window) = web_sys::window() else {
+        return Err("window is unavailable".to_string());
+    };
+    let search = window
+        .location()
+        .search()
+        .map_err(|_| "failed to read browser location".to_string())?;
+    let params = web_sys::UrlSearchParams::new_with_str(&search)
+        .map_err(|_| "failed to parse browser query parameters".to_string())?;
+
+    let Some(value) = params.get("apiBaseUrl") else {
+        return Ok(None);
+    };
+
+    let value = value.trim().to_string();
+    if value.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(value))
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn load_browser_query_api_base_url() -> Result<Option<String>, String> {
+    Ok(None)
+}
+
+#[cfg(target_arch = "wasm32")]
 pub fn persist_browser_session_snapshot(snapshot: &ClientSessionSnapshot) -> Result<(), String> {
     let Some(window) = web_sys::window() else {
         return Err("window is unavailable".to_string());
@@ -313,6 +376,33 @@ pub fn persist_browser_session_snapshot(snapshot: &ClientSessionSnapshot) -> Res
 #[cfg(not(target_arch = "wasm32"))]
 pub fn persist_browser_session_snapshot(snapshot: &ClientSessionSnapshot) -> Result<(), String> {
     let _ = snapshot;
+    Ok(())
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn persist_browser_api_base_url(api_base_url: &str) -> Result<(), String> {
+    let Some(window) = web_sys::window() else {
+        return Err("window is unavailable".to_string());
+    };
+    let storage = window
+        .local_storage()
+        .map_err(|_| "failed to access browser storage".to_string())?
+        .ok_or_else(|| "browser storage is unavailable".to_string())?;
+
+    if api_base_url.trim().is_empty() {
+        storage
+            .remove_item(API_BASE_URL_STORAGE_KEY)
+            .map_err(|_| "failed to clear browser API address".to_string())
+    } else {
+        storage
+            .set_item(API_BASE_URL_STORAGE_KEY, api_base_url.trim())
+            .map_err(|_| "failed to persist browser API address".to_string())
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn persist_browser_api_base_url(api_base_url: &str) -> Result<(), String> {
+    let _ = api_base_url;
     Ok(())
 }
 
@@ -492,8 +582,8 @@ pub fn apply_server_ws_message(
 mod tests {
     use super::*;
     use protocol::{
-        ClientGameState, CoordinatorType, Phase, Player, SessionMeta, WorkshopJoinSuccess,
-        create_default_session_settings,
+        create_default_session_settings, ClientGameState, CoordinatorType, Phase, Player,
+        SessionMeta, WorkshopJoinSuccess,
     };
     use std::collections::BTreeMap;
 
@@ -548,7 +638,7 @@ mod tests {
         assert_eq!(identity.connection_status, ConnectionStatus::Offline);
         assert_eq!(identity.coordinator, CoordinatorType::Rust);
         assert_eq!(identity.identity, None);
-        assert_eq!(identity.api_base_url, "http://127.0.0.1:4100");
+        assert_eq!(identity.api_base_url, "");
     }
 
     #[test]

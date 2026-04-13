@@ -43,6 +43,7 @@ dependencies = [
  "persistence",
  "protocol",
  "realtime",
+ "reqwest",
  "security",
  "serde",
  "serde_json",
