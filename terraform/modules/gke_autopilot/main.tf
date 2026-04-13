@@ -62,7 +62,6 @@ resource "google_container_cluster" "this" {
       "CONTROLLER_MANAGER",
       "SCHEDULER",
       "SYSTEM_COMPONENTS",
-      "WORKLOADS",
     ]
 
     managed_prometheus {
