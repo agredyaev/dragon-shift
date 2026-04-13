@@ -117,7 +117,7 @@ impl AppWebApi {
         let window = web_sys::window().ok_or_else(|| "window is unavailable".to_string())?;
         let response = JsFuture::from(window.fetch_with_request(&request))
             .await
-            .map_err(js_error_message)?;
+            .map_err(|e| format!("failed to reach backend: {}", js_error_message(e)))?;
         let response: web_sys::Response = response
             .dyn_into()
             .map_err(|_| "failed to read browser response".to_string())?;
