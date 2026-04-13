@@ -115,7 +115,7 @@ test.describe('browser restart reconnect proof', () => {
       await reconnect.page.getByTestId('reconnect-button').click()
 
       await expect(reconnect.page.getByTestId('connection-badge')).toContainText('Connected')
-      await waitForNotice(reconnect.page, 'Session synced.')
+      await waitForNotice(reconnect.page, 'Reconnected to workshop.')
       await expect(reconnect.page.getByTestId('session-panel')).toContainText('Handover')
       await expect(reconnect.page.getByTestId('session-panel')).toContainText('3 / 3 handover rules saved')
       await expect(reconnect.page.getByTestId('session-panel')).toContainText('berries')
