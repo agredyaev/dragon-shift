@@ -89,6 +89,7 @@ variable "github_actions_service_account_roles" {
     "roles/monitoring.notificationChannelEditor",
     "roles/monitoring.uptimeCheckConfigEditor",
     "roles/secretmanager.admin",
+    "roles/servicenetworking.networksAdmin",
     "roles/serviceusage.serviceUsageAdmin",
   ]
 }

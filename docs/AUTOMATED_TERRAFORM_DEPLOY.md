@@ -30,8 +30,8 @@ The bootstrap outputs provide `GCP_WORKLOAD_IDENTITY_PROVIDER` and `GCP_SERVICE_
 `TF_PRODUCTION_DB_PASSWORD` is a separate operator-managed secret and is not emitted by Terraform.
 The default GitHub ref allowlist is `refs/heads/main`.
 The bootstrap module intentionally uses a local backend path because it creates the remote state bucket that the other Terraform stacks use.
-Keep that local bootstrap state file so you can re-run the bootstrap module to reconcile GitHub OIDC or service-account changes later.
-Later automation runs only ensure the state bucket exists when it is missing.
+Keep that local bootstrap state file for operator-driven bootstrap changes and recovery.
+If you change bootstrap IAM or Workload Identity settings after the first run, re-apply `terraform/bootstrap` with that saved local state and pass the same `state_bucket_name`, `github_repository_id`, and `github_repository_owner_id` values again before relying on automated deploys.
 
 ## Repository Variables
 
@@ -82,4 +82,4 @@ Prerequisites for local use:
 - authenticated `gcloud` with access to the target project
 - `kubectl`, `helm`, `npm`, and Playwright browser dependencies available
 
-The script resolves the current public IPv4 for `master_authorized_networks`, preserves extra operator CIDRs from `TF_EXTRA_MASTER_AUTHORIZED_CIDRS`, bootstraps the state bucket, applies both Terraform stacks, verifies rollout health through the cluster, and optionally requires public HTTPS plus the deployed Playwright smoke when `TF_VERIFY_PUBLIC_EDGE=true`.
+The script resolves the current public IPv4 for `master_authorized_networks`, preserves extra operator CIDRs from `TF_EXTRA_MASTER_AUTHORIZED_CIDRS`, bootstraps the state bucket when needed, applies both Terraform stacks, verifies rollout health through the cluster, and optionally requires public HTTPS plus the deployed Playwright smoke when `TF_VERIFY_PUBLIC_EDGE=true`.
