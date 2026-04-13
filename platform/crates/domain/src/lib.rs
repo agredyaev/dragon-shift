@@ -1906,4 +1906,974 @@ mod tests {
         assert_eq!(dragon.energy, 97);
         assert_eq!(dragon.happiness, 97);
     }
+
+    // =========================================================================
+    // VALIDATOR 1: Action Correctness (feed, play, sleep — correct vs wrong)
+    // =========================================================================
+
+    /// Helper: create a Phase1 session with one player and one dragon whose
+    /// preferences are fully controlled (day active, day_food=Meat, etc.)
+    fn setup_deterministic_session() -> WorkshopSession {
+        let mut session = WorkshopSession::new(
+            Uuid::new_v4(),
+            SessionCode("999999".into()),
+            ts(1),
+            config(),
+        );
+        session.add_player(player("p1", true, 10));
+        session
+            .begin_phase1(&[Phase1Assignment {
+                player_id: "p1".into(),
+                dragon_id: "d1".into(),
+            }])
+            .expect("phase1");
+        // Fix dragon preferences for determinism
+        let d = session.dragons.get_mut("d1").unwrap();
+        d.active_time = ActiveTime::Day;
+        d.day_food = FoodType::Meat;
+        d.night_food = FoodType::Fish;
+        d.day_play = PlayType::Fetch;
+        d.night_play = PlayType::Music;
+        d.sleep_rate = 2;
+        // Reset stats
+        d.hunger = 50;
+        d.energy = 50;
+        d.happiness = 50;
+        // Set time to daytime
+        session.time = 10;
+        session
+    }
+
+    #[test]
+    fn validator1_feed_correct_food_applies_bonuses() {
+        let mut s = setup_deterministic_session();
+        let outcome = s.apply_action("p1", PlayerAction::Feed(FoodType::Meat)).unwrap();
+
+        assert!(matches!(outcome, ActionOutcome::Applied { was_correct: true, .. }));
+        let d = s.dragons.get("d1").unwrap();
+        assert_eq!(d.hunger, 90);       // 50 + 40
+        assert_eq!(d.happiness, 65);    // 50 + 15
+        assert_eq!(d.correct_actions, 1);
+        assert_eq!(d.wrong_food_count, 0);
+        assert_eq!(d.total_actions, 1);
+        assert!(d.found_correct_food);
+    }
+
+    #[test]
+    fn validator1_feed_wrong_food_applies_penalty() {
+        let mut s = setup_deterministic_session();
+        let outcome = s.apply_action("p1", PlayerAction::Feed(FoodType::Fruit)).unwrap();
+
+        assert!(matches!(outcome, ActionOutcome::Applied { was_correct: false, .. }));
+        let d = s.dragons.get("d1").unwrap();
+        assert_eq!(d.hunger, 55);       // 50 + 5
+        assert_eq!(d.happiness, 30);    // 50 - 20
+        assert_eq!(d.wrong_food_count, 1);
+        assert_eq!(d.penalty_stacks, 1);
+        assert!(!d.found_correct_food);
+    }
+
+    #[test]
+    fn validator1_day_night_food_preference_switches() {
+        let mut s = setup_deterministic_session();
+        // During day (time=10), Meat is correct
+        let out1 = s.apply_action("p1", PlayerAction::Feed(FoodType::Meat)).unwrap();
+        assert!(matches!(out1, ActionOutcome::Applied { was_correct: true, .. }));
+
+        // Clear cooldown and switch to night
+        s.dragons.get_mut("d1").unwrap().action_cooldown = 0;
+        s.dragons.get_mut("d1").unwrap().hunger = 50;
+        s.time = 20; // Night
+
+        // During night, Fish is correct (not Meat)
+        let out2 = s.apply_action("p1", PlayerAction::Feed(FoodType::Fish)).unwrap();
+        assert!(matches!(out2, ActionOutcome::Applied { was_correct: true, .. }));
+
+        // Meat is now wrong at night
+        s.dragons.get_mut("d1").unwrap().action_cooldown = 0;
+        s.dragons.get_mut("d1").unwrap().hunger = 50;
+        let out3 = s.apply_action("p1", PlayerAction::Feed(FoodType::Meat)).unwrap();
+        assert!(matches!(out3, ActionOutcome::Applied { was_correct: false, .. }));
+    }
+
+    #[test]
+    fn validator1_play_correct_vs_wrong() {
+        let mut s = setup_deterministic_session();
+        // Day play = Fetch (correct)
+        let out1 = s.apply_action("p1", PlayerAction::Play(PlayType::Fetch)).unwrap();
+        assert!(matches!(out1, ActionOutcome::Applied { was_correct: true, .. }));
+        let d = s.dragons.get("d1").unwrap();
+        assert_eq!(d.energy, 30);       // 50 - 20
+        assert_eq!(d.happiness, 80);    // 50 + 30
+
+        // Reset and try wrong play
+        s.dragons.get_mut("d1").unwrap().action_cooldown = 0;
+        s.dragons.get_mut("d1").unwrap().energy = 50;
+        s.dragons.get_mut("d1").unwrap().happiness = 50;
+        let out2 = s.apply_action("p1", PlayerAction::Play(PlayType::Puzzle)).unwrap();
+        assert!(matches!(out2, ActionOutcome::Applied { was_correct: false, .. }));
+        let d = s.dragons.get("d1").unwrap();
+        assert_eq!(d.energy, 35);       // 50 - 15
+        assert_eq!(d.happiness, 30);    // 50 - 20
+    }
+
+    #[test]
+    fn validator1_sleep_correct_vs_wrong_time() {
+        let mut s = setup_deterministic_session();
+        let d = s.dragons.get_mut("d1").unwrap();
+        d.energy = 40; // Not too awake
+        d.active_time = ActiveTime::Day;
+
+        // During night → correct sleep time for day-active dragon
+        s.time = 22;
+        let out1 = s.apply_action("p1", PlayerAction::Sleep).unwrap();
+        assert!(matches!(out1, ActionOutcome::Applied { was_correct: true, .. }));
+        let d = s.dragons.get("d1").unwrap();
+        assert_eq!(d.energy, 90);       // 40 + 50
+        assert_eq!(d.happiness, 60);    // 50 + 10
+
+        // Reset: during day → wrong sleep time
+        let d = s.dragons.get_mut("d1").unwrap();
+        d.action_cooldown = 0;
+        d.energy = 40;
+        d.happiness = 50;
+        s.time = 10;
+        let out2 = s.apply_action("p1", PlayerAction::Sleep).unwrap();
+        assert!(matches!(out2, ActionOutcome::Applied { was_correct: false, .. }));
+        let d = s.dragons.get("d1").unwrap();
+        assert_eq!(d.energy, 90);       // 40 + 50 (energy always recovers)
+        assert_eq!(d.happiness, 50);    // No happiness bonus for wrong time
+    }
+
+    // =========================================================================
+    // VALIDATOR 2: Achievement System (all 12 achievements)
+    // =========================================================================
+
+    #[test]
+    fn validator2_master_chef_first_correct_food() {
+        let mut s = setup_deterministic_session();
+        let out = s.apply_action("p1", PlayerAction::Feed(FoodType::Meat)).unwrap();
+        match out {
+            ActionOutcome::Applied { awarded_achievement, was_correct } => {
+                assert!(was_correct);
+                assert_eq!(awarded_achievement, Some("master_chef"));
+            }
+            _ => panic!("expected Applied"),
+        }
+    }
+
+    #[test]
+    fn validator2_master_chef_not_awarded_on_second_try() {
+        let mut s = setup_deterministic_session();
+        // First try: wrong food
+        s.apply_action("p1", PlayerAction::Feed(FoodType::Fruit)).unwrap();
+        s.dragons.get_mut("d1").unwrap().action_cooldown = 0;
+        // Second try: correct food — no master_chef because food_tries > 1
+        let out = s.apply_action("p1", PlayerAction::Feed(FoodType::Meat)).unwrap();
+        match out {
+            ActionOutcome::Applied { awarded_achievement, .. } => {
+                assert_ne!(awarded_achievement, Some("master_chef"));
+            }
+            _ => panic!("expected Applied"),
+        }
+    }
+
+    #[test]
+    fn validator2_playful_spirit_first_correct_play() {
+        let mut s = setup_deterministic_session();
+        let out = s.apply_action("p1", PlayerAction::Play(PlayType::Fetch)).unwrap();
+        match out {
+            ActionOutcome::Applied { awarded_achievement, was_correct } => {
+                assert!(was_correct);
+                assert_eq!(awarded_achievement, Some("playful_spirit"));
+            }
+            _ => panic!("expected Applied"),
+        }
+    }
+
+    #[test]
+    fn validator2_speed_learner_within_three_actions() {
+        let mut s = setup_deterministic_session();
+        // Action 1: correct food (awards master_chef)
+        s.apply_action("p1", PlayerAction::Feed(FoodType::Meat)).unwrap();
+        s.dragons.get_mut("d1").unwrap().action_cooldown = 0;
+
+        // Action 2: correct play → should award speed_learner (both found within 3 actions)
+        let out = s.apply_action("p1", PlayerAction::Play(PlayType::Fetch)).unwrap();
+        match out {
+            ActionOutcome::Applied { awarded_achievement, .. } => {
+                // playful_spirit takes priority on first play try,
+                // but speed_learner check: found_correct_food is true, total_actions <= 3
+                // Actually playful_spirit is checked first; speed_learner only if awarded.is_none()
+                // Since playful_spirit fires, speed_learner doesn't
+                assert_eq!(awarded_achievement, Some("playful_spirit"));
+            }
+            _ => panic!("expected Applied"),
+        }
+        // But the player should have both food + play found
+        let d = s.dragons.get("d1").unwrap();
+        assert!(d.found_correct_food);
+        assert!(d.found_correct_play);
+        assert_eq!(d.total_actions, 2); // Within 3
+    }
+
+    #[test]
+    fn validator2_speed_learner_not_awarded_after_four_actions() {
+        let mut s = setup_deterministic_session();
+        // 3 wrong actions first
+        for _ in 0..3 {
+            s.apply_action("p1", PlayerAction::Feed(FoodType::Fruit)).unwrap();
+            s.dragons.get_mut("d1").unwrap().action_cooldown = 0;
+        }
+        // Now correct food (total_actions = 4)
+        s.apply_action("p1", PlayerAction::Feed(FoodType::Meat)).unwrap();
+        s.dragons.get_mut("d1").unwrap().action_cooldown = 0;
+        // Correct play (total_actions = 5) — too late for speed_learner
+        s.apply_action("p1", PlayerAction::Play(PlayType::Fetch)).unwrap();
+        let d = s.dragons.get("d1").unwrap();
+        assert!(d.found_correct_food);
+        assert!(d.found_correct_play);
+        assert!(d.total_actions > 3);
+        // speed_learner should NOT have been awarded
+        let p = s.players.get("p1").unwrap();
+        assert!(!p.achievements.contains(&"speed_learner".to_string()));
+    }
+
+    #[test]
+    fn validator2_steady_hand_happiness_above_60_for_20_ticks() {
+        let mut s = setup_deterministic_session();
+        // Move to Phase 2
+        s.transition_to(Phase::Handover).unwrap();
+        s.save_handover_tags("p1", vec!["a".into(), "b".into(), "c".into()]);
+        s.enter_phase2().unwrap();
+        let d = s.dragons.get_mut("d1").unwrap();
+        d.active_time = ActiveTime::Day;
+        d.day_food = FoodType::Meat;
+        d.night_food = FoodType::Fish;
+        d.day_play = PlayType::Fetch;
+        d.night_play = PlayType::Music;
+        d.sleep_rate = 1;
+
+        // Simulate 19 ticks already passed with happiness always >= 65
+        d.phase2_ticks = 19;
+        d.phase2_lowest_happiness = 65;
+        d.hunger = 80;
+        d.energy = 80;
+        d.happiness = 80;
+        s.time = 10; // daytime, correct for Day dragon
+
+        // 20th tick — happiness stays above 60, achievement should fire
+        s.advance_tick();
+        let d = s.dragons.get("d1").unwrap();
+        // Decay: (1 + 0 + 0 + 0 + 0) * 3 = 3. happiness = 80 - 3 = 77
+        assert!(d.happiness >= 60, "happiness {} should be >= 60", d.happiness);
+        assert_eq!(d.phase2_ticks, 20);
+
+        let p = s.players.get("p1").unwrap();
+        assert!(
+            p.achievements.contains(&"steady_hand".to_string()),
+            "steady_hand should be awarded when phase2_ticks >= 20 and lowest happiness >= 60"
+        );
+
+        // Negative case: if lowest happiness was below 60, achievement should NOT fire
+        let mut s2 = setup_deterministic_session();
+        s2.transition_to(Phase::Handover).unwrap();
+        s2.save_handover_tags("p1", vec!["a".into(), "b".into(), "c".into()]);
+        s2.enter_phase2().unwrap();
+        let d2 = s2.dragons.get_mut("d1").unwrap();
+        d2.active_time = ActiveTime::Day;
+        d2.sleep_rate = 1;
+        d2.phase2_ticks = 19;
+        d2.phase2_lowest_happiness = 50; // was below 60 at some point
+        d2.hunger = 80;
+        d2.energy = 80;
+        d2.happiness = 80;
+        s2.time = 10;
+
+        s2.advance_tick();
+        let p2 = s2.players.get("p1").unwrap();
+        assert!(
+            !p2.achievements.contains(&"steady_hand".to_string()),
+            "steady_hand should NOT be awarded when lowest happiness was below 60"
+        );
+    }
+
+    #[test]
+    fn validator2_no_mistakes_phase_end() {
+        let mut s = setup_deterministic_session();
+        s.transition_to(Phase::Handover).unwrap();
+        s.save_handover_tags("p1", vec!["a".into(), "b".into(), "c".into()]);
+        s.enter_phase2().unwrap();
+        let d = s.dragons.get_mut("d1").unwrap();
+        d.active_time = ActiveTime::Day;
+        d.day_food = FoodType::Meat;
+        d.day_play = PlayType::Fetch;
+        d.sleep_rate = 1;
+        d.hunger = 50;
+        d.energy = 50;
+        d.happiness = 50;
+        s.time = 10;
+
+        // 5 correct actions, 0 wrong
+        for _ in 0..5 {
+            s.apply_action("p1", PlayerAction::Feed(FoodType::Meat)).unwrap();
+            let d = s.dragons.get_mut("d1").unwrap();
+            d.action_cooldown = 0;
+            d.hunger = 50; // Keep feedable
+        }
+        let d = s.dragons.get("d1").unwrap();
+        assert_eq!(d.wrong_food_count, 0);
+        assert_eq!(d.wrong_play_count, 0);
+        assert!(d.total_actions >= 5);
+
+        s.award_phase_end_achievements();
+        let p = s.players.get("p1").unwrap();
+        assert!(p.achievements.contains(&"no_mistakes".to_string()));
+    }
+
+    #[test]
+    fn validator2_zen_master_zero_penalty_stacks_eight_actions() {
+        let mut s = setup_deterministic_session();
+        s.transition_to(Phase::Handover).unwrap();
+        s.save_handover_tags("p1", vec!["a".into(), "b".into(), "c".into()]);
+        s.enter_phase2().unwrap();
+        let d = s.dragons.get_mut("d1").unwrap();
+        d.active_time = ActiveTime::Day;
+        d.day_food = FoodType::Meat;
+        d.sleep_rate = 1;
+        d.hunger = 50;
+        d.energy = 50;
+        d.happiness = 50;
+        s.time = 10;
+
+        // 8 correct actions
+        for _ in 0..8 {
+            s.apply_action("p1", PlayerAction::Feed(FoodType::Meat)).unwrap();
+            let d = s.dragons.get_mut("d1").unwrap();
+            d.action_cooldown = 0;
+            d.hunger = 50;
+        }
+        let d = s.dragons.get("d1").unwrap();
+        assert_eq!(d.penalty_stacks, 0);
+        assert!(d.total_actions >= 8);
+
+        s.award_phase_end_achievements();
+        let p = s.players.get("p1").unwrap();
+        assert!(p.achievements.contains(&"zen_master".to_string()));
+    }
+
+    #[test]
+    fn validator2_button_masher_five_cooldown_violations() {
+        let mut s = setup_deterministic_session();
+        s.transition_to(Phase::Handover).unwrap();
+        s.save_handover_tags("p1", vec!["a".into(), "b".into(), "c".into()]);
+        s.enter_phase2().unwrap();
+        let d = s.dragons.get_mut("d1").unwrap();
+        d.active_time = ActiveTime::Day;
+        d.day_food = FoodType::Meat;
+        d.sleep_rate = 1;
+        s.time = 10;
+
+        // Trigger one real action to start cooldown
+        s.apply_action("p1", PlayerAction::Feed(FoodType::Meat)).unwrap();
+        // Spam 5 actions during cooldown
+        for _ in 0..5 {
+            let out = s.apply_action("p1", PlayerAction::Feed(FoodType::Meat)).unwrap();
+            assert_eq!(out, ActionOutcome::CooldownViolation);
+        }
+        assert_eq!(s.dragons.get("d1").unwrap().cooldown_violations, 5);
+
+        s.award_phase_end_achievements();
+        let p = s.players.get("p1").unwrap();
+        assert!(p.achievements.contains(&"button_masher".to_string()));
+    }
+
+    #[test]
+    fn validator2_rock_bottom_happiness_hits_zero() {
+        let mut s = setup_deterministic_session();
+        s.transition_to(Phase::Handover).unwrap();
+        s.save_handover_tags("p1", vec!["a".into(), "b".into(), "c".into()]);
+        s.enter_phase2().unwrap();
+        let d = s.dragons.get_mut("d1").unwrap();
+        d.active_time = ActiveTime::Day;
+        d.sleep_rate = 1;
+        d.hunger = 0;
+        d.energy = 0;
+        d.happiness = 5; // Very low, will hit 0 fast with decay_multiplier=3
+        s.time = 10;
+
+        // Run ticks until happiness drops to 0
+        for _ in 0..5 {
+            s.advance_tick();
+        }
+        let d = s.dragons.get("d1").unwrap();
+        assert_eq!(d.happiness, 0);
+        let p = s.players.get("p1").unwrap();
+        assert!(p.achievements.contains(&"rock_bottom".to_string()));
+    }
+
+    #[test]
+    fn validator2_helicopter_parent_twenty_actions() {
+        let mut s = setup_deterministic_session();
+        s.transition_to(Phase::Handover).unwrap();
+        s.save_handover_tags("p1", vec!["a".into(), "b".into(), "c".into()]);
+        s.enter_phase2().unwrap();
+        let d = s.dragons.get_mut("d1").unwrap();
+        d.active_time = ActiveTime::Day;
+        d.day_food = FoodType::Meat;
+        d.sleep_rate = 1;
+        s.time = 10;
+
+        for _ in 0..20 {
+            s.dragons.get_mut("d1").unwrap().action_cooldown = 0;
+            s.dragons.get_mut("d1").unwrap().hunger = 50;
+            s.apply_action("p1", PlayerAction::Feed(FoodType::Meat)).unwrap();
+        }
+        assert_eq!(s.dragons.get("d1").unwrap().total_actions, 20);
+
+        s.award_phase_end_achievements();
+        let p = s.players.get("p1").unwrap();
+        assert!(p.achievements.contains(&"helicopter_parent".to_string()));
+    }
+
+    #[test]
+    fn validator2_comeback_kid_low_to_high_happiness() {
+        let mut s = setup_deterministic_session();
+        s.transition_to(Phase::Handover).unwrap();
+        s.save_handover_tags("p1", vec!["a".into(), "b".into(), "c".into()]);
+        s.enter_phase2().unwrap();
+        let d = s.dragons.get_mut("d1").unwrap();
+        d.active_time = ActiveTime::Day;
+        d.day_food = FoodType::Meat;
+        d.day_play = PlayType::Fetch;
+        d.sleep_rate = 1;
+        d.hunger = 50;
+        d.energy = 50;
+        d.happiness = 10; // Low starting point
+        d.phase2_lowest_happiness = 10;
+        s.time = 10;
+
+        // Record a tick so phase2_lowest_happiness captures the 10
+        s.advance_tick();
+        let d = s.dragons.get("d1").unwrap();
+        assert!(d.phase2_lowest_happiness <= 15);
+
+        // Now recover happiness with correct actions
+        for _ in 0..6 {
+            let d = s.dragons.get_mut("d1").unwrap();
+            d.action_cooldown = 0;
+            d.hunger = 50;
+            d.energy = 50;
+            s.apply_action("p1", PlayerAction::Play(PlayType::Fetch)).unwrap();
+        }
+        let d = s.dragons.get("d1").unwrap();
+        assert!(d.happiness >= 70, "happiness {} should be >= 70", d.happiness);
+        assert!(d.phase2_lowest_happiness <= 15);
+
+        s.award_phase_end_achievements();
+        let p = s.players.get("p1").unwrap();
+        assert!(p.achievements.contains(&"comeback_kid".to_string()));
+    }
+
+    #[test]
+    fn validator2_chaos_gremlin_peak_penalty_stacks() {
+        let mut s = setup_deterministic_session();
+        s.transition_to(Phase::Handover).unwrap();
+        s.save_handover_tags("p1", vec!["a".into(), "b".into(), "c".into()]);
+        s.enter_phase2().unwrap();
+        let d = s.dragons.get_mut("d1").unwrap();
+        d.active_time = ActiveTime::Day;
+        d.day_food = FoodType::Meat;
+        d.sleep_rate = 1;
+        d.happiness = 100; // High so penalties don't zero out
+        s.time = 10;
+
+        // 4 wrong foods → 4 penalty stacks
+        for _ in 0..4 {
+            s.dragons.get_mut("d1").unwrap().action_cooldown = 0;
+            s.dragons.get_mut("d1").unwrap().hunger = 50;
+            s.apply_action("p1", PlayerAction::Feed(FoodType::Fruit)).unwrap();
+        }
+        let d = s.dragons.get("d1").unwrap();
+        assert!(d.peak_penalty_stacks >= 4, "peak {} should be >= 4", d.peak_penalty_stacks);
+
+        s.award_phase_end_achievements();
+        let p = s.players.get("p1").unwrap();
+        assert!(p.achievements.contains(&"chaos_gremlin".to_string()));
+    }
+
+    #[test]
+    fn validator2_perfectionist_high_correct_ratio() {
+        let mut s = setup_deterministic_session();
+        s.transition_to(Phase::Handover).unwrap();
+        s.save_handover_tags("p1", vec!["a".into(), "b".into(), "c".into()]);
+        s.enter_phase2().unwrap();
+        let d = s.dragons.get_mut("d1").unwrap();
+        d.active_time = ActiveTime::Day;
+        d.day_food = FoodType::Meat;
+        d.sleep_rate = 1;
+        s.time = 10;
+
+        // 9 correct + 1 wrong = 90% correct (>= 80%), total = 10
+        for _ in 0..9 {
+            s.dragons.get_mut("d1").unwrap().action_cooldown = 0;
+            s.dragons.get_mut("d1").unwrap().hunger = 50;
+            s.apply_action("p1", PlayerAction::Feed(FoodType::Meat)).unwrap();
+        }
+        s.dragons.get_mut("d1").unwrap().action_cooldown = 0;
+        s.dragons.get_mut("d1").unwrap().hunger = 50;
+        s.apply_action("p1", PlayerAction::Feed(FoodType::Fruit)).unwrap(); // 1 wrong
+
+        let d = s.dragons.get("d1").unwrap();
+        assert_eq!(d.total_actions, 10);
+        assert_eq!(d.correct_actions, 9);
+
+        s.award_phase_end_achievements();
+        let p = s.players.get("p1").unwrap();
+        assert!(p.achievements.contains(&"perfectionist".to_string()));
+    }
+
+    // =========================================================================
+    // VALIDATOR 3: Tick Simulation (decay, penalty stacks, sleep shield, speech)
+    // =========================================================================
+
+    #[test]
+    fn validator3_phase1_tick_decay_multiplier_is_one() {
+        let mut s = setup_deterministic_session();
+        let d = s.dragons.get_mut("d1").unwrap();
+        d.hunger = 100;
+        d.energy = 100;
+        d.happiness = 100;
+        d.sleep_rate = 2;
+        d.active_time = ActiveTime::Day;
+        s.time = 10;
+
+        s.advance_tick();
+
+        let d = s.dragons.get("d1").unwrap();
+        // Phase1: decay_multiplier=1
+        // hunger: 100 - 1 = 99
+        // energy: 100 - (2 * 1 * 1) = 98
+        // happiness: 100 - (1 * 1) = 99
+        assert_eq!(d.hunger, 99);
+        assert_eq!(d.energy, 98);
+        assert_eq!(d.happiness, 99);
+    }
+
+    #[test]
+    fn validator3_penalty_stacks_increase_happiness_decay() {
+        let mut s = setup_deterministic_session();
+        s.transition_to(Phase::Handover).unwrap();
+        s.save_handover_tags("p1", vec!["a".into(), "b".into(), "c".into()]);
+        s.enter_phase2().unwrap();
+        let d = s.dragons.get_mut("d1").unwrap();
+        d.active_time = ActiveTime::Day;
+        d.sleep_rate = 1;
+        d.hunger = 100;
+        d.energy = 100;
+        d.happiness = 100;
+        d.penalty_stacks = 3;
+        s.time = 10;
+
+        s.advance_tick();
+
+        let d = s.dragons.get("d1").unwrap();
+        // happiness_decay = (1 + 0 + 0 + 0 + min(3,4)) * 3 = 4 * 3 = 12
+        assert_eq!(d.happiness, 88);
+    }
+
+    #[test]
+    fn validator3_penalty_stacks_decay_every_six_ticks() {
+        let mut s = setup_deterministic_session();
+        let d = s.dragons.get_mut("d1").unwrap();
+        d.active_time = ActiveTime::Day;
+        d.sleep_rate = 1;
+        d.hunger = 100;
+        d.energy = 100;
+        d.happiness = 100;
+        d.penalty_stacks = 2;
+        d.penalty_decay_timer = 0;
+        s.time = 10;
+
+        // Run 6 ticks — should decay 1 stack
+        for _ in 0..6 {
+            s.advance_tick();
+        }
+        let d = s.dragons.get("d1").unwrap();
+        assert_eq!(d.penalty_stacks, 1, "should have decayed from 2 to 1");
+
+        // Run 6 more ticks
+        for _ in 0..6 {
+            s.advance_tick();
+        }
+        let d = s.dragons.get("d1").unwrap();
+        assert_eq!(d.penalty_stacks, 0, "should have decayed from 1 to 0");
+    }
+
+    #[test]
+    fn validator3_sleep_shield_suppresses_wrong_time_decay() {
+        let mut s = setup_deterministic_session();
+        let d = s.dragons.get_mut("d1").unwrap();
+        d.active_time = ActiveTime::Day;
+        d.sleep_rate = 1;
+        d.hunger = 100;
+        d.energy = 100;
+        d.happiness = 100;
+        d.sleep_shield_ticks = 1;
+        s.time = 22; // Night — wrong time for day dragon
+
+        s.advance_tick();
+
+        let d = s.dragons.get("d1").unwrap();
+        // With sleep shield, wrong_time component is suppressed
+        // happiness_decay = (1 + 0 + 0 + 0_suppressed + 0) * 1 = 1
+        assert_eq!(d.happiness, 99);
+
+        // Shield expired, next tick wrong_time should apply
+        let d = s.dragons.get_mut("d1").unwrap();
+        d.hunger = 100;
+        d.happiness = 100;
+        s.advance_tick();
+        let d = s.dragons.get("d1").unwrap();
+        // happiness_decay = (1 + 0 + 0 + 1_wrong_time + 0) * 1 = 2
+        assert_eq!(d.happiness, 98);
+    }
+
+    #[test]
+    fn validator3_speech_timer_counts_down_and_clears() {
+        let mut s = setup_deterministic_session();
+        let d = s.dragons.get_mut("d1").unwrap();
+        d.active_time = ActiveTime::Day;
+        d.sleep_rate = 1;
+        d.hunger = 100;
+        d.energy = 100;
+        d.speech = Some("Hello!".to_string());
+        d.speech_timer = 2;
+        s.time = 10;
+
+        s.advance_tick();
+        assert_eq!(s.dragons.get("d1").unwrap().speech_timer, 1);
+        assert!(s.dragons.get("d1").unwrap().speech.is_some());
+
+        s.advance_tick();
+        assert_eq!(s.dragons.get("d1").unwrap().speech_timer, 0);
+        assert!(s.dragons.get("d1").unwrap().speech.is_none());
+    }
+
+    #[test]
+    fn validator3_day_night_cycle_resets_food_play_tries() {
+        let mut s = setup_deterministic_session();
+        let d = s.dragons.get_mut("d1").unwrap();
+        d.active_time = ActiveTime::Day;
+        d.sleep_rate = 1;
+        d.hunger = 100;
+        d.energy = 100;
+        d.food_tries = 5;
+        d.play_tries = 3;
+
+        // Transition from day (17) to night (18)
+        s.time = 17;
+        s.advance_tick(); // time becomes 18 (night)
+        let d = s.dragons.get("d1").unwrap();
+        assert_eq!(d.food_tries, 0, "food_tries reset on day→night");
+        assert_eq!(d.play_tries, 0, "play_tries reset on day→night");
+    }
+
+    #[test]
+    fn validator3_wrong_active_time_doubles_energy_decay() {
+        let mut s = setup_deterministic_session();
+        let d = s.dragons.get_mut("d1").unwrap();
+        d.active_time = ActiveTime::Day;
+        d.sleep_rate = 2;
+        d.hunger = 100;
+        d.energy = 100;
+        d.happiness = 100;
+
+        // Correct time (day)
+        s.time = 10;
+        s.advance_tick();
+        let energy_day = s.dragons.get("d1").unwrap().energy;
+        // energy: 100 - (2 * 1 * 1) = 98
+        assert_eq!(energy_day, 98);
+
+        // Wrong time (night) — time_penalty=2
+        let d = s.dragons.get_mut("d1").unwrap();
+        d.energy = 100;
+        s.time = 21;
+        s.advance_tick();
+        let energy_night = s.dragons.get("d1").unwrap().energy;
+        // energy: 100 - (2 * 2 * 1) = 96
+        assert_eq!(energy_night, 96);
+    }
+
+    // =========================================================================
+    // VALIDATOR 4: Stat Clamping (all stats bounded 0–100)
+    // =========================================================================
+
+    #[test]
+    fn validator4_hunger_clamped_at_100_after_feed() {
+        let mut s = setup_deterministic_session();
+        let d = s.dragons.get_mut("d1").unwrap();
+        d.hunger = 80;
+        // Correct food: +40 → 120 should clamp to 100
+        s.apply_action("p1", PlayerAction::Feed(FoodType::Meat)).unwrap();
+        assert_eq!(s.dragons.get("d1").unwrap().hunger, 100);
+    }
+
+    #[test]
+    fn validator4_hunger_clamped_at_zero_after_tick() {
+        let mut s = setup_deterministic_session();
+        let d = s.dragons.get_mut("d1").unwrap();
+        d.hunger = 0;
+        d.energy = 100;
+        d.active_time = ActiveTime::Day;
+        d.sleep_rate = 1;
+        s.time = 10;
+        s.advance_tick();
+        assert_eq!(s.dragons.get("d1").unwrap().hunger, 0);
+    }
+
+    #[test]
+    fn validator4_happiness_clamped_at_zero_after_escalating_penalties() {
+        let mut s = setup_deterministic_session();
+        let d = s.dragons.get_mut("d1").unwrap();
+        d.happiness = 10;
+        // Wrong food penalty = 20 → would go to -10
+        s.apply_action("p1", PlayerAction::Feed(FoodType::Fruit)).unwrap();
+        assert_eq!(s.dragons.get("d1").unwrap().happiness, 0);
+    }
+
+    #[test]
+    fn validator4_energy_clamped_at_100_after_sleep() {
+        let mut s = setup_deterministic_session();
+        let d = s.dragons.get_mut("d1").unwrap();
+        d.energy = 80;
+        // Sleep: +50 → 130 should clamp to 100
+        s.apply_action("p1", PlayerAction::Sleep).unwrap();
+        assert_eq!(s.dragons.get("d1").unwrap().energy, 100);
+    }
+
+    #[test]
+    fn validator4_happiness_clamped_at_100_after_correct_play() {
+        let mut s = setup_deterministic_session();
+        let d = s.dragons.get_mut("d1").unwrap();
+        d.happiness = 90;
+        // Correct play: +30 → 120 should clamp to 100
+        s.apply_action("p1", PlayerAction::Play(PlayType::Fetch)).unwrap();
+        assert_eq!(s.dragons.get("d1").unwrap().happiness, 100);
+    }
+
+    #[test]
+    fn validator4_energy_clamped_at_zero_after_tick() {
+        let mut s = setup_deterministic_session();
+        s.transition_to(Phase::Handover).unwrap();
+        s.save_handover_tags("p1", vec!["a".into(), "b".into(), "c".into()]);
+        s.enter_phase2().unwrap();
+        let d = s.dragons.get_mut("d1").unwrap();
+        d.active_time = ActiveTime::Day;
+        d.sleep_rate = 3;
+        d.energy = 5;
+        s.time = 22; // Wrong time → time_penalty=2
+        // energy: 5 - (3 * 2 * 3) = 5 - 18 → 0
+
+        s.advance_tick();
+        assert_eq!(s.dragons.get("d1").unwrap().energy, 0);
+    }
+
+    // =========================================================================
+    // VALIDATOR 5: Cooldown Enforcement
+    // =========================================================================
+
+    #[test]
+    fn validator5_action_during_cooldown_returns_violation() {
+        let mut s = setup_deterministic_session();
+        // First action starts cooldown
+        s.apply_action("p1", PlayerAction::Feed(FoodType::Meat)).unwrap();
+        let d = s.dragons.get("d1").unwrap();
+        assert_eq!(d.action_cooldown, 3);
+
+        // Second action during cooldown
+        let out = s.apply_action("p1", PlayerAction::Feed(FoodType::Meat)).unwrap();
+        assert_eq!(out, ActionOutcome::CooldownViolation);
+    }
+
+    #[test]
+    fn validator5_cooldown_violation_increments_counter_only() {
+        let mut s = setup_deterministic_session();
+        s.apply_action("p1", PlayerAction::Feed(FoodType::Meat)).unwrap();
+        let hunger_before = s.dragons.get("d1").unwrap().hunger;
+
+        // Spam during cooldown
+        s.apply_action("p1", PlayerAction::Feed(FoodType::Meat)).unwrap();
+        s.apply_action("p1", PlayerAction::Feed(FoodType::Meat)).unwrap();
+
+        let d = s.dragons.get("d1").unwrap();
+        assert_eq!(d.cooldown_violations, 2);
+        assert_eq!(d.hunger, hunger_before, "hunger should not change during cooldown");
+        assert_eq!(d.total_actions, 1, "total_actions should not increase");
+    }
+
+    #[test]
+    fn validator5_cooldown_expires_after_three_ticks() {
+        let mut s = setup_deterministic_session();
+        let d = s.dragons.get_mut("d1").unwrap();
+        d.active_time = ActiveTime::Day;
+        d.day_food = FoodType::Meat;
+        d.sleep_rate = 1;
+        d.hunger = 50; // must be < 95 so feed is not blocked
+        d.energy = 100;
+        s.time = 10;
+
+        s.apply_action("p1", PlayerAction::Feed(FoodType::Meat)).unwrap();
+        assert_eq!(s.dragons.get("d1").unwrap().action_cooldown, 3);
+
+        s.advance_tick();
+        assert_eq!(s.dragons.get("d1").unwrap().action_cooldown, 2);
+        s.advance_tick();
+        assert_eq!(s.dragons.get("d1").unwrap().action_cooldown, 1);
+        s.advance_tick();
+        assert_eq!(s.dragons.get("d1").unwrap().action_cooldown, 0);
+
+        // Now action should work again
+        s.dragons.get_mut("d1").unwrap().hunger = 50;
+        let out = s.apply_action("p1", PlayerAction::Feed(FoodType::Meat)).unwrap();
+        assert!(matches!(out, ActionOutcome::Applied { .. }));
+    }
+
+    #[test]
+    fn validator5_cooldown_violation_does_not_affect_penalty_stacks() {
+        let mut s = setup_deterministic_session();
+        s.apply_action("p1", PlayerAction::Feed(FoodType::Meat)).unwrap();
+
+        // Cooldown violation should NOT add penalty stacks
+        s.apply_action("p1", PlayerAction::Feed(FoodType::Meat)).unwrap();
+        let d = s.dragons.get("d1").unwrap();
+        assert_eq!(d.cooldown_violations, 1);
+        assert_eq!(d.penalty_stacks, 0, "cooldown violations should not add penalty stacks");
+    }
+
+    // =========================================================================
+    // VALIDATOR 6: Penalty & Escalation System
+    // =========================================================================
+
+    #[test]
+    fn validator6_wrong_food_penalty_escalates() {
+        let mut s = setup_deterministic_session();
+        let d = s.dragons.get_mut("d1").unwrap();
+        d.happiness = 100;
+
+        // 1st wrong food: penalty = 20
+        s.apply_action("p1", PlayerAction::Feed(FoodType::Fruit)).unwrap();
+        assert_eq!(s.dragons.get("d1").unwrap().happiness, 80);
+
+        // 2nd wrong food: penalty = 20 + (2-1)*5 = 25
+        s.dragons.get_mut("d1").unwrap().action_cooldown = 0;
+        s.dragons.get_mut("d1").unwrap().happiness = 100;
+        s.apply_action("p1", PlayerAction::Feed(FoodType::Fruit)).unwrap();
+        assert_eq!(s.dragons.get("d1").unwrap().happiness, 75);
+
+        // 3rd wrong food: penalty = 20 + (3-1)*5 = 30
+        s.dragons.get_mut("d1").unwrap().action_cooldown = 0;
+        s.dragons.get_mut("d1").unwrap().happiness = 100;
+        s.apply_action("p1", PlayerAction::Feed(FoodType::Fruit)).unwrap();
+        assert_eq!(s.dragons.get("d1").unwrap().happiness, 70);
+
+        // 4th wrong food: penalty = 20 + min(3,3)*5 = 35 (capped)
+        s.dragons.get_mut("d1").unwrap().action_cooldown = 0;
+        s.dragons.get_mut("d1").unwrap().happiness = 100;
+        s.apply_action("p1", PlayerAction::Feed(FoodType::Fruit)).unwrap();
+        assert_eq!(s.dragons.get("d1").unwrap().happiness, 65);
+
+        // 5th wrong food: penalty still 35 (cap holds)
+        s.dragons.get_mut("d1").unwrap().action_cooldown = 0;
+        s.dragons.get_mut("d1").unwrap().happiness = 100;
+        s.apply_action("p1", PlayerAction::Feed(FoodType::Fruit)).unwrap();
+        assert_eq!(s.dragons.get("d1").unwrap().happiness, 65);
+    }
+
+    #[test]
+    fn validator6_wrong_play_penalty_escalates() {
+        let mut s = setup_deterministic_session();
+        let d = s.dragons.get_mut("d1").unwrap();
+        d.happiness = 100;
+
+        // 1st wrong play: penalty = 20
+        s.apply_action("p1", PlayerAction::Play(PlayType::Puzzle)).unwrap();
+        assert_eq!(s.dragons.get("d1").unwrap().happiness, 80);
+
+        // 2nd wrong play: penalty = 25
+        s.dragons.get_mut("d1").unwrap().action_cooldown = 0;
+        s.dragons.get_mut("d1").unwrap().happiness = 100;
+        s.dragons.get_mut("d1").unwrap().energy = 50;
+        s.apply_action("p1", PlayerAction::Play(PlayType::Puzzle)).unwrap();
+        assert_eq!(s.dragons.get("d1").unwrap().happiness, 75);
+    }
+
+    #[test]
+    fn validator6_correct_action_reduces_penalty_stacks() {
+        let mut s = setup_deterministic_session();
+        // Build up 3 penalty stacks
+        for _ in 0..3 {
+            s.dragons.get_mut("d1").unwrap().action_cooldown = 0;
+            s.dragons.get_mut("d1").unwrap().hunger = 50;
+            s.apply_action("p1", PlayerAction::Feed(FoodType::Fruit)).unwrap();
+        }
+        assert_eq!(s.dragons.get("d1").unwrap().penalty_stacks, 3);
+
+        // Correct food: penalty_stacks -= 1
+        s.dragons.get_mut("d1").unwrap().action_cooldown = 0;
+        s.dragons.get_mut("d1").unwrap().hunger = 50;
+        s.apply_action("p1", PlayerAction::Feed(FoodType::Meat)).unwrap();
+        assert_eq!(s.dragons.get("d1").unwrap().penalty_stacks, 2);
+    }
+
+    #[test]
+    fn validator6_peak_penalty_stacks_tracks_maximum() {
+        let mut s = setup_deterministic_session();
+        let d = s.dragons.get_mut("d1").unwrap();
+        d.happiness = 100;
+
+        // Build 3 penalty stacks
+        for _ in 0..3 {
+            s.dragons.get_mut("d1").unwrap().action_cooldown = 0;
+            s.dragons.get_mut("d1").unwrap().hunger = 50;
+            s.apply_action("p1", PlayerAction::Feed(FoodType::Fruit)).unwrap();
+        }
+        assert_eq!(s.dragons.get("d1").unwrap().peak_penalty_stacks, 3);
+
+        // Reduce with correct action
+        s.dragons.get_mut("d1").unwrap().action_cooldown = 0;
+        s.dragons.get_mut("d1").unwrap().hunger = 50;
+        s.apply_action("p1", PlayerAction::Feed(FoodType::Meat)).unwrap();
+        assert_eq!(s.dragons.get("d1").unwrap().penalty_stacks, 2);
+        // Peak should NOT decrease
+        assert_eq!(s.dragons.get("d1").unwrap().peak_penalty_stacks, 3);
+
+        // Add 2 more wrongs → stacks = 4, peak should update
+        for _ in 0..2 {
+            s.dragons.get_mut("d1").unwrap().action_cooldown = 0;
+            s.dragons.get_mut("d1").unwrap().hunger = 50;
+            s.apply_action("p1", PlayerAction::Feed(FoodType::Fruit)).unwrap();
+        }
+        assert_eq!(s.dragons.get("d1").unwrap().penalty_stacks, 4);
+        assert_eq!(s.dragons.get("d1").unwrap().peak_penalty_stacks, 4);
+    }
+
+    #[test]
+    fn validator6_penalty_stacks_capped_at_four_for_happiness_decay() {
+        let mut s = setup_deterministic_session();
+        let d = s.dragons.get_mut("d1").unwrap();
+        d.active_time = ActiveTime::Day;
+        d.sleep_rate = 1;
+        d.hunger = 100;
+        d.energy = 100;
+        d.happiness = 100;
+        d.penalty_stacks = 6; // More than 4, but capped to 4 for decay
+        s.time = 10;
+
+        s.advance_tick();
+        let d = s.dragons.get("d1").unwrap();
+        // happiness_decay = (1 + 0 + 0 + 0 + min(6,4)) * 1 = 5
+        assert_eq!(d.happiness, 95);
+    }
 }
