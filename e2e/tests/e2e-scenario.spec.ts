@@ -307,9 +307,32 @@ test.describe.serial('e2e evolution scenario', () => {
         })
 
         // ---------------------------------------------------------------
+        // Step 7c: Agent 2 joins in lobby (server rejects late join
+        // after Phase 1, so Agent 2 must join before it starts)
+        // DS-E2E-001: late join after Phase 1 is blocked by server
+        // ---------------------------------------------------------------
+        await joinWorkshop(agent2.page, workshopCode, 'Agent2Carol')
+        logStep({
+          role: 'Agent 2',
+          iteration,
+          step: '7c',
+          action: 'Join workshop in lobby (server blocks post-Phase1 join)',
+          expected: 'Session synced., Connected',
+          actual: 'Joined successfully in lobby',
+          status: 'pass',
+          kind: 'ok',
+          workshopCode,
+          phase: 'Lobby',
+          playerCount: '5',
+          page: agent2.page,
+          note: 'DS-E2E-001: server rejects late join after Phase 1 with "This workshop has already started. New players can only join in the lobby." Agent 2 must join during lobby.',
+          issueId: 'DS-E2E-001',
+        })
+
+        // ---------------------------------------------------------------
         // Step 8: All show Workshop lobby and same code
         // ---------------------------------------------------------------
-        for (const ctx of [host, agent1, agent3, agent4]) {
+        for (const ctx of [host, agent1, agent2, agent3, agent4]) {
           await expect(ctx.page.getByTestId('session-panel')).toContainText('Workshop lobby', {
             timeout: TIMEOUT_PHASE,
           })
@@ -320,13 +343,13 @@ test.describe.serial('e2e evolution scenario', () => {
           iteration,
           step: '8',
           action: 'Confirm all clients show Workshop lobby',
-          expected: 'Workshop lobby and code visible on all 4 clients',
-          actual: 'All 4 clients show Workshop lobby and matching code',
+          expected: 'Workshop lobby and code visible on all 5 clients',
+          actual: 'All 5 clients show Workshop lobby and matching code',
           status: 'pass',
           kind: 'ok',
           workshopCode,
           phase: 'Lobby',
-          playerCount: '4',
+          playerCount: '5',
           page: host.page,
         })
 
@@ -346,14 +369,14 @@ test.describe.serial('e2e evolution scenario', () => {
           kind: 'ok',
           workshopCode,
           phase: 'Phase1',
-          playerCount: '4',
+          playerCount: '5',
           page: host.page,
         })
 
         // ---------------------------------------------------------------
-        // Step 10: Agent 2 late joins after Phase 1
+        // Step 10: Agent 2 confirms Discovery round after Phase 1 start
+        // (Originally "late join" but server blocks post-lobby joins)
         // ---------------------------------------------------------------
-        await joinWorkshop(agent2.page, workshopCode, 'Agent2Carol')
         await expect(agent2.page.getByTestId('session-panel')).toContainText('Discovery round', {
           timeout: TIMEOUT_JOIN,
         })
@@ -361,8 +384,8 @@ test.describe.serial('e2e evolution scenario', () => {
           role: 'Agent 2',
           iteration,
           step: '10',
-          action: 'Late join after Phase 1 started',
-          expected: 'Client lands on Discovery round',
+          action: 'Verify Agent 2 sees Discovery round after Phase 1',
+          expected: 'Client shows Discovery round',
           actual: 'Discovery round visible',
           status: 'pass',
           kind: 'ok',
@@ -370,6 +393,7 @@ test.describe.serial('e2e evolution scenario', () => {
           phase: 'Phase1',
           playerCount: '5',
           page: agent2.page,
+          note: 'Agent 2 joined in lobby; verifying realtime phase transition arrived.',
         })
 
         // ---------------------------------------------------------------
