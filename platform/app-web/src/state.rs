@@ -170,6 +170,8 @@ pub fn hydrate_from_snapshot(
     reconnect_token: &mut String,
     snapshot: &ClientSessionSnapshot,
 ) {
+    identity.screen = ShellScreen::Session;
+    identity.connection_status = ConnectionStatus::Offline;
     identity.coordinator = snapshot.coordinator_type;
     identity.identity = Some(SessionIdentity {
         session_code: snapshot.session_code.clone(),
@@ -286,7 +288,7 @@ pub fn load_browser_session_snapshot() -> Result<Option<ClientSessionSnapshot>, 
         return Err("window is unavailable".to_string());
     };
     let storage = window
-        .local_storage()
+        .session_storage()
         .map_err(|_| "failed to access browser storage".to_string())?
         .ok_or_else(|| "browser storage is unavailable".to_string())?;
 
@@ -370,7 +372,7 @@ pub fn persist_browser_session_snapshot(snapshot: &ClientSessionSnapshot) -> Res
         return Err("window is unavailable".to_string());
     };
     let storage = window
-        .local_storage()
+        .session_storage()
         .map_err(|_| "failed to access browser storage".to_string())?
         .ok_or_else(|| "browser storage is unavailable".to_string())?;
     let encoded = encode_session_snapshot(snapshot)?;
@@ -391,7 +393,7 @@ pub fn clear_browser_session_snapshot() -> Result<(), String> {
         return Err("window is unavailable".to_string());
     };
     let storage = window
-        .local_storage()
+        .session_storage()
         .map_err(|_| "failed to access browser storage".to_string())?
         .ok_or_else(|| "browser storage is unavailable".to_string())?;
     storage
@@ -723,7 +725,7 @@ mod tests {
 
         let result = restore_bootstrap(Some(snapshot.clone()));
 
-        assert_eq!(result.identity.screen, ShellScreen::Home);
+        assert_eq!(result.identity.screen, ShellScreen::Session);
         assert_eq!(result.identity.connection_status, ConnectionStatus::Offline);
         assert_eq!(
             result
