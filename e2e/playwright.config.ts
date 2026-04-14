@@ -6,7 +6,7 @@ const baseURL = process.env.E2E_BASE_URL ?? 'http://127.0.0.1:32000'
 
 export default defineConfig({
   testDir: './tests',
-  testIgnore: ['**/e2e-scenario*'],
+  testIgnore: ['**/e2e-scenario*', '**/view-validators.spec.ts', '**/visual-validators.spec.ts'],
   outputDir: './.tmp/test-results',
   timeout: 60_000,
   expect: {

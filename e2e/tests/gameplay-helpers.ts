@@ -2,6 +2,52 @@ import { expect, test, type Browser, type BrowserContext, type Page } from '@pla
 
 import { getProjectContextOptions } from '../project-profiles'
 
+const SESSION_SNAPSHOT_STORAGE_KEY = 'dragon-switch/platform/session-snapshot'
+
+type SessionSnapshot = {
+  sessionCode: string
+  reconnectToken: string
+  playerId: string
+  coordinatorType: string
+}
+
+export async function readSessionSnapshot(page: Page): Promise<SessionSnapshot> {
+  const snapshot = await page.evaluate(storageKey => {
+    const raw = window.sessionStorage.getItem(storageKey)
+    if (!raw) {
+      return null
+    }
+
+    return JSON.parse(raw)
+  }, SESSION_SNAPSHOT_STORAGE_KEY)
+
+  if (!snapshot) {
+    throw new Error('session snapshot is missing from browser sessionStorage')
+  }
+
+  return snapshot as SessionSnapshot
+}
+
+export async function readReconnectToken(page: Page) {
+  const snapshot = await readSessionSnapshot(page)
+  return snapshot.reconnectToken
+}
+
+export async function saveDragonProfile(page: Page, description?: string) {
+  if (description) {
+    await page.getByTestId('dragon-description-input').fill(description)
+  }
+
+  await page.getByTestId('save-dragon-button').click()
+  await waitForNotice(page, 'Dragon profile saved.')
+}
+
+export async function generateDragonSprites(page: Page, timeout = 120_000) {
+  await page.getByTestId('generate-sprites-button').click()
+  await expect(page.getByTestId('notice-bar')).toContainText('Dragon sprites generated!', { timeout })
+  await expect(page.getByTestId('sprite-preview-image')).toBeVisible({ timeout })
+}
+
 export async function newPlayerContext(
   browser: Browser,
 ): Promise<{ context: BrowserContext; page: Page }> {
@@ -17,6 +63,12 @@ export async function gotoApp(page: Page) {
 
 export async function waitForNotice(page: Page, text: string) {
   await expect(page.getByTestId('notice-bar')).toContainText(text)
+}
+
+export async function expectPhaseVisible(pages: Page[], text: string) {
+  for (const page of pages) {
+    await expect(page.getByTestId('session-panel')).toContainText(text)
+  }
 }
 
 export async function createWorkshop(page: Page, hostName: string) {
@@ -59,34 +111,67 @@ export async function voteForVisibleDragon(page: Page) {
   await voteButton.click()
 }
 
-export async function advanceWorkshopToVoting(hostPage: Page, guestPage: Page) {
+export async function openCharacterCreation(hostPage: Page, ...otherPages: Page[]) {
+  await hostPage.getByTestId('start-phase0-button').click()
+  await waitForNotice(hostPage, 'Character creation opened.')
+  await expectPhaseVisible([hostPage, ...otherPages], 'Character creation')
+}
+
+export async function enterPhase1(hostPage: Page, ...otherPages: Page[]) {
   await hostPage.getByTestId('start-phase1-button').click()
   await waitForNotice(hostPage, 'Phase 1 started.')
-  await expect(hostPage.getByTestId('session-panel')).toContainText('Discovery round')
-  await expect(guestPage.getByTestId('session-panel')).toContainText('Discovery round')
+  await expectPhaseVisible([hostPage, ...otherPages], 'Discovery round')
+}
 
+export async function enterHandover(hostPage: Page, ...otherPages: Page[]) {
   await hostPage.getByTestId('start-handover-button').click()
   await waitForNotice(hostPage, 'Handover started.')
-  await expect(hostPage.getByTestId('session-panel')).toContainText('Handover')
-  await expect(guestPage.getByTestId('session-panel')).toContainText('Handover')
+  await expectPhaseVisible([hostPage, ...otherPages], 'Handover')
+}
 
-  await hostPage.getByTestId('handover-tags-input').fill('calm,dusk,berries')
-  await hostPage.getByTestId('save-handover-tags-button').click()
-  await waitForNotice(hostPage, 'Handover tags saved.')
+export async function saveHandoverTags(page: Page, tags: string) {
+  await page.getByTestId('handover-tags-input').fill(tags)
+  await page.getByTestId('save-handover-tags-button').click()
+  await waitForNotice(page, 'Handover tags saved.')
+}
 
-  await guestPage.getByTestId('handover-tags-input').fill('music,night,playful')
-  await guestPage.getByTestId('save-handover-tags-button').click()
-  await waitForNotice(guestPage, 'Handover tags saved.')
-
+export async function enterPhase2(hostPage: Page, ...otherPages: Page[]) {
   await hostPage.getByTestId('start-phase2-button').click()
   await waitForNotice(hostPage, 'Phase 2 started.')
-  await expect(hostPage.getByTestId('session-panel')).toContainText('Care round')
-  await expect(guestPage.getByTestId('session-panel')).toContainText('Care round')
+  await expectPhaseVisible([hostPage, ...otherPages], 'Care round')
+}
 
+export async function enterJudge(hostPage: Page, ...otherPages: Page[]) {
   await hostPage.getByTestId('end-game-button').click()
-  await waitForNotice(hostPage, 'Voting started.')
-  await expect(hostPage.getByTestId('session-panel')).toContainText('Voting')
-  await expect(guestPage.getByTestId('session-panel')).toContainText('Voting')
+  await waitForNotice(hostPage, 'Judge review started.')
+  await expectPhaseVisible([hostPage, ...otherPages], 'Judge review')
+}
+
+export async function enterVoting(hostPage: Page, ...otherPages: Page[]) {
+  await hostPage.getByTestId('start-voting-button').click()
+  await waitForNotice(hostPage, 'Design voting started.')
+  await expectPhaseVisible([hostPage, ...otherPages], 'Design voting')
+}
+
+export async function advanceWorkshopToVoting(hostPage: Page, guestPage: Page) {
+  await openCharacterCreation(hostPage, guestPage)
+
+  await saveDragonProfile(hostPage, 'A confident coral dragon with striped wings and lantern eyes.')
+  await saveDragonProfile(guestPage, 'A moss-green dragon with wide fins and a comet tail.')
+
+  await enterPhase1(hostPage, guestPage)
+
+  await enterHandover(hostPage, guestPage)
+
+  await saveHandoverTags(hostPage, 'calm,dusk,berries')
+
+  await saveHandoverTags(guestPage, 'music,night,playful')
+
+  await enterPhase2(hostPage, guestPage)
+
+  await enterJudge(hostPage, guestPage)
+
+  await enterVoting(hostPage, guestPage)
   await expect(hostPage.getByTestId('session-panel')).toContainText('0 / 2 votes submitted')
   await expect(guestPage.getByTestId('session-panel')).toContainText('0 / 2 votes submitted')
   await expect(hostPage.locator('[data-testid^="vote-button-"]')).toHaveCount(1)

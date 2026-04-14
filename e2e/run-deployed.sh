@@ -3,6 +3,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BASE_URL="${E2E_BASE_URL:-http://127.0.0.1:32000}"
+BASE_URL="${BASE_URL%/}"
 PORT_FORWARD_LOG="${PORT_FORWARD_LOG:-${ROOT_DIR}/e2e/.tmp/port-forward.log}"
 PORT_FORWARD_NAMESPACE="${PORT_FORWARD_NAMESPACE:-default}"
 PORT_FORWARD_SERVICE="${PORT_FORWARD_SERVICE:-dragon-shift-dragon-shift}"

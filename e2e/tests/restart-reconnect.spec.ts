@@ -6,6 +6,8 @@ import {
   createWorkshop,
   joinWorkshop,
   newPlayerContext,
+  readReconnectToken,
+  saveDragonProfile,
   voteForVisibleDragon,
   waitForNotice,
 } from './gameplay-helpers'
@@ -81,6 +83,14 @@ test.describe('browser restart reconnect proof', () => {
       const workshopCode = await createWorkshop(host.page, 'Alice')
       await joinWorkshop(guest.page, workshopCode, 'Bob')
 
+      await host.page.getByTestId('start-phase0-button').click()
+      await waitForNotice(host.page, 'Character creation opened.')
+      await expect(host.page.getByTestId('session-panel')).toContainText('Character creation')
+      await expect(guest.page.getByTestId('session-panel')).toContainText('Character creation')
+
+      await saveDragonProfile(host.page, 'A lantern-scaled dragon with ember whiskers.')
+      await saveDragonProfile(guest.page, 'A mint dragon with ribbon fins and calm eyes.')
+
       await host.page.getByTestId('start-phase1-button').click()
       await waitForNotice(host.page, 'Phase 1 started.')
       await expect(host.page.getByTestId('session-panel')).toContainText('Discovery round')
@@ -96,7 +106,7 @@ test.describe('browser restart reconnect proof', () => {
       await waitForNotice(host.page, 'Handover tags saved.')
       await expect(host.page.getByTestId('session-panel')).toContainText('3 / 3 handover rules saved')
 
-      const reconnectToken = await host.page.getByTestId('reconnect-token-input').inputValue()
+      const reconnectToken = await readReconnectToken(host.page)
       const beforeRestart = readManagedState()
 
       process.kill(beforeRestart.managerPid, 'SIGHUP')
@@ -137,9 +147,14 @@ test.describe('browser restart reconnect proof', () => {
       await expect(guest.page.getByTestId('session-panel')).toContainText('Care round')
 
       await reconnect.page.getByTestId('end-game-button').click()
-      await waitForNotice(reconnect.page, 'Voting started.')
-      await expect(reconnect.page.getByTestId('session-panel')).toContainText('Voting')
-      await expect(guest.page.getByTestId('session-panel')).toContainText('Voting')
+      await waitForNotice(reconnect.page, 'Judge review started.')
+      await expect(reconnect.page.getByTestId('session-panel')).toContainText('Judge review')
+      await expect(guest.page.getByTestId('session-panel')).toContainText('Judge review')
+
+      await reconnect.page.getByTestId('start-voting-button').click()
+      await waitForNotice(reconnect.page, 'Design voting started.')
+      await expect(reconnect.page.getByTestId('session-panel')).toContainText('Design voting')
+      await expect(guest.page.getByTestId('session-panel')).toContainText('Design voting')
       await expect(reconnect.page.getByTestId('session-panel')).toContainText('0 / 2 votes submitted')
 
       await voteForVisibleDragon(guest.page)

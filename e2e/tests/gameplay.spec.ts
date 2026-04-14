@@ -7,9 +7,17 @@ import {
   gotoApp,
   joinWorkshop,
   newPlayerContext,
+  readReconnectToken,
+  readSessionSnapshot,
   voteForVisibleDragon,
   waitForNotice,
 } from './gameplay-helpers'
+
+async function safeClose(...contexts: Array<{ close: () => Promise<void> }>) {
+  await Promise.allSettled(contexts.map(context => context.close()))
+}
+
+const lobbyTitlePattern = /Workshop lobby|Waiting lobby/
 
 test.describe('dragon shift deployed gameplay', () => {
   test('host and guest can advance through the visible workshop flow', async ({ browser }) => {
@@ -20,8 +28,8 @@ test.describe('dragon shift deployed gameplay', () => {
       const workshopCode = await createWorkshop(host.page, 'Alice')
       await joinWorkshop(guest.page, workshopCode, 'Bob')
 
-      await expect(host.page.getByTestId('session-panel')).toContainText('Workshop lobby')
-      await expect(guest.page.getByTestId('session-panel')).toContainText('Workshop lobby')
+      await expect(host.page.getByTestId('session-panel')).toContainText(lobbyTitlePattern)
+      await expect(guest.page.getByTestId('session-panel')).toContainText(lobbyTitlePattern)
 
       await advanceWorkshopToVoting(host.page, guest.page)
 
@@ -37,7 +45,7 @@ test.describe('dragon shift deployed gameplay', () => {
       await waitForNotice(host.page, 'Voting results revealed.')
       await expect(host.page.getByTestId('session-panel')).toContainText('Workshop results')
       await expect(host.page.getByTestId('session-panel')).toContainText('Creativity Leaderboard')
-      await expect(host.page.getByTestId('session-panel')).toContainText('Mechanics Leaderboard')
+      await expect(host.page.getByTestId('session-panel')).toContainText('Mechanics leaderboard')
       await expect(guest.page.getByTestId('session-panel')).toContainText('Workshop results')
       await expect(guest.page.getByTestId('session-panel')).toContainText('Creativity Leaderboard')
 
@@ -52,11 +60,10 @@ test.describe('dragon shift deployed gameplay', () => {
 
       await host.page.getByTestId('reset-workshop-button').click()
       await waitForNotice(host.page, 'Workshop reset.')
-      await expect(host.page.getByTestId('session-panel')).toContainText('Workshop lobby')
-      await expect(guest.page.getByTestId('session-panel')).toContainText('Workshop lobby')
+      await expect(host.page.getByTestId('session-panel')).toContainText(lobbyTitlePattern)
+      await expect(guest.page.getByTestId('session-panel')).toContainText(lobbyTitlePattern)
     } finally {
-      await host.context.close()
-      await guest.context.close()
+      await safeClose(host.context, guest.context)
     }
   })
 
@@ -71,9 +78,7 @@ test.describe('dragon shift deployed gameplay', () => {
       const workshopCode = await createWorkshop(original.page, 'Alice')
       await joinWorkshop(guest.page, workshopCode, 'Bob')
 
-      const reconnectTokenInput = original.page.getByTestId('reconnect-token-input')
-      await expect(reconnectTokenInput).toHaveValue(/.+/)
-      const reconnectToken = await reconnectTokenInput.inputValue()
+      const reconnectToken = await readReconnectToken(original.page)
 
       await original.context.close()
       originalClosed = true
@@ -83,7 +88,7 @@ test.describe('dragon shift deployed gameplay', () => {
       await reconnect.page.getByTestId('reconnect-token-input').fill(reconnectToken)
       await reconnect.page.getByTestId('reconnect-button').click()
 
-      await expect(reconnect.page.getByTestId('session-panel')).toContainText('Workshop lobby')
+      await expect(reconnect.page.getByTestId('session-panel')).toContainText(lobbyTitlePattern)
       await expect(reconnect.page.getByTestId('connection-badge')).toContainText('Connected')
       await expect(reconnect.page.getByTestId('workshop-code-badge')).toContainText(workshopCode)
 
@@ -93,11 +98,9 @@ test.describe('dragon shift deployed gameplay', () => {
       await expect(guest.page.getByTestId('session-panel')).toContainText('Players in view: 3')
     } finally {
       if (!originalClosed) {
-        await original.context.close()
+        await safeClose(original.context)
       }
-      await reconnect.context.close()
-      await guest.context.close()
-      await lateJoiner.context.close()
+      await safeClose(reconnect.context, guest.context, lateJoiner.context)
     }
   })
 
@@ -110,24 +113,23 @@ test.describe('dragon shift deployed gameplay', () => {
       const workshopCode = await createWorkshop(host.page, 'Alice')
       await joinWorkshop(guest.page, workshopCode, 'Bob')
 
-      await expect(host.page.getByTestId('session-panel')).toContainText('Workshop lobby')
+      await expect(host.page.getByTestId('session-panel')).toContainText(lobbyTitlePattern)
 
       await host.page.reload()
 
-      await expect(host.page.getByTestId('session-panel')).toContainText('Workshop lobby')
+      await expect(host.page.getByTestId('session-panel')).toContainText(lobbyTitlePattern)
       await expect(host.page.getByTestId('workshop-code-badge')).toContainText(workshopCode)
       await expect(host.page.getByTestId('connection-badge')).toContainText('Connected')
-      await expect(host.page.getByTestId('reconnect-session-code-input')).toHaveValue(workshopCode)
-      await expect(host.page.getByTestId('reconnect-token-input')).toHaveValue(/.+/)
+      const snapshot = await readSessionSnapshot(host.page)
+      expect(snapshot.sessionCode).toBe(workshopCode)
+      expect(snapshot.reconnectToken).toBeTruthy()
 
       await joinWorkshop(lateJoiner.page, workshopCode, 'Carol')
 
       await expect(host.page.getByTestId('session-panel')).toContainText('Players in view: 3')
       await expect(host.page.getByTestId('connection-badge')).toContainText('Connected')
     } finally {
-      await host.context.close()
-      await guest.context.close()
-      await lateJoiner.context.close()
+      await safeClose(host.context, guest.context, lateJoiner.context)
     }
   })
 
@@ -143,7 +145,7 @@ test.describe('dragon shift deployed gameplay', () => {
       await waitForNotice(guest.page, 'Workshop not found.')
       await expectToStayOnHome(guest.page)
     } finally {
-      await guest.context.close()
+      await safeClose(guest.context)
     }
   })
 
@@ -162,12 +164,11 @@ test.describe('dragon shift deployed gameplay', () => {
       await waitForNotice(reconnect.page, 'Session identity is invalid or expired.')
       await expectToStayOnHome(reconnect.page)
     } finally {
-      await host.context.close()
-      await reconnect.context.close()
+      await safeClose(host.context, reconnect.context)
     }
   })
 
-  test('guest host-only rejection shows a visible error notice', async ({ browser }) => {
+  test('guest does not see host-only controls in the lobby', async ({ browser }) => {
     const host = await newPlayerContext(browser)
     const guest = await newPlayerContext(browser)
 
@@ -175,14 +176,12 @@ test.describe('dragon shift deployed gameplay', () => {
       const workshopCode = await createWorkshop(host.page, 'Alice')
       await joinWorkshop(guest.page, workshopCode, 'Bob')
 
-      await guest.page.getByTestId('start-phase1-button').click()
-
-      await waitForNotice(guest.page, 'Only the host can start the workshop.')
-      await expect(host.page.getByTestId('session-panel')).toContainText('Workshop lobby')
-      await expect(guest.page.getByTestId('session-panel')).toContainText('Workshop lobby')
+      await expect(guest.page.getByTestId('controls-panel')).toBeVisible()
+      await expect(guest.page.getByTestId('start-phase0-button')).toHaveCount(0)
+      await expect(host.page.getByTestId('session-panel')).toContainText(lobbyTitlePattern)
+      await expect(guest.page.getByTestId('session-panel')).toContainText(lobbyTitlePattern)
     } finally {
-      await host.context.close()
-      await guest.context.close()
+      await safeClose(host.context, guest.context)
     }
   })
 
@@ -202,7 +201,7 @@ test.describe('dragon shift deployed gameplay', () => {
       await waitForNotice(guest.page, 'failed to reach backend:')
       await expectToStayOnHome(guest.page)
     } finally {
-      await guest.context.close()
+      await safeClose(guest.context)
     }
   })
 
@@ -237,9 +236,7 @@ test.describe('dragon shift deployed gameplay', () => {
 
       await expect(host.page.getByTestId('session-panel')).toContainText('Players in view: 3')
     } finally {
-      await host.context.close()
-      await guest.context.close()
-      await lateJoiner.context.close()
+      await safeClose(host.context, guest.context, lateJoiner.context)
     }
   })
 
@@ -265,8 +262,7 @@ test.describe('dragon shift deployed gameplay', () => {
       await waitForNotice(host.page, 'failed to reach backend:')
       await expect(host.page.getByTestId('archive-panel')).toContainText('Build the workshop archive')
     } finally {
-      await host.context.close()
-      await guest.context.close()
+      await safeClose(host.context, guest.context)
     }
   })
 })
