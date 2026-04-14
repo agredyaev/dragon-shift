@@ -58,7 +58,7 @@ app:
   #   apiKeySecretKey: LLM_JUDGE_API_KEY_0
   imageProviders: []
   # - type: vertex_ai
-  #   model: imagen-4.0-generate-001
+  #   model: gemini-2.5-flash-preview-04-17
   extraEnv: []
 
 database:

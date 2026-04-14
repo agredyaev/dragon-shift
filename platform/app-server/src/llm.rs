@@ -264,6 +264,8 @@ struct GeminiGenerationConfig {
     temperature: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     response_mime_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    response_modalities: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -282,58 +284,17 @@ struct GeminiResponseContent {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct GeminiResponsePart {
     text: Option<String>,
-}
-
-// Imagen request/response
-#[derive(Serialize)]
-struct ImagenRequest {
-    instances: Vec<ImagenInstance>,
-    parameters: ImagenParameters,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ImagenInstance {
-    prompt: String,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ImagenParameters {
-    sample_count: u32,
-}
-
-#[derive(Deserialize)]
-struct ImagenResponse {
-    predictions: Option<Vec<ImagenPrediction>>,
+    inline_data: Option<GeminiInlineData>,
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct ImagenPrediction {
-    bytes_base64_encoded: Option<String>,
+struct GeminiInlineData {
     mime_type: Option<String>,
-}
-
-// Generative Language API image response
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct GenAiImageResponse {
-    generated_images: Option<Vec<GenAiGeneratedImage>>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct GenAiGeneratedImage {
-    image: Option<GenAiImageData>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct GenAiImageData {
-    image_bytes: Option<String>,
+    data: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -483,6 +444,7 @@ impl LlmClient {
                 max_output_tokens: Some(4096),
                 temperature: Some(0.4),
                 response_mime_type: Some("application/json".to_string()),
+                response_modalities: None,
             }),
         };
 
@@ -619,15 +581,23 @@ impl LlmClient {
         let token = self.token_cache.get_token().await?;
 
         let url = format!(
-            "https://{location}-aiplatform.googleapis.com/v1/projects/{project}/locations/{location}/publishers/google/models/{}:predict",
+            "https://{location}-aiplatform.googleapis.com/v1/projects/{project}/locations/{location}/publishers/google/models/{}:generateContent",
             provider.model
         );
 
-        let request_body = ImagenRequest {
-            instances: vec![ImagenInstance {
-                prompt: prompt.to_string(),
+        let request_body = GeminiRequest {
+            contents: vec![GeminiContent {
+                role: "user".to_string(),
+                parts: vec![GeminiPart {
+                    text: prompt.to_string(),
+                }],
             }],
-            parameters: ImagenParameters { sample_count: 1 },
+            generation_config: Some(GeminiGenerationConfig {
+                max_output_tokens: None,
+                temperature: Some(1.0),
+                response_mime_type: None,
+                response_modalities: Some(vec!["IMAGE".to_string()]),
+            }),
         };
 
         let response = self
@@ -657,28 +627,12 @@ impl LlmClient {
             )));
         }
 
-        let body: ImagenResponse = response
+        let body: GeminiResponse = response
             .json()
             .await
             .map_err(|e| LlmError::ProviderUnavailable(format!("response parse: {e}")))?;
 
-        let prediction = body
-            .predictions
-            .as_ref()
-            .and_then(|p| p.first())
-            .ok_or_else(|| LlmError::ProviderUnavailable("no predictions returned".into()))?;
-
-        let base64 = prediction
-            .bytes_base64_encoded
-            .as_ref()
-            .ok_or_else(|| LlmError::ProviderUnavailable("no image bytes returned".into()))?;
-        let mime = prediction
-            .mime_type
-            .as_deref()
-            .unwrap_or("image/png")
-            .to_string();
-
-        Ok((base64.clone(), mime))
+        extract_gemini_image(&body)
     }
 
     async fn call_api_key_image(
@@ -690,20 +644,24 @@ impl LlmClient {
             LlmError::BadRequest("API key missing for api_key provider".into())
         })?;
 
-        // Use Gemini generateContent with image generation instructions
-        // as the Generative Language API for image models varies.
-        // For Imagen models through the API key path, use the predict endpoint
-        // style adapted for the Generative Language API.
         let url = format!(
-            "https://generativelanguage.googleapis.com/v1beta/models/{}:predict",
+            "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent",
             provider.model
         );
 
-        let request_body = ImagenRequest {
-            instances: vec![ImagenInstance {
-                prompt: prompt.to_string(),
+        let request_body = GeminiRequest {
+            contents: vec![GeminiContent {
+                role: "user".to_string(),
+                parts: vec![GeminiPart {
+                    text: prompt.to_string(),
+                }],
             }],
-            parameters: ImagenParameters { sample_count: 1 },
+            generation_config: Some(GeminiGenerationConfig {
+                max_output_tokens: None,
+                temperature: Some(1.0),
+                response_mime_type: None,
+                response_modalities: Some(vec!["IMAGE".to_string()]),
+            }),
         };
 
         let response = self
@@ -733,45 +691,41 @@ impl LlmClient {
             )));
         }
 
-        // Try Imagen-style response first, then GenAI-style
-        let body_text = response
-            .text()
+        let body: GeminiResponse = response
+            .json()
             .await
-            .map_err(|e| LlmError::ProviderUnavailable(format!("response read: {e}")))?;
+            .map_err(|e| LlmError::ProviderUnavailable(format!("response parse: {e}")))?;
 
-        if let Ok(imagen_resp) = serde_json::from_str::<ImagenResponse>(&body_text) {
-            if let Some(prediction) = imagen_resp.predictions.as_ref().and_then(|p| p.first()) {
-                if let Some(base64) = &prediction.bytes_base64_encoded {
-                    let mime = prediction
-                        .mime_type
-                        .as_deref()
-                        .unwrap_or("image/png")
-                        .to_string();
-                    return Ok((base64.clone(), mime));
-                }
-            }
-        }
-
-        if let Ok(genai_resp) = serde_json::from_str::<GenAiImageResponse>(&body_text) {
-            if let Some(img) = genai_resp
-                .generated_images
-                .as_ref()
-                .and_then(|imgs| imgs.first())
-            {
-                if let Some(base64) = img
-                    .image
-                    .as_ref()
-                    .and_then(|i| i.image_bytes.as_ref())
-                {
-                    return Ok((base64.clone(), "image/png".to_string()));
-                }
-            }
-        }
-
-        Err(LlmError::ProviderUnavailable(
-            "could not extract image from provider response".into(),
-        ))
+        extract_gemini_image(&body)
     }
+}
+
+/// Extract base64 image data from a Gemini generateContent response.
+fn extract_gemini_image(body: &GeminiResponse) -> Result<(String, String), LlmError> {
+    let parts = body
+        .candidates
+        .as_ref()
+        .and_then(|c| c.first())
+        .and_then(|c| c.content.as_ref())
+        .and_then(|c| c.parts.as_ref())
+        .ok_or_else(|| LlmError::ProviderUnavailable("empty response from image model".into()))?;
+
+    for part in parts {
+        if let Some(inline) = &part.inline_data {
+            if let Some(data) = &inline.data {
+                let mime = inline
+                    .mime_type
+                    .as_deref()
+                    .unwrap_or("image/png")
+                    .to_string();
+                return Ok((data.clone(), mime));
+            }
+        }
+    }
+
+    Err(LlmError::ProviderUnavailable(
+        "no image data in model response".into(),
+    ))
 }
 
 // ---------------------------------------------------------------------------
