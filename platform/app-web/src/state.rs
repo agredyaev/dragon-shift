@@ -506,6 +506,20 @@ pub fn command_success_message(command: SessionCommand) -> &'static str {
     }
 }
 
+fn command_completed_by_phase_update(command: SessionCommand, phase: Phase) -> bool {
+    matches!(
+        (command, phase),
+        (SessionCommand::StartPhase0, Phase::Phase0)
+            | (SessionCommand::StartPhase1, Phase::Phase1)
+            | (SessionCommand::StartHandover, Phase::Handover)
+            | (SessionCommand::StartPhase2, Phase::Phase2)
+            | (SessionCommand::EndGame, Phase::Judge)
+            | (SessionCommand::StartVoting, Phase::Voting)
+            | (SessionCommand::RevealVotingResults, Phase::End)
+            | (SessionCommand::ResetGame, Phase::Lobby)
+    )
+}
+
 pub fn apply_successful_command(
     identity: &mut IdentityState,
     ops: &mut OperationState,
@@ -605,20 +619,29 @@ pub fn apply_server_ws_message(
         ServerWsMessage::StateUpdate(client_state) => {
             let first_attach = identity.connection_status != ConnectionStatus::Connected;
             let phase = client_state.phase;
+            let completed_pending_command = ops
+                .pending_command
+                .filter(|command| command_completed_by_phase_update(*command, phase));
             identity.screen = ShellScreen::Session;
             *game_state = Some(client_state);
             identity.connection_status = ConnectionStatus::Connected;
-            ops.pending_command = None;
             if phase != Phase::End {
                 *judge_bundle = None;
                 ops.pending_judge_bundle = false;
             }
             if first_attach {
+                ops.pending_command = None;
                 ops.notice = Some(
                     ops.pending_realtime_notice
                         .take()
                         .unwrap_or_else(|| info_notice("Session synced.")),
                 );
+            } else if let Some(command) = completed_pending_command {
+                // Phase-transition commands can unmount the source component before
+                // the HTTP task applies its success notice, so confirm them from the
+                // resulting state update as well.
+                ops.pending_command = None;
+                ops.notice = Some(success_notice(command_success_message(command)));
             }
         }
         ServerWsMessage::Notice(ProtocolSessionNotice {
@@ -658,8 +681,8 @@ pub fn apply_server_ws_message(
 mod tests {
     use super::*;
     use protocol::{
-        ClientGameState, CoordinatorType, Phase, Player, SessionMeta, WorkshopJoinSuccess,
-        create_default_session_settings,
+        create_default_session_settings, ClientGameState, CoordinatorType, Phase, Player,
+        SessionMeta, WorkshopJoinSuccess,
     };
     use std::collections::BTreeMap;
 
@@ -995,6 +1018,54 @@ mod tests {
         assert_eq!(
             ops.notice.as_ref().map(|n| n.message.as_str()),
             Some("Session synced.")
+        );
+    }
+
+    #[test]
+    fn server_ws_phase_update_confirms_pending_transition_command() {
+        let mut identity = default_identity_state();
+        let mut game_state = None;
+        let mut ops = default_operation_state();
+        let mut join_session_code = String::new();
+        let mut reconnect_session_code = String::new();
+        let mut reconnect_token = String::new();
+        let mut judge_bundle = None;
+
+        apply_join_success(
+            &mut identity,
+            &mut game_state,
+            &mut ops,
+            &mut join_session_code,
+            &mut reconnect_session_code,
+            &mut reconnect_token,
+            &mut judge_bundle,
+            mock_join_success(),
+            PendingFlow::Join,
+        );
+
+        ops.pending_command = Some(SessionCommand::StartPhase0);
+        ops.notice = Some(info_notice("Opening character creation…"));
+
+        let mut next_state = mock_join_success().state;
+        next_state.phase = Phase::Phase0;
+
+        apply_server_ws_message(
+            &mut identity,
+            &mut game_state,
+            &mut ops,
+            &mut judge_bundle,
+            ServerWsMessage::StateUpdate(next_state),
+        );
+
+        assert_eq!(identity.connection_status, ConnectionStatus::Connected);
+        assert_eq!(ops.pending_command, None);
+        assert_eq!(
+            ops.notice.as_ref().map(|n| n.message.as_str()),
+            Some("Character creation opened.")
+        );
+        assert_eq!(
+            game_state.as_ref().map(|state| state.phase),
+            Some(Phase::Phase0)
         );
     }
 
