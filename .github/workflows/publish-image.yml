@@ -327,7 +327,14 @@ jobs:
           TF_NOTIFICATION_CHANNEL_ID: ${{ vars.TF_NOTIFICATION_CHANNEL_ID }}
           TF_EXTRA_MASTER_AUTHORIZED_CIDRS: ${{ vars.TF_EXTRA_MASTER_AUTHORIZED_CIDRS }}
           TF_VERIFY_PUBLIC_EDGE: ${{ vars.TF_VERIFY_PUBLIC_EDGE }}
+          TF_GOOGLE_CLOUD_PROJECT: ${{ vars.TF_GOOGLE_CLOUD_PROJECT }}
+          TF_GOOGLE_CLOUD_LOCATION: ${{ vars.TF_GOOGLE_CLOUD_LOCATION }}
+          TF_LLM_PROVIDER_TYPE: ${{ vars.TF_LLM_PROVIDER_TYPE }}
+          TF_LLM_JUDGE_MODEL: ${{ vars.TF_LLM_JUDGE_MODEL }}
+          TF_LLM_IMAGE_MODEL: ${{ vars.TF_LLM_IMAGE_MODEL }}
+          TF_RUST_LOG: ${{ vars.TF_RUST_LOG }}
           TF_PRODUCTION_DB_PASSWORD: ${{ secrets.TF_PRODUCTION_DB_PASSWORD }}
+          TF_GEMINI_API_KEY: ${{ secrets.TF_GEMINI_API_KEY }}
           IMAGE_REPOSITORY: ${{ needs.publish.outputs.image_repository }}
           IMAGE_DIGEST: ${{ needs.publish.outputs.image_digest }}
           IMAGE_TAG: ${{ needs.publish.outputs.image_tag }}

@@ -54,7 +54,7 @@ variable "github_actions_allowed_ref" {
 }
 
 variable "github_actions_allowed_event_name" {
-  description = "GitHub Actions event name allowed to assume the Terraform service account."
+  description = "Primary GitHub Actions event name allowed to assume the Terraform service account. Manual workflow_dispatch reruns of the same workflow on the allowed ref are also accepted."
   type        = string
   default     = "push"
 }
@@ -85,6 +85,8 @@ variable "github_actions_service_account_roles" {
     "roles/compute.admin",
     "roles/container.admin",
     "roles/dns.admin",
+    "roles/iam.serviceAccountAdmin",
+    "roles/resourcemanager.projectIamAdmin",
     "roles/monitoring.alertPolicyEditor",
     "roles/monitoring.notificationChannelEditor",
     "roles/monitoring.uptimeCheckConfigEditor",

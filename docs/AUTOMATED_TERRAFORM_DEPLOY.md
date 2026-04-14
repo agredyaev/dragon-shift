@@ -30,9 +30,11 @@ terraform -chdir=terraform/bootstrap apply -auto-approve \
 The bootstrap outputs provide `GCP_WORKLOAD_IDENTITY_PROVIDER` and `GCP_SERVICE_ACCOUNT_EMAIL`.
 `TF_PRODUCTION_DB_PASSWORD` is a separate operator-managed secret and is not emitted by Terraform.
 The default GitHub ref allowlist is `refs/heads/main`.
+The default GitHub event allowlist is `push` plus `workflow_dispatch` for manual `Publish Image` re-runs on `main`.
 The bootstrap module intentionally uses a local backend path because it creates the remote state bucket that the other Terraform stacks use.
 Keep that local bootstrap state file for operator-driven bootstrap changes and recovery.
 If you change bootstrap IAM or Workload Identity settings after the first run, re-apply `terraform/bootstrap` with that saved local state and pass the same `state_bucket_name`, `github_repository_id`, and `github_repository_owner_id` values again before relying on automated deploys.
+The default GitHub Actions Terraform roles now include `roles/iam.serviceAccountAdmin` and `roles/resourcemanager.projectIamAdmin` because the production platform stack creates a runtime GSA for Vertex AI and grants it `roles/aiplatform.user`.
 
 ## Repository Variables
 
@@ -134,3 +136,12 @@ Error 403: Permission denied to add peering for service
 **Problem:** The `publish-image.yml` deploy job only ran for `push` events. Manual re-deploys via `workflow_dispatch` were impossible without creating empty commits.
 
 **Fix (permanent):** Updated the deploy job condition to `(github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main'`. Also gated the CI-wait step inside the deploy job with `if: github.event_name == 'push'` since manual dispatches are intentional operator actions that do not require gating on CI completion.
+
+### 5. Vertex AI bootstrap IAM for the GitHub Terraform deployer
+
+**Problem:** The production platform stack now creates the application GSA `dragon-shift-app` and binds `roles/aiplatform.user` for Workload Identity based Vertex AI access. Existing bootstrap state that predates this change leaves the GitHub Actions Terraform service account without permission to create service accounts or edit project IAM, which causes production apply failures such as:
+```
+Error creating service account: googleapi: Error 403: Permission 'iam.serviceAccounts.create' denied
+```
+
+**Fix (permanent):** Added `roles/iam.serviceAccountAdmin` and `roles/resourcemanager.projectIamAdmin` to `terraform/bootstrap/variables.tf`. After pulling this change, re-apply `terraform/bootstrap` with the original local bootstrap state before re-running `Publish Image` for production.

@@ -93,7 +93,7 @@ resource "google_iam_workload_identity_pool_provider" "github_actions" {
     "attribute.ref"                 = "assertion.ref"
   }
   attribute_condition = format(
-    "assertion.repository_owner_id=='%s' && assertion.repository_id=='%s' && assertion.ref=='%s' && assertion.event_name=='%s' && assertion.workflow_ref=='%s'",
+    "assertion.repository_owner_id=='%s' && assertion.repository_id=='%s' && assertion.ref=='%s' && (assertion.event_name=='%s' || assertion.event_name=='workflow_dispatch') && assertion.workflow_ref=='%s'",
     var.github_repository_owner_id,
     var.github_repository_id,
     var.github_actions_allowed_ref,
