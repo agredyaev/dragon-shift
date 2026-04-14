@@ -74,16 +74,6 @@ pub(crate) async fn refresh_reconnect_identity(
         .await
 }
 
-pub(crate) async fn rotate_reconnect_identity(
-    _state: &AppState,
-    _identity: &persistence::PlayerIdentityMatch,
-    _previous_token: &str,
-    _timestamp: DateTime<Utc>,
-) -> Result<String, persistence::PersistenceError> {
-    let next_token = random_prefixed_id("reconnect");
-    Ok(next_token)
-}
-
 #[derive(Clone, Copy)]
 pub(crate) struct MaybeConnectInfo(pub(crate) Option<SocketAddr>);
 
@@ -284,15 +274,7 @@ pub(crate) async fn join_workshop(
             (session_before, session.clone())
         };
 
-        let next_reconnect_token =
-            rotate_reconnect_identity(&state, &identity, reconnect_token, timestamp)
-                .await
-                .map_err(|error| {
-                    internal_join_error(format!("failed to rotate player identity: {error}"))
-                });
-        let Ok(next_reconnect_token) = next_reconnect_token else {
-            return next_reconnect_token.expect_err("identity rotation error");
-        };
+        let next_reconnect_token = random_prefixed_id("reconnect");
         let next_identity = persistence::PlayerIdentity {
             session_id: identity.session_id.clone(),
             player_id: identity.player_id.clone(),
@@ -470,12 +452,30 @@ pub(crate) async fn workshop_command(
     headers: HeaderMap,
     Json(request): Json<WorkshopCommandRequest>,
 ) -> (StatusCode, Json<WorkshopCommandResult>) {
+    let command_name = format!("{:?}", request.command);
+    tracing::info!(
+        session_code = %request.session_code,
+        command = %command_name,
+        "workshop_command request received"
+    );
+
     if let Some(response) = reject_disallowed_command_origin(&headers, &state.config.origin_policy)
     {
+        tracing::warn!(
+            session_code = %request.session_code,
+            command = %command_name,
+            "workshop_command rejected: origin not allowed"
+        );
         return response;
     }
     let client_key = client_key(&state, connect_info, &headers);
     if is_rate_limited(&state.command_limiter, &client_key).await {
+        tracing::warn!(
+            session_code = %request.session_code,
+            command = %command_name,
+            client_key = %client_key,
+            "workshop_command rejected: rate limited"
+        );
         return too_many_command_requests();
     }
 
@@ -485,13 +485,35 @@ pub(crate) async fn workshop_command(
         || reconnect_token.is_empty()
         || security::validate_session_code(session_code).is_err()
     {
+        tracing::warn!(
+            session_code = %session_code,
+            command = %command_name,
+            session_code_empty = session_code.is_empty(),
+            reconnect_token_empty = reconnect_token.is_empty(),
+            "workshop_command rejected: missing workshop credentials"
+        );
         return bad_command_request("Missing workshop credentials.");
     }
 
     let identity = match authorize_reconnect_identity(&state, session_code, reconnect_token).await {
         Ok(Some(identity)) => identity,
-        Ok(None) => return bad_command_request("Session identity is invalid or expired."),
-        Err(error) => return internal_command_error(format!("failed to lookup identity: {error}")),
+        Ok(None) => {
+            tracing::warn!(
+                session_code = %session_code,
+                command = %command_name,
+                "workshop_command rejected: session identity invalid or expired"
+            );
+            return bad_command_request("Session identity is invalid or expired.");
+        }
+        Err(error) => {
+            tracing::error!(
+                session_code = %session_code,
+                command = %command_name,
+                %error,
+                "workshop_command error: failed to lookup identity"
+            );
+            return internal_command_error(format!("failed to lookup identity: {error}"));
+        }
     };
 
     if let Err(error) = refresh_reconnect_identity(&state, reconnect_token, Utc::now()).await {
@@ -996,6 +1018,14 @@ pub(crate) async fn workshop_command(
         broadcast_session_state(&state, session_code, None).await;
     }
 
+    tracing::info!(
+        session_code = %session_code,
+        command = %command_name,
+        player_id = %identity.player_id,
+        broadcast = should_broadcast,
+        "workshop_command completed successfully"
+    );
+
     response
 }
 
@@ -1151,6 +1181,7 @@ fn bad_join_request(message: &str) -> (StatusCode, Json<WorkshopJoinResult>) {
 }
 
 fn bad_command_request(message: &str) -> (StatusCode, Json<WorkshopCommandResult>) {
+    tracing::warn!(error = %message, "workshop_command returning 400 Bad Request");
     (
         StatusCode::BAD_REQUEST,
         Json(WorkshopCommandResult::Error(WorkshopError {
@@ -1161,6 +1192,7 @@ fn bad_command_request(message: &str) -> (StatusCode, Json<WorkshopCommandResult
 }
 
 fn internal_command_error(message: String) -> (StatusCode, Json<WorkshopCommandResult>) {
+    tracing::error!(error = %message, "workshop_command returning 500 Internal Server Error");
     (
         StatusCode::INTERNAL_SERVER_ERROR,
         Json(WorkshopCommandResult::Error(WorkshopError {

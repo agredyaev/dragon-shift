@@ -36,6 +36,7 @@ app:
   allowedOrigins: https://dragon-shift.example.com
   viteAppUrl: https://dragon-shift.example.com
   staticDir: /app/static
+  rustLog: "info,tower_http=debug"
   rustSessionCodePrefix: "9"
   trustForwardedFor: false
   databasePoolSize: 10

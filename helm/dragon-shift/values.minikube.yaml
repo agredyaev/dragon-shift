@@ -17,6 +17,7 @@ app:
   allowedOrigins: http://127.0.0.1:32000
   viteAppUrl: http://127.0.0.1:32000
   staticDir: /app/static
+  rustLog: "info,tower_http=debug,app_server=debug"
   rustSessionCodePrefix: "9"
   databasePoolSize: 5
   createRateLimitMax: 20

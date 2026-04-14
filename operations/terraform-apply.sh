@@ -31,6 +31,13 @@ EXTRA_MASTER_AUTHORIZED_CIDRS="${TF_EXTRA_MASTER_AUTHORIZED_CIDRS:-}"
 RUN_DEPLOYED_SMOKE="${RUN_DEPLOYED_SMOKE:-true}"
 RUNNER_PUBLIC_IPV4="${RUNNER_PUBLIC_IPV4:-}"
 VERIFY_PUBLIC_EDGE="${TF_VERIFY_PUBLIC_EDGE:-}"
+GOOGLE_CLOUD_PROJECT="${TF_GOOGLE_CLOUD_PROJECT:-}"
+GOOGLE_CLOUD_LOCATION="${TF_GOOGLE_CLOUD_LOCATION:-}"
+LLM_PROVIDER_TYPE="${TF_LLM_PROVIDER_TYPE:-vertex_ai}"
+LLM_JUDGE_MODEL="${TF_LLM_JUDGE_MODEL:-gemini-2.5-flash}"
+LLM_IMAGE_MODEL="${TF_LLM_IMAGE_MODEL:-imagen-4.0-generate-001}"
+RUST_LOG="${TF_RUST_LOG:-info,tower_http=debug}"
+GEMINI_API_KEY="${TF_GEMINI_API_KEY:-}"
 
 if [[ -z "${IMAGE_DIGEST}" && -z "${IMAGE_TAG}" ]]; then
   printf 'Either IMAGE_DIGEST or IMAGE_TAG must be set.\n' >&2
@@ -85,14 +92,17 @@ if [[ -z "${VERIFY_PUBLIC_EDGE}" ]]; then
   VERIFY_PUBLIC_EDGE="true"
 fi
 
+if [[ -z "${GOOGLE_CLOUD_PROJECT}" ]]; then
+  GOOGLE_CLOUD_PROJECT="${PROJECT_ID}"
+fi
+
+if [[ -z "${GOOGLE_CLOUD_LOCATION}" ]]; then
+  GOOGLE_CLOUD_LOCATION="${REGION}"
+fi
+
 require_boolean "TF_ENABLE_CLOUD_ARMOR" "${ENABLE_CLOUD_ARMOR}"
 require_boolean "TF_ENABLE_UPTIME_CHECKS" "${ENABLE_UPTIME_CHECKS}"
 require_boolean "TF_VERIFY_PUBLIC_EDGE" "${VERIFY_PUBLIC_EDGE}"
-
-if [[ "${ENABLE_UPTIME_CHECKS}" == "true" && -z "${NOTIFICATION_CHANNEL_ID}" ]]; then
-  printf 'TF_NOTIFICATION_CHANNEL_ID is required when TF_ENABLE_UPTIME_CHECKS=true.\n' >&2
-  exit 1
-fi
 
 FOUNDATION_VARS_FILE="${TMP_DIR}/foundation.auto.tfvars.json"
 PLATFORM_VARS_FILE="${TMP_DIR}/platform.auto.tfvars.json"
@@ -146,6 +156,11 @@ if [[ -n "${NOTIFICATION_CHANNEL_ID}" ]]; then
   notification_channel_json=$',\n  "notification_channel_id": "'"$(json_escape "${NOTIFICATION_CHANNEL_ID}")"'"'
 fi
 
+gemini_api_key_json=""
+if [[ -n "${GEMINI_API_KEY}" ]]; then
+  gemini_api_key_json=$',\n  "gemini_api_key": "'"$(json_escape "${GEMINI_API_KEY}")"'"'
+fi
+
 cat >"${PLATFORM_VARS_FILE}" <<EOF
 {
   "project_id": "$(json_escape "${PROJECT_ID}")",
@@ -162,10 +177,16 @@ cat >"${PLATFORM_VARS_FILE}" <<EOF
   "image_tag": "$(json_escape "${IMAGE_TAG}")",
   "enable_cloud_armor": ${ENABLE_CLOUD_ARMOR},
   "enable_uptime_checks": ${ENABLE_UPTIME_CHECKS},
+  "google_cloud_project": "$(json_escape "${GOOGLE_CLOUD_PROJECT}")",
+  "google_cloud_location": "$(json_escape "${GOOGLE_CLOUD_LOCATION}")",
+  "llm_provider_type": "$(json_escape "${LLM_PROVIDER_TYPE}")",
+  "llm_judge_model": "$(json_escape "${LLM_JUDGE_MODEL}")",
+  "llm_image_model": "$(json_escape "${LLM_IMAGE_MODEL}")",
+  "rust_log": "$(json_escape "${RUST_LOG}")",
   "kubeconfig_path": "$(json_escape "${KUBECONFIG_PATH}")",
   "labels": {
     "owner": "platform"
-  }${notification_channel_json}
+  }${notification_channel_json}${gemini_api_key_json}
 }
 EOF
 
@@ -256,6 +277,19 @@ fi
 printf 'Applying foundation stack...\n'
 terraform_init_gcs "${ROOT_DIR}/terraform/environments/production/foundation" "${STATE_PREFIX_BASE}/foundation"
 terraform -chdir="${ROOT_DIR}/terraform/environments/production/foundation" apply -input=false -auto-approve -var-file="${FOUNDATION_VARS_FILE}"
+
+if [[ -z "${NOTIFICATION_CHANNEL_ID}" ]]; then
+  NOTIFICATION_CHANNEL_ID="$(terraform -chdir="${ROOT_DIR}/terraform/environments/production/foundation" output -raw notification_channel_id)"
+  python3 - <<'PY' "${PLATFORM_VARS_FILE}" "${NOTIFICATION_CHANNEL_ID}"
+import json, pathlib, sys
+path = pathlib.Path(sys.argv[1])
+value = sys.argv[2].strip()
+data = json.loads(path.read_text())
+if value:
+    data["notification_channel_id"] = value
+path.write_text(json.dumps(data, indent=2) + "\n")
+PY
+fi
 
 printf 'Fetching cluster credentials...\n'
 KUBECONFIG="${KUBECONFIG_PATH}" gcloud container clusters get-credentials "${CLUSTER_NAME}" --region "${REGION}" --project "${PROJECT_ID}"

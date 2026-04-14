@@ -97,6 +97,21 @@ pub(crate) fn load_llm_pool_config() -> Result<LlmPoolConfig, String> {
     let judge_providers = resolve_providers(&judge_entries, "judge");
     let image_providers = resolve_providers(&image_entries, "image");
 
+    let uses_vertex_ai = judge_providers
+        .iter()
+        .chain(image_providers.iter())
+        .any(|provider| provider.kind == LlmProviderKind::VertexAi);
+
+    if uses_vertex_ai && google_cloud_project.is_none() {
+        return Err("GOOGLE_CLOUD_PROJECT is required when any LLM provider uses vertex_ai"
+            .to_string());
+    }
+
+    if uses_vertex_ai && google_cloud_location.is_none() {
+        return Err("GOOGLE_CLOUD_LOCATION is required when any LLM provider uses vertex_ai"
+            .to_string());
+    }
+
     info!(
         judge_provider_count = judge_providers.len(),
         image_provider_count = image_providers.len(),

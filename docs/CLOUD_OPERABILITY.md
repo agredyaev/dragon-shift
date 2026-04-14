@@ -6,7 +6,8 @@ This document defines what the repo owns and what operators own in production.
 - application image and runtime config
 - Helm chart in `helm/dragon-shift`
 - Terraform under `terraform/` for network, GKE, Cloud SQL, ingress edge, Secret Manager wiring, and monitoring
-- manual deploy, promote, and rollback workflow
+- automated Terraform production deploy via `.github/workflows/publish-image.yml`
+- manual non-production Helm deploy and rollback via `.github/workflows/deploy.yml`
 - health endpoints and deploy smoke checks
 
 ## Operator-owned

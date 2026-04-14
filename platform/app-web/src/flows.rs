@@ -349,8 +349,10 @@ pub async fn submit_workshop_command(
             });
         }
         Err(error) => {
-            ops.with_mut(|o| {
-                apply_command_error(o, error);
+            identity.with_mut(|id| {
+                ops.with_mut(|o| {
+                    apply_command_error(id, o, error);
+                });
             });
         }
     }
@@ -384,7 +386,7 @@ pub async fn submit_handover_tags_command(
 }
 
 pub async fn submit_judge_bundle_request(
-    identity: Signal<IdentityState>,
+    mut identity: Signal<IdentityState>,
     _game_state: Signal<Option<ClientGameState>>,
     mut ops: Signal<OperationState>,
     mut judge_bundle: Signal<Option<JudgeBundle>>,
@@ -421,8 +423,10 @@ pub async fn submit_judge_bundle_request(
             });
         }
         Err(error) => {
-            ops.with_mut(|o| {
-                apply_judge_bundle_error(o, error);
+            identity.with_mut(|id| {
+                ops.with_mut(|o| {
+                    apply_judge_bundle_error(id, o, error);
+                });
             });
         }
     }

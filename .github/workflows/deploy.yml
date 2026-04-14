@@ -9,7 +9,6 @@ on:
         type: choice
         options:
           - staging
-          - production
       action:
         description: Operation to run
         required: true
@@ -89,6 +88,10 @@ jobs:
           PORT_FORWARD_SERVICE: ${{ vars.PORT_FORWARD_SERVICE }}
           ROLLBACK_REVISION: ${{ github.event.inputs.rollback_revision }}
         run: |
+          if [[ "${TARGET_ENV}" == "production" ]]; then
+            printf 'Production deploys are Terraform-managed through publish-image.yml and operations/terraform-apply.sh. Use that path instead of deploy.yml.\n' >&2
+            exit 1
+          fi
           test -n "${IMAGE_REPOSITORY}"
           test -n "${KUBE_NAMESPACE}"
           test -n "${APP_ALLOWED_ORIGINS}"

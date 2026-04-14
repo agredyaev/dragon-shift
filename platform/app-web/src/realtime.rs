@@ -11,14 +11,14 @@ use crate::api::{build_session_envelope, build_ws_url};
 
 #[cfg(target_arch = "wasm32")]
 use crate::state::{
-    ConnectionStatus, apply_realtime_connecting, apply_server_ws_message, error_notice,
+    apply_realtime_connecting, apply_server_ws_message, error_notice, ConnectionStatus,
 };
 
 #[cfg(target_arch = "wasm32")]
 use std::cell::RefCell;
 
 #[cfg(target_arch = "wasm32")]
-use wasm_bindgen::{JsCast, closure::Closure};
+use wasm_bindgen::{closure::Closure, JsCast};
 
 #[cfg(target_arch = "wasm32")]
 pub struct RealtimeClientHandle {
@@ -47,18 +47,17 @@ pub fn bootstrap_realtime(
     };
     let snapshot =
         snapshot.ok_or_else(|| "Join a workshop before syncing the session.".to_string())?;
+    identity.with_mut(|id| {
+        ops.with_mut(|o| {
+            apply_realtime_connecting(id, o);
+        });
+    });
     let envelope_json = serde_json::to_string(&ClientWsMessage::AttachSession(
         build_session_envelope(&snapshot),
     ))
     .map_err(|error| format!("failed to encode attach payload: {error}"))?;
     let socket = web_sys::WebSocket::new(&build_ws_url(&base_url))
         .map_err(|_| "failed to open session connection".to_string())?;
-
-    identity.with_mut(|id| {
-        ops.with_mut(|o| {
-            apply_realtime_connecting(id, o);
-        });
-    });
 
     let open_socket = socket.clone();
     let mut open_identity = identity;

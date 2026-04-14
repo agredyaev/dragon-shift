@@ -16,7 +16,7 @@
 - `helm/dragon-shift` - Kubernetes deployment chart
 - `.github/workflows/ci.yml` - repo checks and chart validation
 - `.github/workflows/publish-image.yml` - GHCR image publishing plus automatic Terraform apply on `main`
-- `.github/workflows/deploy.yml` - manual deploy, promote, and rollback flow
+- `.github/workflows/deploy.yml` - manual non-production Helm deploy and rollback flow
 - `operations/terraform-apply.sh` - bootstrap, apply, and verify the cloud deployment locally or in CI
 - `e2e/` - deployed browser smoke and local restart proofs
 

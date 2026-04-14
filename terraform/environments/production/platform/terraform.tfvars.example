@@ -2,17 +2,14 @@ project_id   = "my-production-project"
 region       = "europe-west4"
 cluster_name  = "dragon-shift-prod"
 
-hostname_mode      = "managed_dns"
-hostname           = "dragon-shift.example.com"
-dns_zone_name      = "dragon-shift-example-com"
-dns_zone_dns_name  = "example.com."
+hostname_mode = "nip_io"
+nip_io_label  = "dragon-shift"
 
-# For an ephemeral public test URL without a parent DNS zone, switch to:
-# hostname_mode = "nip_io"
-# hostname      = ""
-# dns_zone_name = ""
-# dns_zone_dns_name = ""
-# nip_io_label  = "dragon-shift"
+# For a delegated production hostname, switch to:
+# hostname_mode     = "managed_dns"
+# hostname          = "dragon-shift.example.com"
+# dns_zone_name     = "dragon-shift-example-com"
+# dns_zone_dns_name = "example.com."
 
 image_repository      = "ghcr.io/your-org/dragon-switch"
 image_digest          = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"

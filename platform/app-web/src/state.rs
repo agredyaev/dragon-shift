@@ -386,6 +386,25 @@ pub fn persist_browser_session_snapshot(snapshot: &ClientSessionSnapshot) -> Res
 }
 
 #[cfg(target_arch = "wasm32")]
+pub fn clear_browser_session_snapshot() -> Result<(), String> {
+    let Some(window) = web_sys::window() else {
+        return Err("window is unavailable".to_string());
+    };
+    let storage = window
+        .local_storage()
+        .map_err(|_| "failed to access browser storage".to_string())?
+        .ok_or_else(|| "browser storage is unavailable".to_string())?;
+    storage
+        .remove_item(SESSION_SNAPSHOT_STORAGE_KEY)
+        .map_err(|_| "failed to clear browser session".to_string())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn clear_browser_session_snapshot() -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(target_arch = "wasm32")]
 pub fn persist_browser_api_base_url(api_base_url: &str) -> Result<(), String> {
     let Some(window) = web_sys::window() else {
         return Err("window is unavailable".to_string());
@@ -463,6 +482,9 @@ pub fn apply_join_success(
 pub fn apply_request_error(identity: &mut IdentityState, ops: &mut OperationState, error: String) {
     identity.connection_status = ConnectionStatus::Offline;
     ops.pending_flow = None;
+    if should_clear_session_snapshot(&error) {
+        clear_session_identity(identity);
+    }
     ops.notice = Some(error_notice(&error));
 }
 
@@ -497,8 +519,11 @@ pub fn apply_successful_command(
     ops.notice = Some(success_notice(command_success_message(command)));
 }
 
-pub fn apply_command_error(ops: &mut OperationState, error: String) {
+pub fn apply_command_error(identity: &mut IdentityState, ops: &mut OperationState, error: String) {
     ops.pending_command = None;
+    if should_clear_session_snapshot(&error) {
+        clear_session_identity(identity);
+    }
     ops.notice = Some(error_notice(&error));
 }
 
@@ -512,8 +537,15 @@ pub fn apply_judge_bundle_success(
     ops.notice = Some(success_notice("Workshop archive ready."));
 }
 
-pub fn apply_judge_bundle_error(ops: &mut OperationState, error: String) {
+pub fn apply_judge_bundle_error(
+    identity: &mut IdentityState,
+    ops: &mut OperationState,
+    error: String,
+) {
     ops.pending_judge_bundle = false;
+    if should_clear_session_snapshot(&error) {
+        clear_session_identity(identity);
+    }
     ops.notice = Some(error_notice(&error));
 }
 
@@ -523,7 +555,11 @@ pub fn apply_realtime_bootstrap_error(
     ops: &mut OperationState,
     error: String,
 ) {
+    identity.realtime_bootstrap_attempted = true;
     identity.connection_status = ConnectionStatus::Offline;
+    if should_clear_session_snapshot(&error) {
+        clear_session_identity(identity);
+    }
     ops.notice = Some(error_notice(&error));
 }
 
@@ -532,6 +568,24 @@ pub fn apply_realtime_connecting(identity: &mut IdentityState, ops: &mut Operati
     identity.realtime_bootstrap_attempted = true;
     identity.connection_status = ConnectionStatus::Connecting;
     ops.notice = Some(info_notice("Syncing session…"));
+}
+
+fn should_clear_session_snapshot(error: &str) -> bool {
+    matches!(
+        error.trim(),
+        "Missing workshop credentials."
+            | "Session identity is invalid or expired."
+            | "Workshop not found."
+    )
+}
+
+fn clear_session_identity(identity: &mut IdentityState) {
+    identity.screen = ShellScreen::Home;
+    identity.connection_status = ConnectionStatus::Offline;
+    identity.identity = None;
+    identity.session_snapshot = None;
+    identity.realtime_bootstrap_attempted = false;
+    let _ = clear_browser_session_snapshot();
 }
 
 #[allow(dead_code)]
@@ -580,6 +634,9 @@ pub fn apply_server_ws_message(
         }
         ServerWsMessage::Error { message } => {
             identity.connection_status = ConnectionStatus::Offline;
+            if should_clear_session_snapshot(&message) {
+                clear_session_identity(identity);
+            }
             ops.notice = Some(error_notice(&message));
         }
         ServerWsMessage::Pong => {
@@ -841,6 +898,57 @@ mod tests {
         assert_eq!(
             ops.notice.as_ref().map(|n| n.message.as_str()),
             Some("Workshop archive ready.")
+        );
+    }
+
+    #[test]
+    fn auth_errors_clear_stale_session_snapshot() {
+        let mut identity = default_identity_state();
+        identity.screen = ShellScreen::Session;
+        identity.realtime_bootstrap_attempted = true;
+        identity.identity = Some(SessionIdentity {
+            session_code: "123456".to_string(),
+            player_id: "player-1".to_string(),
+            reconnect_token: "reconnect-1".to_string(),
+        });
+        identity.session_snapshot = Some(ClientSessionSnapshot {
+            session_code: "123456".to_string(),
+            reconnect_token: "reconnect-1".to_string(),
+            player_id: "player-1".to_string(),
+            coordinator_type: CoordinatorType::Rust,
+        });
+        let mut ops = default_operation_state();
+        ops.pending_command = Some(SessionCommand::StartPhase1);
+
+        apply_command_error(
+            &mut identity,
+            &mut ops,
+            "Session identity is invalid or expired.".to_string(),
+        );
+
+        assert_eq!(identity.screen, ShellScreen::Home);
+        assert_eq!(identity.identity, None);
+        assert_eq!(identity.session_snapshot, None);
+        assert!(!identity.realtime_bootstrap_attempted);
+        assert_eq!(ops.pending_command, None);
+    }
+
+    #[test]
+    fn realtime_bootstrap_error_marks_attempted_even_when_connect_fails_early() {
+        let mut identity = default_identity_state();
+        let mut ops = default_operation_state();
+
+        apply_realtime_bootstrap_error(
+            &mut identity,
+            &mut ops,
+            "failed to open session connection".to_string(),
+        );
+
+        assert!(identity.realtime_bootstrap_attempted);
+        assert_eq!(identity.connection_status, ConnectionStatus::Offline);
+        assert_eq!(
+            ops.notice.as_ref().map(|n| n.message.as_str()),
+            Some("failed to open session connection")
         );
     }
 

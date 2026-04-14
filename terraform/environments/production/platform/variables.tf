@@ -41,7 +41,7 @@ variable "hostname" {
 variable "hostname_mode" {
   description = "Hostname strategy for production: managed_dns creates a Cloud DNS zone/record, external_dns expects an externally managed hostname, and nip_io derives a public hostname from the reserved global IP."
   type        = string
-  default     = "managed_dns"
+  default     = "nip_io"
 }
 
 variable "dns_zone_name" {
@@ -152,7 +152,7 @@ variable "enable_cloud_armor" {
 }
 
 variable "notification_channel_id" {
-  description = "Optional Monitoring notification channel ID. Required when enable_uptime_checks=true."
+  description = "Optional Monitoring notification channel ID override. When empty, the automated production apply uses the foundation stack output."
   type        = string
   default     = ""
 }
@@ -185,4 +185,61 @@ variable "kubeconfig_context" {
   description = "Optional kubeconfig context name to use with kubeconfig_path."
   type        = string
   default     = ""
+}
+
+# ---------------------------------------------------------------------------
+# Gemini / Vertex AI
+# ---------------------------------------------------------------------------
+
+variable "gemini_api_key" {
+  description = "Gemini API key for LLM judge and image generation. When set, a K8s secret dragon-shift-llm is created and api_key providers are configured in the Helm release. Leave empty to rely solely on Vertex AI with Workload Identity."
+  type        = string
+  default     = ""
+  sensitive   = true
+}
+
+variable "google_cloud_project" {
+  description = "Google Cloud project ID passed to the app runtime for Vertex AI calls. Required for vertex_ai providers and defaults to var.project_id in production automation."
+  type        = string
+  default     = ""
+}
+
+variable "google_cloud_location" {
+  description = "Google Cloud region for Vertex AI endpoint routing. Required for vertex_ai providers and defaults to var.region in production automation."
+  type        = string
+  default     = ""
+}
+
+variable "llm_judge_model" {
+  description = "Model name for the LLM judge provider."
+  type        = string
+  default     = "gemini-2.5-flash"
+}
+
+variable "llm_image_model" {
+  description = "Model name for the LLM image generation provider."
+  type        = string
+  default     = "imagen-4.0-generate-001"
+}
+
+variable "llm_provider_type" {
+  description = "LLM provider type: vertex_ai (Workload Identity, no API key) or api_key (requires gemini_api_key)."
+  type        = string
+  default     = "vertex_ai"
+
+  validation {
+    condition     = contains(["vertex_ai", "api_key"], var.llm_provider_type)
+    error_message = "llm_provider_type must be vertex_ai or api_key."
+  }
+
+  validation {
+    condition     = var.llm_provider_type != "api_key" || trimspace(var.gemini_api_key) != ""
+    error_message = "gemini_api_key must be set when llm_provider_type is api_key."
+  }
+}
+
+variable "rust_log" {
+  description = "RUST_LOG filter string for the app-server container."
+  type        = string
+  default     = "info,tower_http=debug"
 }

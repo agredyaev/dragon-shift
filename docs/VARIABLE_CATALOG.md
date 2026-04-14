@@ -24,8 +24,8 @@
 - `image.digest` - immutable image digest
 - `app.allowedOrigins` - runtime origin allowlist
 - `app.viteAppUrl` - runtime base URL
-- `app.googleCloudProject` - optional GCP project for server-side Google API calls
-- `app.googleCloudLocation` - optional GCP region/location for model routing
+- `app.googleCloudProject` - runtime GCP project for server-side Vertex AI calls; required when any `vertex_ai` provider is configured
+- `app.googleCloudLocation` - runtime GCP region/location for Vertex AI model routing; required when any `vertex_ai` provider is configured
 - `app.judgeProviders` - ordered provider pool for the judge LLM; each entry has `type` (`vertex_ai` or `api_key`), `model`, and optional `apiKeySecretName`/`apiKeySecretKey`
 - `app.imageProviders` - ordered provider pool for image generation; same entry schema as `judgeProviders`
 - `app.extraEnv` - additional runtime env entries appended to the container
@@ -37,7 +37,7 @@
 
 ## Notes
 - LLM provider pools are configured as ordered arrays in Helm values (`judgeProviders` / `imageProviders`). Failover happens left-to-right on 429 or provider failure.
-- `vertex_ai` providers use Application Default Credentials (GCE metadata server) and require no API key secret.
+- `vertex_ai` providers in the current runtime use the in-cluster Google metadata server with Workload Identity and require no API key secret.
 - `api_key` providers read their key from a Kubernetes Secret referenced by `apiKeySecretName` / `apiKeySecretKey` in the provider entry.
 - GKE Workload Identity additionally requires the corresponding Google IAM binding for the Kubernetes service account principal.
 - Browser local/dev API routing can be overridden without code changes by setting the saved Advanced panel address or passing `?apiBaseUrl=https://...` in the page URL.
@@ -60,7 +60,7 @@
 - `image_repository` - deployed image repository
 - `image_digest` - deployed image digest
 - `image_tag` - deployed image tag
-- `notification_channel_id` - Monitoring notification channel ID
+- `notification_channel_id` - optional Monitoring notification channel override; automated production deploys default to the foundation stack output
 - `kubeconfig_path` - optional kubeconfig path for platform apply
 - `kubeconfig_context` - optional kubeconfig context name
 
@@ -76,9 +76,15 @@
 - `TF_NIP_IO_LABEL` - repository variable for the `nip.io` hostname label
 - `TF_ENABLE_CLOUD_ARMOR` - repository variable to disable Cloud Armor when quota is unavailable
 - `TF_ENABLE_UPTIME_CHECKS` - repository variable to opt into Monitoring uptime checks
-- `TF_NOTIFICATION_CHANNEL_ID` - repository variable required when `TF_ENABLE_UPTIME_CHECKS=true`
+- `TF_NOTIFICATION_CHANNEL_ID` - optional repository variable overriding the foundation stack notification channel output
 - `TF_EXTRA_MASTER_AUTHORIZED_CIDRS` - repository variable with extra operator IPv4 CIDRs, comma-separated
 - `TF_VERIFY_PUBLIC_EDGE` - repository variable to require public HTTPS and browser smoke validation
+- `TF_GOOGLE_CLOUD_PROJECT` - optional repository variable overriding the runtime Vertex AI project id
+- `TF_GOOGLE_CLOUD_LOCATION` - optional repository variable overriding the runtime Vertex AI location
+- `TF_LLM_PROVIDER_TYPE` - repository variable selecting `vertex_ai` or `api_key`
+- `TF_LLM_JUDGE_MODEL` - optional repository variable overriding the judge model
+- `TF_LLM_IMAGE_MODEL` - optional repository variable overriding the image model
+- `TF_RUST_LOG` - optional repository variable overriding runtime `RUST_LOG`
 - `GCP_WORKLOAD_IDENTITY_PROVIDER` - repository secret for the Google Workload Identity Provider resource name
 - `GCP_SERVICE_ACCOUNT_EMAIL` - repository secret for the GitHub Actions Terraform service account email
 - `TF_PRODUCTION_DB_PASSWORD` - repository secret for the Cloud SQL application password

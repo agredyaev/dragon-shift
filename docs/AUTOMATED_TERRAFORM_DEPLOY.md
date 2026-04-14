@@ -11,6 +11,7 @@ Pushes to `main` use `.github/workflows/publish-image.yml` to:
 The production apply waits for the `CI` workflow for the same SHA to succeed before it touches Google Cloud.
 
 Manual `workflow_dispatch` runs of `Publish Image` still publish an image, but the Terraform production apply only runs for `refs/heads/main`.
+Direct Helm deploys through `.github/workflows/deploy.yml` are non-production only; production is Terraform-managed.
 
 ## Bootstrap Once
 
@@ -49,10 +50,19 @@ If you change bootstrap IAM or Workload Identity settings after the first run, r
 - `TF_NOTIFICATION_CHANNEL_ID`
 - `TF_EXTRA_MASTER_AUTHORIZED_CIDRS`
 - `TF_VERIFY_PUBLIC_EDGE`
+- `TF_GOOGLE_CLOUD_PROJECT`
+- `TF_GOOGLE_CLOUD_LOCATION`
+- `TF_LLM_PROVIDER_TYPE`
+- `TF_LLM_JUDGE_MODEL`
+- `TF_LLM_IMAGE_MODEL`
+- `TF_RUST_LOG`
 
 `TF_HOSTNAME_MODE=nip_io` is the zero-DNS default for a fresh project.
 `TF_STATE_BUCKET_NAME` is optional and defaults to `<project-id>-tfstate`.
 `TF_VERIFY_PUBLIC_EDGE` defaults to `true`; set it to `false` only for an intentionally partial rollout where public DNS or certificate readiness is managed outside the current run.
+`TF_NOTIFICATION_CHANNEL_ID` is optional; when unset, the production apply uses the notification channel output from the foundation stack.
+`TF_GOOGLE_CLOUD_PROJECT` and `TF_GOOGLE_CLOUD_LOCATION` are optional overrides; by default the runtime uses `GCP_PROJECT_ID` and `GCP_REGION` for Vertex AI.
+`TF_LLM_PROVIDER_TYPE` defaults to `vertex_ai`.
 For `managed_dns` or `external_dns`, public HTTPS verification depends on DNS delegation or external DNS records outside this repo.
 
 ## Repository Secrets
@@ -60,6 +70,7 @@ For `managed_dns` or `external_dns`, public HTTPS verification depends on DNS de
 - `GCP_WORKLOAD_IDENTITY_PROVIDER`
 - `GCP_SERVICE_ACCOUNT_EMAIL`
 - `TF_PRODUCTION_DB_PASSWORD`
+- `TF_GEMINI_API_KEY`
 
 ## Local Apply Path
 

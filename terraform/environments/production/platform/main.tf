@@ -13,6 +13,7 @@ locals {
   )
 
   ksa_name         = "dragon-shift-app"
+  gsa_name         = "dragon-shift-app"
   use_image_digest = trimspace(var.image_digest) != ""
 }
 
@@ -147,11 +148,48 @@ resource "kubernetes_service_account" "app" {
     labels = {
       "app.kubernetes.io/name" = "dragon-shift"
     }
+    annotations = var.llm_provider_type == "vertex_ai" ? {
+      "iam.gke.io/gcp-service-account" = google_service_account.app[0].email
+    } : {}
   }
 
-  automount_service_account_token = false
+  automount_service_account_token = var.llm_provider_type == "vertex_ai"
 
   depends_on = [kubernetes_namespace.app, terraform_data.wait_for_cluster_apis]
+}
+
+# ---------------------------------------------------------------------------
+# Application Google Service Account (GSA) for Vertex AI / Gemini access
+# ---------------------------------------------------------------------------
+
+resource "google_service_account" "app" {
+  count = var.llm_provider_type == "vertex_ai" ? 1 : 0
+
+  account_id   = local.gsa_name
+  display_name = "Dragon Shift Application"
+  description  = "Runtime identity for the Dragon Shift app workload (Vertex AI, etc.)"
+  project      = var.project_id
+}
+
+resource "google_project_iam_member" "app_vertex_ai_user" {
+  count = var.llm_provider_type == "vertex_ai" ? 1 : 0
+
+  project = var.project_id
+  role    = "roles/aiplatform.user"
+  member  = format("serviceAccount:%s", google_service_account.app[0].email)
+}
+
+resource "google_service_account_iam_member" "app_workload_identity" {
+  count = var.llm_provider_type == "vertex_ai" ? 1 : 0
+
+  service_account_id = google_service_account.app[0].name
+  role               = "roles/iam.workloadIdentityUser"
+  member = format(
+    "serviceAccount:%s.svc.id.goog[%s/%s]",
+    var.project_id,
+    kubernetes_namespace.app.metadata[0].name,
+    local.ksa_name,
+  )
 }
 
 data "google_secret_manager_secret_version" "database_url" {
@@ -172,6 +210,27 @@ resource "kubernetes_secret" "database_url" {
 
   data = {
     DATABASE_URL = data.google_secret_manager_secret_version.database_url.secret_data
+  }
+
+  depends_on = [kubernetes_namespace.app]
+}
+
+resource "kubernetes_secret" "llm" {
+  count = var.llm_provider_type == "api_key" ? 1 : 0
+
+  metadata {
+    name      = "dragon-shift-llm"
+    namespace = kubernetes_namespace.app.metadata[0].name
+
+    labels = {
+      "app.kubernetes.io/name"    = "dragon-shift"
+      "app.kubernetes.io/part-of" = "dragon-shift"
+    }
+  }
+
+  data = {
+    LLM_JUDGE_API_KEY_0 = var.gemini_api_key
+    LLM_IMAGE_API_KEY_0 = var.gemini_api_key
   }
 
   depends_on = [kubernetes_namespace.app]
@@ -339,6 +398,7 @@ resource "helm_release" "app" {
     app = {
       allowedOrigins        = format("https://%s", local.app_hostname)
       viteAppUrl            = format("https://%s", local.app_hostname)
+      rustLog               = var.rust_log
       rustSessionCodePrefix = var.rust_session_code_prefix
       trustForwardedFor     = var.trust_forwarded_for
       databasePoolSize      = var.database_pool_size
@@ -346,6 +406,34 @@ resource "helm_release" "app" {
       joinRateLimitMax      = var.join_rate_limit_max
       commandRateLimitMax   = var.command_rate_limit_max
       socketRateLimitMax    = var.websocket_rate_limit_max
+      googleCloudProject    = var.llm_provider_type == "vertex_ai" ? (var.google_cloud_project != "" ? var.google_cloud_project : var.project_id) : ""
+      googleCloudLocation   = var.llm_provider_type == "vertex_ai" ? (var.google_cloud_location != "" ? var.google_cloud_location : var.region) : ""
+      judgeProviders = var.llm_provider_type == "api_key" ? [
+        {
+          type             = "api_key"
+          model            = var.llm_judge_model
+          apiKeySecretName = "dragon-shift-llm"
+          apiKeySecretKey  = "LLM_JUDGE_API_KEY_0"
+        }
+        ] : [
+        {
+          type  = "vertex_ai"
+          model = var.llm_judge_model
+        }
+      ]
+      imageProviders = var.llm_provider_type == "api_key" ? [
+        {
+          type             = "api_key"
+          model            = var.llm_image_model
+          apiKeySecretName = "dragon-shift-llm"
+          apiKeySecretKey  = "LLM_IMAGE_API_KEY_0"
+        }
+        ] : [
+        {
+          type  = "vertex_ai"
+          model = var.llm_image_model
+        }
+      ]
     }
     database = {
       existingSecretName = kubernetes_secret.database_url.metadata[0].name
@@ -358,7 +446,7 @@ resource "helm_release" "app" {
     serviceAccount = {
       create                       = false
       name                         = kubernetes_service_account.app.metadata[0].name
-      automountServiceAccountToken = false
+      automountServiceAccountToken = var.llm_provider_type == "vertex_ai"
     }
     podDisruptionBudget = {
       enabled      = true
@@ -371,6 +459,8 @@ resource "helm_release" "app" {
     kubernetes_manifest.managed_certificate,
     kubernetes_secret.database_url,
     kubernetes_service_account.app,
+    google_service_account.app,
+    google_service_account_iam_member.app_workload_identity,
     terraform_data.wait_for_cluster_apis,
   ]
 }

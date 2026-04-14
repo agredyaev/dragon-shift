@@ -28,7 +28,6 @@ use crate::http::{
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct WsAttachOutcome {
     session_code: String,
-    replaced_connection_id: Option<String>,
     state_changed: bool,
 }
 
@@ -900,10 +899,6 @@ async fn attach_ws_session(
 
     Ok(WsAttachOutcome {
         session_code: session_code.to_string(),
-        replaced_connection_id: attach_result
-            .replaced
-            .or(local_replaced_registration)
-            .map(|registration| registration.connection_id),
         state_changed,
     })
 }

@@ -63,6 +63,8 @@ spec:
           env:
             - name: NODE_ENV
               value: production
+            - name: RUST_LOG
+              value: {{ .Values.app.rustLog | quote }}
             - name: APP_SERVER_BIND_ADDR
               value: 0.0.0.0:{{ .Values.app.port }}
             - name: APP_SERVER_STATIC_DIR
