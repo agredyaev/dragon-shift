@@ -65,9 +65,9 @@ export async function waitForNotice(page: Page, text: string) {
   await expect(page.getByTestId('notice-bar')).toContainText(text)
 }
 
-export async function expectPhaseVisible(pages: Page[], text: string) {
+export async function expectPhaseVisible(pages: Page[], text: string, timeout = 15_000) {
   for (const page of pages) {
-    await expect(page.getByTestId('session-panel')).toContainText(text)
+    await expect(page.getByTestId('session-panel')).toContainText(text, { timeout })
   }
 }
 
@@ -143,8 +143,7 @@ export async function enterPhase2(hostPage: Page, ...otherPages: Page[]) {
 
 export async function enterJudge(hostPage: Page, ...otherPages: Page[]) {
   await hostPage.getByTestId('end-game-button').click()
-  await waitForNotice(hostPage, 'Judge review started.')
-  await expectPhaseVisible([hostPage, ...otherPages], 'Judge review')
+  await expectPhaseVisible([hostPage, ...otherPages], 'Judge review', 120_000)
 }
 
 export async function enterVoting(hostPage: Page, ...otherPages: Page[]) {

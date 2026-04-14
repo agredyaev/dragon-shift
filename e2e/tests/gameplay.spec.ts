@@ -176,7 +176,7 @@ test.describe('dragon shift deployed gameplay', () => {
       const workshopCode = await createWorkshop(host.page, 'Alice')
       await joinWorkshop(guest.page, workshopCode, 'Bob')
 
-      await expect(guest.page.getByTestId('controls-panel')).toBeVisible()
+      await expect(guest.page.getByTestId('controls-panel')).toHaveCount(0)
       await expect(guest.page.getByTestId('start-phase0-button')).toHaveCount(0)
       await expect(host.page.getByTestId('session-panel')).toContainText(lobbyTitlePattern)
       await expect(guest.page.getByTestId('session-panel')).toContainText(lobbyTitlePattern)
