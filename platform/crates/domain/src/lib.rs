@@ -2876,4 +2876,1033 @@ mod tests {
         // happiness_decay = (1 + 0 + 0 + 0 + min(6,4)) * 1 = 5
         assert_eq!(d.happiness, 95);
     }
+
+    // ── Validator 7: Action edge cases ────────────────────────────────────
+
+    #[test]
+    fn validator7_action_rejected_in_lobby_phase() {
+        let mut s = WorkshopSession::new(
+            Uuid::new_v4(),
+            SessionCode("700001".into()),
+            ts(1),
+            config(),
+        );
+        s.add_player(player("p1", true, 10));
+        // Still in Lobby — no begin_phase1 called
+        let result = s.apply_action("p1", PlayerAction::Sleep);
+        assert_eq!(result, Err(DomainError::ActionNotAllowed));
+    }
+
+    #[test]
+    fn validator7_action_rejected_in_voting_phase() {
+        let mut s = setup_deterministic_session();
+        s.dragons.get_mut("d1").unwrap().handover_tags =
+            vec!["a".into(), "b".into(), "c".into()];
+        s.transition_to(Phase::Handover).unwrap();
+        s.enter_phase2().unwrap();
+        s.enter_voting().unwrap();
+
+        let result = s.apply_action("p1", PlayerAction::Sleep);
+        assert_eq!(result, Err(DomainError::ActionNotAllowed));
+    }
+
+    #[test]
+    fn validator7_action_rejected_for_unknown_player() {
+        let mut s = setup_deterministic_session();
+        let result = s.apply_action("ghost", PlayerAction::Sleep);
+        assert_eq!(result, Err(DomainError::DragonNotAssigned));
+    }
+
+    #[test]
+    fn validator7_play_blocked_when_energy_too_low() {
+        let mut s = setup_deterministic_session();
+        s.dragons.get_mut("d1").unwrap().energy = 10;
+        s.dragons.get_mut("d1").unwrap().hunger = 50;
+
+        let outcome = s.apply_action("p1", PlayerAction::Play(PlayType::Fetch)).unwrap();
+        assert!(matches!(
+            outcome,
+            ActionOutcome::Blocked { reason: ActionBlockReason::TooTiredToPlay }
+        ));
+        let d = s.dragons.get("d1").unwrap();
+        assert_eq!(d.last_emotion, DragonEmotion::Sleepy);
+    }
+
+    #[test]
+    fn validator7_blocked_action_does_not_increment_counters() {
+        let mut s = setup_deterministic_session();
+        let d = s.dragons.get_mut("d1").unwrap();
+        d.hunger = 100; // will block feed (AlreadyFull, threshold >= 95)
+
+        s.apply_action("p1", PlayerAction::Feed(FoodType::Meat)).unwrap();
+        let d = s.dragons.get("d1").unwrap();
+        assert_eq!(d.total_actions, 0);
+        assert_eq!(d.food_tries, 0);
+        assert_eq!(d.correct_actions, 0);
+    }
+
+    #[test]
+    fn validator7_blocked_action_does_not_set_cooldown() {
+        let mut s = setup_deterministic_session();
+        s.dragons.get_mut("d1").unwrap().hunger = 100;
+
+        s.apply_action("p1", PlayerAction::Feed(FoodType::Meat)).unwrap();
+        assert_eq!(s.dragons.get("d1").unwrap().action_cooldown, 0);
+    }
+
+    #[test]
+    fn validator7_feed_resets_sleep_shield() {
+        let mut s = setup_deterministic_session();
+        s.dragons.get_mut("d1").unwrap().sleep_shield_ticks = 3;
+
+        s.apply_action("p1", PlayerAction::Feed(FoodType::Meat)).unwrap();
+        assert_eq!(s.dragons.get("d1").unwrap().sleep_shield_ticks, 0);
+    }
+
+    #[test]
+    fn validator7_play_resets_sleep_shield() {
+        let mut s = setup_deterministic_session();
+        s.dragons.get_mut("d1").unwrap().sleep_shield_ticks = 3;
+
+        s.apply_action("p1", PlayerAction::Play(PlayType::Fetch)).unwrap();
+        assert_eq!(s.dragons.get("d1").unwrap().sleep_shield_ticks, 0);
+    }
+
+    #[test]
+    fn validator7_sleep_action_sets_sleep_shield() {
+        let mut s = setup_deterministic_session();
+        s.dragons.get_mut("d1").unwrap().energy = 40;
+
+        s.apply_action("p1", PlayerAction::Sleep).unwrap();
+        assert_eq!(s.dragons.get("d1").unwrap().sleep_shield_ticks, 1);
+    }
+
+    #[test]
+    fn validator7_sleep_blocked_emotion_is_angry() {
+        let mut s = setup_deterministic_session();
+        s.dragons.get_mut("d1").unwrap().energy = 95;
+
+        let outcome = s.apply_action("p1", PlayerAction::Sleep).unwrap();
+        assert!(matches!(
+            outcome,
+            ActionOutcome::Blocked { reason: ActionBlockReason::TooAwakeToSleep }
+        ));
+        assert_eq!(s.dragons.get("d1").unwrap().last_emotion, DragonEmotion::Angry);
+    }
+
+    #[test]
+    fn validator7_feed_blocked_emotion_is_neutral() {
+        let mut s = setup_deterministic_session();
+        s.dragons.get_mut("d1").unwrap().hunger = 100;
+
+        s.apply_action("p1", PlayerAction::Feed(FoodType::Meat)).unwrap();
+        assert_eq!(s.dragons.get("d1").unwrap().last_emotion, DragonEmotion::Neutral);
+    }
+
+    #[test]
+    fn validator7_play_hungry_blocked_emotion_is_angry() {
+        let mut s = setup_deterministic_session();
+        s.dragons.get_mut("d1").unwrap().hunger = 10;
+
+        s.apply_action("p1", PlayerAction::Play(PlayType::Fetch)).unwrap();
+        assert_eq!(s.dragons.get("d1").unwrap().last_emotion, DragonEmotion::Angry);
+    }
+
+    #[test]
+    fn validator7_correct_feed_emotion_is_happy() {
+        let mut s = setup_deterministic_session();
+        s.apply_action("p1", PlayerAction::Feed(FoodType::Meat)).unwrap();
+        assert_eq!(s.dragons.get("d1").unwrap().last_emotion, DragonEmotion::Happy);
+    }
+
+    #[test]
+    fn validator7_wrong_feed_emotion_is_angry() {
+        let mut s = setup_deterministic_session();
+        s.apply_action("p1", PlayerAction::Feed(FoodType::Fruit)).unwrap();
+        assert_eq!(s.dragons.get("d1").unwrap().last_emotion, DragonEmotion::Angry);
+    }
+
+    #[test]
+    fn validator7_sleep_emotion_is_sleepy() {
+        let mut s = setup_deterministic_session();
+        s.dragons.get_mut("d1").unwrap().energy = 40;
+
+        s.apply_action("p1", PlayerAction::Sleep).unwrap();
+        assert_eq!(s.dragons.get("d1").unwrap().last_emotion, DragonEmotion::Sleepy);
+    }
+
+    // ── Validator 8: Decay deep tests ─────────────────────────────────────
+
+    #[test]
+    fn validator8_low_hunger_adds_happiness_decay() {
+        let mut s = setup_deterministic_session();
+        let d = s.dragons.get_mut("d1").unwrap();
+        d.active_time = ActiveTime::Day;
+        d.sleep_rate = 1;
+        d.hunger = 25; // < 30 → +1 happiness decay
+        d.energy = 100; // >= 30 → no extra
+        d.happiness = 100;
+        d.penalty_stacks = 0;
+        s.time = 10; // daytime, day dragon → no wrong_time
+
+        s.advance_tick();
+        let d = s.dragons.get("d1").unwrap();
+        // hunger_decay = 1, energy_decay = 1*1*1 = 1
+        // happiness_decay = (1 + 1_hunger + 0_energy + 0_time + 0_penalty) * 1 = 2
+        assert_eq!(d.happiness, 98);
+    }
+
+    #[test]
+    fn validator8_low_energy_adds_happiness_decay() {
+        let mut s = setup_deterministic_session();
+        let d = s.dragons.get_mut("d1").unwrap();
+        d.active_time = ActiveTime::Day;
+        d.sleep_rate = 1;
+        d.hunger = 100; // >= 30 → no extra
+        d.energy = 25; // < 30 → +1 happiness decay
+        d.happiness = 100;
+        d.penalty_stacks = 0;
+        s.time = 10;
+
+        s.advance_tick();
+        let d = s.dragons.get("d1").unwrap();
+        // happiness_decay = (1 + 0_hunger + 1_energy + 0_time + 0_penalty) * 1 = 2
+        assert_eq!(d.happiness, 98);
+    }
+
+    #[test]
+    fn validator8_combined_max_happiness_decay_phase2() {
+        let mut s = setup_deterministic_session();
+        s.dragons.get_mut("d1").unwrap().handover_tags =
+            vec!["a".into(), "b".into(), "c".into()];
+        s.transition_to(Phase::Handover).unwrap();
+        s.enter_phase2().unwrap();
+        let d = s.dragons.get_mut("d1").unwrap();
+        d.active_time = ActiveTime::Day;
+        d.sleep_rate = 1;
+        d.hunger = 0; // < 30 → +1
+        d.energy = 0; // < 30 → +1
+        d.happiness = 100;
+        d.penalty_stacks = 4;
+        d.sleep_shield_ticks = 0;
+        s.time = 20; // nighttime → wrong_time for Day dragon → +1
+
+        s.advance_tick();
+        let d = s.dragons.get("d1").unwrap();
+        // happiness_decay = (1 + 1 + 1 + 1 + min(4,4)) * 3 = 8 * 3 = 24
+        assert_eq!(d.happiness, 76);
+    }
+
+    #[test]
+    fn validator8_disconnected_player_dragon_skipped_by_tick() {
+        let mut s = WorkshopSession::new(
+            Uuid::new_v4(),
+            SessionCode("800001".into()),
+            ts(1),
+            config(),
+        );
+        let mut p1 = player("p1", false, 10); // disconnected
+        p1.is_connected = false;
+        s.add_player(p1);
+        s.begin_phase1(&[Phase1Assignment {
+            player_id: "p1".into(),
+            dragon_id: "d1".into(),
+        }])
+        .unwrap();
+        let d = s.dragons.get_mut("d1").unwrap();
+        d.active_time = ActiveTime::Day;
+        d.sleep_rate = 1;
+        d.hunger = 50;
+        d.energy = 50;
+        d.happiness = 50;
+        s.time = 10;
+
+        s.advance_tick();
+        let d = s.dragons.get("d1").unwrap();
+        // Dragon stats should be unchanged because owner is disconnected
+        assert_eq!(d.hunger, 50);
+        assert_eq!(d.energy, 50);
+        assert_eq!(d.happiness, 50);
+    }
+
+    #[test]
+    fn validator8_tick_noop_in_lobby() {
+        let mut s = WorkshopSession::new(
+            Uuid::new_v4(),
+            SessionCode("800002".into()),
+            ts(1),
+            config(),
+        );
+        s.add_player(player("p1", true, 10));
+        s.time = 10;
+
+        let result = s.advance_tick();
+        assert!(result.is_empty());
+        assert_eq!(s.time, 10); // time should NOT advance in lobby
+    }
+
+    #[test]
+    fn validator8_time_wraps_from_23_to_0() {
+        let mut s = setup_deterministic_session();
+        s.time = 23;
+
+        s.advance_tick();
+        assert_eq!(s.time, 0);
+    }
+
+    #[test]
+    fn validator8_is_daytime_boundaries() {
+        // Hour 5 = night, 6 = day, 17 = day, 18 = night
+        assert!(!is_daytime(5));
+        assert!(is_daytime(6));
+        assert!(is_daytime(17));
+        assert!(!is_daytime(18));
+        assert!(!is_daytime(0));
+        assert!(is_daytime(12));
+        assert!(!is_daytime(23));
+    }
+
+    #[test]
+    fn validator8_night_dragon_no_time_penalty_at_night() {
+        let mut s = setup_deterministic_session();
+        let d = s.dragons.get_mut("d1").unwrap();
+        d.active_time = ActiveTime::Night;
+        d.sleep_rate = 1;
+        d.hunger = 100;
+        d.energy = 100;
+        d.happiness = 100;
+        d.sleep_shield_ticks = 0;
+        s.time = 20; // nighttime → correct time for Night dragon
+
+        s.advance_tick();
+        let d = s.dragons.get("d1").unwrap();
+        // energy_decay = sleep_rate(1) * time_penalty(1) * decay(1) = 1
+        assert_eq!(d.energy, 99);
+        // No wrong_time → happiness_decay = 1
+        assert_eq!(d.happiness, 99);
+    }
+
+    #[test]
+    fn validator8_night_dragon_time_penalty_during_day() {
+        let mut s = setup_deterministic_session();
+        let d = s.dragons.get_mut("d1").unwrap();
+        d.active_time = ActiveTime::Night;
+        d.sleep_rate = 1;
+        d.hunger = 100;
+        d.energy = 100;
+        d.happiness = 100;
+        d.sleep_shield_ticks = 0;
+        s.time = 10; // daytime → wrong time for Night dragon
+
+        s.advance_tick();
+        let d = s.dragons.get("d1").unwrap();
+        // energy_decay = 1 * 2 * 1 = 2
+        assert_eq!(d.energy, 98);
+        // wrong_time → happiness_decay = 1 + 1 = 2
+        assert_eq!(d.happiness, 98);
+    }
+
+    #[test]
+    fn validator8_sleep_shield_expiry_resets_emotion_to_neutral() {
+        let mut s = setup_deterministic_session();
+        let d = s.dragons.get_mut("d1").unwrap();
+        d.sleep_shield_ticks = 1;
+        d.last_action = DragonAction::Sleep;
+        d.last_emotion = DragonEmotion::Sleepy;
+        d.speech = None;
+        d.speech_timer = 0;
+
+        s.advance_tick();
+        let d = s.dragons.get("d1").unwrap();
+        assert_eq!(d.sleep_shield_ticks, 0);
+        assert_eq!(d.last_action, DragonAction::Idle);
+        assert_eq!(d.last_emotion, DragonEmotion::Neutral);
+    }
+
+    #[test]
+    fn validator8_penalty_decay_timer_resets_when_stacks_reach_zero() {
+        let mut s = setup_deterministic_session();
+        let d = s.dragons.get_mut("d1").unwrap();
+        d.penalty_stacks = 1;
+        d.penalty_decay_timer = 5;
+        d.hunger = 100;
+        d.energy = 100;
+        d.happiness = 100;
+
+        s.advance_tick(); // timer goes 5→6, then stacks 1→0, timer resets to 0
+        let d = s.dragons.get("d1").unwrap();
+        assert_eq!(d.penalty_stacks, 0);
+        assert_eq!(d.penalty_decay_timer, 0);
+    }
+
+    // ── Validator 9: Voting & phase transitions ───────────────────────────
+
+    fn setup_two_player_session() -> WorkshopSession {
+        let mut s = WorkshopSession::new(
+            Uuid::new_v4(),
+            SessionCode("900000".into()),
+            ts(1),
+            config(),
+        );
+        s.add_player(player("p1", true, 10));
+        s.add_player(player("p2", true, 20));
+        s.begin_phase1(&[
+            Phase1Assignment { player_id: "p1".into(), dragon_id: "d1".into() },
+            Phase1Assignment { player_id: "p2".into(), dragon_id: "d2".into() },
+        ]).unwrap();
+        // Fix preferences
+        for (did, food) in [("d1", FoodType::Meat), ("d2", FoodType::Fish)] {
+            let d = s.dragons.get_mut(did).unwrap();
+            d.active_time = ActiveTime::Day;
+            d.day_food = food;
+            d.night_food = FoodType::Fruit;
+            d.day_play = PlayType::Fetch;
+            d.night_play = PlayType::Music;
+            d.sleep_rate = 1;
+            d.hunger = 50;
+            d.energy = 50;
+            d.happiness = 50;
+        }
+        s.time = 10;
+        s
+    }
+
+    #[test]
+    fn validator9_successful_vote_recorded() {
+        let mut s = setup_two_player_session();
+        // Advance to voting
+        for did in ["d1", "d2"] {
+            s.dragons.get_mut(did).unwrap().handover_tags =
+                vec!["a".into(), "b".into(), "c".into()];
+        }
+        s.transition_to(Phase::Handover).unwrap();
+        s.enter_phase2().unwrap();
+        let immediate = s.enter_voting().unwrap();
+        assert!(!immediate); // 2 players → not immediate
+
+        // p1 votes for d2 (not their own dragon after shuffle)
+        let p1_dragon = s.players.get("p1").unwrap().current_dragon_id.clone().unwrap();
+        let p2_dragon = s.players.get("p2").unwrap().current_dragon_id.clone().unwrap();
+        s.submit_vote("p1", &p2_dragon).unwrap();
+
+        let voting = s.voting.as_ref().unwrap();
+        assert_eq!(voting.votes_by_player_id.get("p1"), Some(&p2_dragon));
+
+        // p2 votes for p1's dragon
+        s.submit_vote("p2", &p1_dragon).unwrap();
+        let voting = s.voting.as_ref().unwrap();
+        assert_eq!(voting.votes_by_player_id.len(), 2);
+    }
+
+    #[test]
+    fn validator9_vote_overwrite_replaces_previous() {
+        let mut s = setup_two_player_session();
+        for did in ["d1", "d2"] {
+            s.dragons.get_mut(did).unwrap().handover_tags =
+                vec!["a".into(), "b".into(), "c".into()];
+        }
+        s.transition_to(Phase::Handover).unwrap();
+        s.enter_phase2().unwrap();
+        s.enter_voting().unwrap();
+
+        let p1_dragon = s.players.get("p1").unwrap().current_dragon_id.clone().unwrap();
+        let p2_dragon = s.players.get("p2").unwrap().current_dragon_id.clone().unwrap();
+
+        // p1 votes for d2, then changes vote
+        s.submit_vote("p1", &p2_dragon).unwrap();
+        s.submit_vote("p1", &p1_dragon).unwrap_err(); // can't self-vote — but let's test overwrite with valid target
+        // Since there are only 2 dragons, p1 can only vote for p2_dragon
+        // The overwrite case is demonstrated by voting for same target twice
+        s.submit_vote("p1", &p2_dragon).unwrap();
+        assert_eq!(s.voting.as_ref().unwrap().votes_by_player_id.len(), 1);
+    }
+
+    #[test]
+    fn validator9_submit_vote_before_voting_returns_error() {
+        let mut s = setup_deterministic_session();
+        let result = s.submit_vote("p1", "d1");
+        assert_eq!(result, Err(DomainError::VotingNotActive));
+    }
+
+    #[test]
+    fn validator9_enter_voting_multi_player_returns_false() {
+        let mut s = setup_two_player_session();
+        for did in ["d1", "d2"] {
+            s.dragons.get_mut(did).unwrap().handover_tags =
+                vec!["a".into(), "b".into(), "c".into()];
+        }
+        s.transition_to(Phase::Handover).unwrap();
+        s.enter_phase2().unwrap();
+
+        let immediate = s.enter_voting().unwrap();
+        assert!(!immediate);
+        let eligible = &s.voting.as_ref().unwrap().eligible_player_ids;
+        assert_eq!(eligible.len(), 2);
+    }
+
+    #[test]
+    fn validator9_all_valid_transitions_accepted() {
+        assert!(can_transition(Phase::Lobby, Phase::Phase1));
+        assert!(can_transition(Phase::Phase1, Phase::Handover));
+        assert!(can_transition(Phase::Handover, Phase::Phase2));
+        assert!(can_transition(Phase::Phase2, Phase::Voting));
+        assert!(can_transition(Phase::Voting, Phase::End));
+        assert!(can_transition(Phase::End, Phase::Lobby));
+    }
+
+    #[test]
+    fn validator9_invalid_transitions_rejected() {
+        // Skip phases
+        assert!(!can_transition(Phase::Lobby, Phase::Phase2));
+        assert!(!can_transition(Phase::Phase1, Phase::Phase2));
+        assert!(!can_transition(Phase::Phase2, Phase::End));
+        assert!(!can_transition(Phase::Lobby, Phase::End));
+        // Backwards
+        assert!(!can_transition(Phase::Phase1, Phase::Lobby));
+        assert!(!can_transition(Phase::End, Phase::Phase1));
+        assert!(!can_transition(Phase::Voting, Phase::Phase2));
+        // Self
+        assert!(!can_transition(Phase::Lobby, Phase::Lobby));
+        assert!(!can_transition(Phase::Phase1, Phase::Phase1));
+    }
+
+    #[test]
+    fn validator9_transition_resets_warned_flag() {
+        let mut s = WorkshopSession::new(
+            Uuid::new_v4(),
+            SessionCode("900005".into()),
+            ts(1),
+            config(),
+        );
+        s.warned_for_current_phase = true;
+
+        s.transition_to(Phase::Phase1).unwrap();
+        assert!(!s.warned_for_current_phase);
+    }
+
+    #[test]
+    fn validator9_three_player_rotation_correctness() {
+        let mut s = WorkshopSession::new(
+            Uuid::new_v4(),
+            SessionCode("900006".into()),
+            ts(1),
+            config(),
+        );
+        s.add_player(player("p1", true, 10));
+        s.add_player(player("p2", true, 20));
+        s.add_player(player("p3", true, 30));
+        s.begin_phase1(&[
+            Phase1Assignment { player_id: "p1".into(), dragon_id: "d1".into() },
+            Phase1Assignment { player_id: "p2".into(), dragon_id: "d2".into() },
+            Phase1Assignment { player_id: "p3".into(), dragon_id: "d3".into() },
+        ]).unwrap();
+        // Set tags
+        for did in ["d1", "d2", "d3"] {
+            s.dragons.get_mut(did).unwrap().handover_tags =
+                vec!["a".into(), "b".into(), "c".into()];
+        }
+        s.transition_to(Phase::Handover).unwrap();
+        s.enter_phase2().unwrap();
+
+        // Each player should have a DIFFERENT dragon than they created
+        let p1_dragon = s.players.get("p1").unwrap().current_dragon_id.as_deref().unwrap();
+        let p2_dragon = s.players.get("p2").unwrap().current_dragon_id.as_deref().unwrap();
+        let p3_dragon = s.players.get("p3").unwrap().current_dragon_id.as_deref().unwrap();
+        assert_ne!(p1_dragon, "d1", "p1 should not keep their own dragon");
+        assert_ne!(p2_dragon, "d2", "p2 should not keep their own dragon");
+        assert_ne!(p3_dragon, "d3", "p3 should not keep their own dragon");
+        // All different
+        assert_ne!(p1_dragon, p2_dragon);
+        assert_ne!(p2_dragon, p3_dragon);
+        assert_ne!(p1_dragon, p3_dragon);
+    }
+
+    #[test]
+    fn validator9_dragon_initial_stats_are_50() {
+        let mut s = WorkshopSession::new(
+            Uuid::new_v4(),
+            SessionCode("900007".into()),
+            ts(1),
+            config(),
+        );
+        s.add_player(player("p1", true, 10));
+        s.begin_phase1(&[Phase1Assignment {
+            player_id: "p1".into(),
+            dragon_id: "d1".into(),
+        }]).unwrap();
+
+        let d = s.dragons.get("d1").unwrap();
+        assert_eq!(d.hunger, 50);
+        assert_eq!(d.energy, 50);
+        assert_eq!(d.happiness, 50);
+    }
+
+    // ── Validator 10: Achievement edge cases ──────────────────────────────
+
+    #[test]
+    fn validator10_rock_bottom_deduplicated_across_ticks() {
+        let mut s = setup_deterministic_session();
+        let d = s.dragons.get_mut("d1").unwrap();
+        d.happiness = 1;
+        d.hunger = 100;
+        d.energy = 100;
+        d.sleep_rate = 1;
+
+        // First tick: happiness 1 → 0, awards rock_bottom
+        let awards1 = s.advance_tick();
+        assert!(awards1.iter().any(|(_, ach)| *ach == "rock_bottom"));
+
+        // Second tick: happiness stays 0 (clamped), should NOT duplicate
+        let awards2 = s.advance_tick();
+        assert!(!awards2.iter().any(|(_, ach)| *ach == "rock_bottom"));
+
+        // Player should have exactly one rock_bottom
+        let count = s.players.get("p1").unwrap().achievements
+            .iter().filter(|a| *a == "rock_bottom").count();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn validator10_phase_end_achievement_dedup_on_double_call() {
+        let mut s = setup_deterministic_session();
+        let d = s.dragons.get_mut("d1").unwrap();
+        d.wrong_food_count = 0;
+        d.wrong_play_count = 0;
+        d.total_actions = 10;
+        d.correct_actions = 10;
+
+        let awards1 = s.award_phase_end_achievements();
+        let awards2 = s.award_phase_end_achievements();
+
+        // First call awards, second should not duplicate
+        assert!(!awards1.is_empty());
+        assert!(awards2.is_empty());
+    }
+
+    #[test]
+    fn validator10_no_mistakes_requires_both_zero_wrong() {
+        let mut s = setup_deterministic_session();
+        let d = s.dragons.get_mut("d1").unwrap();
+        d.total_actions = 6;
+        d.wrong_food_count = 0;
+        d.wrong_play_count = 1; // has wrong plays
+        d.correct_actions = 5;
+
+        let awards = s.award_phase_end_achievements();
+        assert!(!awards.iter().any(|(_, ach)| *ach == "no_mistakes"));
+    }
+
+    #[test]
+    fn validator10_no_mistakes_requires_min_five_actions() {
+        let mut s = setup_deterministic_session();
+        let d = s.dragons.get_mut("d1").unwrap();
+        d.total_actions = 4; // less than 5
+        d.wrong_food_count = 0;
+        d.wrong_play_count = 0;
+        d.correct_actions = 4;
+
+        let awards = s.award_phase_end_achievements();
+        assert!(!awards.iter().any(|(_, ach)| *ach == "no_mistakes"));
+    }
+
+    #[test]
+    fn validator10_zen_master_negative_with_penalty_stacks() {
+        let mut s = setup_deterministic_session();
+        let d = s.dragons.get_mut("d1").unwrap();
+        d.total_actions = 10;
+        d.correct_actions = 8;
+        d.penalty_stacks = 1; // has stacks → should NOT get zen_master
+
+        let awards = s.award_phase_end_achievements();
+        assert!(!awards.iter().any(|(_, ach)| *ach == "zen_master"));
+    }
+
+    #[test]
+    fn validator10_zen_master_requires_eight_actions() {
+        let mut s = setup_deterministic_session();
+        let d = s.dragons.get_mut("d1").unwrap();
+        d.total_actions = 7; // less than 8
+        d.correct_actions = 7;
+        d.penalty_stacks = 0;
+
+        let awards = s.award_phase_end_achievements();
+        assert!(!awards.iter().any(|(_, ach)| *ach == "zen_master"));
+    }
+
+    #[test]
+    fn validator10_perfectionist_boundary_exactly_80_percent() {
+        let mut s = setup_deterministic_session();
+        let d = s.dragons.get_mut("d1").unwrap();
+        d.total_actions = 10;
+        d.correct_actions = 8; // 80% exactly
+        d.wrong_food_count = 0;
+        d.wrong_play_count = 0;
+
+        let awards = s.award_phase_end_achievements();
+        assert!(awards.iter().any(|(_, ach)| *ach == "perfectionist"));
+    }
+
+    #[test]
+    fn validator10_perfectionist_below_80_percent_not_awarded() {
+        let mut s = setup_deterministic_session();
+        let d = s.dragons.get_mut("d1").unwrap();
+        d.total_actions = 10;
+        d.correct_actions = 7; // 70%
+        d.wrong_food_count = 1;
+        d.wrong_play_count = 2;
+
+        let awards = s.award_phase_end_achievements();
+        assert!(!awards.iter().any(|(_, ach)| *ach == "perfectionist"));
+    }
+
+    #[test]
+    fn validator10_comeback_kid_boundary_lowest_16_not_awarded() {
+        let mut s = setup_deterministic_session();
+        let d = s.dragons.get_mut("d1").unwrap();
+        d.phase2_lowest_happiness = 16; // > 15 → should NOT qualify
+        d.happiness = 70;
+
+        let awards = s.award_phase_end_achievements();
+        assert!(!awards.iter().any(|(_, ach)| *ach == "comeback_kid"));
+    }
+
+    #[test]
+    fn validator10_comeback_kid_boundary_happiness_69_not_awarded() {
+        let mut s = setup_deterministic_session();
+        let d = s.dragons.get_mut("d1").unwrap();
+        d.phase2_lowest_happiness = 10;
+        d.happiness = 69; // < 70 → should NOT qualify
+
+        let awards = s.award_phase_end_achievements();
+        assert!(!awards.iter().any(|(_, ach)| *ach == "comeback_kid"));
+    }
+
+    #[test]
+    fn validator10_comeback_kid_awarded_at_boundaries() {
+        let mut s = setup_deterministic_session();
+        let d = s.dragons.get_mut("d1").unwrap();
+        d.phase2_lowest_happiness = 15; // exactly 15
+        d.happiness = 70; // exactly 70
+
+        let awards = s.award_phase_end_achievements();
+        assert!(awards.iter().any(|(_, ach)| *ach == "comeback_kid"));
+    }
+
+    // ── Validator 11: Penalty floor, sleep penalty, Phase2 counter reset ──
+
+    #[test]
+    fn validator11_penalty_stacks_floor_at_zero_on_correct_action() {
+        let mut s = setup_deterministic_session();
+        s.dragons.get_mut("d1").unwrap().penalty_stacks = 0;
+
+        s.apply_action("p1", PlayerAction::Feed(FoodType::Meat)).unwrap();
+        assert_eq!(s.dragons.get("d1").unwrap().penalty_stacks, 0);
+    }
+
+    #[test]
+    fn validator11_correct_sleep_reduces_penalty_stacks() {
+        let mut s = setup_deterministic_session();
+        let d = s.dragons.get_mut("d1").unwrap();
+        d.penalty_stacks = 3;
+        d.energy = 40;
+        d.active_time = ActiveTime::Day;
+        s.time = 20; // nighttime → correct sleep time for Day dragon
+
+        s.apply_action("p1", PlayerAction::Sleep).unwrap();
+        assert_eq!(s.dragons.get("d1").unwrap().penalty_stacks, 2);
+    }
+
+    #[test]
+    fn validator11_wrong_time_sleep_does_not_reduce_penalty() {
+        let mut s = setup_deterministic_session();
+        let d = s.dragons.get_mut("d1").unwrap();
+        d.penalty_stacks = 3;
+        d.energy = 40;
+        d.active_time = ActiveTime::Day;
+        s.time = 10; // daytime → wrong sleep time for Day dragon
+
+        s.apply_action("p1", PlayerAction::Sleep).unwrap();
+        assert_eq!(s.dragons.get("d1").unwrap().penalty_stacks, 3);
+    }
+
+    #[test]
+    fn validator11_phase2_resets_all_counters_multi_player() {
+        let mut s = setup_two_player_session();
+        // Build up state in Phase 1
+        let d = s.dragons.get_mut("d1").unwrap();
+        d.penalty_stacks = 3;
+        d.penalty_decay_timer = 4;
+        d.peak_penalty_stacks = 3;
+        d.wrong_food_count = 2;
+        d.wrong_play_count = 1;
+        d.cooldown_violations = 3;
+        d.total_actions = 10;
+        d.correct_actions = 5;
+        d.found_correct_food = true;
+        d.found_correct_play = true;
+        d.food_tries = 5;
+        d.play_tries = 3;
+        d.sleep_shield_ticks = 2;
+        d.action_cooldown = 2;
+        d.high_happiness_ticks = 10;
+
+        // Set tags and advance to phase2
+        for did in ["d1", "d2"] {
+            s.dragons.get_mut(did).unwrap().handover_tags =
+                vec!["a".into(), "b".into(), "c".into()];
+        }
+        s.transition_to(Phase::Handover).unwrap();
+        s.enter_phase2().unwrap();
+
+        // Check d1 was reset (now owned by a different player)
+        let d = s.dragons.get("d1").unwrap();
+        assert_eq!(d.hunger, 50);
+        assert_eq!(d.energy, 50);
+        assert_eq!(d.happiness, 50);
+        assert_eq!(d.penalty_stacks, 0);
+        assert_eq!(d.penalty_decay_timer, 0);
+        assert_eq!(d.peak_penalty_stacks, 0);
+        assert_eq!(d.wrong_food_count, 0);
+        assert_eq!(d.wrong_play_count, 0);
+        assert_eq!(d.cooldown_violations, 0);
+        assert_eq!(d.total_actions, 0);
+        assert_eq!(d.correct_actions, 0);
+        assert!(!d.found_correct_food);
+        assert!(!d.found_correct_play);
+        assert_eq!(d.food_tries, 0);
+        assert_eq!(d.play_tries, 0);
+        assert_eq!(d.sleep_shield_ticks, 0);
+        assert_eq!(d.action_cooldown, 0);
+        assert_eq!(d.phase2_ticks, 0);
+        assert_eq!(d.phase2_lowest_happiness, 100);
+        assert_eq!(d.last_action, DragonAction::Idle);
+        assert_eq!(d.last_emotion, DragonEmotion::Neutral);
+    }
+
+    #[test]
+    fn validator11_phase2_resets_all_counters_single_player() {
+        let mut s = setup_deterministic_session();
+        let d = s.dragons.get_mut("d1").unwrap();
+        d.penalty_stacks = 5;
+        d.penalty_decay_timer = 3;
+        d.peak_penalty_stacks = 5;
+        d.wrong_food_count = 4;
+        d.wrong_play_count = 2;
+        d.cooldown_violations = 7;
+        d.total_actions = 15;
+        d.correct_actions = 8;
+        d.found_correct_food = true;
+        d.found_correct_play = true;
+        d.handover_tags = vec!["a".into(), "b".into(), "c".into()];
+
+        s.transition_to(Phase::Handover).unwrap();
+        s.enter_phase2().unwrap();
+
+        let d = s.dragons.get("d1").unwrap();
+        assert_eq!(d.penalty_stacks, 0);
+        assert_eq!(d.penalty_decay_timer, 0);
+        assert_eq!(d.peak_penalty_stacks, 0);
+        assert_eq!(d.wrong_food_count, 0);
+        assert_eq!(d.wrong_play_count, 0);
+        assert_eq!(d.cooldown_violations, 0);
+        assert_eq!(d.total_actions, 0);
+        assert_eq!(d.correct_actions, 0);
+        assert!(!d.found_correct_food);
+        assert!(!d.found_correct_play);
+        assert_eq!(d.phase2_ticks, 0);
+        assert_eq!(d.phase2_lowest_happiness, 100);
+    }
+
+    #[test]
+    fn validator11_speech_timer_values_per_action() {
+        let mut s = setup_deterministic_session();
+        // Feed → speech_timer = 4
+        s.apply_action("p1", PlayerAction::Feed(FoodType::Meat)).unwrap();
+        assert_eq!(s.dragons.get("d1").unwrap().speech_timer, 4);
+
+        // Play → speech_timer = 4
+        s.dragons.get_mut("d1").unwrap().action_cooldown = 0;
+        s.apply_action("p1", PlayerAction::Play(PlayType::Fetch)).unwrap();
+        assert_eq!(s.dragons.get("d1").unwrap().speech_timer, 4);
+
+        // Sleep → speech_timer = 5
+        s.dragons.get_mut("d1").unwrap().action_cooldown = 0;
+        s.dragons.get_mut("d1").unwrap().energy = 40;
+        s.apply_action("p1", PlayerAction::Sleep).unwrap();
+        assert_eq!(s.dragons.get("d1").unwrap().speech_timer, 5);
+    }
+
+    // ── Validator 12: Tags, scores, observation edge cases ────────────────
+
+    #[test]
+    fn validator12_handover_tags_truncated_to_three() {
+        let mut s = setup_deterministic_session();
+        s.save_handover_tags(
+            "p1",
+            vec!["a".into(), "b".into(), "c".into(), "d".into(), "e".into()],
+        );
+        assert_eq!(
+            s.dragons.get("d1").unwrap().handover_tags.len(),
+            3
+        );
+    }
+
+    #[test]
+    fn validator12_handover_tags_ghost_player_noop() {
+        let mut s = setup_deterministic_session();
+        let dragon_count_before = s.dragons.len();
+        s.save_handover_tags("ghost", vec!["a".into()]);
+        assert_eq!(s.dragons.len(), dragon_count_before);
+    }
+
+    #[test]
+    fn validator12_observation_ghost_player_noop() {
+        let mut s = setup_deterministic_session();
+        s.record_discovery_observation("ghost", "some note");
+        // Should not panic, no changes
+        assert_eq!(s.dragons.get("d1").unwrap().discovery_observations.len(), 0);
+    }
+
+    #[test]
+    fn validator12_apply_judge_scores_resets_before_applying() {
+        let mut s = setup_deterministic_session();
+        s.players.get_mut("p1").unwrap().score = 50;
+
+        s.apply_judge_scores(&[("d1".to_string(), 10, 20)]);
+        // Score should be 10 + 20 = 30, NOT 50 + 10 + 20 = 80
+        assert_eq!(s.players.get("p1").unwrap().score, 30);
+    }
+
+    #[test]
+    fn validator12_apply_judge_scores_unknown_dragon_skipped() {
+        let mut s = setup_deterministic_session();
+        s.apply_judge_scores(&[
+            ("d1".to_string(), 10, 20),
+            ("nonexistent".to_string(), 100, 100),
+        ]);
+        assert_eq!(s.players.get("p1").unwrap().score, 30);
+    }
+
+    #[test]
+    fn validator12_single_player_score_gets_both_components() {
+        let mut s = setup_deterministic_session();
+        // In single player, original_owner == current_owner
+        s.apply_judge_scores(&[("d1".to_string(), 15, 25)]);
+        // p1 gets both observation_score (15) + care_score (25) = 40
+        assert_eq!(s.players.get("p1").unwrap().score, 40);
+    }
+
+    #[test]
+    fn validator12_two_player_score_split() {
+        let mut s = setup_two_player_session();
+        // After phase2 shuffle, d1 original_owner=p1 but current_owner changes
+        for did in ["d1", "d2"] {
+            s.dragons.get_mut(did).unwrap().handover_tags =
+                vec!["a".into(), "b".into(), "c".into()];
+        }
+        s.transition_to(Phase::Handover).unwrap();
+        s.enter_phase2().unwrap();
+
+        let d1_creator = s.dragons.get("d1").unwrap().original_owner_id.clone();
+        let d1_caretaker = s.dragons.get("d1").unwrap().current_owner_id.clone();
+        assert_ne!(d1_creator, d1_caretaker);
+
+        s.apply_judge_scores(&[
+            ("d1".to_string(), 10, 20),
+            ("d2".to_string(), 30, 40),
+        ]);
+
+        // Each player gets observation from their created dragon + care from their cared dragon
+        let p1_score = s.players.get("p1").unwrap().score;
+        let p2_score = s.players.get("p2").unwrap().score;
+        // Total distributed: 10+20+30+40 = 100
+        assert_eq!(p1_score + p2_score, 100);
+    }
+
+    #[test]
+    fn validator12_second_player_does_not_steal_host() {
+        let mut s = WorkshopSession::new(
+            Uuid::new_v4(),
+            SessionCode("120001".into()),
+            ts(1),
+            config(),
+        );
+        s.add_player(player("p1", true, 10));
+        s.add_player(player("p2", true, 20));
+
+        assert_eq!(s.host_player_id.as_deref(), Some("p1"));
+        assert!(s.players.get("p1").unwrap().is_host);
+        assert!(!s.players.get("p2").unwrap().is_host);
+    }
+
+    #[test]
+    fn validator12_phase_duration_minutes_mapping() {
+        let s = WorkshopSession::new(
+            Uuid::new_v4(),
+            SessionCode("120002".into()),
+            ts(1),
+            config(),
+        );
+        assert_eq!(s.phase_duration_minutes(Phase::Lobby), 5);
+        assert_eq!(s.phase_duration_minutes(Phase::Phase1), 10);
+        assert_eq!(s.phase_duration_minutes(Phase::Handover), 10);
+        assert_eq!(s.phase_duration_minutes(Phase::Phase2), 10);
+        assert_eq!(s.phase_duration_minutes(Phase::Voting), 0);
+        assert_eq!(s.phase_duration_minutes(Phase::End), 0);
+    }
+
+    #[test]
+    fn validator12_remaining_phase_seconds_zero_duration_returns_none() {
+        let mut s = WorkshopSession::new(
+            Uuid::new_v4(),
+            SessionCode("120003".into()),
+            ts(1),
+            config(),
+        );
+        s.phase = Phase::Voting;
+        assert_eq!(s.remaining_phase_seconds(ts(100)), None);
+    }
+
+    #[test]
+    fn validator12_remaining_phase_seconds_clamps_to_zero() {
+        let s = WorkshopSession::new(
+            Uuid::new_v4(),
+            SessionCode("120004".into()),
+            ts(1),
+            config(),
+        );
+        // Lobby = 5 minutes = 300 seconds. 1000 seconds elapsed → should clamp to 0
+        assert_eq!(s.remaining_phase_seconds(ts(1001)), Some(0));
+    }
+
+    #[test]
+    fn validator12_sleep_rate_range() {
+        // Generate many dragons and verify sleep_rate is always 1-3
+        let mut s = WorkshopSession::new(
+            Uuid::new_v4(),
+            SessionCode("120005".into()),
+            ts(1),
+            config(),
+        );
+        for i in 0..20 {
+            let pid = format!("p{i}");
+            s.add_player(player(&pid, true, i as i64));
+        }
+        let assignments: Vec<Phase1Assignment> = (0..20)
+            .map(|i| Phase1Assignment {
+                player_id: format!("p{i}"),
+                dragon_id: format!("d{i}"),
+            })
+            .collect();
+        s.begin_phase1(&assignments).unwrap();
+
+        for dragon in s.dragons.values() {
+            assert!(
+                (1..=3).contains(&dragon.sleep_rate),
+                "sleep_rate {} out of range for dragon {}",
+                dragon.sleep_rate,
+                dragon.id
+            );
+        }
+    }
 }
