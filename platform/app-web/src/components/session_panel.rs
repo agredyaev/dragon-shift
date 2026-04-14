@@ -141,13 +141,25 @@ pub fn SessionPanel(
                     LobbyView { game_state: game_state }
                 },
                 Some(Phase::Phase1) => rsx! {
-                    Phase1View { game_state: game_state }
+                    Phase1View {
+                        identity: identity,
+                        game_state: game_state,
+                        ops: ops,
+                        handover_tags_input: handover_tags_input,
+                        judge_bundle: judge_bundle,
+                    }
                 },
                 Some(Phase::Handover) => rsx! {
                     HandoverView { game_state: game_state, handover_tags_input: handover_tags_input }
                 },
                 Some(Phase::Phase2) => rsx! {
-                    Phase2View { game_state: game_state }
+                    Phase2View {
+                        identity: identity,
+                        game_state: game_state,
+                        ops: ops,
+                        handover_tags_input: handover_tags_input,
+                        judge_bundle: judge_bundle,
+                    }
                 },
                 Some(Phase::Voting) => rsx! {
                     VotingView {

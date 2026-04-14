@@ -1,4 +1,3 @@
-pub mod advanced_panel;
 pub mod archive_panel;
 pub mod controls_panel;
 pub mod create_panel;

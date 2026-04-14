@@ -42,28 +42,62 @@ pub fn VotingView(
             span { class: "roster__status roster__status--phase status-connected", "Voting" }
         }
         p { class: "panel__body", {status} }
-        div { class: "roster",
+        div { class: "voting-grid",
             for row in rows {
-                article { class: "roster__item",
-                    div {
-                        p { class: "roster__name", {row.dragon_name.clone()} }
-                        p { class: "roster__meta",
-                            if row.is_current_players_dragon {
-                                "Your current dragon cannot receive your vote."
-                            } else if row.is_selected {
-                                "Current selection"
-                            } else {
-                                "Eligible vote target"
-                            }
+                article {
+                    class: format!(
+                        "voting-card{}{}",
+                        if row.is_selected { " voting-card--selected" } else { "" },
+                        if row.is_current_players_dragon { " voting-card--blocked" } else { "" },
+                    ),
+                    // ---- Pixel sprite ----
+                    div { class: "voting-card__sprite",
+                        // Body (primary color)
+                        div {
+                            class: "sprite-pixel sprite-body",
+                            style: format!("background: {};", row.color_primary),
+                        }
+                        // Head (secondary color)
+                        div {
+                            class: "sprite-pixel sprite-head",
+                            style: format!("background: {};", row.color_secondary),
+                        }
+                        // Eye (accent color)
+                        div {
+                            class: "sprite-pixel sprite-eye",
+                            style: format!("background: {};", row.color_accent),
+                        }
+                        // Wing (secondary color, shifted)
+                        div {
+                            class: "sprite-pixel sprite-wing",
+                            style: format!("background: {};", row.color_secondary),
+                        }
+                        // Tail (primary color, extended)
+                        div {
+                            class: "sprite-pixel sprite-tail",
+                            style: format!("background: {};", row.color_primary),
+                        }
+                        // Horn / crest (accent)
+                        div {
+                            class: "sprite-pixel sprite-horn",
+                            style: format!("background: {};", row.color_accent),
+                        }
+                        // Legs (secondary)
+                        div {
+                            class: "sprite-pixel sprite-legs",
+                            style: format!("background: {};", row.color_secondary),
                         }
                     }
+                    // ---- Label ----
+                    p { class: "voting-card__name", {row.dragon_name.clone()} }
+                    // ---- Action ----
                     if row.is_current_players_dragon {
-                        span { class: "roster__status status-offline", "Blocked" }
+                        span { class: "voting-card__badge status-offline", "Your dragon" }
                     } else if row.is_selected {
-                        span { class: "roster__status status-connected", "Selected" }
+                        span { class: "voting-card__badge status-connected", "Voted" }
                     } else {
                         button {
-                            class: "button button--secondary",
+                            class: "button button--secondary voting-card__button",
                             "data-testid": format!("vote-button-{}", row.dragon_id),
                             disabled: commands_disabled,
                             onclick: {

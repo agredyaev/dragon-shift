@@ -236,15 +236,10 @@
         background:
             linear-gradient(180deg, rgba(224, 231, 255, 0.98) 0%, rgba(255,255,255,0.96) 100%);
     }
-    .panel--advanced {
-        background:
-            linear-gradient(180deg, rgba(241, 245, 249, 0.98) 0%, rgba(255,255,255,0.96) 100%);
-    }
     .panel--session::after,
     .panel--controls::after,
     .panel--judge::after,
-    .panel--runtime::after,
-    .panel--advanced::after {
+    .panel--runtime::after {
         content: "";
         position: absolute;
         inset: 0 0 auto 0;
@@ -256,7 +251,6 @@
     .panel--controls::after { background: #34d399; }
     .panel--judge::after { background: #38bdf8; }
     .panel--runtime::after { background: #4c63d9; }
-    .panel--advanced::after { background: #64748b; }
     .panel__title {
         margin: 0;
         font-family: var(--font-display);
@@ -473,6 +467,183 @@
         padding: 6px 8px;
         border: 3px solid currentColor;
         background: rgba(255,255,255,0.65);
+    }
+    /* ---- Voting grid + pixel dragon sprites ---- */
+    .voting-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+        gap: 14px;
+    }
+    .voting-card {
+        border: 4px solid #0f172a;
+        background: #ffffff;
+        padding: 14px 12px;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 10px;
+        box-shadow:
+            inset 3px 3px 0 0 rgba(255,255,255,0.72),
+            inset -3px -3px 0 0 rgba(0,0,0,0.08),
+            4px 4px 0 0 rgba(0,0,0,0.24);
+        transition: transform 0.08s ease-out;
+    }
+    .voting-card--selected {
+        border-color: #166534;
+        background: #dcfce7;
+    }
+    .voting-card--blocked {
+        opacity: 0.55;
+    }
+    .voting-card__sprite {
+        width: 64px;
+        height: 64px;
+        position: relative;
+        image-rendering: pixelated;
+    }
+    /* Pixel blocks forming a simplified dragon silhouette */
+    .sprite-pixel {
+        position: absolute;
+        image-rendering: pixelated;
+    }
+    .sprite-body {
+        width: 28px;
+        height: 20px;
+        top: 24px;
+        left: 16px;
+        border: 2px solid rgba(0,0,0,0.18);
+    }
+    .sprite-head {
+        width: 16px;
+        height: 14px;
+        top: 14px;
+        left: 36px;
+        border: 2px solid rgba(0,0,0,0.18);
+    }
+    .sprite-eye {
+        width: 4px;
+        height: 4px;
+        top: 18px;
+        left: 44px;
+    }
+    .sprite-wing {
+        width: 18px;
+        height: 10px;
+        top: 16px;
+        left: 14px;
+        border: 2px solid rgba(0,0,0,0.12);
+        clip-path: polygon(0% 100%, 50% 0%, 100% 100%);
+    }
+    .sprite-tail {
+        width: 14px;
+        height: 8px;
+        top: 32px;
+        left: 4px;
+        border: 2px solid rgba(0,0,0,0.18);
+        clip-path: polygon(0% 50%, 60% 0%, 100% 50%, 60% 100%);
+    }
+    .sprite-horn {
+        width: 6px;
+        height: 8px;
+        top: 8px;
+        left: 42px;
+        clip-path: polygon(50% 0%, 0% 100%, 100% 100%);
+    }
+    .sprite-legs {
+        width: 6px;
+        height: 8px;
+        top: 44px;
+        left: 22px;
+        border: 2px solid rgba(0,0,0,0.12);
+        box-shadow: 12px 0 0 0 currentColor;
+    }
+    .voting-card__name {
+        margin: 0;
+        font-family: var(--font-display);
+        font-size: 12px;
+        text-transform: uppercase;
+        text-align: center;
+    }
+    .voting-card__badge {
+        font-family: var(--font-display);
+        font-size: 10px;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+        padding: 4px 8px;
+        border: 2px solid currentColor;
+    }
+    .voting-card__button {
+        font-size: 11px;
+        padding: 6px 12px;
+    }
+    /* ---- Scoring methodology (end view) ---- */
+    .scoring-method {
+        border: 3px solid #0f172a;
+        background: #f8fafc;
+        padding: 14px 16px;
+        margin-top: 4px;
+        box-shadow:
+            inset 2px 2px 0 0 rgba(255,255,255,0.5),
+            inset -2px -2px 0 0 rgba(0,0,0,0.06),
+            3px 3px 0 0 rgba(0,0,0,0.18);
+    }
+    .scoring-method__title {
+        margin: 0 0 8px;
+        font-family: var(--font-display);
+        font-size: 12px;
+        text-transform: uppercase;
+        letter-spacing: 0.06em;
+        color: #0f172a;
+    }
+    .scoring-method__body {
+        font-family: var(--font-body);
+        font-size: 12px;
+        color: #334155;
+        line-height: 1.6;
+    }
+    .scoring-method__section {
+        margin: 6px 0;
+    }
+    /* ---- Stat bars (dragon stats display) ---- */
+    .stat-bars {
+        display: grid;
+        gap: 8px;
+    }
+    .stat-bar {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+    }
+    .stat-bar__label {
+        font-family: var(--font-display);
+        font-size: 11px;
+        text-transform: uppercase;
+        letter-spacing: 0.06em;
+        color: #0f172a;
+        min-width: 56px;
+    }
+    .stat-bar__track {
+        flex: 1;
+        height: 16px;
+        border: 3px solid #0f172a;
+        background: #e2e8f0;
+        position: relative;
+        box-shadow:
+            inset 2px 2px 0 0 rgba(0,0,0,0.12),
+            2px 2px 0 0 rgba(0,0,0,0.18);
+    }
+    .stat-bar__fill {
+        height: 100%;
+        background: #38bdf8;
+        transition: width 0.3s ease;
+        box-shadow: inset 2px 2px 0 0 rgba(255,255,255,0.4);
+    }
+    .stat-bar__value {
+        font-family: var(--font-display);
+        font-size: 11px;
+        color: #0f172a;
+        min-width: 28px;
+        text-align: right;
     }
     @media (max-width: 720px) {
         .shell {

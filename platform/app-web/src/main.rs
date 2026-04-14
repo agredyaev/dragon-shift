@@ -7,7 +7,6 @@ mod state;
 
 use dioxus::prelude::*;
 
-use components::advanced_panel::AdvancedPanel;
 use components::archive_panel::ArchivePanel;
 use components::controls_panel::ControlsPanel;
 use components::create_panel::CreatePanel;
@@ -53,10 +52,6 @@ fn App() -> Element {
         id.session_snapshot.is_some() && !id.realtime_bootstrap_attempted
     };
 
-    let has_session_snapshot = {
-        let id = identity.read();
-        id.session_snapshot.is_some()
-    };
     let render_session_panels_first = {
         let id = identity.read();
         id.screen == ShellScreen::Session
@@ -77,15 +72,14 @@ fn App() -> Element {
         }
     });
 
-    let render_session_panels = has_session_snapshot;
-
     rsx! {
         main { class: "shell",
             section { class: "shell__container",
                 Hero { identity, game_state }
                 NoticeBar { ops }
                 section { class: "grid",
-                    if render_session_panels && render_session_panels_first {
+                    if render_session_panels_first {
+                        // ---- Session screen ----
                         SessionPanel {
                             identity,
                             game_state,
@@ -101,49 +95,33 @@ fn App() -> Element {
                             judge_bundle,
                         }
                         ArchivePanel { game_state, judge_bundle }
-                    }
-                    WorkshopBrief {}
-                    CreatePanel {
-                        identity,
-                        game_state,
-                        ops,
-                        create_name,
-                        phase0_minutes,
-                        phase1_minutes,
-                        phase2_minutes,
-                        join_session_code,
-                        reconnect_session_code,
-                        reconnect_token,
-                        judge_bundle,
-                    }
-                    JoinPanel {
-                        identity,
-                        game_state,
-                        ops,
-                        join_session_code,
-                        join_name,
-                        reconnect_session_code,
-                        reconnect_token,
-                        judge_bundle,
-                    }
-                    if render_session_panels && !render_session_panels_first {
-                        SessionPanel {
+                    } else {
+                        // ---- Home screen ----
+                        WorkshopBrief {}
+                        CreatePanel {
                             identity,
                             game_state,
                             ops,
-                            handover_tags_input,
+                            create_name,
+                            phase0_minutes,
+                            phase1_minutes,
+                            phase2_minutes,
+                            join_session_code,
+                            reconnect_session_code,
+                            reconnect_token,
                             judge_bundle,
                         }
-                        ControlsPanel {
+                        JoinPanel {
                             identity,
                             game_state,
                             ops,
-                            handover_tags_input,
+                            join_session_code,
+                            join_name,
+                            reconnect_session_code,
+                            reconnect_token,
                             judge_bundle,
                         }
-                        ArchivePanel { game_state, judge_bundle }
                     }
-                    AdvancedPanel { identity }
                 }
             }
         }

@@ -23,6 +23,10 @@ pub struct VotingOptionRow {
     pub dragon_name: String,
     pub is_selected: bool,
     pub is_current_players_dragon: bool,
+    pub color_primary: String,
+    pub color_secondary: String,
+    pub color_accent: String,
+    pub base_variant: i32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -514,6 +518,10 @@ pub fn voting_option_rows(state: &ClientGameState) -> Vec<VotingOptionRow> {
             dragon_name: format!("Dragon #{}", index + 1),
             is_selected: current_vote_dragon_id == Some(dragon.id.as_str()),
             is_current_players_dragon: current_player_dragon_id == Some(dragon.id.as_str()),
+            color_primary: dragon.visuals.color_p.clone(),
+            color_secondary: dragon.visuals.color_s.clone(),
+            color_accent: dragon.visuals.color_a.clone(),
+            base_variant: dragon.visuals.base,
         })
         .collect()
 }
