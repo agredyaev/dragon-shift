@@ -33,7 +33,7 @@ app:
       apiKeySecretKey: LLM_JUDGE_API_KEY_0
   imageProviders:
     - type: api_key
-      model: gemini-2.5-flash-preview-04-17
+      model: gemini-2.5-flash-image
       apiKeySecretName: dragon-shift-llm
       apiKeySecretKey: LLM_IMAGE_API_KEY_0
   extraEnv: []

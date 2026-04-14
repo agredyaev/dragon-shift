@@ -2886,7 +2886,7 @@ fn load_config_reads_server_side_llm_settings() {
     );
     let _image_providers = ScopedEnvVar::set(
         "LLM_IMAGE_PROVIDERS",
-        r#"[{"type":"vertex_ai","model":"gemini-2.5-flash-preview-04-17"}]"#,
+        r#"[{"type":"vertex_ai","model":"gemini-2.5-flash-image"}]"#,
     );
     let _judge_key = ScopedEnvVar::set("LLM_JUDGE_API_KEY_0", "judge-key");
 
@@ -2905,7 +2905,7 @@ fn load_config_reads_server_side_llm_settings() {
     assert_eq!(config.llm_pool.image_providers.len(), 1);
     assert_eq!(
         config.llm_pool.image_providers[0].model,
-        "gemini-2.5-flash-preview-04-17"
+        "gemini-2.5-flash-image"
     );
 }
 

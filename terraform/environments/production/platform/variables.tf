@@ -219,7 +219,7 @@ variable "llm_judge_model" {
 variable "llm_image_model" {
   description = "Model name for the LLM image generation provider."
   type        = string
-  default     = "gemini-2.5-flash-preview-04-17"
+  default     = "gemini-2.5-flash-image"
 }
 
 variable "llm_provider_type" {

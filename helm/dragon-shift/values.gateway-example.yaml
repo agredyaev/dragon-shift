@@ -41,7 +41,7 @@ app:
       model: gemini-2.5-flash
   imageProviders:
     - type: vertex_ai
-      model: gemini-2.5-flash-preview-04-17
+      model: gemini-2.5-flash-image
   extraEnv: []
 
 database:
