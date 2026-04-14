@@ -8,11 +8,12 @@ use wasm_bindgen::JsCast;
 
 use crate::helpers::*;
 use crate::realtime::bootstrap_realtime;
-use crate::state::{apply_realtime_bootstrap_error, IdentityState, OperationState};
+use crate::state::{IdentityState, OperationState, apply_realtime_bootstrap_error};
 
 use super::end_view::EndView;
 use super::handover_view::HandoverView;
 use super::lobby_view::LobbyView;
+use super::phase0_view::Phase0View;
 use super::phase1_view::Phase1View;
 use super::phase2_view::Phase2View;
 use super::voting_view::VotingView;
@@ -138,7 +139,22 @@ pub fn SessionPanel(
 
             match current_phase {
                 Some(Phase::Lobby) => rsx! {
-                    LobbyView { game_state: game_state }
+                    LobbyView {
+                        identity: identity,
+                        game_state: game_state,
+                        ops: ops,
+                        handover_tags_input: handover_tags_input,
+                        judge_bundle: judge_bundle,
+                    }
+                },
+                Some(Phase::Phase0) => rsx! {
+                    Phase0View {
+                        identity: identity,
+                        game_state: game_state,
+                        ops: ops,
+                        handover_tags_input: handover_tags_input,
+                        judge_bundle: judge_bundle,
+                    }
                 },
                 Some(Phase::Phase1) => rsx! {
                     Phase1View {
@@ -150,7 +166,13 @@ pub fn SessionPanel(
                     }
                 },
                 Some(Phase::Handover) => rsx! {
-                    HandoverView { game_state: game_state, handover_tags_input: handover_tags_input }
+                    HandoverView {
+                        identity: identity,
+                        game_state: game_state,
+                        ops: ops,
+                        handover_tags_input: handover_tags_input,
+                        judge_bundle: judge_bundle,
+                    }
                 },
                 Some(Phase::Phase2) => rsx! {
                     Phase2View {
@@ -160,6 +182,9 @@ pub fn SessionPanel(
                         handover_tags_input: handover_tags_input,
                         judge_bundle: judge_bundle,
                     }
+                },
+                Some(Phase::Judge) => rsx! {
+                    EndView { game_state: game_state }
                 },
                 Some(Phase::Voting) => rsx! {
                     VotingView {

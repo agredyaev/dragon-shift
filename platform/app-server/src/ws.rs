@@ -930,8 +930,7 @@ pub(crate) async fn advance_game_ticks(state: &AppState) {
         sessions
             .iter()
             .filter(|(_, session)| {
-                session.phase == protocol::Phase::Phase1
-                    || session.phase == protocol::Phase::Phase2
+                session.phase == protocol::Phase::Phase1 || session.phase == protocol::Phase::Phase2
             })
             .map(|(code, _)| code.clone())
             .collect()

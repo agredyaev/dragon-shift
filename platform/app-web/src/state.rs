@@ -492,11 +492,14 @@ pub fn apply_request_error(identity: &mut IdentityState, ops: &mut OperationStat
 
 pub fn command_success_message(command: SessionCommand) -> &'static str {
     match command {
+        SessionCommand::StartPhase0 => "Character creation opened.",
+        SessionCommand::UpdatePlayerPet => "Dragon profile saved.",
         SessionCommand::StartPhase1 => "Phase 1 started.",
         SessionCommand::StartHandover => "Handover started.",
         SessionCommand::SubmitTags => "Handover tags saved.",
         SessionCommand::StartPhase2 => "Phase 2 started.",
-        SessionCommand::EndGame => "Voting started.",
+        SessionCommand::EndGame => "Judge review started.",
+        SessionCommand::StartVoting => "Design voting started.",
         SessionCommand::RevealVotingResults => "Voting results revealed.",
         SessionCommand::ResetGame => "Workshop reset.",
         _ => "Command sent.",
@@ -655,8 +658,8 @@ pub fn apply_server_ws_message(
 mod tests {
     use super::*;
     use protocol::{
-        create_default_session_settings, ClientGameState, CoordinatorType, Phase, Player,
-        SessionMeta, WorkshopJoinSuccess,
+        ClientGameState, CoordinatorType, Phase, Player, SessionMeta, WorkshopJoinSuccess,
+        create_default_session_settings,
     };
     use std::collections::BTreeMap;
 
@@ -674,6 +677,7 @@ mod tests {
                 is_ready: false,
                 is_connected: true,
                 pet_description: Some("Alice's workshop dragon".to_string()),
+                custom_sprites: None,
             },
         );
 

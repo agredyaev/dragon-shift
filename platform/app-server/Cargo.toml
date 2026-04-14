@@ -23,6 +23,8 @@ security.workspace = true
 realtime.workspace = true
 reqwest.workspace = true
 uuid.workspace = true
+image.workspace = true
+base64.workspace = true
 
 [dev-dependencies]
 futures-util = "0.3"

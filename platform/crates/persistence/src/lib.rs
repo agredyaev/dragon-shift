@@ -2013,6 +2013,7 @@ mod tests {
             current_dragon_id: None,
             achievements: Vec::new(),
             joined_at: ts(updated_at_seconds),
+            custom_sprites: None,
         });
         session
     }

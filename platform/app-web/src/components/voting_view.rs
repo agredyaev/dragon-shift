@@ -36,10 +36,10 @@ pub fn VotingView(
     rsx! {
         article { class: "roster__item roster__item--phase",
             div {
-                p { class: "roster__name", "Vote for the most creative dragon" }
+                p { class: "roster__name", "Vote for the most creative dragon design" }
                 p { class: "roster__meta", {progress} }
             }
-            span { class: "roster__status roster__status--phase status-connected", "Voting" }
+            span { class: "roster__status roster__status--phase status-connected", "Design vote" }
         }
         p { class: "panel__body", {status} }
         div { class: "voting-grid",
@@ -50,42 +50,51 @@ pub fn VotingView(
                         if row.is_selected { " voting-card--selected" } else { "" },
                         if row.is_current_players_dragon { " voting-card--blocked" } else { "" },
                     ),
-                    // ---- Pixel sprite ----
+                    // ---- Dragon sprite ----
                     div { class: "voting-card__sprite",
-                        // Body (primary color)
-                        div {
-                            class: "sprite-pixel sprite-body",
-                            style: format!("background: {};", row.color_primary),
-                        }
-                        // Head (secondary color)
-                        div {
-                            class: "sprite-pixel sprite-head",
-                            style: format!("background: {};", row.color_secondary),
-                        }
-                        // Eye (accent color)
-                        div {
-                            class: "sprite-pixel sprite-eye",
-                            style: format!("background: {};", row.color_accent),
-                        }
-                        // Wing (secondary color, shifted)
-                        div {
-                            class: "sprite-pixel sprite-wing",
-                            style: format!("background: {};", row.color_secondary),
-                        }
-                        // Tail (primary color, extended)
-                        div {
-                            class: "sprite-pixel sprite-tail",
-                            style: format!("background: {};", row.color_primary),
-                        }
-                        // Horn / crest (accent)
-                        div {
-                            class: "sprite-pixel sprite-horn",
-                            style: format!("background: {};", row.color_accent),
-                        }
-                        // Legs (secondary)
-                        div {
-                            class: "sprite-pixel sprite-legs",
-                            style: format!("background: {};", row.color_secondary),
+                        if let Some(ref sprites) = row.custom_sprites {
+                            img {
+                                class: "voting-card__sprite-img",
+                                src: "data:image/png;base64,{sprites.neutral}",
+                                alt: "Dragon sprite",
+                            }
+                        } else {
+                            // Fallback: CSS pixel dragon
+                            // Body (primary color)
+                            div {
+                                class: "sprite-pixel sprite-body",
+                                style: format!("background: {};", row.color_primary),
+                            }
+                            // Head (secondary color)
+                            div {
+                                class: "sprite-pixel sprite-head",
+                                style: format!("background: {};", row.color_secondary),
+                            }
+                            // Eye (accent color)
+                            div {
+                                class: "sprite-pixel sprite-eye",
+                                style: format!("background: {};", row.color_accent),
+                            }
+                            // Wing (secondary color, shifted)
+                            div {
+                                class: "sprite-pixel sprite-wing",
+                                style: format!("background: {};", row.color_secondary),
+                            }
+                            // Tail (primary color, extended)
+                            div {
+                                class: "sprite-pixel sprite-tail",
+                                style: format!("background: {};", row.color_primary),
+                            }
+                            // Horn / crest (accent)
+                            div {
+                                class: "sprite-pixel sprite-horn",
+                                style: format!("background: {};", row.color_accent),
+                            }
+                            // Legs (secondary)
+                            div {
+                                class: "sprite-pixel sprite-legs",
+                                style: format!("background: {};", row.color_secondary),
+                            }
                         }
                     }
                     // ---- Label ----

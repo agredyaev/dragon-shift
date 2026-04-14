@@ -11,14 +11,14 @@ use crate::api::{build_session_envelope, build_ws_url};
 
 #[cfg(target_arch = "wasm32")]
 use crate::state::{
-    apply_realtime_connecting, apply_server_ws_message, error_notice, ConnectionStatus,
+    ConnectionStatus, apply_realtime_connecting, apply_server_ws_message, error_notice,
 };
 
 #[cfg(target_arch = "wasm32")]
 use std::cell::RefCell;
 
 #[cfg(target_arch = "wasm32")]
-use wasm_bindgen::{closure::Closure, JsCast};
+use wasm_bindgen::{JsCast, closure::Closure};
 
 #[cfg(target_arch = "wasm32")]
 pub struct RealtimeClientHandle {

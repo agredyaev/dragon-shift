@@ -7,6 +7,7 @@ pub mod hero;
 pub mod join_panel;
 pub mod lobby_view;
 pub mod notice;
+pub mod phase0_view;
 pub mod phase1_view;
 pub mod phase2_view;
 pub mod session_panel;

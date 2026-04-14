@@ -1,10 +1,10 @@
 use chrono::Utc;
 use domain::{PlayerAction, SessionDragon, WorkshopSession};
 use protocol::{
-    create_session_settings, ActionPayload, ActiveTime, ClientDragon, ClientGameState,
-    ClientVotingState, DragonStats, DragonVisuals, FoodType, JudgeActionTrace, JudgeBundle,
-    JudgeDragonBundle, JudgeHandoverChain, JudgePlayerSummary, PlayType, Player,
-    SessionArtifactKind, SessionArtifactRecord, SessionMeta, VoteResult,
+    ActionPayload, ActiveTime, ClientDragon, ClientGameState, ClientVotingState, DragonStats,
+    DragonVisuals, FoodType, JudgeActionTrace, JudgeBundle, JudgeDragonBundle, JudgeHandoverChain,
+    JudgePlayerSummary, PlayType, Player, SessionArtifactKind, SessionArtifactRecord, SessionMeta,
+    VoteResult, create_session_settings,
 };
 use std::collections::BTreeMap;
 use uuid::Uuid;
@@ -12,9 +12,11 @@ use uuid::Uuid;
 pub(crate) fn phase_label(phase: protocol::Phase) -> &'static str {
     match phase {
         protocol::Phase::Lobby => "Phase 0",
+        protocol::Phase::Phase0 => "Create",
         protocol::Phase::Phase1 => "Phase 1",
         protocol::Phase::Handover => "Handover",
         protocol::Phase::Phase2 => "Phase 2",
+        protocol::Phase::Judge => "Judge",
         protocol::Phase::Voting => "Voting",
         protocol::Phase::End => "Results",
     }
@@ -148,6 +150,7 @@ pub(crate) fn to_client_game_state(
                     is_ready: player.is_ready,
                     is_connected: player.is_connected,
                     pet_description: player.pet_description.clone(),
+                    custom_sprites: player.custom_sprites.clone(),
                 },
             )
         })
@@ -157,14 +160,23 @@ pub(crate) fn to_client_game_state(
         .dragons
         .iter()
         .map(|(dragon_id, dragon)| {
+            let hide_owner_identity = session.phase == protocol::Phase::Voting;
             (
                 dragon_id.clone(),
                 ClientDragon {
                     id: dragon.id.clone(),
                     name: dragon.name.clone(),
                     visuals: client_dragon_visuals(dragon),
-                    original_owner_id: Some(dragon.original_owner_id.clone()),
-                    current_owner_id: Some(dragon.current_owner_id.clone()),
+                    original_owner_id: if hide_owner_identity {
+                        None
+                    } else {
+                        Some(dragon.original_owner_id.clone())
+                    },
+                    current_owner_id: if hide_owner_identity {
+                        None
+                    } else {
+                        Some(dragon.current_owner_id.clone())
+                    },
                     stats: DragonStats {
                         hunger: dragon.hunger,
                         energy: dragon.energy,
@@ -178,7 +190,13 @@ pub(crate) fn to_client_game_state(
                     speech: dragon.speech.clone(),
                     speech_timer: dragon.speech_timer,
                     action_cooldown: dragon.action_cooldown,
-                    custom_sprites: None,
+                    custom_sprites: session
+                        .players
+                        .get(&dragon.original_owner_id)
+                        .and_then(|player| player.custom_sprites.clone()),
+                    judge_observation_score: dragon.judge_observation_score,
+                    judge_care_score: dragon.judge_care_score,
+                    judge_feedback: dragon.judge_feedback.clone(),
                 },
             )
         })
@@ -206,11 +224,13 @@ pub(crate) fn to_client_game_state(
 pub(crate) fn phase_step(phase: protocol::Phase) -> u8 {
     match phase {
         protocol::Phase::Lobby => 0,
-        protocol::Phase::Phase1 => 1,
-        protocol::Phase::Handover => 2,
-        protocol::Phase::Phase2 => 2,
-        protocol::Phase::Voting => 3,
-        protocol::Phase::End => 4,
+        protocol::Phase::Phase0 => 1,
+        protocol::Phase::Phase1 => 2,
+        protocol::Phase::Handover => 3,
+        protocol::Phase::Phase2 => 4,
+        protocol::Phase::Judge => 5,
+        protocol::Phase::Voting => 6,
+        protocol::Phase::End => 7,
     }
 }
 

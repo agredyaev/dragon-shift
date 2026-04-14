@@ -442,6 +442,7 @@ mod postgres_tests {
             current_dragon_id: None,
             achievements: Vec::new(),
             joined_at: Utc::now(),
+            custom_sprites: None,
         });
         session.add_player(SessionPlayer {
             id: "player_2".to_string(),
@@ -454,6 +455,7 @@ mod postgres_tests {
             current_dragon_id: None,
             achievements: Vec::new(),
             joined_at: Utc::now(),
+            custom_sprites: None,
         });
         session
             .players

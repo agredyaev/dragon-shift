@@ -10,9 +10,11 @@ pub type SessionPhaseConfig = BTreeMap<Phase, SessionPhaseSettings>;
 #[serde(rename_all = "lowercase")]
 pub enum Phase {
     Lobby,
+    Phase0,
     Phase1,
     Handover,
     Phase2,
+    Judge,
     Voting,
     End,
 }
@@ -28,6 +30,7 @@ pub enum CoordinatorType {
 #[serde(rename_all = "camelCase")]
 pub enum SessionCommand {
     Join,
+    StartPhase0,
     UpdatePlayerPet,
     SubmitObservation,
     StartPhase1,
@@ -36,6 +39,7 @@ pub enum SessionCommand {
     StartPhase2,
     Action,
     EndGame,
+    StartVoting,
     SubmitVote,
     RevealVotingResults,
     ResetGame,
@@ -74,6 +78,10 @@ pub enum DragonEmotion {
     Angry,
     Sleepy,
     Neutral,
+    Content,
+    Tired,
+    Excited,
+    Hungry,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -99,6 +107,10 @@ pub struct SpriteSet {
     pub happy: String,
     pub angry: String,
     pub sleepy: String,
+    pub content: String,
+    pub tired: String,
+    pub excited: String,
+    pub hungry: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -114,6 +126,8 @@ pub struct Player {
     pub is_connected: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pet_description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom_sprites: Option<SpriteSet>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -218,6 +232,12 @@ pub struct ClientDragon {
     pub action_cooldown: i32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_sprites: Option<SpriteSet>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub judge_observation_score: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub judge_care_score: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub judge_feedback: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -595,6 +615,28 @@ pub enum LlmImageResult {
     Error(WorkshopError),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SpriteSheetRequest {
+    pub session_code: String,
+    pub reconnect_token: String,
+    pub description: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SpriteSheetSuccess {
+    pub ok: bool,
+    pub sprites: SpriteSet,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum SpriteSheetResult {
+    Success(SpriteSheetSuccess),
+    Error(WorkshopError),
+}
+
 // ---------------------------------------------------------------------------
 // Workshop command result types
 // ---------------------------------------------------------------------------
@@ -693,13 +735,29 @@ pub fn create_session_settings(config: &WorkshopCreateConfig) -> SessionSettings
         Phase::Lobby,
         SessionPhaseSettings {
             step: 0,
-            label: "Phase 0 - Intro & Create Pet".to_string(),
+            label: "Lobby - Waiting Room".to_string(),
             description:
-                "Review the rules, join the session, and create a pet before the workshop starts."
+                "Join the workshop, confirm the roster, and wait for the host to open character creation."
+                    .to_string(),
+            duration_seconds: 0,
+            allowed_commands: vec![
+                SessionCommand::Join,
+                SessionCommand::StartPhase0,
+                SessionCommand::ResetGame,
+                SessionCommand::LeaveWorkshop,
+            ],
+        },
+    );
+    phases.insert(
+        Phase::Phase0,
+        SessionPhaseSettings {
+            step: 1,
+            label: "Phase 0 - Create Pet".to_string(),
+            description:
+                "Describe your dragon, generate sprites, and save your character profile before discovery begins."
                     .to_string(),
             duration_seconds: (config.phase0_minutes as i32) * 60,
             allowed_commands: vec![
-                SessionCommand::Join,
                 SessionCommand::UpdatePlayerPet,
                 SessionCommand::StartPhase1,
                 SessionCommand::ResetGame,
@@ -710,7 +768,7 @@ pub fn create_session_settings(config: &WorkshopCreateConfig) -> SessionSettings
     phases.insert(
         Phase::Phase1,
         SessionPhaseSettings {
-            step: 1,
+            step: 2,
             label: "Phase 1 - Discovery".to_string(),
             description:
                 "Observe the pet, test assumptions, and discover what care patterns actually work."
@@ -727,7 +785,7 @@ pub fn create_session_settings(config: &WorkshopCreateConfig) -> SessionSettings
     phases.insert(
         Phase::Handover,
         SessionPhaseSettings {
-            step: 2,
+            step: 3,
             label: "Phase 2 - Handover".to_string(),
             description:
                 "Capture instructions and context so another teammate can inherit the pet."
@@ -743,7 +801,7 @@ pub fn create_session_settings(config: &WorkshopCreateConfig) -> SessionSettings
     phases.insert(
         Phase::Phase2,
         SessionPhaseSettings {
-            step: 2,
+            step: 4,
             label: "Phase 2 - Shuffle & Care".to_string(),
             description:
                 "Take over a reassigned pet and apply what the previous teammate documented."
@@ -757,11 +815,23 @@ pub fn create_session_settings(config: &WorkshopCreateConfig) -> SessionSettings
         },
     );
     phases.insert(
+        Phase::Judge,
+        SessionPhaseSettings {
+            step: 5,
+            label: "Judge Review".to_string(),
+            description:
+                "Review the judge's mechanics evaluation before opening the anonymous design vote."
+                    .to_string(),
+            duration_seconds: 0,
+            allowed_commands: vec![SessionCommand::StartVoting, SessionCommand::ResetGame],
+        },
+    );
+    phases.insert(
         Phase::Voting,
         SessionPhaseSettings {
-            step: 3,
-            label: "Phase 3 - Review & Voting".to_string(),
-            description: "Review the session, vote for the most creative pet, and prepare the final scoreboard.".to_string(),
+            step: 6,
+            label: "Phase 3 - Design Vote".to_string(),
+            description: "Vote for the most creative pet design and wait for the host to reveal the final standings.".to_string(),
             duration_seconds: 0,
             allowed_commands: vec![
                 SessionCommand::SubmitVote,
@@ -773,8 +843,8 @@ pub fn create_session_settings(config: &WorkshopCreateConfig) -> SessionSettings
     phases.insert(
         Phase::End,
         SessionPhaseSettings {
-            step: 3,
-            label: "Phase 3 - Leaderboard".to_string(),
+            step: 7,
+            label: "Final Leaderboard".to_string(),
             description: "Reveal final scores, creator identities, and wrap up the workshop."
                 .to_string(),
             duration_seconds: 0,
@@ -875,7 +945,7 @@ mod tests {
     fn default_session_settings_cover_all_phases() {
         let settings = create_default_session_settings();
 
-        assert_eq!(settings.phases.len(), 6);
+        assert_eq!(settings.phases.len(), 8);
         assert_eq!(
             settings
                 .phases
@@ -884,17 +954,37 @@ mod tests {
                 .step,
             0
         );
-        assert!(settings
-            .phases
-            .get(&Phase::Lobby)
-            .expect("lobby phase")
-            .allowed_commands
-            .contains(&SessionCommand::Join));
-        assert!(settings
-            .phases
-            .get(&Phase::Voting)
-            .expect("voting phase")
-            .allowed_commands
-            .contains(&SessionCommand::SubmitVote));
+        assert!(
+            settings
+                .phases
+                .get(&Phase::Lobby)
+                .expect("lobby phase")
+                .allowed_commands
+                .contains(&SessionCommand::Join)
+        );
+        assert!(
+            settings
+                .phases
+                .get(&Phase::Phase0)
+                .expect("phase0 phase")
+                .allowed_commands
+                .contains(&SessionCommand::UpdatePlayerPet)
+        );
+        assert!(
+            settings
+                .phases
+                .get(&Phase::Judge)
+                .expect("judge phase")
+                .allowed_commands
+                .contains(&SessionCommand::StartVoting)
+        );
+        assert!(
+            settings
+                .phases
+                .get(&Phase::Voting)
+                .expect("voting phase")
+                .allowed_commands
+                .contains(&SessionCommand::SubmitVote)
+        );
     }
 }

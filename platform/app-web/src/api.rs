@@ -1,7 +1,8 @@
 use protocol::{
     ClientSessionSnapshot, CreateWorkshopRequest, JoinWorkshopRequest, JudgeBundle, SessionCommand,
-    SessionEnvelope, WorkshopCommandRequest, WorkshopCommandResult, WorkshopCreateConfig,
-    WorkshopJoinResult, WorkshopJoinSuccess, WorkshopJudgeBundleRequest, WorkshopJudgeBundleResult,
+    SessionEnvelope, SpriteSet, SpriteSheetRequest, SpriteSheetResult, WorkshopCommandRequest,
+    WorkshopCommandResult, WorkshopCreateConfig, WorkshopJoinResult, WorkshopJoinSuccess,
+    WorkshopJudgeBundleRequest, WorkshopJudgeBundleResult,
 };
 
 use serde::de::DeserializeOwned;
@@ -81,6 +82,20 @@ impl AppWebApi {
         match payload {
             WorkshopJudgeBundleResult::Success(success) => Ok(success.bundle),
             WorkshopJudgeBundleResult::Error(error) => Err(error.error),
+        }
+    }
+
+    pub async fn generate_sprite_sheet(
+        &self,
+        request: SpriteSheetRequest,
+    ) -> Result<SpriteSet, String> {
+        let payload: SpriteSheetResult = self
+            .post_json("/api/workshops/sprite-sheet", &request)
+            .await?;
+
+        match payload {
+            SpriteSheetResult::Success(success) => Ok(success.sprites),
+            SpriteSheetResult::Error(error) => Err(error.error),
         }
     }
 
@@ -240,6 +255,17 @@ pub fn build_judge_bundle_request(snapshot: &ClientSessionSnapshot) -> WorkshopJ
         session_code: snapshot.session_code.clone(),
         reconnect_token: snapshot.reconnect_token.clone(),
         coordinator_type: Some(snapshot.coordinator_type),
+    }
+}
+
+pub fn build_sprite_sheet_request(
+    snapshot: &ClientSessionSnapshot,
+    description: &str,
+) -> SpriteSheetRequest {
+    SpriteSheetRequest {
+        session_code: snapshot.session_code.clone(),
+        reconnect_token: snapshot.reconnect_token.clone(),
+        description: description.to_string(),
     }
 }
 

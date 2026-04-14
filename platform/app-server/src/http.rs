@@ -7,15 +7,22 @@ use chrono::{DateTime, Utc};
 use domain::{DomainError, Phase1Assignment, SessionCode, SessionPlayer, WorkshopSession};
 use protocol::{
     ActionPayload, CoordinatorType, CreateWorkshopRequest, DiscoveryObservationRequest,
-    JoinWorkshopRequest, LlmImageRequest, LlmImageResult, LlmImageSuccess, LlmJudgeRequest,
-    LlmJudgeResult, LlmJudgeSuccess, SessionArtifactKind, SessionArtifactRecord, SessionCommand,
-    VotePayload, WorkshopCommandRequest, WorkshopCommandResult, WorkshopCommandSuccess,
-    WorkshopError, WorkshopJoinResult, WorkshopJoinSuccess, WorkshopJudgeBundleRequest,
-    WorkshopJudgeBundleResult, WorkshopJudgeBundleSuccess,
+    JoinWorkshopRequest, JudgeBundle, JudgeDragonBundle, LlmDragonEvaluation, LlmImageRequest,
+    LlmImageResult, LlmImageSuccess, LlmJudgeEvaluation, LlmJudgeRequest, LlmJudgeResult,
+    LlmJudgeSuccess, SessionArtifactKind, SessionArtifactRecord, SessionCommand,
+    SpriteSheetRequest, SpriteSheetResult, SpriteSheetSuccess, UpdatePlayerPetRequest, VotePayload,
+    WorkshopCommandRequest, WorkshopCommandResult, WorkshopCommandSuccess, WorkshopError,
+    WorkshopJoinResult, WorkshopJoinSuccess, WorkshopJudgeBundleRequest, WorkshopJudgeBundleResult,
+    WorkshopJudgeBundleSuccess,
 };
 use security::{FixedWindowRateLimiter, OriginPolicy};
 use serde_json::json;
-use std::{collections::BTreeMap, convert::Infallible, net::SocketAddr, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    convert::Infallible,
+    net::SocketAddr,
+    sync::Arc,
+};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
@@ -26,6 +33,336 @@ use crate::helpers::{
     session_config_from_request, to_client_game_state,
 };
 use crate::ws::broadcast_session_state;
+
+fn default_player_pet_description(player_name: &str) -> String {
+    format!(
+        "A plain training-manikin dragon for {player_name}: neutral gray scales, simple proportions, and no distinctive personality yet."
+    )
+}
+
+fn clamp_score(score: i32) -> i32 {
+    score.clamp(0, 100)
+}
+
+fn active_time_keyword(active_time: protocol::ActiveTime) -> &'static str {
+    match active_time {
+        protocol::ActiveTime::Day => "day",
+        protocol::ActiveTime::Night => "night",
+    }
+}
+
+fn food_keyword(food: protocol::FoodType) -> &'static str {
+    match food {
+        protocol::FoodType::Meat => "meat",
+        protocol::FoodType::Fruit => "fruit",
+        protocol::FoodType::Fish => "fish",
+    }
+}
+
+fn play_keyword(play: protocol::PlayType) -> &'static str {
+    match play {
+        protocol::PlayType::Fetch => "fetch",
+        protocol::PlayType::Puzzle => "puzzle",
+        protocol::PlayType::Music => "music",
+    }
+}
+
+fn unique_keyword_hits(text: &str, keywords: &[&str]) -> i32 {
+    let mut seen = BTreeSet::new();
+    let mut hits = 0;
+
+    for keyword in keywords {
+        if seen.insert(*keyword) && text.contains(keyword) {
+            hits += 1;
+        }
+    }
+
+    hits
+}
+
+fn deterministic_local_judge_dragon_evaluation(dragon: &JudgeDragonBundle) -> LlmDragonEvaluation {
+    let observation_count = dragon
+        .handover_chain
+        .discovery_observations
+        .iter()
+        .filter(|note| !note.trim().is_empty())
+        .count() as i32;
+    let tags_count = dragon
+        .handover_chain
+        .handover_tags
+        .iter()
+        .filter(|tag| !tag.trim().is_empty())
+        .count() as i32;
+
+    let combined_notes = std::iter::once(dragon.handover_chain.creator_instructions.as_str())
+        .chain(
+            dragon
+                .handover_chain
+                .discovery_observations
+                .iter()
+                .map(String::as_str),
+        )
+        .chain(
+            dragon
+                .handover_chain
+                .handover_tags
+                .iter()
+                .map(String::as_str),
+        )
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase();
+
+    let mechanic_clue_hits =
+        (combined_notes.contains(active_time_keyword(dragon.actual_active_time)) as i32)
+            + unique_keyword_hits(
+                &combined_notes,
+                &[
+                    food_keyword(dragon.actual_day_food),
+                    food_keyword(dragon.actual_night_food),
+                ],
+            )
+            + unique_keyword_hits(
+                &combined_notes,
+                &[
+                    play_keyword(dragon.actual_day_play),
+                    play_keyword(dragon.actual_night_play),
+                ],
+            );
+
+    let completeness_score = match observation_count + tags_count {
+        0 => 0,
+        1 => 5,
+        2 => 10,
+        3 => 14,
+        4 => 17,
+        _ => 20,
+    };
+    let clarity_score = if observation_count >= 2 && tags_count >= 2 {
+        15
+    } else if observation_count + tags_count >= 3 {
+        10
+    } else if observation_count + tags_count >= 1 {
+        5
+    } else {
+        0
+    };
+    let observation_score = clamp_score(
+        (mechanic_clue_hits * 8).min(40)
+            + ((tags_count * 8).min(24) + if tags_count > 0 { 1 } else { 0 })
+            + completeness_score
+            + clarity_score,
+    );
+
+    let total_actions = dragon.total_actions.max(0);
+    let correct_actions = dragon.correct_actions.clamp(0, total_actions);
+    let final_hunger = dragon.final_stats.hunger.clamp(0, 100);
+    let final_energy = dragon.final_stats.energy.clamp(0, 100);
+    let final_happiness = dragon.final_stats.happiness.clamp(0, 100);
+    let stat_average = (final_hunger + final_energy + final_happiness) / 3;
+    let recovery_delta = final_happiness - dragon.phase2_lowest_happiness.clamp(0, 100);
+    let recovery_score = if recovery_delta >= 25 && final_happiness >= 70 {
+        5
+    } else if recovery_delta >= 15 && final_happiness >= 55 {
+        4
+    } else if recovery_delta >= 10 && final_happiness >= 45 {
+        3
+    } else if recovery_delta > 0 {
+        2
+    } else if final_happiness >= dragon.phase2_lowest_happiness {
+        1
+    } else {
+        0
+    };
+    let care_score = clamp_score(
+        if total_actions == 0 {
+            0
+        } else {
+            correct_actions * 50 / total_actions
+        } + stat_average / 5
+            + (15
+                - dragon.wrong_food_count.max(0) * 4
+                - dragon.wrong_play_count.max(0) * 4
+                - dragon.penalty_stacks_at_end.max(0) * 2)
+                .clamp(0, 15)
+            + (10 - dragon.cooldown_violations.max(0) * 2).clamp(0, 10)
+            + recovery_score,
+    );
+
+    let word_count = combined_notes.split_whitespace().count() as i32;
+    let creativity_score =
+        clamp_score(20 + (word_count / 2).min(45) + observation_count * 5 + tags_count * 5);
+
+    let mistake_count = dragon.wrong_food_count.max(0) + dragon.wrong_play_count.max(0);
+    let feedback = if total_actions == 0 {
+        format!(
+            "Discovery covered {mechanic_clue_hits}/5 core clues with {tags_count} handover tags. Care had no recorded Phase 2 actions and finished at {stat_average}/100 average stats.",
+        )
+    } else if mistake_count > 0 || dragon.cooldown_violations > 0 {
+        format!(
+            "Discovery covered {mechanic_clue_hits}/5 core clues with {tags_count} handover tags. Care finished at {stat_average}/100 average stats with {correct_actions}/{total_actions} correct actions, {mistake_count} wrong actions, and {} cooldown violations.",
+            dragon.cooldown_violations.max(0),
+        )
+    } else {
+        format!(
+            "Discovery covered {mechanic_clue_hits}/5 core clues with {tags_count} handover tags. Care finished at {stat_average}/100 average stats with {correct_actions}/{total_actions} correct actions.",
+        )
+    };
+
+    LlmDragonEvaluation {
+        dragon_id: dragon.dragon_id.clone(),
+        dragon_name: dragon.dragon_name.clone(),
+        observation_score,
+        care_score,
+        creativity_score,
+        feedback,
+    }
+}
+
+fn deterministic_local_judge_evaluation(bundle: &JudgeBundle) -> LlmJudgeEvaluation {
+    let dragon_evaluations = bundle
+        .dragons
+        .iter()
+        .map(deterministic_local_judge_dragon_evaluation)
+        .collect::<Vec<_>>();
+    let dragon_count = dragon_evaluations.len() as i32;
+    let (avg_observation, avg_care) = if dragon_count > 0 {
+        let total_observation = dragon_evaluations
+            .iter()
+            .map(|evaluation| evaluation.observation_score)
+            .sum::<i32>();
+        let total_care = dragon_evaluations
+            .iter()
+            .map(|evaluation| evaluation.care_score)
+            .sum::<i32>();
+        (total_observation / dragon_count, total_care / dragon_count)
+    } else {
+        (0, 0)
+    };
+
+    LlmJudgeEvaluation {
+        summary: format!(
+            "Local judge fallback scored {dragon_count} dragons because no judge model is configured. Average observation was {avg_observation}/100 and average care was {avg_care}/100.",
+        ),
+        dragon_evaluations,
+    }
+}
+
+async fn run_judge_for_session(
+    state: &AppState,
+    session_code: &str,
+    actor_player_id: &str,
+) -> Result<LlmJudgeEvaluation, String> {
+    let session = {
+        match ensure_session_cached(state, session_code).await {
+            Ok(true) => {}
+            Ok(false) => return Err("Workshop not found.".to_string()),
+            Err(error) => return Err(format!("failed to load session: {error}")),
+        }
+        let sessions = state.sessions.lock().await;
+        let Some(session) = sessions.get(session_code) else {
+            return Err("Workshop not found.".to_string());
+        };
+        session.clone()
+    };
+
+    let artifacts = state
+        .store
+        .list_session_artifacts(&session.id.to_string())
+        .await
+        .map_err(|error| format!("failed to list session artifacts: {error}"))?;
+
+    let bundle = build_judge_bundle(&session, &artifacts);
+    let evaluation = if state.config.llm_pool.is_judge_configured() {
+        state
+            .llm_client
+            .judge(&bundle)
+            .await
+            .map_err(|error| format!("LLM judge failed: {error}"))?
+    } else {
+        tracing::info!(%session_code, "using deterministic local judge fallback");
+        deterministic_local_judge_evaluation(&bundle)
+    };
+
+    let (_, _write_guard, write_lease) = SessionWriteLease::acquire(state, session_code)
+        .await
+        .map_err(|error| format!("failed to acquire session lease: {error}"))?;
+    write_lease
+        .ensure_active()
+        .map_err(|error| format!("lost session lease before judge mutation: {error}"))?;
+
+    if !reload_cached_session(state, session_code)
+        .await
+        .map_err(|error| format!("failed to reload session before judge persist: {error}"))?
+    {
+        return Err("Workshop not found.".to_string());
+    }
+    write_lease
+        .ensure_active()
+        .map_err(|error| format!("lost session lease before judge scoring: {error}"))?;
+
+    let (session_before, session_snapshot, artifact) = {
+        let mut sessions = state.sessions.lock().await;
+        let Some(session) = sessions.get_mut(session_code) else {
+            return Err("Workshop not found.".to_string());
+        };
+        let session_before = session.clone();
+        if session.phase == protocol::Phase::Phase2 {
+            session.award_phase_end_achievements();
+        }
+        let score_tuples: Vec<(String, i32, i32, String)> = evaluation
+            .dragon_evaluations
+            .iter()
+            .map(|d| {
+                (
+                    d.dragon_id.clone(),
+                    d.observation_score,
+                    d.care_score,
+                    d.feedback.clone(),
+                )
+            })
+            .collect();
+        session.apply_judge_scores(&score_tuples);
+        if session.phase == protocol::Phase::Phase2 {
+            session
+                .enter_judge()
+                .map_err(|error| format!("failed to enter judge phase: {error}"))?;
+        }
+        let session_snapshot = session.clone();
+        let artifact = SessionArtifactRecord {
+            id: random_prefixed_id("artifact"),
+            session_id: session.id.to_string(),
+            phase: session.phase,
+            step: phase_step(session.phase),
+            kind: SessionArtifactKind::JudgeBundleGenerated,
+            player_id: Some(actor_player_id.to_string()),
+            created_at: Utc::now().to_rfc3339(),
+            payload: json!({
+                "dragonCount": bundle.dragons.len(),
+                "artifactCount": bundle.artifact_count,
+                "llmSummary": evaluation.summary,
+                "dragonEvaluations": evaluation.dragon_evaluations,
+            }),
+        };
+        (session_before, session_snapshot, artifact)
+    };
+
+    write_lease
+        .ensure_active()
+        .map_err(|error| format!("lost session lease before judge persist: {error}"))?;
+    if let Err(error) = state
+        .store
+        .save_session_with_artifact(&session_snapshot, &artifact)
+        .await
+    {
+        let mut sessions = state.sessions.lock().await;
+        sessions.insert(session_code.to_string(), session_before);
+        return Err(format!("failed to persist judge scores: {error}"));
+    }
+
+    broadcast_session_state(state, session_code, None).await;
+    Ok(evaluation)
+}
 
 pub(crate) fn reconnect_identity_is_valid(
     identity: &persistence::PlayerIdentityMatch,
@@ -133,7 +470,8 @@ pub(crate) async fn create_workshop(
     let host_player = SessionPlayer {
         id: player_id.clone(),
         name: normalized_name.to_string(),
-        pet_description: Some(format!("{}'s workshop dragon", normalized_name)),
+        pet_description: Some(default_player_pet_description(normalized_name)),
+        custom_sprites: None,
         is_host: true,
         is_connected: true,
         is_ready: false,
@@ -286,13 +624,7 @@ pub(crate) async fn join_workshop(
             id: random_prefixed_id("artifact"),
             session_id: session_clone.id.to_string(),
             phase: session_clone.phase,
-            step: match session_clone.phase {
-                protocol::Phase::Lobby => 0,
-                protocol::Phase::Phase1 => 1,
-                protocol::Phase::Handover => 2,
-                protocol::Phase::Phase2 | protocol::Phase::Voting => 3,
-                protocol::Phase::End => 4,
-            },
+            step: phase_step(session_clone.phase),
             kind: SessionArtifactKind::PlayerReconnected,
             player_id: Some(identity.player_id.clone()),
             created_at: timestamp.to_rfc3339(),
@@ -386,7 +718,8 @@ pub(crate) async fn join_workshop(
         let player = SessionPlayer {
             id: player_id.clone(),
             name: normalized_name.clone(),
-            pet_description: Some(format!("{}'s workshop dragon", normalized_name)),
+            pet_description: Some(default_player_pet_description(&normalized_name)),
+            custom_sprites: None,
             is_host: false,
             is_connected: true,
             is_ready: false,
@@ -553,12 +886,38 @@ pub(crate) async fn workshop_command(
         let mut artifact_to_append = None;
 
         let response = match request.command {
+            SessionCommand::StartPhase0 => {
+                if session.host_player_id.as_deref() != Some(identity.player_id.as_str()) {
+                    return bad_command_request("Only the host can open character creation.");
+                }
+                if session.phase != protocol::Phase::Lobby {
+                    return bad_command_request(
+                        "Character creation can only begin from the lobby.",
+                    );
+                }
+                if let Err(error) = session.transition_to(protocol::Phase::Phase0) {
+                    return bad_command_request(&error.to_string());
+                }
+                session_to_persist = Some(session.clone());
+                artifact_to_append = Some(SessionArtifactRecord {
+                    id: random_prefixed_id("artifact"),
+                    session_id: session.id.to_string(),
+                    phase: session.phase,
+                    step: phase_step(session.phase),
+                    kind: SessionArtifactKind::PhaseChanged,
+                    player_id: Some(identity.player_id.clone()),
+                    created_at: Utc::now().to_rfc3339(),
+                    payload: json!({ "toPhase": "phase0" }),
+                });
+
+                successful_workshop_command(&mut should_broadcast)
+            }
             SessionCommand::StartPhase1 => {
                 if session.host_player_id.as_deref() != Some(identity.player_id.as_str()) {
                     return bad_command_request("Only the host can start the workshop.");
                 }
-                if session.phase != protocol::Phase::Lobby {
-                    return bad_command_request("Phase 1 can only start from the lobby.");
+                if session.phase != protocol::Phase::Phase0 {
+                    return bad_command_request("Phase 1 can only start after character creation.");
                 }
 
                 let assignments = session
@@ -578,7 +937,7 @@ pub(crate) async fn workshop_command(
                     id: random_prefixed_id("artifact"),
                     session_id: session.id.to_string(),
                     phase: session.phase,
-                    step: 1,
+                    step: phase_step(session.phase),
                     kind: SessionArtifactKind::PhaseChanged,
                     player_id: Some(identity.player_id.clone()),
                     created_at: Utc::now().to_rfc3339(),
@@ -697,23 +1056,15 @@ pub(crate) async fn workshop_command(
                         domain::ActionOutcome::Blocked { reason } => {
                             let reason_str = match reason {
                                 domain::ActionBlockReason::AlreadyFull => "already_full",
-                                domain::ActionBlockReason::TooHungryToPlay =>
-                                    "too_hungry_to_play",
-                                domain::ActionBlockReason::TooTiredToPlay =>
-                                    "too_tired_to_play",
-                                domain::ActionBlockReason::TooAwakeToSleep =>
-                                    "too_awake_to_sleep",
+                                domain::ActionBlockReason::TooHungryToPlay => "too_hungry_to_play",
+                                domain::ActionBlockReason::TooTiredToPlay => "too_tired_to_play",
+                                domain::ActionBlockReason::TooAwakeToSleep => "too_awake_to_sleep",
                             };
-                            payload_map.insert(
-                                "blockedReason".to_string(),
-                                json!(reason_str),
-                            );
+                            payload_map.insert("blockedReason".to_string(), json!(reason_str));
                         }
                         domain::ActionOutcome::CooldownViolation => {
-                            payload_map.insert(
-                                "blockedReason".to_string(),
-                                json!("cooldown_violation"),
-                            );
+                            payload_map
+                                .insert("blockedReason".to_string(), json!("cooldown_violation"));
                         }
                     }
                 }
@@ -747,7 +1098,7 @@ pub(crate) async fn workshop_command(
                     id: random_prefixed_id("artifact"),
                     session_id: session.id.to_string(),
                     phase: session.phase,
-                    step: 2,
+                    step: phase_step(session.phase),
                     kind: SessionArtifactKind::PhaseChanged,
                     player_id: Some(identity.player_id.clone()),
                     created_at: Utc::now().to_rfc3339(),
@@ -793,7 +1144,7 @@ pub(crate) async fn workshop_command(
                     id: random_prefixed_id("artifact"),
                     session_id: session.id.to_string(),
                     phase: session.phase,
-                    step: 2,
+                    step: phase_step(session.phase),
                     kind: SessionArtifactKind::HandoverSaved,
                     player_id: Some(identity.player_id.clone()),
                     created_at: Utc::now().to_rfc3339(),
@@ -822,7 +1173,7 @@ pub(crate) async fn workshop_command(
                     id: random_prefixed_id("artifact"),
                     session_id: session.id.to_string(),
                     phase: session.phase,
-                    step: 2,
+                    step: phase_step(session.phase),
                     kind: SessionArtifactKind::PhaseChanged,
                     player_id: Some(identity.player_id.clone()),
                     created_at: Utc::now().to_rfc3339(),
@@ -836,10 +1187,31 @@ pub(crate) async fn workshop_command(
                     return bad_command_request("Only the host can end the workshop.");
                 }
                 if session.phase != protocol::Phase::Phase2 {
-                    return bad_command_request("Voting can only begin from Phase 2.");
+                    return bad_command_request("Judge review can only begin from Phase 2.");
                 }
                 // Award phase-end achievements before transitioning
                 session.award_phase_end_achievements();
+                session_to_persist = Some(session.clone());
+                artifact_to_append = Some(SessionArtifactRecord {
+                    id: random_prefixed_id("artifact"),
+                    session_id: session.id.to_string(),
+                    phase: session.phase,
+                    step: phase_step(session.phase),
+                    kind: SessionArtifactKind::ActionProcessed,
+                    player_id: Some(identity.player_id.clone()),
+                    created_at: Utc::now().to_rfc3339(),
+                    payload: json!({ "command": "endGame", "judgeQueued": true }),
+                });
+
+                successful_workshop_command(&mut should_broadcast)
+            }
+            SessionCommand::StartVoting => {
+                if session.host_player_id.as_deref() != Some(identity.player_id.as_str()) {
+                    return bad_command_request("Only the host can open the design vote.");
+                }
+                if session.phase != protocol::Phase::Judge {
+                    return bad_command_request("Design voting can only begin after judge review.");
+                }
                 let immediate_finalize = match session.enter_voting() {
                     Ok(immediate_finalize) => immediate_finalize,
                     Err(error) => return bad_command_request(&error.to_string()),
@@ -852,7 +1224,7 @@ pub(crate) async fn workshop_command(
                     id: random_prefixed_id("artifact"),
                     session_id: session.id.to_string(),
                     phase: session.phase,
-                    step: 3,
+                    step: phase_step(session.phase),
                     kind: SessionArtifactKind::PhaseChanged,
                     player_id: Some(identity.player_id.clone()),
                     created_at: Utc::now().to_rfc3339(),
@@ -895,7 +1267,7 @@ pub(crate) async fn workshop_command(
                     id: random_prefixed_id("artifact"),
                     session_id: session.id.to_string(),
                     phase: session.phase,
-                    step: 3,
+                    step: phase_step(session.phase),
                     kind: SessionArtifactKind::VoteSubmitted,
                     player_id: Some(identity.player_id.clone()),
                     created_at: Utc::now().to_rfc3339(),
@@ -924,7 +1296,7 @@ pub(crate) async fn workshop_command(
                     id: random_prefixed_id("artifact"),
                     session_id: session.id.to_string(),
                     phase: session.phase,
-                    step: 3,
+                    step: phase_step(session.phase),
                     kind: SessionArtifactKind::VotingFinalized,
                     player_id: Some(identity.player_id.clone()),
                     created_at: Utc::now().to_rfc3339(),
@@ -957,6 +1329,43 @@ pub(crate) async fn workshop_command(
                     player_id: Some(identity.player_id.clone()),
                     created_at: Utc::now().to_rfc3339(),
                     payload: json!({ "toPhase": "lobby" }),
+                });
+
+                successful_workshop_command(&mut should_broadcast)
+            }
+            SessionCommand::UpdatePlayerPet => {
+                if session.phase != protocol::Phase::Phase0 {
+                    return bad_command_request(
+                        "Pet profile can only be updated during character creation.",
+                    );
+                }
+                let payload = match request.payload.clone() {
+                    Some(value) => serde_json::from_value::<UpdatePlayerPetRequest>(value).ok(),
+                    None => None,
+                };
+                let Some(payload) = payload else {
+                    return bad_command_request("Pet profile payload is invalid.");
+                };
+                let description = payload.description.trim().to_string();
+                if description.is_empty() {
+                    return bad_command_request("Pet description is required.");
+                }
+                let has_sprites = payload.sprites.is_some();
+                if let Err(error) =
+                    session.update_player_pet(&identity.player_id, description, payload.sprites)
+                {
+                    return bad_command_request(&error.to_string());
+                }
+                session_to_persist = Some(session.clone());
+                artifact_to_append = Some(SessionArtifactRecord {
+                    id: random_prefixed_id("artifact"),
+                    session_id: session.id.to_string(),
+                    phase: session.phase,
+                    step: phase_step(session.phase),
+                    kind: SessionArtifactKind::PetProfileUpdated,
+                    player_id: Some(identity.player_id.clone()),
+                    created_at: Utc::now().to_rfc3339(),
+                    payload: json!({ "hasSprites": has_sprites }),
                 });
 
                 successful_workshop_command(&mut should_broadcast)
@@ -1014,8 +1423,19 @@ pub(crate) async fn workshop_command(
         _ => unreachable!("checked command persistence invariants above"),
     }
 
-    if should_broadcast {
+    let should_run_judge = request.command == SessionCommand::EndGame;
+
+    drop(_write_guard);
+    drop(write_lease);
+
+    if should_broadcast && !should_run_judge {
         broadcast_session_state(&state, session_code, None).await;
+    }
+
+    if should_run_judge {
+        if let Err(error) = run_judge_for_session(&state, session_code, &identity.player_id).await {
+            return internal_command_error(error);
+        }
     }
 
     tracing::info!(
@@ -1398,84 +1818,10 @@ pub(crate) async fn llm_judge(
         return internal_llm_judge_error(format!("failed to touch player identity: {error}"));
     }
 
-    let session = {
-        match ensure_session_cached(&state, session_code).await {
-            Ok(true) => {}
-            Ok(false) => return bad_llm_judge_request("Workshop not found."),
-            Err(error) => {
-                return internal_llm_judge_error(format!("failed to load session: {error}"));
-            }
-        }
-        let sessions = state.sessions.lock().await;
-        let Some(session) = sessions.get(session_code) else {
-            return bad_llm_judge_request("Workshop not found.");
-        };
-        session.clone()
-    };
-
-    let artifacts = match state
-        .store
-        .list_session_artifacts(&session.id.to_string())
-        .await
-    {
-        Ok(artifacts) => artifacts,
-        Err(error) => {
-            return internal_llm_judge_error(format!(
-                "failed to list session artifacts: {error}"
-            ));
-        }
-    };
-
-    let bundle = build_judge_bundle(&session, &artifacts);
-
-    let evaluation = match state.llm_client.judge(&bundle).await {
+    let evaluation = match run_judge_for_session(&state, session_code, &identity.player_id).await {
         Ok(evaluation) => evaluation,
-        Err(error) => {
-            return internal_llm_judge_error(format!("LLM judge failed: {error}"));
-        }
+        Err(error) => return internal_llm_judge_error(error),
     };
-
-    // Apply judge scores back to the session and persist + broadcast
-    {
-        let score_tuples: Vec<(String, i32, i32)> = evaluation
-            .dragon_evaluations
-            .iter()
-            .map(|d| (d.dragon_id.clone(), d.observation_score, d.care_score))
-            .collect();
-
-        let mut sessions = state.sessions.lock().await;
-        if let Some(session) = sessions.get_mut(session_code) {
-            session.apply_judge_scores(&score_tuples);
-            let session_snapshot = session.clone();
-            drop(sessions);
-
-            if let Err(error) = state.store.save_session(&session_snapshot).await {
-                tracing::warn!(%error, "failed to persist judge scores (non-fatal)");
-            }
-            broadcast_session_state(&state, session_code, None).await;
-        }
-    }
-
-    if let Err(error) = state
-        .store
-        .append_session_artifact(&SessionArtifactRecord {
-            id: random_prefixed_id("artifact"),
-            session_id: session.id.to_string(),
-            phase: session.phase,
-            step: 4,
-            kind: SessionArtifactKind::JudgeBundleGenerated,
-            player_id: Some(identity.player_id.clone()),
-            created_at: Utc::now().to_rfc3339(),
-            payload: json!({
-                "dragonCount": bundle.dragons.len(),
-                "artifactCount": bundle.artifact_count,
-                "llmSummary": evaluation.summary,
-            }),
-        })
-        .await
-    {
-        tracing::warn!(%error, "failed to append judge artifact (non-fatal)");
-    }
 
     (
         StatusCode::OK,
@@ -1492,7 +1838,9 @@ pub(crate) async fn llm_generate_image(
     headers: HeaderMap,
     Json(request): Json<LlmImageRequest>,
 ) -> (StatusCode, Json<LlmImageResult>) {
-    if let Some(response) = reject_disallowed_llm_image_origin(&headers, &state.config.origin_policy) {
+    if let Some(response) =
+        reject_disallowed_llm_image_origin(&headers, &state.config.origin_policy)
+    {
         return response;
     }
     let client_key = client_key(&state, connect_info, &headers);
@@ -1540,6 +1888,88 @@ pub(crate) async fn llm_generate_image(
             ok: true,
             image_base64,
             mime_type,
+        })),
+    )
+}
+
+pub(crate) async fn generate_sprite_sheet(
+    State(state): State<AppState>,
+    connect_info: MaybeConnectInfo,
+    headers: HeaderMap,
+    Json(request): Json<SpriteSheetRequest>,
+) -> (StatusCode, Json<SpriteSheetResult>) {
+    if let Some(response) =
+        reject_disallowed_sprite_sheet_origin(&headers, &state.config.origin_policy)
+    {
+        return response;
+    }
+    let client_key = client_key(&state, connect_info, &headers);
+    if is_rate_limited(&state.command_limiter, &client_key).await {
+        return too_many_sprite_sheet_requests();
+    }
+
+    let session_code = request.session_code.trim();
+    let reconnect_token = request.reconnect_token.trim();
+    if session_code.is_empty()
+        || reconnect_token.is_empty()
+        || security::validate_session_code(session_code).is_err()
+    {
+        return bad_sprite_sheet_request("Missing workshop credentials.");
+    }
+
+    let identity = match authorize_reconnect_identity(&state, session_code, reconnect_token).await {
+        Ok(Some(identity)) => identity,
+        Ok(None) => return bad_sprite_sheet_request("Session identity is invalid or expired."),
+        Err(error) => {
+            return internal_sprite_sheet_error(format!("failed to lookup identity: {error}"));
+        }
+    };
+
+    if let Err(error) = refresh_reconnect_identity(&state, reconnect_token, Utc::now()).await {
+        return internal_sprite_sheet_error(format!("failed to touch player identity: {error}"));
+    }
+
+    let phase = {
+        match ensure_session_cached(&state, session_code).await {
+            Ok(true) => {}
+            Ok(false) => return bad_sprite_sheet_request("Workshop not found."),
+            Err(error) => {
+                return internal_sprite_sheet_error(format!("failed to load session: {error}"));
+            }
+        }
+        let sessions = state.sessions.lock().await;
+        let Some(session) = sessions.get(session_code) else {
+            return bad_sprite_sheet_request("Workshop not found.");
+        };
+        if session.players.get(&identity.player_id).is_none() {
+            return bad_sprite_sheet_request("Session identity is invalid or expired.");
+        }
+        session.phase
+    };
+
+    if phase != protocol::Phase::Phase0 {
+        return bad_sprite_sheet_request(
+            "Dragon sprites can only be generated during character creation.",
+        );
+    }
+
+    let description = request.description.trim();
+    if description.is_empty() {
+        return bad_sprite_sheet_request("Dragon description is required.");
+    }
+
+    let sprites = match state.llm_client.generate_sprite_sheet(description).await {
+        Ok(result) => result,
+        Err(error) => {
+            return internal_sprite_sheet_error(format!("sprite sheet generation failed: {error}"));
+        }
+    };
+
+    (
+        StatusCode::OK,
+        Json(SpriteSheetResult::Success(SpriteSheetSuccess {
+            ok: true,
+            sprites,
         })),
     )
 }
@@ -1634,6 +2064,54 @@ fn too_many_llm_image_requests() -> (StatusCode, Json<LlmImageResult>) {
     (
         StatusCode::TOO_MANY_REQUESTS,
         Json(LlmImageResult::Error(WorkshopError {
+            ok: false,
+            error: "Too many requests. Please slow down and try again.".to_string(),
+        })),
+    )
+}
+
+fn reject_disallowed_sprite_sheet_origin(
+    headers: &HeaderMap,
+    policy: &OriginPolicy,
+) -> Option<(StatusCode, Json<SpriteSheetResult>)> {
+    let origin = headers.get("origin").and_then(|value| value.to_str().ok());
+    if security::is_origin_allowed(origin, policy) {
+        None
+    } else {
+        Some((
+            StatusCode::FORBIDDEN,
+            Json(SpriteSheetResult::Error(WorkshopError {
+                ok: false,
+                error: "Origin is not allowed.".to_string(),
+            })),
+        ))
+    }
+}
+
+fn bad_sprite_sheet_request(message: &str) -> (StatusCode, Json<SpriteSheetResult>) {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(SpriteSheetResult::Error(WorkshopError {
+            ok: false,
+            error: message.to_string(),
+        })),
+    )
+}
+
+fn internal_sprite_sheet_error(message: String) -> (StatusCode, Json<SpriteSheetResult>) {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(SpriteSheetResult::Error(WorkshopError {
+            ok: false,
+            error: message,
+        })),
+    )
+}
+
+fn too_many_sprite_sheet_requests() -> (StatusCode, Json<SpriteSheetResult>) {
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        Json(SpriteSheetResult::Error(WorkshopError {
             ok: false,
             error: "Too many requests. Please slow down and try again.".to_string(),
         })),

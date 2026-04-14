@@ -1,9 +1,11 @@
 #![allow(clippy::too_many_arguments)]
 
 use dioxus::prelude::*;
-use protocol::{ClientGameState, JoinWorkshopRequest, JudgeBundle, SessionCommand};
+use protocol::{ClientGameState, JoinWorkshopRequest, JudgeBundle, SessionCommand, SpriteSet};
 
-use crate::api::{AppWebApi, build_command_request, build_judge_bundle_request};
+use crate::api::{
+    AppWebApi, build_command_request, build_judge_bundle_request, build_sprite_sheet_request,
+};
 use crate::helpers::{parse_tags_input, pending_command_label};
 use crate::realtime::bootstrap_realtime;
 use crate::state::{
@@ -432,6 +434,78 @@ pub async fn submit_judge_bundle_request(
     }
 }
 
+pub async fn submit_sprite_sheet_request(
+    identity: Signal<IdentityState>,
+    mut ops: Signal<OperationState>,
+    mut sprite_result: Signal<Option<SpriteSet>>,
+    description: String,
+) {
+    let (base_url, snapshot) = {
+        let id = identity.read();
+        (id.api_base_url.clone(), id.session_snapshot.clone())
+    };
+
+    let Some(snapshot) = snapshot else {
+        ops.with_mut(|o| {
+            o.notice = Some(error_notice(
+                "Connect to a workshop before generating sprites.",
+            ))
+        });
+        return;
+    };
+
+    if description.trim().is_empty() {
+        ops.with_mut(|o| o.notice = Some(error_notice("Enter a dragon description.")));
+        return;
+    }
+
+    ops.with_mut(|o| {
+        o.notice = Some(info_notice("Generating dragon sprites…"));
+    });
+
+    let api = AppWebApi::new(base_url);
+    match api
+        .generate_sprite_sheet(build_sprite_sheet_request(&snapshot, &description))
+        .await
+    {
+        Ok(sprites) => {
+            sprite_result.set(Some(sprites));
+            ops.with_mut(|o| {
+                o.notice = Some(info_notice("Dragon sprites generated!"));
+            });
+        }
+        Err(error) => {
+            ops.with_mut(|o| {
+                o.notice = Some(error_notice(&format!("Sprite generation failed: {error}")));
+            });
+        }
+    }
+}
+
+pub async fn submit_update_player_pet(
+    identity: Signal<IdentityState>,
+    ops: Signal<OperationState>,
+    handover_tags_input: Signal<String>,
+    judge_bundle: Signal<Option<JudgeBundle>>,
+    description: String,
+    sprites: Option<SpriteSet>,
+) {
+    let payload = serde_json::json!({
+        "description": description,
+        "sprites": sprites,
+    });
+
+    submit_workshop_command(
+        identity,
+        ops,
+        handover_tags_input,
+        judge_bundle,
+        SessionCommand::UpdatePlayerPet,
+        Some(payload),
+    )
+    .await;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -461,6 +535,7 @@ mod tests {
                 is_ready: false,
                 is_connected: true,
                 pet_description: Some("Alice's workshop dragon".to_string()),
+                custom_sprites: None,
             },
         );
 

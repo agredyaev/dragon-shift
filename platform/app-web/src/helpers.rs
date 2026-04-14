@@ -1,6 +1,6 @@
 use protocol::{
     ClientDragon, ClientGameState, DragonAction, DragonEmotion, JudgeBundle, Phase, Player,
-    SessionCommand,
+    SessionCommand, SpriteSet,
 };
 
 use crate::state::{ConnectionStatus, NoticeTone, ShellScreen};
@@ -27,6 +27,7 @@ pub struct VotingOptionRow {
     pub color_secondary: String,
     pub color_accent: String,
     pub base_variant: i32,
+    pub custom_sprites: Option<SpriteSet>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,7 +44,16 @@ pub struct EndPlayerScoreRow {
     pub player_name: String,
     pub score_label: String,
     pub achievements_label: String,
+    pub judge_feedback_label: String,
     pub is_winner: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JudgeFeedbackRow {
+    pub dragon_name: String,
+    pub observation_score_label: String,
+    pub care_score_label: String,
+    pub feedback: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -102,11 +112,14 @@ pub fn notice_class(tone: NoticeTone) -> &'static str {
 
 pub fn pending_command_label(command: SessionCommand) -> &'static str {
     match command {
+        SessionCommand::StartPhase0 => "Opening character creation…",
+        SessionCommand::UpdatePlayerPet => "Saving dragon profile…",
         SessionCommand::StartPhase1 => "Starting Phase 1…",
         SessionCommand::StartHandover => "Starting handover…",
         SessionCommand::SubmitTags => "Saving handover tags…",
         SessionCommand::StartPhase2 => "Starting Phase 2…",
-        SessionCommand::EndGame => "Ending workshop…",
+        SessionCommand::EndGame => "Running judge review…",
+        SessionCommand::StartVoting => "Opening design voting…",
         SessionCommand::RevealVotingResults => "Revealing results…",
         SessionCommand::ResetGame => "Resetting workshop…",
         _ => "Sending command…",
@@ -132,19 +145,22 @@ pub fn active_player_name(state: &ClientGameState) -> Option<String> {
 
 pub fn phase_screen_title(phase: Phase) -> &'static str {
     match phase {
-        Phase::Lobby => "Workshop lobby",
+        Phase::Lobby => "Waiting lobby",
+        Phase::Phase0 => "Character creation",
         Phase::Phase1 => "Discovery round",
         Phase::Handover => "Handover",
         Phase::Phase2 => "Care round",
-        Phase::Voting => "Voting",
+        Phase::Judge => "Judge review",
+        Phase::Voting => "Design voting",
         Phase::End => "Workshop results",
     }
 }
 
 pub fn phase_screen_body(phase: Phase) -> &'static str {
     match phase {
-        Phase::Lobby => {
-            "Review the roster, make sure everyone is here, and start when the workshop is ready."
+        Phase::Lobby => "Wait for the host to gather the group and open character creation.",
+        Phase::Phase0 => {
+            "Describe your dragon, generate sprites, and save your character before discovery begins."
         }
         Phase::Phase1 => {
             "Observe your dragon, capture what stands out, and get ready for the handover."
@@ -155,13 +171,22 @@ pub fn phase_screen_body(phase: Phase) -> &'static str {
         Phase::Phase2 => {
             "Use the handover notes to guide care actions and keep the dragon thriving."
         }
+        Phase::Judge => {
+            "Review the mechanics scores and judge feedback before the host opens the anonymous design vote."
+        }
         Phase::Voting => {
-            "Cast a creative vote, track submission progress, and wait for the host to reveal the standings."
+            "Cast an anonymous design vote, track submission progress, and wait for the host to reveal the standings."
         }
         Phase::End => {
             "Review creative awards and final standings, then let the host reset when the workshop is complete."
         }
     }
+}
+
+pub fn fallback_pet_description(player_name: &str) -> String {
+    format!(
+        "A plain training-manikin dragon for {player_name}: neutral gray scales, simple proportions, and no distinctive personality yet."
+    )
 }
 
 pub fn phase_duration_seconds(state: &ClientGameState) -> Option<i32> {
@@ -259,6 +284,10 @@ pub fn dragon_emotion_label(emotion: DragonEmotion) -> &'static str {
         DragonEmotion::Angry => "Angry",
         DragonEmotion::Sleepy => "Sleepy",
         DragonEmotion::Neutral => "Neutral",
+        DragonEmotion::Content => "Content",
+        DragonEmotion::Tired => "Tired",
+        DragonEmotion::Excited => "Excited",
+        DragonEmotion::Hungry => "Hungry",
     }
 }
 
@@ -483,7 +512,82 @@ pub fn voting_status_copy(state: &ClientGameState) -> String {
             "Vote submitted. Waiting for the remaining players before reveal.".to_string()
         }
     } else {
-        "Choose the most creative dragon that is not currently assigned to you.".to_string()
+        "Choose the most creative dragon design that is not currently assigned to you.".to_string()
+    }
+}
+
+pub fn judge_feedback_rows(state: &ClientGameState) -> Vec<JudgeFeedbackRow> {
+    let mut dragons = state.dragons.values().collect::<Vec<_>>();
+    dragons.sort_by(|left, right| {
+        let left_total =
+            left.judge_observation_score.unwrap_or(0) + left.judge_care_score.unwrap_or(0);
+        let right_total =
+            right.judge_observation_score.unwrap_or(0) + right.judge_care_score.unwrap_or(0);
+        right_total
+            .cmp(&left_total)
+            .then_with(|| {
+                left.name
+                    .to_ascii_lowercase()
+                    .cmp(&right.name.to_ascii_lowercase())
+            })
+            .then_with(|| left.id.cmp(&right.id))
+    });
+
+    dragons
+        .into_iter()
+        .filter(|dragon| {
+            dragon.judge_observation_score.is_some()
+                || dragon.judge_care_score.is_some()
+                || dragon
+                    .judge_feedback
+                    .as_deref()
+                    .is_some_and(|feedback| !feedback.trim().is_empty())
+        })
+        .map(|dragon| JudgeFeedbackRow {
+            dragon_name: dragon.name.clone(),
+            observation_score_label: format!("{} obs", dragon.judge_observation_score.unwrap_or(0)),
+            care_score_label: format!("{} care", dragon.judge_care_score.unwrap_or(0)),
+            feedback: dragon
+                .judge_feedback
+                .clone()
+                .unwrap_or_else(|| "No judge feedback yet.".to_string()),
+        })
+        .collect()
+}
+
+fn player_judge_feedback_label(state: &ClientGameState, player_id: &str) -> String {
+    let mut labels = state
+        .dragons
+        .values()
+        .filter_map(|dragon| {
+            let feedback = dragon.judge_feedback.as_deref()?.trim();
+            if feedback.is_empty() {
+                return None;
+            }
+
+            let is_creator = dragon.original_owner_id.as_deref() == Some(player_id);
+            let is_caretaker = dragon.current_owner_id.as_deref() == Some(player_id);
+
+            if is_creator && is_caretaker {
+                Some(format!(
+                    "Created and cared for {}: {}",
+                    dragon.name, feedback
+                ))
+            } else if is_creator {
+                Some(format!("Created {}: {}", dragon.name, feedback))
+            } else if is_caretaker {
+                Some(format!("Cared for {}: {}", dragon.name, feedback))
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+
+    labels.sort();
+    if labels.is_empty() {
+        "No judge feedback yet".to_string()
+    } else {
+        labels.join(" | ")
     }
 }
 
@@ -522,6 +626,7 @@ pub fn voting_option_rows(state: &ClientGameState) -> Vec<VotingOptionRow> {
             color_secondary: dragon.visuals.color_s.clone(),
             color_accent: dragon.visuals.color_a.clone(),
             base_variant: dragon.visuals.base,
+            custom_sprites: dragon.custom_sprites.clone(),
         })
         .collect()
 }
@@ -586,6 +691,14 @@ pub fn end_vote_result_rows(state: &ClientGameState) -> Vec<EndVoteResultRow> {
 pub fn end_results_status_copy(state: &ClientGameState) -> String {
     let rows = end_vote_result_rows(state);
     let Some(top_result) = rows.first() else {
+        if state.phase == Phase::End
+            && state
+                .voting
+                .as_ref()
+                .is_some_and(|voting| voting.eligible_count == 0)
+        {
+            return "No anonymous design vote was needed. Final standings are ready.".to_string();
+        }
         return "Results will appear once the host reveals the creative vote.".to_string();
     };
 
@@ -622,6 +735,7 @@ pub fn end_player_score_rows(state: &ClientGameState) -> Vec<EndPlayerScoreRow> 
             } else {
                 format!("{} achievement(s)", player.achievements.len())
             },
+            judge_feedback_label: player_judge_feedback_label(state, &player.id),
             is_winner: index == 0,
         })
         .collect()
@@ -713,8 +827,8 @@ pub fn judge_bundle_dragon_rows(bundle: &JudgeBundle) -> Vec<JudgeBundleDragonRo
 pub mod tests {
     use super::*;
     use protocol::{
-        create_default_session_settings, ClientDragon, ClientGameState, CoordinatorType,
-        DragonAction, DragonEmotion, Phase, Player, SessionMeta, WorkshopJoinSuccess,
+        ClientDragon, ClientGameState, CoordinatorType, DragonAction, DragonEmotion, Phase, Player,
+        SessionMeta, WorkshopJoinSuccess, create_default_session_settings,
     };
     use std::collections::BTreeMap;
 
@@ -732,6 +846,7 @@ pub mod tests {
                 is_ready: false,
                 is_connected: true,
                 pet_description: Some("Alice's workshop dragon".to_string()),
+                custom_sprites: None,
             },
         );
 
@@ -796,6 +911,9 @@ pub mod tests {
                 speech_timer: 2,
                 action_cooldown: 0,
                 custom_sprites: None,
+                judge_observation_score: None,
+                judge_care_score: None,
+                judge_feedback: None,
             },
         );
         state
@@ -836,6 +954,7 @@ pub mod tests {
                 is_ready: true,
                 is_connected: true,
                 pet_description: Some("Bob's workshop dragon".to_string()),
+                custom_sprites: None,
             },
         );
         state.dragons.insert(
@@ -865,6 +984,9 @@ pub mod tests {
                 speech_timer: 1,
                 action_cooldown: 0,
                 custom_sprites: None,
+                judge_observation_score: None,
+                judge_care_score: None,
+                judge_feedback: None,
             },
         );
         state.voting = Some(protocol::ClientVotingState {
@@ -1058,11 +1180,11 @@ pub mod tests {
 
     #[test]
     fn phase_screen_copy_matches_lobby_and_voting_states() {
-        assert_eq!(phase_screen_title(Phase::Lobby), "Workshop lobby");
-        assert_eq!(phase_screen_title(Phase::Voting), "Voting");
+        assert_eq!(phase_screen_title(Phase::Lobby), "Waiting lobby");
+        assert_eq!(phase_screen_title(Phase::Voting), "Design voting");
         assert_eq!(
             phase_screen_body(Phase::Lobby),
-            "Review the roster, make sure everyone is here, and start when the workshop is ready."
+            "Wait for the host to gather the group and open character creation."
         );
     }
 
@@ -1081,6 +1203,7 @@ pub mod tests {
                 is_ready: true,
                 is_connected: false,
                 pet_description: Some("Bob's workshop dragon".to_string()),
+                custom_sprites: None,
             },
         );
 
@@ -1202,9 +1325,10 @@ pub mod tests {
         assert!(rows
             .iter()
             .any(|row| row.dragon_name.starts_with("Dragon #") && row.is_current_players_dragon));
-        assert!(rows
-            .iter()
-            .any(|row| row.dragon_name.starts_with("Dragon #") && row.is_selected));
+        assert!(
+            rows.iter()
+                .any(|row| row.dragon_name.starts_with("Dragon #") && row.is_selected)
+        );
     }
 
     #[test]
@@ -1306,6 +1430,7 @@ pub mod tests {
                     is_ready: i % 2 == 0,
                     is_connected: i % 3 != 0,
                     pet_description: Some(format!("Dragon description {i}")),
+                    custom_sprites: None,
                 },
             );
             state.dragons.insert(
@@ -1335,6 +1460,9 @@ pub mod tests {
                     speech_timer: 1,
                     action_cooldown: 0,
                     custom_sprites: None,
+                    judge_observation_score: None,
+                    judge_care_score: None,
+                    judge_feedback: None,
                 },
             );
         }
@@ -1481,7 +1609,8 @@ pub mod tests {
 
     #[test]
     fn phase_remaining_seconds_supports_zulu_and_offset_timestamps() {
-        let state = mock_join_success().state;
+        let mut state = mock_join_success().state;
+        state.phase = Phase::Phase0;
         let started_at =
             parse_rfc3339_epoch_seconds(&state.session.phase_started_at).expect("zulu");
 
@@ -1500,6 +1629,7 @@ pub mod tests {
     #[test]
     fn phase_remaining_seconds_handles_fractional_seconds() {
         let mut state = mock_join_success().state;
+        state.phase = Phase::Phase0;
         state.session.phase_started_at = "2026-01-01T00:00:00.500Z".to_string();
         let started_at =
             parse_rfc3339_epoch_seconds(&state.session.phase_started_at).expect("fractional");

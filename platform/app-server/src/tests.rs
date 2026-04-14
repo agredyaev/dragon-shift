@@ -603,7 +603,8 @@ fn session_player(id: &str, name: &str, joined_at_seconds: i64) -> SessionPlayer
     SessionPlayer {
         id: id.to_string(),
         name: name.to_string(),
-        pet_description: Some(format!("{name}'s workshop dragon")),
+        pet_description: Some(default_player_pet_description(name)),
+        custom_sprites: None,
         is_host: false,
         is_connected: true,
         is_ready: false,
@@ -612,6 +613,12 @@ fn session_player(id: &str, name: &str, joined_at_seconds: i64) -> SessionPlayer
         achievements: Vec::new(),
         joined_at: chrono::DateTime::from_timestamp(joined_at_seconds, 0).expect("valid timestamp"),
     }
+}
+
+fn default_player_pet_description(name: &str) -> String {
+    format!(
+        "A plain training-manikin dragon for {name}: neutral gray scales, simple proportions, and no distinctive personality yet."
+    )
 }
 
 fn create_workshop_body(name: &str) -> String {
@@ -624,6 +631,20 @@ fn create_workshop_body(name: &str) -> String {
         }
     })
     .to_string()
+}
+
+fn setup_phase0_body(session_code: &str, reconnect_token: &str) -> String {
+    format!(
+        r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"startPhase0"}}"#,
+        session_code, reconnect_token
+    )
+}
+
+fn setup_phase1_body(session_code: &str, reconnect_token: &str) -> String {
+    format!(
+        r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"startPhase1"}}"#,
+        session_code, reconnect_token
+    )
 }
 
 fn test_state() -> AppState {
@@ -1043,6 +1064,7 @@ async fn workshop_command_does_not_leave_mutated_cache_when_persisted_command_wr
         id: player_id.clone(),
         name: "Alice".to_string(),
         pet_description: Some("Alice's workshop dragon".to_string()),
+        custom_sprites: None,
         is_host: true,
         is_connected: true,
         is_ready: false,
@@ -1073,6 +1095,30 @@ async fn workshop_command_does_not_leave_mutated_cache_when_persisted_command_wr
         .lock()
         .await
         .insert(session_code.to_string(), session.clone());
+
+    let phase0_response = build_app(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops/command")
+                .header("origin", "http://localhost:5173")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&WorkshopCommandRequest {
+                        session_code: session_code.to_string(),
+                        reconnect_token: reconnect_token.clone(),
+                        coordinator_type: Some(CoordinatorType::Rust),
+                        command: SessionCommand::StartPhase0,
+                        payload: None,
+                    })
+                    .expect("encode phase0 command request"),
+                ))
+                .expect("build phase0 command request"),
+        )
+        .await
+        .expect("call phase0 command endpoint");
+    assert_eq!(phase0_response.status(), StatusCode::OK);
+
     store.fail_save_with_artifact();
 
     let app = build_app(state.clone());
@@ -1102,7 +1148,7 @@ async fn workshop_command_does_not_leave_mutated_cache_when_persisted_command_wr
 
     let sessions = state.sessions.lock().await;
     let cached = sessions.get(session_code).expect("session remains cached");
-    assert_eq!(cached.phase, protocol::Phase::Lobby);
+    assert_eq!(cached.phase, protocol::Phase::Phase0);
 }
 
 #[tokio::test]
@@ -1248,6 +1294,7 @@ async fn ensure_session_cached_clears_restored_transient_connectivity() {
         id: "player-1".to_string(),
         name: "Alice".to_string(),
         pet_description: Some("Alice's workshop dragon".to_string()),
+        custom_sprites: None,
         is_host: true,
         is_connected: true,
         is_ready: false,
@@ -1331,6 +1378,36 @@ async fn workshop_command_pushes_state_update_to_attached_websocket() {
         .expect("initial state update frame")
         .expect("initial state update message");
 
+    let phase0_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops/command")
+                .header("origin", "http://localhost:5173")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&WorkshopCommandRequest {
+                        session_code: create_success.session_code.clone(),
+                        reconnect_token: create_success.reconnect_token.clone(),
+                        coordinator_type: Some(CoordinatorType::Rust),
+                        command: SessionCommand::StartPhase0,
+                        payload: None,
+                    })
+                    .expect("encode phase0 command request"),
+                ))
+                .expect("build phase0 command request"),
+        )
+        .await
+        .expect("call phase0 command endpoint");
+    assert_eq!(phase0_response.status(), StatusCode::OK);
+
+    let _ = socket
+        .next()
+        .await
+        .expect("phase0 state update frame")
+        .expect("phase0 state update message");
+
     let command_response = app
         .clone()
         .oneshot(
@@ -1392,6 +1469,7 @@ async fn session_update_notification_skip_does_not_evict_cache_or_broadcast() {
         id: "player-1".to_string(),
         name: "Alice".to_string(),
         pet_description: Some("Alice's workshop dragon".to_string()),
+        custom_sprites: None,
         is_host: true,
         is_connected: true,
         is_ready: false,
@@ -1573,6 +1651,7 @@ async fn typed_notification_followed_by_legacy_notification_does_not_rebroadcast
         id: "player-1".to_string(),
         name: "Alice".to_string(),
         pet_description: Some("Alice's workshop dragon".to_string()),
+        custom_sprites: None,
         is_host: true,
         is_connected: true,
         is_ready: false,
@@ -1687,6 +1766,7 @@ async fn realtime_replaced_notification_clears_local_registration_without_persis
         id: "player-1".to_string(),
         name: "Alice".to_string(),
         pet_description: Some("Alice's workshop dragon".to_string()),
+        custom_sprites: None,
         is_host: true,
         is_connected: true,
         is_ready: false,
@@ -1811,6 +1891,7 @@ async fn clearing_local_realtime_before_close_prevents_false_disconnect_fallback
         id: "player-1".to_string(),
         name: "Alice".to_string(),
         pet_description: Some("Alice's workshop dragon".to_string()),
+        custom_sprites: None,
         is_host: true,
         is_connected: true,
         is_ready: false,
@@ -2229,7 +2310,7 @@ async fn workshop_command_endpoint_is_rate_limited_for_repeated_requests() {
                         session_code: create_success.session_code.clone(),
                         reconnect_token: create_success.reconnect_token.clone(),
                         coordinator_type: Some(CoordinatorType::Rust),
-                        command: SessionCommand::StartPhase1,
+                        command: SessionCommand::StartPhase0,
                         payload: None,
                     })
                     .expect("encode first command request"),
@@ -2252,7 +2333,7 @@ async fn workshop_command_endpoint_is_rate_limited_for_repeated_requests() {
                         session_code: create_success.session_code.clone(),
                         reconnect_token: create_success.reconnect_token.clone(),
                         coordinator_type: Some(CoordinatorType::Rust),
-                        command: SessionCommand::StartPhase1,
+                        command: SessionCommand::StartPhase0,
                         payload: None,
                     })
                     .expect("encode second command request"),
@@ -2389,10 +2470,8 @@ async fn workshop_judge_bundle_returns_bundle_for_completed_session() {
     };
 
     for request_body in [
-        format!(
-            r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"startPhase1"}}"#,
-            session_code, create_success.reconnect_token
-        ),
+        setup_phase0_body(&session_code, &create_success.reconnect_token),
+        setup_phase1_body(&session_code, &create_success.reconnect_token),
         format!(
             r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"startHandover"}}"#,
             session_code, create_success.reconnect_token
@@ -2411,6 +2490,10 @@ async fn workshop_judge_bundle_returns_bundle_for_completed_session() {
         ),
         format!(
             r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"endGame"}}"#,
+            session_code, create_success.reconnect_token
+        ),
+        format!(
+            r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"startVoting"}}"#,
             session_code, create_success.reconnect_token
         ),
     ] {
@@ -2589,9 +2672,10 @@ async fn create_workshop_endpoint_returns_join_success() {
                 .players
                 .get(&success.player_id)
                 .expect("host player in state");
+            let expected_description = default_player_pet_description("Alice");
             assert_eq!(
                 host.pet_description.as_deref(),
-                Some("Alice's workshop dragon")
+                Some(expected_description.as_str())
             );
         }
         WorkshopJoinResult::Error(error) => panic!("expected success, got error: {}", error.error),
@@ -2808,12 +2892,21 @@ fn load_config_reads_server_side_llm_settings() {
 
     let config = crate::app::load_config().expect("load config");
 
-    assert_eq!(config.llm_pool.google_cloud_project.as_deref(), Some("dragon-shift-prod"));
-    assert_eq!(config.llm_pool.google_cloud_location.as_deref(), Some("us-central1"));
+    assert_eq!(
+        config.llm_pool.google_cloud_project.as_deref(),
+        Some("dragon-shift-prod")
+    );
+    assert_eq!(
+        config.llm_pool.google_cloud_location.as_deref(),
+        Some("us-central1")
+    );
     assert_eq!(config.llm_pool.judge_providers.len(), 1);
     assert_eq!(config.llm_pool.judge_providers[0].model, "gemini-2.5-flash");
     assert_eq!(config.llm_pool.image_providers.len(), 1);
-    assert_eq!(config.llm_pool.image_providers[0].model, "gemini-2.5-flash-preview-04-17");
+    assert_eq!(
+        config.llm_pool.image_providers[0].model,
+        "gemini-2.5-flash-preview-04-17"
+    );
 }
 
 #[tokio::test]
@@ -3232,9 +3325,10 @@ async fn join_workshop_endpoint_returns_join_success_for_lobby_session() {
                 .players
                 .get(&success.player_id)
                 .expect("joined player in state");
+            let expected_description = default_player_pet_description("Bob");
             assert_eq!(
                 joined.pet_description.as_deref(),
-                Some("Bob's workshop dragon")
+                Some(expected_description.as_str())
             );
         }
         WorkshopJoinResult::Error(error) => panic!("expected success, got error: {}", error.error),
@@ -3268,6 +3362,23 @@ async fn join_workshop_endpoint_reconnects_existing_player_without_name() {
             panic!("expected create success, got error: {}", error.error)
         }
     };
+
+    let start_phase0_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops/command")
+                .header("content-type", "application/json")
+                .body(Body::from(format!(
+                    r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"startPhase0"}}"#,
+                    create_success.session_code, create_success.reconnect_token
+                )))
+                .expect("build start phase0 request"),
+        )
+        .await
+        .expect("call start phase0 command");
+    assert_eq!(start_phase0_response.status(), StatusCode::OK);
 
     let start_phase1_response = app
         .clone()
@@ -3696,6 +3807,52 @@ async fn postgres_restart_reload_and_reconnect_keep_presence_runtime_only() {
         other => panic!("expected state update, got {other:?}"),
     }
 
+    let phase0_command_response = app2
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops/command")
+                .header("origin", "http://localhost:5173")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&WorkshopCommandRequest {
+                        session_code: reconnect_success.session_code.clone(),
+                        reconnect_token: reconnect_success.reconnect_token.clone(),
+                        coordinator_type: Some(CoordinatorType::Rust),
+                        command: SessionCommand::StartPhase0,
+                        payload: None,
+                    })
+                    .expect("encode phase0 command request"),
+                ))
+                .expect("build phase0 command request"),
+        )
+        .await
+        .expect("call phase0 command after websocket reconnect");
+    assert_eq!(phase0_command_response.status(), StatusCode::OK);
+
+    let message = socket
+        .next()
+        .await
+        .expect("phase0 update frame")
+        .expect("phase0 update message");
+    let payload = match message {
+        WsMessage::Text(payload) => payload,
+        other => panic!("expected text frame, got {other:?}"),
+    };
+    let server_message: ServerWsMessage =
+        serde_json::from_str(&payload).expect("parse phase0 server ws message");
+    match server_message {
+        ServerWsMessage::StateUpdate(client_state) => {
+            assert_eq!(client_state.phase, protocol::Phase::Phase0);
+            assert_eq!(
+                client_state.current_player_id.as_deref(),
+                Some(reconnect_success.player_id.as_str())
+            );
+        }
+        other => panic!("expected phase0 state update, got {other:?}"),
+    }
+
     let command_response = app2
         .clone()
         .oneshot(
@@ -3799,6 +3956,7 @@ async fn reload_cached_session_clears_stale_cached_presence_without_realtime_reg
         id: player_id.clone(),
         name: "Alice".to_string(),
         pet_description: Some("Alice's workshop dragon".to_string()),
+        custom_sprites: None,
         is_host: true,
         is_connected: false,
         is_ready: false,
@@ -3862,6 +4020,7 @@ async fn postgres_reload_ignores_stale_distributed_realtime_presence() {
         id: player_id.clone(),
         name: "Alice".to_string(),
         pet_description: Some("Alice's workshop dragon".to_string()),
+        custom_sprites: None,
         is_host: true,
         is_connected: false,
         is_ready: false,
@@ -4205,6 +4364,23 @@ async fn workshop_command_saves_observation_during_phase1() {
         }
     };
 
+    let start_phase0_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops/command")
+                .header("content-type", "application/json")
+                .body(Body::from(setup_phase0_body(
+                    &create_success.session_code,
+                    &create_success.reconnect_token,
+                )))
+                .expect("build start phase0 request"),
+        )
+        .await
+        .expect("call start phase0 command");
+    assert_eq!(start_phase0_response.status(), StatusCode::OK);
+
     let start_phase1_response = app
         .clone()
         .oneshot(
@@ -4212,9 +4388,9 @@ async fn workshop_command_saves_observation_during_phase1() {
                 .method("POST")
                 .uri("/api/workshops/command")
                 .header("content-type", "application/json")
-                .body(Body::from(format!(
-                    r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"startPhase1"}}"#,
-                    create_success.session_code, create_success.reconnect_token
+                .body(Body::from(setup_phase1_body(
+                    &create_success.session_code,
+                    &create_success.reconnect_token,
                 )))
                 .expect("build start phase1 request"),
         )
@@ -4321,9 +4497,13 @@ async fn workshop_command_records_action_artifact_during_phase2() {
     };
 
     for request_body in [
-        format!(
-            r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"startPhase1"}}"#,
-            create_success.session_code, create_success.reconnect_token
+        setup_phase0_body(
+            &create_success.session_code,
+            &create_success.reconnect_token,
+        ),
+        setup_phase1_body(
+            &create_success.session_code,
+            &create_success.reconnect_token,
         ),
         format!(
             r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"startHandover"}}"#,
@@ -4496,6 +4676,23 @@ async fn workshop_command_rejects_non_host_start_phase1() {
         }
     };
 
+    let host_start_phase0_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops/command")
+                .header("content-type", "application/json")
+                .body(Body::from(setup_phase0_body(
+                    &session_code,
+                    &create_success.reconnect_token,
+                )))
+                .expect("build command request"),
+        )
+        .await
+        .expect("call startPhase0 command");
+    assert_eq!(host_start_phase0_response.status(), StatusCode::OK);
+
     let response = app
         .oneshot(
             Request::builder()
@@ -4526,7 +4723,7 @@ async fn workshop_command_rejects_non_host_start_phase1() {
 }
 
 #[tokio::test]
-async fn workshop_command_starts_phase1_for_single_player_host() {
+async fn workshop_command_rejects_start_phase1_from_lobby() {
     let state = test_state();
     let app = build_app(state.clone());
     let create_response = app
@@ -4568,25 +4765,21 @@ async fn workshop_command_starts_phase1_for_single_player_host() {
         .await
         .expect("call command endpoint");
 
-    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     let body = to_bytes(response.into_body(), usize::MAX)
         .await
         .expect("read command body");
     let result: WorkshopCommandResult =
         serde_json::from_slice(&body).expect("parse command result");
     match result {
-        WorkshopCommandResult::Success(success) => assert!(success.ok),
         WorkshopCommandResult::Error(error) => {
-            panic!("expected success, got error: {}", error.error)
+            assert_eq!(
+                error.error,
+                "Phase 1 can only start after character creation."
+            );
         }
+        WorkshopCommandResult::Success(_) => panic!("expected error response"),
     }
-
-    let sessions = state.sessions.lock().await;
-    let session = sessions
-        .get(&create_success.session_code)
-        .expect("session exists");
-    assert_eq!(session.phase, protocol::Phase::Phase1);
-    assert_eq!(session.dragons.len(), 1);
 }
 
 #[tokio::test]
@@ -4699,6 +4892,23 @@ async fn workshop_command_rejects_non_host_start_handover() {
         }
     };
 
+    let host_start_phase0_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops/command")
+                .header("content-type", "application/json")
+                .body(Body::from(format!(
+                    r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"startPhase0"}}"#,
+                    session_code, create_success.reconnect_token
+                )))
+                .expect("build start phase0 request"),
+        )
+        .await
+        .expect("call startPhase0 command");
+    assert_eq!(host_start_phase0_response.status(), StatusCode::OK);
+
     let host_start_phase1_response = app
         .clone()
         .oneshot(
@@ -4773,7 +4983,7 @@ async fn workshop_command_starts_handover_for_host_in_phase1() {
         }
     };
 
-    let start_phase1_response = app
+    let start_phase0_response = app
         .clone()
         .oneshot(
             Request::builder()
@@ -4781,8 +4991,25 @@ async fn workshop_command_starts_handover_for_host_in_phase1() {
                 .uri("/api/workshops/command")
                 .header("content-type", "application/json")
                 .body(Body::from(format!(
-                    r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"startPhase1"}}"#,
+                    r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"startPhase0"}}"#,
                     create_success.session_code, create_success.reconnect_token
+                )))
+                .expect("build start phase0 request"),
+        )
+        .await
+        .expect("call startPhase0 command");
+    assert_eq!(start_phase0_response.status(), StatusCode::OK);
+
+    let start_phase1_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops/command")
+                .header("content-type", "application/json")
+                .body(Body::from(setup_phase1_body(
+                    &create_success.session_code,
+                    &create_success.reconnect_token,
                 )))
                 .expect("build start phase1 request"),
         )
@@ -4908,7 +5135,7 @@ async fn workshop_command_rejects_invalid_submit_tags_payload() {
         }
     };
 
-    let start_phase1_response = app
+    let start_phase0_response = app
         .clone()
         .oneshot(
             Request::builder()
@@ -4916,8 +5143,25 @@ async fn workshop_command_rejects_invalid_submit_tags_payload() {
                 .uri("/api/workshops/command")
                 .header("content-type", "application/json")
                 .body(Body::from(format!(
-                    r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"startPhase1"}}"#,
+                    r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"startPhase0"}}"#,
                     create_success.session_code, create_success.reconnect_token
+                )))
+                .expect("build start phase0 request"),
+        )
+        .await
+        .expect("call startPhase0 command");
+    assert_eq!(start_phase0_response.status(), StatusCode::OK);
+
+    let start_phase1_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops/command")
+                .header("content-type", "application/json")
+                .body(Body::from(setup_phase1_body(
+                    &create_success.session_code,
+                    &create_success.reconnect_token,
                 )))
                 .expect("build start phase1 request"),
         )
@@ -4995,6 +5239,23 @@ async fn workshop_command_saves_submit_tags_in_handover_phase() {
             panic!("expected create success, got error: {}", error.error)
         }
     };
+
+    let start_phase0_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops/command")
+                .header("content-type", "application/json")
+                .body(Body::from(format!(
+                    r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"startPhase0"}}"#,
+                    create_success.session_code, create_success.reconnect_token
+                )))
+                .expect("build start phase0 request"),
+        )
+        .await
+        .expect("call startPhase0 command");
+    assert_eq!(start_phase0_response.status(), StatusCode::OK);
 
     let start_phase1_response = app
         .clone()
@@ -5179,7 +5440,7 @@ async fn workshop_command_rejects_non_host_start_phase2() {
         }
     };
 
-    let start_phase1_response = app
+    let start_phase0_response = app
         .clone()
         .oneshot(
             Request::builder()
@@ -5187,8 +5448,25 @@ async fn workshop_command_rejects_non_host_start_phase2() {
                 .uri("/api/workshops/command")
                 .header("content-type", "application/json")
                 .body(Body::from(format!(
-                    r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"startPhase1"}}"#,
+                    r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"startPhase0"}}"#,
                     session_code, create_success.reconnect_token
+                )))
+                .expect("build start phase0 request"),
+        )
+        .await
+        .expect("call startPhase0 command");
+    assert_eq!(start_phase0_response.status(), StatusCode::OK);
+
+    let start_phase1_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops/command")
+                .header("content-type", "application/json")
+                .body(Body::from(setup_phase1_body(
+                    &session_code,
+                    &create_success.reconnect_token,
                 )))
                 .expect("build start phase1 request"),
         )
@@ -5281,6 +5559,23 @@ async fn workshop_command_rejects_start_phase2_when_tags_are_missing() {
         .await
         .expect("seed host realtime registration");
 
+    let start_phase0_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops/command")
+                .header("content-type", "application/json")
+                .body(Body::from(format!(
+                    r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"startPhase0"}}"#,
+                    create_success.session_code, create_success.reconnect_token
+                )))
+                .expect("build start phase0 request"),
+        )
+        .await
+        .expect("call startPhase0 command");
+    assert_eq!(start_phase0_response.status(), StatusCode::OK);
+
     let start_phase1_response = app
         .clone()
         .oneshot(
@@ -5371,6 +5666,23 @@ async fn workshop_command_starts_phase2_when_handover_is_complete() {
             panic!("expected create success, got error: {}", error.error)
         }
     };
+
+    let start_phase0_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops/command")
+                .header("content-type", "application/json")
+                .body(Body::from(format!(
+                    r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"startPhase0"}}"#,
+                    create_success.session_code, create_success.reconnect_token
+                )))
+                .expect("build start phase0 request"),
+        )
+        .await
+        .expect("call startPhase0 command");
+    assert_eq!(start_phase0_response.status(), StatusCode::OK);
 
     let start_phase1_response = app
         .clone()
@@ -5505,7 +5817,7 @@ async fn workshop_command_rejects_end_game_outside_phase2() {
         serde_json::from_slice(&body).expect("parse command result");
     match result {
         WorkshopCommandResult::Error(error) => {
-            assert_eq!(error.error, "Voting can only begin from Phase 2.");
+            assert_eq!(error.error, "Judge review can only begin from Phase 2.");
         }
         WorkshopCommandResult::Success(_) => panic!("expected error response"),
     }
@@ -5566,6 +5878,23 @@ async fn workshop_command_rejects_non_host_end_game() {
         }
     };
 
+    let start_phase0_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops/command")
+                .header("content-type", "application/json")
+                .body(Body::from(setup_phase0_body(
+                    &session_code,
+                    &create_success.reconnect_token,
+                )))
+                .expect("build start phase0 request"),
+        )
+        .await
+        .expect("call startPhase0 command");
+    assert_eq!(start_phase0_response.status(), StatusCode::OK);
+
     let start_phase1_response = app
         .clone()
         .oneshot(
@@ -5573,9 +5902,9 @@ async fn workshop_command_rejects_non_host_end_game() {
                 .method("POST")
                 .uri("/api/workshops/command")
                 .header("content-type", "application/json")
-                .body(Body::from(format!(
-                    r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"startPhase1"}}"#,
-                    session_code, create_success.reconnect_token
+                .body(Body::from(setup_phase1_body(
+                    &session_code,
+                    &create_success.reconnect_token,
                 )))
                 .expect("build start phase1 request"),
         )
@@ -5675,7 +6004,7 @@ async fn workshop_command_rejects_non_host_end_game() {
 }
 
 #[tokio::test]
-async fn workshop_command_starts_voting_when_host_ends_multiplayer_phase2() {
+async fn workshop_command_enters_judge_when_host_ends_multiplayer_phase2() {
     let state = test_state();
     let app = build_app(state.clone());
     let create_response = app
@@ -5731,10 +6060,8 @@ async fn workshop_command_starts_voting_when_host_ends_multiplayer_phase2() {
     };
 
     for request_body in [
-        format!(
-            r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"startPhase1"}}"#,
-            session_code, create_success.reconnect_token
-        ),
+        setup_phase0_body(&session_code, &create_success.reconnect_token),
+        setup_phase1_body(&session_code, &create_success.reconnect_token),
         format!(
             r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"startHandover"}}"#,
             session_code, create_success.reconnect_token
@@ -5797,8 +6124,8 @@ async fn workshop_command_starts_voting_when_host_ends_multiplayer_phase2() {
 
     let sessions = state.sessions.lock().await;
     let session = sessions.get(&session_code).expect("session exists");
-    assert_eq!(session.phase, protocol::Phase::Voting);
-    assert!(session.voting.is_some());
+    assert_eq!(session.phase, protocol::Phase::Judge);
+    assert!(session.voting.is_none());
 }
 
 #[tokio::test]
@@ -5964,10 +6291,8 @@ async fn workshop_command_rejects_self_vote_in_voting() {
     };
 
     for request_body in [
-        format!(
-            r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"startPhase1"}}"#,
-            session_code, create_success.reconnect_token
-        ),
+        setup_phase0_body(&session_code, &create_success.reconnect_token),
+        setup_phase1_body(&session_code, &create_success.reconnect_token),
         format!(
             r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"startHandover"}}"#,
             session_code, create_success.reconnect_token
@@ -5986,6 +6311,10 @@ async fn workshop_command_rejects_self_vote_in_voting() {
         ),
         format!(
             r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"endGame"}}"#,
+            session_code, create_success.reconnect_token
+        ),
+        format!(
+            r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"startVoting"}}"#,
             session_code, create_success.reconnect_token
         ),
     ] {
@@ -6096,10 +6425,8 @@ async fn workshop_command_accepts_valid_vote_in_voting() {
     };
 
     for request_body in [
-        format!(
-            r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"startPhase1"}}"#,
-            session_code, create_success.reconnect_token
-        ),
+        setup_phase0_body(&session_code, &create_success.reconnect_token),
+        setup_phase1_body(&session_code, &create_success.reconnect_token),
         format!(
             r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"startHandover"}}"#,
             session_code, create_success.reconnect_token
@@ -6118,6 +6445,10 @@ async fn workshop_command_accepts_valid_vote_in_voting() {
         ),
         format!(
             r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"endGame"}}"#,
+            session_code, create_success.reconnect_token
+        ),
+        format!(
+            r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"startVoting"}}"#,
             session_code, create_success.reconnect_token
         ),
     ] {
@@ -6280,10 +6611,8 @@ async fn workshop_command_rejects_non_host_reveal_results() {
     };
 
     for request_body in [
-        format!(
-            r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"startPhase1"}}"#,
-            session_code, create_success.reconnect_token
-        ),
+        setup_phase0_body(&session_code, &create_success.reconnect_token),
+        setup_phase1_body(&session_code, &create_success.reconnect_token),
         format!(
             r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"startHandover"}}"#,
             session_code, create_success.reconnect_token
@@ -6302,6 +6631,10 @@ async fn workshop_command_rejects_non_host_reveal_results() {
         ),
         format!(
             r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"endGame"}}"#,
+            session_code, create_success.reconnect_token
+        ),
+        format!(
+            r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"startVoting"}}"#,
             session_code, create_success.reconnect_token
         ),
     ] {
@@ -6402,10 +6735,8 @@ async fn workshop_command_rejects_reveal_results_while_votes_are_pending() {
     };
 
     for request_body in [
-        format!(
-            r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"startPhase1"}}"#,
-            session_code, create_success.reconnect_token
-        ),
+        setup_phase0_body(&session_code, &create_success.reconnect_token),
+        setup_phase1_body(&session_code, &create_success.reconnect_token),
         format!(
             r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"startHandover"}}"#,
             session_code, create_success.reconnect_token
@@ -6424,6 +6755,10 @@ async fn workshop_command_rejects_reveal_results_while_votes_are_pending() {
         ),
         format!(
             r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"endGame"}}"#,
+            session_code, create_success.reconnect_token
+        ),
+        format!(
+            r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"startVoting"}}"#,
             session_code, create_success.reconnect_token
         ),
     ] {
@@ -6525,10 +6860,8 @@ async fn workshop_command_reveals_voting_results_after_all_votes() {
     };
 
     for request_body in [
-        format!(
-            r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"startPhase1"}}"#,
-            session_code, create_success.reconnect_token
-        ),
+        setup_phase0_body(&session_code, &create_success.reconnect_token),
+        setup_phase1_body(&session_code, &create_success.reconnect_token),
         format!(
             r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"startHandover"}}"#,
             session_code, create_success.reconnect_token
@@ -6547,6 +6880,10 @@ async fn workshop_command_reveals_voting_results_after_all_votes() {
         ),
         format!(
             r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"endGame"}}"#,
+            session_code, create_success.reconnect_token
+        ),
+        format!(
+            r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"startVoting"}}"#,
             session_code, create_success.reconnect_token
         ),
     ] {
@@ -6744,6 +7081,23 @@ async fn workshop_command_reset_game_returns_session_to_lobby() {
             panic!("expected create success, got error: {}", error.error)
         }
     };
+
+    let start_phase0_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops/command")
+                .header("content-type", "application/json")
+                .body(Body::from(format!(
+                    r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"startPhase0"}}"#,
+                    create_success.session_code, create_success.reconnect_token
+                )))
+                .expect("build start phase0 request"),
+        )
+        .await
+        .expect("call startPhase0 command");
+    assert_eq!(start_phase0_response.status(), StatusCode::OK);
 
     let start_response = app
         .clone()
@@ -7123,6 +7477,7 @@ async fn workshop_ws_attach_restores_cache_state_when_grouped_reconnect_persist_
         id: player_id.clone(),
         name: "Alice".to_string(),
         pet_description: Some("Alice's workshop dragon".to_string()),
+        custom_sprites: None,
         is_host: true,
         is_connected: false,
         is_ready: false,
@@ -7735,6 +8090,7 @@ async fn reconnect_join_restores_cache_state_when_grouped_reconnect_persist_fail
         id: player_id.clone(),
         name: "Alice".to_string(),
         pet_description: Some("Alice's workshop dragon".to_string()),
+        custom_sprites: None,
         is_host: true,
         is_connected: false,
         is_ready: false,
@@ -7810,6 +8166,7 @@ async fn websocket_reconnect_persistence_does_not_store_connected_presence() {
         id: player_id.clone(),
         name: "Alice".to_string(),
         pet_description: Some("Alice's workshop dragon".to_string()),
+        custom_sprites: None,
         is_host: true,
         is_connected: false,
         is_ready: false,
@@ -7902,6 +8259,7 @@ async fn websocket_disconnect_restores_cache_state_when_grouped_disconnect_persi
         id: player_id.clone(),
         name: "Alice".to_string(),
         pet_description: Some("Alice's workshop dragon".to_string()),
+        custom_sprites: None,
         is_host: true,
         is_connected: true,
         is_ready: false,
@@ -7991,6 +8349,7 @@ async fn replaced_connection_close_before_notification_does_not_persist_false_di
         id: player_id.clone(),
         name: "Alice".to_string(),
         pet_description: Some("Alice's workshop dragon".to_string()),
+        custom_sprites: None,
         is_host: true,
         is_connected: true,
         is_ready: false,
@@ -8159,6 +8518,7 @@ async fn fresh_join_restores_cache_state_when_grouped_join_persist_fails() {
         id: "host-1".to_string(),
         name: "Alice".to_string(),
         pet_description: Some("Alice's workshop dragon".to_string()),
+        custom_sprites: None,
         is_host: true,
         is_connected: true,
         is_ready: false,
@@ -8446,6 +8806,30 @@ async fn phase_timer_broadcasts_warning_notice_at_thirty_seconds_remaining() {
         }
     };
 
+    let phase0_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops/command")
+                .header("origin", "http://localhost:5173")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&WorkshopCommandRequest {
+                        session_code: create_success.session_code.clone(),
+                        reconnect_token: create_success.reconnect_token.clone(),
+                        coordinator_type: Some(CoordinatorType::Rust),
+                        command: SessionCommand::StartPhase0,
+                        payload: None,
+                    })
+                    .expect("encode phase0 command request"),
+                ))
+                .expect("build phase0 command request"),
+        )
+        .await
+        .expect("call phase0 command endpoint");
+    assert_eq!(phase0_response.status(), StatusCode::OK);
+
     let command_response = app
         .clone()
         .oneshot(
@@ -8671,6 +9055,9 @@ fn to_client_game_state_includes_dragons_and_voting_details() {
             dragon_id: "dragon-p2".into(),
         },
     ];
+    session
+        .transition_to(protocol::Phase::Phase0)
+        .expect("enter phase0");
     session.begin_phase1(&assignments).expect("begin phase1");
     session.record_discovery_observation("p1", "Calms down at dusk");
     session.record_discovery_observation("p2", "Rejects fruit at night");

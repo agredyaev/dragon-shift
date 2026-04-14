@@ -870,7 +870,8 @@ async fn smoke_judge_bundle(base_url: String) -> Result<(), String> {
     let smoke_start = std::time::Instant::now();
     let client = reqwest::Client::new();
     let mut host = create_workshop(&client, &base_url, "XtaskJudgeHost").await?;
-    let mut guest = join_workshop(&client, &base_url, &host.session_code, "XtaskJudgeGuest").await?;
+    let mut guest =
+        join_workshop(&client, &base_url, &host.session_code, "XtaskJudgeGuest").await?;
 
     send_command(
         &client,
@@ -1044,7 +1045,8 @@ async fn smoke_offline_failover(base_url: String) -> Result<(), String> {
     let smoke_start = std::time::Instant::now();
     let client = reqwest::Client::new();
     let host = create_workshop(&client, &base_url, "XtaskFailoverHost").await?;
-    let mut guest = join_workshop(&client, &base_url, &host.session_code, "XtaskFailoverGuest").await?;
+    let mut guest =
+        join_workshop(&client, &base_url, &host.session_code, "XtaskFailoverGuest").await?;
 
     let mut host_socket = attach_ws_session(&base_url, &host).await?;
     host_socket

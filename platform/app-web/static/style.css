@@ -441,6 +441,10 @@
     .roster__item--phase {
         background: #fff7d6;
     }
+    .roster__item--feedback {
+        align-items: flex-start;
+        background: #f8fbff;
+    }
     .roster__name {
         margin: 0;
         font-family: var(--font-display);
@@ -457,6 +461,13 @@
         letter-spacing: 0.01em;
         line-height: 1.5;
     }
+    .roster__meta--feedback {
+        margin-top: 8px;
+        color: #0f172a;
+        font-size: 12px;
+        line-height: 1.7;
+        max-width: 54ch;
+    }
     .roster__status {
         font-family: var(--font-display);
         font-size: 11px;
@@ -467,6 +478,29 @@
         padding: 6px 8px;
         border: 3px solid currentColor;
         background: rgba(255,255,255,0.65);
+    }
+    .judge-feedback-grid {
+        display: grid;
+        gap: 12px;
+        grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+    }
+    .judge-feedback-card {
+        border: 4px solid #0f172a;
+        background: #eff6ff;
+        padding: 16px;
+        display: grid;
+        gap: 8px;
+        box-shadow:
+            inset 3px 3px 0 0 rgba(255,255,255,0.72),
+            inset -3px -3px 0 0 rgba(0,0,0,0.08),
+            4px 4px 0 0 rgba(0,0,0,0.24);
+    }
+    .judge-feedback-card__body {
+        margin: 0;
+        font-family: var(--font-body);
+        color: #1e293b;
+        font-size: 12px;
+        line-height: 1.7;
     }
     /* ---- Voting grid + pixel dragon sprites ---- */
     .voting-grid {
@@ -575,6 +609,73 @@
     .voting-card__button {
         font-size: 11px;
         padding: 6px 12px;
+    }
+    /* ---- Voting card: base64 sprite image ---- */
+    .voting-card__sprite-img {
+        width: 64px;
+        height: 64px;
+        image-rendering: pixelated;
+        display: block;
+    }
+    /* ---- Phase 0: dragon description textarea ---- */
+    .sprite-description-input {
+        resize: vertical;
+        min-height: 64px;
+        font-family: var(--font-body);
+        font-size: 13px;
+        line-height: 1.6;
+    }
+    /* ---- Phase 0: sprite preview ---- */
+    .sprite-preview-section {
+        border: 3px solid #0f172a;
+        background: #fffdf6;
+        padding: 16px;
+        box-shadow:
+            inset 2px 2px 0 0 rgba(255,255,255,0.5),
+            inset -2px -2px 0 0 rgba(0,0,0,0.06),
+            3px 3px 0 0 rgba(0,0,0,0.18);
+    }
+    .sprite-preview {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 8px;
+        padding: 12px 0;
+    }
+    .sprite-preview__image {
+        width: 128px;
+        height: 128px;
+        image-rendering: pixelated;
+        border: 4px solid #0f172a;
+        background: #e2e8f0;
+        box-shadow:
+            inset 3px 3px 0 0 rgba(0,0,0,0.08),
+            4px 4px 0 0 rgba(0,0,0,0.24);
+    }
+    .sprite-preview__label {
+        margin: 0;
+        font-family: var(--font-display);
+        font-size: 12px;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+        color: #0f172a;
+    }
+    .sprite-emotion-nav {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px;
+        justify-content: center;
+    }
+    .sprite-emotion-btn {
+        font-size: 10px;
+        padding: 4px 8px;
+    }
+    .sprite-emotion-btn--active {
+        box-shadow:
+            inset 4px 4px 0 0 rgba(0,0,0,0.12),
+            inset -4px -4px 0 0 rgba(255,255,255,0.72),
+            0 0 0 0 transparent;
+        transform: translate(2px, 2px);
     }
     /* ---- Scoring methodology (end view) ---- */
     .scoring-method {

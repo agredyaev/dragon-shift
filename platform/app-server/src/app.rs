@@ -29,7 +29,7 @@ use tower_http::{
 };
 
 use crate::http::{
-    create_workshop, join_workshop, live, ready, workshop_command,
+    create_workshop, generate_sprite_sheet, join_workshop, live, ready, workshop_command,
     workshop_judge_bundle,
 };
 use crate::llm::{LlmClient, LlmPoolConfig, load_llm_pool_config};
@@ -126,6 +126,7 @@ pub(crate) fn build_app(state: AppState) -> Router {
         .route("/workshops/command", post(workshop_command))
         .route("/workshops/ws", get(workshop_ws))
         .route("/workshops/judge-bundle", post(workshop_judge_bundle))
+        .route("/workshops/sprite-sheet", post(generate_sprite_sheet))
         .route("/live", get(live))
         .route("/ready", get(ready))
         .fallback(api_not_found);
