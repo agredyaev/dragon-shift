@@ -14,7 +14,7 @@ ingress:
 
 app:
   port: 3000
-  allowedOrigins: http://127.0.0.1:4100
+  allowedOrigins: "http://localhost:4100,http://127.0.0.1:4100"
   viteAppUrl: http://127.0.0.1:4100
   staticDir: /app/static
   rustLog: "info,tower_http=debug,app_server=debug"

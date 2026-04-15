@@ -1,10 +1,20 @@
 use dioxus::prelude::*;
-use protocol::{ClientGameState, Phase};
+use protocol::{ClientGameState, JudgeBundle, Phase, SessionCommand};
 
+use crate::flows::submit_workshop_command;
 use crate::helpers::*;
+use crate::state::{IdentityState, OperationState};
+
+use super::archive_panel::ArchivePanel;
 
 #[component]
-pub fn EndView(game_state: Signal<Option<ClientGameState>>) -> Element {
+pub fn EndView(
+    identity: Signal<IdentityState>,
+    game_state: Signal<Option<ClientGameState>>,
+    ops: Signal<OperationState>,
+    handover_tags_input: Signal<String>,
+    judge_bundle: Signal<Option<JudgeBundle>>,
+) -> Element {
     let gs = game_state.read();
     let Some(state) = gs.as_ref() else {
         return rsx! {};
@@ -27,6 +37,13 @@ pub fn EndView(game_state: Signal<Option<ClientGameState>>) -> Element {
         results_status
     };
     let header_status = if is_judge_screen { "Judge" } else { "Final" };
+
+    let commands_disabled = {
+        let o = ops.read();
+        o.pending_flow.is_some() || o.pending_command.is_some()
+    };
+
+    drop(gs);
 
     rsx! {
         article { class: "roster__item roster__item--phase",
@@ -81,17 +98,40 @@ pub fn EndView(game_state: Signal<Option<ClientGameState>>) -> Element {
                 }
             }
         }
-        if is_judge_screen {
+        // ---- Host controls ----
+        if is_host {
+            div { class: "button-row",
+                if is_judge_screen {
+                    button {
+                        class: "button button--primary",
+                        "data-testid": "start-voting-button",
+                        disabled: commands_disabled,
+                        onclick: move |_| {
+                            spawn(submit_workshop_command(identity, ops, handover_tags_input, judge_bundle, SessionCommand::StartVoting, None));
+                        },
+                        "Open design voting"
+                    }
+                }
+                button {
+                    class: "button button--secondary",
+                    "data-testid": "reset-game-button",
+                    disabled: commands_disabled,
+                    onclick: move |_| {
+                        spawn(submit_workshop_command(identity, ops, handover_tags_input, judge_bundle, SessionCommand::ResetGame, None));
+                    },
+                    "Reset workshop"
+                }
+            }
+        } else {
             p {
                 class: "meta",
-                if is_host {
-                    "The host can now open anonymous design voting."
-                } else {
+                if is_judge_screen {
                     "Waiting for the host to open anonymous design voting."
+                } else {
+                    "Waiting for the host to reset or archive this workshop."
                 }
             }
         }
-        // ---- Scoring methodology ----
         article { class: "scoring-method",
             p { class: "scoring-method__title", "How scores work" }
             div { class: "scoring-method__body",
@@ -132,13 +172,9 @@ pub fn EndView(game_state: Signal<Option<ClientGameState>>) -> Element {
                 }
             }
         }
-        p {
-            class: "meta",
-            if is_host {
-                "Host can reset the workshop when the group is ready for another round."
-            } else {
-                "Waiting for the host to reset or archive this workshop."
-            }
+        // ---- Workshop archive (End phase only) ----
+        if !is_judge_screen {
+            ArchivePanel { game_state, judge_bundle }
         }
     }
 }

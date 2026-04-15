@@ -4,7 +4,7 @@ use protocol::{ClientGameState, JudgeBundle, SessionCommand, SpriteSet};
 use crate::flows::{
     submit_sprite_sheet_request, submit_update_player_pet, submit_workshop_command,
 };
-use crate::helpers::{current_player, fallback_pet_description};
+use crate::helpers::current_player;
 use crate::state::{IdentityState, OperationState};
 
 const EMOTION_LABELS: [&str; 4] = ["Neutral", "Happy", "Angry", "Sleepy"];
@@ -31,19 +31,26 @@ pub fn Phase0View(
         return rsx! {};
     };
 
-    let default_description = current_player(state)
-        .map(|player| fallback_pet_description(&player.name))
-        .unwrap_or_else(|| fallback_pet_description("this player"));
-
     let mut dragon_description = use_signal(|| {
         current_player(state)
             .and_then(|player| player.pet_description.clone())
-            .unwrap_or_else(|| default_description.clone())
+            .unwrap_or_default()
     });
     let generated_sprites: Signal<Option<SpriteSet>> =
         use_signal(|| current_player(state).and_then(|player| player.custom_sprites.clone()));
     let mut generating = use_signal(|| false);
     let mut saving = use_signal(|| false);
+    let mut generation_count = use_signal(|| {
+        // If player already has sprites, they used at least 1 generation
+        if current_player(state)
+            .and_then(|p| p.custom_sprites.as_ref())
+            .is_some()
+        {
+            1_u32
+        } else {
+            0_u32
+        }
+    });
 
     let is_host = current_player(state).map(|p| p.is_host).unwrap_or(false);
     let commands_disabled = {
@@ -51,6 +58,8 @@ pub fn Phase0View(
         o.pending_flow.is_some() || o.pending_command.is_some()
     };
     let has_sprites = generated_sprites.read().is_some();
+    let description_empty = dragon_description.read().trim().is_empty();
+    let can_regenerate = *generation_count.read() < 2;
 
     drop(gs);
 
@@ -80,7 +89,7 @@ pub fn Phase0View(
                 button {
                     class: "button phase0-action-button",
                     "data-testid": "generate-sprites-button",
-                    disabled: commands_disabled || *generating.read(),
+                    disabled: commands_disabled || *generating.read() || description_empty,
                     onclick: {
                         let desc = dragon_description.read().clone();
                         move |_| {
@@ -88,6 +97,7 @@ pub fn Phase0View(
                             generating.set(true);
                             spawn(async move {
                                 submit_sprite_sheet_request(identity, ops, generated_sprites, desc).await;
+                                generation_count += 1;
                                 generating.set(false);
                             });
                         }
@@ -148,21 +158,24 @@ pub fn Phase0View(
                     },
                     if *saving.read() { "Saving..." } else { "Looks good!" }
                 }
-                button {
-                    class: "button button--secondary phase0-action-button",
-                    disabled: commands_disabled || *generating.read(),
-                    onclick: {
-                        let desc = dragon_description.read().clone();
-                        move |_| {
-                            let desc = desc.clone();
-                            generating.set(true);
-                            spawn(async move {
-                                submit_sprite_sheet_request(identity, ops, generated_sprites, desc).await;
-                                generating.set(false);
-                            });
-                        }
-                    },
-                    if *generating.read() { "Drawing..." } else { "Regenerate" }
+                if can_regenerate {
+                    button {
+                        class: "button button--secondary phase0-action-button",
+                        disabled: commands_disabled || *generating.read() || description_empty,
+                        onclick: {
+                            let desc = dragon_description.read().clone();
+                            move |_| {
+                                let desc = desc.clone();
+                                generating.set(true);
+                                spawn(async move {
+                                    submit_sprite_sheet_request(identity, ops, generated_sprites, desc).await;
+                                    generation_count += 1;
+                                    generating.set(false);
+                                });
+                            }
+                        },
+                        if *generating.read() { "Drawing..." } else { "Regenerate" }
+                    }
                 }
             }
 

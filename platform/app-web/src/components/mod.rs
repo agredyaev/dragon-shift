@@ -1,5 +1,4 @@
 pub mod archive_panel;
-pub mod controls_panel;
 pub mod create_panel;
 pub mod end_view;
 pub mod handover_view;
@@ -10,6 +9,5 @@ pub mod notice;
 pub mod phase0_view;
 pub mod phase1_view;
 pub mod phase2_view;
-pub mod session_panel;
 pub mod voting_view;
 pub mod workshop_brief;

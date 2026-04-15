@@ -7,9 +7,8 @@ mod state;
 
 use dioxus::prelude::*;
 
-use components::archive_panel::ArchivePanel;
-use components::controls_panel::ControlsPanel;
 use components::create_panel::CreatePanel;
+use components::end_view::EndView;
 use components::handover_view::HandoverView;
 use components::hero::Hero;
 use components::join_panel::JoinPanel;
@@ -17,7 +16,8 @@ use components::lobby_view::LobbyView;
 use components::notice::NoticeBar;
 use components::phase0_view::Phase0View;
 use components::phase1_view::Phase1View;
-use components::session_panel::SessionPanel;
+use components::phase2_view::Phase2View;
+use components::voting_view::VotingView;
 use components::workshop_brief::WorkshopBrief;
 
 use helpers::poke_icon_url;
@@ -83,7 +83,11 @@ fn App() -> Element {
     let is_lobby = render_session_panels_first && current_phase == Some(Phase::Lobby);
     let is_phase0 = render_session_panels_first && current_phase == Some(Phase::Phase0);
     let is_phase1 = render_session_panels_first && current_phase == Some(Phase::Phase1);
+    let is_phase2 = render_session_panels_first && current_phase == Some(Phase::Phase2);
     let is_handover = render_session_panels_first && current_phase == Some(Phase::Handover);
+    let is_voting = render_session_panels_first && current_phase == Some(Phase::Voting);
+    let is_judge = render_session_panels_first && current_phase == Some(Phase::Judge);
+    let is_end = render_session_panels_first && current_phase == Some(Phase::End);
     let show_clock = render_session_panels_first && is_clock_phase;
 
     let time_string = format!("{:02}:00", game_time.rem_euclid(24));
@@ -91,19 +95,27 @@ fn App() -> Element {
     let clock_icon_url = poke_icon_url(clock_icon);
 
     // ---- Container class ----
-    let container_class = if is_lobby {
-        "shell__container shell__container--lobby"
-    } else if is_phase0 {
+    let container_class = if is_phase0 {
         "shell__container shell__container--phase0"
-    } else if is_phase1 {
+    } else if is_phase1 || is_phase2 {
         "shell__container shell__container--phase1"
     } else if is_handover {
         "shell__container shell__container--handover"
+    } else if is_voting {
+        "shell__container shell__container--voting"
+    } else if is_judge || is_end {
+        "shell__container shell__container--end"
     } else {
         "shell__container"
     };
 
-    let shell_class = if is_daytime { "shell shell--day" } else { "shell shell--night" };
+    // Day/night background only applies during clock phases (Phase1/Phase2).
+    // Home screen (no game_state) and other phases use the neutral shell background.
+    let shell_class = if is_clock_phase {
+        if is_daytime { "shell shell--day" } else { "shell shell--night" }
+    } else {
+        "shell"
+    };
 
     let mut effect_identity = identity;
     let mut effect_ops = ops;
@@ -135,15 +147,7 @@ fn App() -> Element {
                 }
             }
             section { class: container_class,
-                if is_lobby {
-                    LobbyView {
-                        identity,
-                        game_state,
-                        ops,
-                        handover_tags_input,
-                        judge_bundle,
-                    }
-                } else if is_phase0 {
+                if is_phase0 {
                     Phase0View {
                         identity,
                         game_state,
@@ -169,30 +173,57 @@ fn App() -> Element {
                         handover_tags_input,
                         judge_bundle,
                     }
+                } else if is_phase2 {
+                    NoticeBar { ops }
+                    Phase2View {
+                        identity,
+                        game_state,
+                        ops,
+                        handover_tags_input,
+                        judge_bundle,
+                    }
+                } else if is_voting {
+                    NoticeBar { ops }
+                    VotingView {
+                        identity,
+                        game_state,
+                        ops,
+                        handover_tags_input,
+                        judge_bundle,
+                    }
+                } else if is_judge {
+                    NoticeBar { ops }
+                    EndView {
+                        identity,
+                        game_state,
+                        ops,
+                        handover_tags_input,
+                        judge_bundle,
+                    }
+                } else if is_end {
+                    NoticeBar { ops }
+                    EndView {
+                        identity,
+                        game_state,
+                        ops,
+                        handover_tags_input,
+                        judge_bundle,
+                    }
                 } else {
+                    // ---- Home screen ----
                     Hero { identity, game_state }
                     NoticeBar { ops }
                     section { class: "grid",
-                        if render_session_panels_first {
-                            // ---- Session screen ----
-                            SessionPanel {
+                        WorkshopBrief {}
+                        if is_lobby {
+                            LobbyView {
                                 identity,
                                 game_state,
                                 ops,
                                 handover_tags_input,
                                 judge_bundle,
                             }
-                            ControlsPanel {
-                                identity,
-                                game_state,
-                                ops,
-                                handover_tags_input,
-                                judge_bundle,
-                            }
-                            ArchivePanel { game_state, judge_bundle }
                         } else {
-                            // ---- Home screen ----
-                            WorkshopBrief {}
                             CreatePanel {
                                 identity,
                                 game_state,

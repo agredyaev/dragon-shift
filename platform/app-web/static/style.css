@@ -100,10 +100,14 @@
         inset: -64px;
         pointer-events: none;
         z-index: -1;
+        background-image:
+            linear-gradient(45deg, rgba(165, 228, 255, 0.16) 25%, transparent 25%, transparent 75%, rgba(165, 228, 255, 0.16) 75%),
+            linear-gradient(45deg, rgba(76, 99, 217, 0.12) 25%, transparent 25%, transparent 75%, rgba(76, 99, 217, 0.12) 75%);
         background-size: 64px 64px, 64px 64px;
         background-position: 0 0, 32px 32px;
         will-change: transform;
         transition: background-image 1s ease;
+        animation: bgPan 24s linear infinite;
     }
     /* Night pattern (default): polka-dot starfield */
     .shell--night .shell__container::before {
@@ -796,7 +800,7 @@
     /* ---- Phase 0: sprite grid (all 4 emotions) ---- */
     .sprite-grid {
         display: grid;
-        grid-template-columns: repeat(2, 1fr);
+        grid-template-columns: repeat(4, 1fr);
         gap: 12px;
     }
     .sprite-grid__cell {
@@ -959,6 +963,12 @@
         align-items: center;
         justify-content: center;
         min-height: calc(100vh - 96px);
+    }
+    .shell__container--voting {
+        max-width: 900px;
+    }
+    .shell__container--end {
+        max-width: 900px;
     }
     @media (max-width: 720px) {
         .handover-card {
@@ -1240,6 +1250,13 @@
     }
 
     /* ---- Decay badge (phase 2) ---- */
+    .phase2-creator-label {
+        margin: 4px 0 0;
+        font-size: 10px;
+        color: #94a3b8;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+    }
     .decay-badge {
         display: inline-flex;
         align-items: center;

@@ -1238,39 +1238,34 @@ fn slice_sprite_sheet(image_base64: &str) -> Result<SpriteSet, LlmError> {
 }
 
 fn build_sprite_sheet_system_instruction() -> &'static str {
-    r#"You are a production sprite-sheet generator for an automated game pipeline.
+    r#"You are a sprite-sheet generator for a pixel-art dragon game.
 
 Your output will be sliced mechanically into 4 equal tiles, so layout accuracy is mandatory.
 
+Subject: 2D pixel art cute baby dragon.
+
 Hard requirements:
 - Return exactly one image.
-- The full canvas must be a 2 columns × 2 rows sprite sheet.
+- The full canvas must be a 2 columns x 2 rows sprite sheet.
 - Use equal-sized tiles with perfect alignment.
 - No gutters, no spacing, no borders, no frames, no labels, no captions, no text.
 - Show the same dragon in all 4 tiles.
 - Keep the same camera angle, scale, framing, and silhouette in every tile.
 - Center the dragon in each tile and let it fill most of the tile.
-- Retro pixel-art only: crisp edges, no anti-aliasing, no painterly shading, no blur.
+- Retro pixel-art style: crisp edges, no anti-aliasing, no blur.
 - Background must be transparent or a uniform dark flat background.
 - No props, scenery, UI, speech bubbles, or extra characters.
 
 Emotion order is fixed:
 - Top row, left to right: neutral, happy
-- Bottom row, left to right: angry, sleepy
-
-Positive example of the required layout:
-- [neutral][happy]
-- [angry][sleepy]"#
+- Bottom row, left to right: angry, sleepy"#
 }
 
 fn build_sprite_sheet_user_prompt(description: &str) -> String {
     format!(
-        r#"Create a single sprite sheet image that follows the system instructions.
-
-Dragon description: {description}
+        r#"Draw a 2D pixel art cute baby dragon with these traits: {description}
 
 Render the same dragon across 4 emotion tiles with clearly distinct facial expression and body language.
-Do not add any text or decorative frame elements.
 Return exactly one image."#
     )
 }

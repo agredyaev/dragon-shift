@@ -139,14 +139,26 @@ pub fn VotingView(
             }
             div { class: "button-row",
                 button {
-                    class: "button button--secondary",
+                    class: "button button--primary",
+                    "data-testid": "reveal-results-button",
                     disabled: commands_disabled || !reveal_enabled,
                     onclick: move |_| {
                         spawn(submit_workshop_command(identity, ops, handover_tags_input, judge_bundle, SessionCommand::RevealVotingResults, None));
                     },
                     "Reveal results"
                 }
+                button {
+                    class: "button button--secondary",
+                    "data-testid": "reset-game-button",
+                    disabled: commands_disabled,
+                    onclick: move |_| {
+                        spawn(submit_workshop_command(identity, ops, handover_tags_input, judge_bundle, SessionCommand::ResetGame, None));
+                    },
+                    "Reset workshop"
+                }
             }
+        } else {
+            p { class: "meta", "Waiting for the host to reveal the final standings." }
         }
     }
 }
