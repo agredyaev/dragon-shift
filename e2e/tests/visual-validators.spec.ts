@@ -128,11 +128,23 @@ async function openReconnectWindow(
   expectedText: string,
 ) {
   const player = await newPlayerContext(browser)
-  await gotoApp(player.page)
-  await player.page.getByTestId('reconnect-session-code-input').fill(workshopCode)
-  await player.page.getByTestId('reconnect-token-input').fill(reconnectToken)
-  await player.page.getByTestId('reconnect-button').click()
-  await expect(player.page.getByTestId('session-panel')).toContainText(expectedText)
+  await player.page.goto('/')
+
+  const sessionPanel = player.page.getByTestId('session-panel')
+  const reconnectButton = player.page.getByTestId('reconnect-button')
+
+  await Promise.race([
+    sessionPanel.waitFor({ state: 'visible', timeout: 30_000 }).then(() => 'session'),
+    reconnectButton.waitFor({ state: 'visible', timeout: 30_000 }).then(() => 'home'),
+  ])
+
+  if (await reconnectButton.isVisible().catch(() => false)) {
+    await player.page.getByTestId('reconnect-session-code-input').fill(workshopCode)
+    await player.page.getByTestId('reconnect-token-input').fill(reconnectToken)
+    await reconnectButton.click()
+  }
+
+  await expect(sessionPanel).toContainText(expectedText)
   await expect(player.page.getByTestId('connection-badge')).toContainText('Connected')
   return player
 }

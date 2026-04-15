@@ -11,5 +11,6 @@ context.md
 CONTEXT.md
 helm
 platform/target
+!platform/target/aarch64-unknown-linux-gnu/release/app-server
 platform/.tmp
 README.md
