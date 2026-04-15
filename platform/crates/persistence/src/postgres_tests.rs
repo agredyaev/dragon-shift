@@ -7,8 +7,11 @@ mod postgres_tests {
     use protocol::{Phase, SessionArtifactKind, SessionArtifactRecord};
     use serde_json::json;
     use sqlx::PgPool;
-    use std::{net::TcpListener, ops::Deref, process::Command};
+    use std::{ops::Deref, process::Command, sync::LazyLock};
     use uuid::Uuid;
+
+    static EPHEMERAL_POSTGRES_TEST_MUTEX: LazyLock<tokio::sync::Mutex<()>> =
+        LazyLock::new(|| tokio::sync::Mutex::new(()));
 
     /// Returns `TEST_DATABASE_URL` from the environment, or `None` if unset.
     fn database_url() -> Option<String> {
@@ -57,21 +60,45 @@ mod postgres_tests {
         format!("{base_url}{separator}options=-csearch_path%3D{schema}")
     }
 
-    fn allocate_local_port() -> u16 {
-        TcpListener::bind("127.0.0.1:0")
-            .expect("bind ephemeral port")
-            .local_addr()
-            .expect("local addr")
-            .port()
+    async fn docker_host_port(container_name: &str, container_port: &str) -> u16 {
+        for _ in 0..20 {
+            let output = Command::new("docker")
+                .args(["port", container_name, container_port])
+                .output()
+                .expect("read ephemeral Postgres port mapping");
+
+            if output.status.success() {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                if let Some(port) = stdout
+                    .lines()
+                    .find_map(|line| line.rsplit(':').next()?.trim().parse().ok())
+                {
+                    return port;
+                }
+            }
+
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
+
+        panic!("timed out reading mapped docker port for ephemeral postgres")
     }
 
     async fn wait_for_postgres(database_url: &str) {
-        for _ in 0..60 {
-            if PgPool::connect(database_url).await.is_ok() {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(120);
+        while tokio::time::Instant::now() < deadline {
+            if let Ok(Ok(pool)) = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                PgPool::connect(database_url),
+            )
+            .await
+            {
+                pool.close().await;
                 return;
             }
+
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         }
+
         panic!("timed out waiting for ephemeral postgres");
     }
 
@@ -140,9 +167,9 @@ mod postgres_tests {
         let (container_name, url) = if let Some(url) = database_url() {
             (None, url)
         } else {
+            let _ephemeral_postgres_guard = EPHEMERAL_POSTGRES_TEST_MUTEX.lock().await;
             let container_name =
                 format!("dragon-switch-persistence-pg-{}", Uuid::new_v4().simple());
-            let host_port = allocate_local_port();
             let status = Command::new("docker")
                 .args([
                     "run",
@@ -157,7 +184,7 @@ mod postgres_tests {
                     "-e",
                     "POSTGRES_DB=dragon_switch_test",
                     "-p",
-                    &format!("{}:5432", host_port),
+                    "5432",
                     "postgres:16-alpine",
                 ])
                 .status()
@@ -166,6 +193,8 @@ mod postgres_tests {
                 status.success(),
                 "docker run for Postgres test container failed"
             );
+
+            let host_port = docker_host_port(&container_name, "5432/tcp").await;
 
             let url = format!(
                 "postgres://postgres:postgres@127.0.0.1:{}/dragon_switch_test",

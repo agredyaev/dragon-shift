@@ -121,15 +121,20 @@ struct PostgresAppTestStore {
     base_url: String,
     schema: String,
     store: Arc<PostgresSessionStore>,
+    _ephemeral_guard: Option<tokio::sync::OwnedMutexGuard<()>>,
 }
+
+static EPHEMERAL_POSTGRES_TEST_MUTEX: LazyLock<Arc<tokio::sync::Mutex<()>>> =
+    LazyLock::new(|| Arc::new(tokio::sync::Mutex::new(())));
 
 impl PostgresAppTestStore {
     async fn new(test_name: &str) -> Self {
-        let (container_name, url) = if let Some(url) = postgres_test_database_url() {
-            (None, url)
+        let (container_name, url, ephemeral_guard) = if let Some(url) = postgres_test_database_url()
+        {
+            (None, url, None)
         } else {
+            let ephemeral_guard = EPHEMERAL_POSTGRES_TEST_MUTEX.clone().lock_owned().await;
             let container_name = format!("dragon-shift-pg-{}", Uuid::new_v4().simple());
-            let host_port = allocate_local_port().await;
             let status = Command::new("docker")
                 .args([
                     "run",
@@ -144,7 +149,7 @@ impl PostgresAppTestStore {
                     "-e",
                     "POSTGRES_DB=dragon_shift_test",
                     "-p",
-                    &format!("{}:5432", host_port),
+                    "5432",
                     "postgres:16-alpine",
                 ])
                 .status()
@@ -154,12 +159,14 @@ impl PostgresAppTestStore {
                 "docker run for Postgres test container failed"
             );
 
+            let host_port = docker_host_port(&container_name, "5432/tcp").await;
+
             let url = format!(
                 "postgres://postgres:postgres@127.0.0.1:{}/dragon_shift_test",
                 host_port
             );
             wait_for_postgres(&url).await;
-            (Some(container_name), url)
+            (Some(container_name), url, Some(ephemeral_guard))
         };
         let schema = postgres_test_schema_name(test_name);
         create_schema(&url, &schema).await;
@@ -175,6 +182,7 @@ impl PostgresAppTestStore {
             base_url: url,
             schema,
             store,
+            _ephemeral_guard: ephemeral_guard,
         }
     }
 
@@ -199,6 +207,7 @@ impl PostgresAppTestStore {
             base_url,
             schema,
             store,
+            _ephemeral_guard,
         } = self;
         drop(store);
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -216,22 +225,45 @@ impl PostgresAppTestStore {
     }
 }
 
-async fn allocate_local_port() -> u16 {
-    tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
-        .await
-        .expect("bind ephemeral port")
-        .local_addr()
-        .expect("local addr")
-        .port()
+async fn docker_host_port(container_name: &str, container_port: &str) -> u16 {
+    for _ in 0..20 {
+        let output = Command::new("docker")
+            .args(["port", container_name, container_port])
+            .output()
+            .expect("read ephemeral Postgres port mapping");
+
+        if output.status.success() {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            if let Some(port) = stdout
+                .lines()
+                .find_map(|line| line.rsplit(':').next()?.trim().parse().ok())
+            {
+                return port;
+            }
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+
+    panic!("timed out reading mapped docker port for ephemeral postgres")
 }
 
 async fn wait_for_postgres(database_url: &str) {
-    for _ in 0..60 {
-        if PgPool::connect(database_url).await.is_ok() {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(120);
+    while tokio::time::Instant::now() < deadline {
+        if let Ok(Ok(pool)) = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            PgPool::connect(database_url),
+        )
+        .await
+        {
+            pool.close().await;
             return;
         }
+
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
+
     panic!("timed out waiting for ephemeral postgres");
 }
 
