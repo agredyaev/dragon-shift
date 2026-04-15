@@ -9,12 +9,17 @@ export const projectProfiles: Record<string, DeviceProfile> = {
 
 const defaultBaseURL = process.env.E2E_BASE_URL ?? 'http://127.0.0.1:32000'
 
-export function getProjectContextOptions(projectName: string): BrowserContextOptions {
+export function getProjectContextOptions(
+  projectName: string,
+  baseURL?: string,
+): BrowserContextOptions {
+  const resolvedBaseURL = baseURL ?? defaultBaseURL
+
   const profile = projectProfiles[projectName]
   if (!profile) {
-    return { baseURL: defaultBaseURL }
+    return { baseURL: resolvedBaseURL }
   }
 
   const { defaultBrowserType: _defaultBrowserType, ...contextOptions } = profile
-  return { ...contextOptions, baseURL: defaultBaseURL }
+  return { ...contextOptions, baseURL: resolvedBaseURL }
 }

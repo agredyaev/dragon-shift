@@ -51,7 +51,9 @@ export async function generateDragonSprites(page: Page, timeout = 120_000) {
 export async function newPlayerContext(
   browser: Browser,
 ): Promise<{ context: BrowserContext; page: Page }> {
-  const context = await browser.newContext(getProjectContextOptions(test.info().project.name))
+  const context = await browser.newContext(
+    getProjectContextOptions(test.info().project.name, test.info().project.use.baseURL),
+  )
   const page = await context.newPage()
   return { context, page }
 }

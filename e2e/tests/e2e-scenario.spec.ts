@@ -35,7 +35,7 @@ interface PlayerCtx {
 }
 
 async function freshPlayerCtx(browser: Browser, role: Role): Promise<PlayerCtx> {
-  const opts = getProjectContextOptions(test.info().project.name)
+  const opts = getProjectContextOptions(test.info().project.name, test.info().project.use.baseURL)
   const context = await browser.newContext(opts)
   const page = await context.newPage()
   return { context, page, role }
