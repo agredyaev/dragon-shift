@@ -1,9 +1,15 @@
+use chrono::{DateTime, Utc};
 use protocol::{
     JudgeBundle, LlmDragonEvaluation, LlmJudgeEvaluation, LlmProviderEntry, LlmProviderKind,
     SpriteSet,
 };
+use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use serde::{Deserialize, Serialize};
-use std::{env, sync::Arc, time::Duration};
+use std::{
+    env, fs,
+    sync::Arc,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
@@ -131,7 +137,7 @@ pub(crate) fn load_llm_pool_config() -> Result<LlmPoolConfig, String> {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Deserialize)]
-struct MetadataTokenResponse {
+struct AccessTokenResponse {
     access_token: String,
     #[allow(dead_code)]
     expires_in: u64,
@@ -145,10 +151,114 @@ pub(crate) struct GceTokenCache {
     client: reqwest::Client,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct ServiceAccountCredentials {
+    client_email: String,
+    private_key: String,
+    #[serde(default = "default_google_token_uri")]
+    token_uri: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct AuthorizedUserCredentials {
+    client_id: String,
+    client_secret: String,
+    refresh_token: String,
+    #[serde(default = "default_google_token_uri")]
+    token_uri: String,
+    #[serde(default)]
+    service_account_impersonation_url: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+enum GoogleApplicationCredentials {
+    ServiceAccount(ServiceAccountCredentials),
+    AuthorizedUser(AuthorizedUserCredentials),
+}
+
+#[derive(Serialize)]
+struct ServiceAccountJwtClaims<'a> {
+    iss: &'a str,
+    scope: &'a str,
+    aud: &'a str,
+    exp: usize,
+    iat: usize,
+}
+
+#[derive(Serialize)]
+struct ServiceAccountTokenRequest<'a> {
+    grant_type: &'a str,
+    assertion: &'a str,
+}
+
+#[derive(Serialize)]
+struct AuthorizedUserTokenRequest<'a> {
+    client_id: &'a str,
+    client_secret: &'a str,
+    refresh_token: &'a str,
+    grant_type: &'a str,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ImpersonatedTokenRequest<'a> {
+    scope: &'a [&'a str],
+    lifetime: &'a str,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ImpersonatedTokenResponse {
+    access_token: String,
+    expire_time: String,
+}
+
 #[derive(Clone)]
 struct CachedToken {
     access_token: String,
     expires_at: std::time::Instant,
+}
+
+fn default_google_token_uri() -> String {
+    "https://oauth2.googleapis.com/token".to_string()
+}
+
+fn build_cached_token(access_token: String, expires_in: u64) -> CachedToken {
+    CachedToken {
+        access_token,
+        expires_at: std::time::Instant::now() + Duration::from_secs(expires_in),
+    }
+}
+
+fn build_cached_token_from_expire_time(
+    access_token: String,
+    expire_time: &str,
+) -> Result<CachedToken, LlmError> {
+    let expires_at = DateTime::parse_from_rfc3339(expire_time).map_err(|e| {
+        LlmError::ProviderUnavailable(format!("parse impersonated token expiry: {e}"))
+    })?;
+    let remaining_seconds = (expires_at.with_timezone(&Utc) - Utc::now())
+        .num_seconds()
+        .max(0) as u64;
+    Ok(build_cached_token(access_token, remaining_seconds))
+}
+
+fn configured_impersonation_url(adc_url: Option<&str>) -> Option<String> {
+    env::var("GOOGLE_IMPERSONATE_SERVICE_ACCOUNT")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .map(|service_account| {
+            format!(
+                "https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/{service_account}:generateAccessToken"
+            )
+        })
+        .or_else(|| {
+            adc_url
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        })
 }
 
 impl GceTokenCache {
@@ -169,6 +279,32 @@ impl GceTokenCache {
             }
         }
 
+        if let Some(token) = env::var("GOOGLE_OAUTH_ACCESS_TOKEN")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+        {
+            let expires_in = env::var("GOOGLE_OAUTH_ACCESS_TOKEN_EXPIRES_IN")
+                .ok()
+                .and_then(|value| value.trim().parse::<u64>().ok())
+                .filter(|value| *value > 60)
+                .unwrap_or(3000);
+            let cached = build_cached_token(token.clone(), expires_in);
+            *self.token.lock().await = Some(cached);
+            return Ok(token);
+        }
+
+        if let Some(path) = env::var("GOOGLE_APPLICATION_CREDENTIALS")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+        {
+            let cached = fetch_google_application_credentials_token(&self.client, &path).await?;
+            let access_token = cached.access_token.clone();
+            *self.token.lock().await = Some(cached);
+            return Ok(access_token);
+        }
+
         let response = self
             .client
             .get("http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token")
@@ -185,18 +321,183 @@ impl GceTokenCache {
             )));
         }
 
-        let body: MetadataTokenResponse = response
+        let body: AccessTokenResponse = response
             .json()
             .await
             .map_err(|e| LlmError::ProviderUnavailable(format!("metadata token parse: {e}")))?;
 
-        let cached = CachedToken {
-            access_token: body.access_token.clone(),
-            expires_at: std::time::Instant::now() + Duration::from_secs(body.expires_in),
-        };
+        let cached = build_cached_token(body.access_token.clone(), body.expires_in);
         *self.token.lock().await = Some(cached);
 
         Ok(body.access_token)
+    }
+}
+
+fn load_google_application_credentials(path: &str) -> Result<GoogleApplicationCredentials, LlmError> {
+    let raw = fs::read_to_string(path).map_err(|e| {
+        LlmError::ProviderUnavailable(format!(
+            "read GOOGLE_APPLICATION_CREDENTIALS file {path}: {e}"
+        ))
+    })?;
+    let value: serde_json::Value = serde_json::from_str(&raw).map_err(|e| {
+        LlmError::ProviderUnavailable(format!(
+            "parse GOOGLE_APPLICATION_CREDENTIALS file {path}: {e}"
+        ))
+    })?;
+    let credential_type = value
+        .get("type")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default();
+    match credential_type {
+        "service_account" => serde_json::from_value(value)
+            .map(GoogleApplicationCredentials::ServiceAccount)
+            .map_err(|e| {
+                LlmError::ProviderUnavailable(format!(
+                    "parse service_account GOOGLE_APPLICATION_CREDENTIALS file {path}: {e}"
+                ))
+            }),
+        "authorized_user" => serde_json::from_value(value)
+            .map(GoogleApplicationCredentials::AuthorizedUser)
+            .map_err(|e| {
+                LlmError::ProviderUnavailable(format!(
+                    "parse authorized_user GOOGLE_APPLICATION_CREDENTIALS file {path}: {e}"
+                ))
+            }),
+        other => Err(LlmError::ProviderUnavailable(format!(
+            "unsupported GOOGLE_APPLICATION_CREDENTIALS type '{other}' in {path}"
+        ))),
+    }
+}
+
+async fn fetch_service_account_token(
+    client: &reqwest::Client,
+    credentials: &ServiceAccountCredentials,
+) -> Result<AccessTokenResponse, LlmError> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| LlmError::ProviderUnavailable(format!("system clock before epoch: {e}")))?
+        .as_secs() as usize;
+    let claims = ServiceAccountJwtClaims {
+        iss: &credentials.client_email,
+        scope: "https://www.googleapis.com/auth/cloud-platform",
+        aud: &credentials.token_uri,
+        iat: now,
+        exp: now + 3600,
+    };
+    let key = EncodingKey::from_rsa_pem(credentials.private_key.as_bytes()).map_err(|e| {
+        LlmError::ProviderUnavailable(format!("decode service account private key: {e}"))
+    })?;
+    let assertion = encode(&Header::new(Algorithm::RS256), &claims, &key)
+        .map_err(|e| LlmError::ProviderUnavailable(format!("sign service account jwt: {e}")))?;
+
+    let response = client
+        .post(&credentials.token_uri)
+        .form(&ServiceAccountTokenRequest {
+            grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer",
+            assertion: &assertion,
+        })
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await
+        .map_err(|e| LlmError::ProviderUnavailable(format!("service account token HTTP: {e}")))?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        return Err(LlmError::ProviderUnavailable(format!(
+            "service account token endpoint {}: {body}",
+            status.as_u16()
+        )));
+    }
+
+    response.json().await.map_err(|e| {
+        LlmError::ProviderUnavailable(format!("service account token parse: {e}"))
+    })
+}
+
+async fn fetch_authorized_user_token(
+    client: &reqwest::Client,
+    credentials: &AuthorizedUserCredentials,
+) -> Result<AccessTokenResponse, LlmError> {
+    let response = client
+        .post(&credentials.token_uri)
+        .form(&AuthorizedUserTokenRequest {
+            client_id: &credentials.client_id,
+            client_secret: &credentials.client_secret,
+            refresh_token: &credentials.refresh_token,
+            grant_type: "refresh_token",
+        })
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await
+        .map_err(|e| LlmError::ProviderUnavailable(format!("authorized user token HTTP: {e}")))?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        return Err(LlmError::ProviderUnavailable(format!(
+            "authorized user token endpoint {}: {body}",
+            status.as_u16()
+        )));
+    }
+
+    response.json().await.map_err(|e| {
+        LlmError::ProviderUnavailable(format!("authorized user token parse: {e}"))
+    })
+}
+
+async fn fetch_impersonated_service_account_token(
+    client: &reqwest::Client,
+    source_access_token: &str,
+    url: &str,
+) -> Result<CachedToken, LlmError> {
+    let scopes = ["https://www.googleapis.com/auth/cloud-platform"];
+    let response = client
+        .post(url)
+        .bearer_auth(source_access_token)
+        .json(&ImpersonatedTokenRequest {
+            scope: &scopes,
+            lifetime: "3600s",
+        })
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await
+        .map_err(|e| LlmError::ProviderUnavailable(format!("service account impersonation HTTP: {e}")))?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        return Err(LlmError::ProviderUnavailable(format!(
+            "service account impersonation endpoint {}: {body}",
+            status.as_u16()
+        )));
+    }
+
+    let body: ImpersonatedTokenResponse = response.json().await.map_err(|e| {
+        LlmError::ProviderUnavailable(format!("service account impersonation parse: {e}"))
+    })?;
+    build_cached_token_from_expire_time(body.access_token, &body.expire_time)
+}
+
+async fn fetch_google_application_credentials_token(
+    client: &reqwest::Client,
+    path: &str,
+) -> Result<CachedToken, LlmError> {
+    match load_google_application_credentials(path)? {
+        GoogleApplicationCredentials::ServiceAccount(credentials) => {
+            let body = fetch_service_account_token(client, &credentials).await?;
+            Ok(build_cached_token(body.access_token, body.expires_in))
+        }
+        GoogleApplicationCredentials::AuthorizedUser(credentials) => {
+            let body = fetch_authorized_user_token(client, &credentials).await?;
+            if let Some(url) = configured_impersonation_url(
+                credentials.service_account_impersonation_url.as_deref(),
+            ) {
+                fetch_impersonated_service_account_token(client, &body.access_token, &url).await
+            } else {
+                Ok(build_cached_token(body.access_token, body.expires_in))
+            }
+        }
     }
 }
 
@@ -882,12 +1183,12 @@ fn extract_gemini_image(body: &GeminiResponse) -> Result<(String, String), LlmEr
 }
 
 // ---------------------------------------------------------------------------
-// Sprite sheet slicing: base64 → 8 emotion frames → SpriteSet
+// Sprite sheet slicing: base64 → 4 emotion frames → SpriteSet
 // ---------------------------------------------------------------------------
 
-/// Layout: 4 columns × 2 rows.
-/// Row 0 (top):    happy, content, angry, tired
-/// Row 1 (bottom): excited, hungry, sleepy, neutral
+/// Layout: 2 columns × 2 rows.
+/// Top-left: neutral, Top-right: happy
+/// Bottom-left: angry, Bottom-right: sleepy
 fn slice_sprite_sheet(image_base64: &str) -> Result<SpriteSet, LlmError> {
     use base64::Engine as _;
     use image::{GenericImageView, ImageFormat, ImageReader};
@@ -911,12 +1212,12 @@ fn slice_sprite_sheet(image_base64: &str) -> Result<SpriteSet, LlmError> {
         })?;
 
     let (w, h) = img.dimensions();
-    let tile_w = w / 4;
+    let tile_w = w / 2;
     let tile_h = h / 2;
 
     if tile_w == 0 || tile_h == 0 {
         return Err(LlmError::BadRequest(format!(
-            "sprite sheet too small to slice into 4×2 grid: {w}×{h}"
+            "sprite sheet too small to slice into 2×2 grid: {w}×{h}"
         )));
     }
 
@@ -929,28 +1230,24 @@ fn slice_sprite_sheet(image_base64: &str) -> Result<SpriteSet, LlmError> {
     };
 
     Ok(SpriteSet {
-        happy: encode_tile(0, 0)?,
-        content: encode_tile(1, 0)?,
-        angry: encode_tile(2, 0)?,
-        tired: encode_tile(3, 0)?,
-        excited: encode_tile(0, 1)?,
-        hungry: encode_tile(1, 1)?,
-        sleepy: encode_tile(2, 1)?,
-        neutral: encode_tile(3, 1)?,
+        neutral: encode_tile(0, 0)?,
+        happy: encode_tile(1, 0)?,
+        angry: encode_tile(0, 1)?,
+        sleepy: encode_tile(1, 1)?,
     })
 }
 
 fn build_sprite_sheet_system_instruction() -> &'static str {
     r#"You are a production sprite-sheet generator for an automated game pipeline.
 
-Your output will be sliced mechanically into 8 equal tiles, so layout accuracy is mandatory.
+Your output will be sliced mechanically into 4 equal tiles, so layout accuracy is mandatory.
 
 Hard requirements:
 - Return exactly one image.
-- The full canvas must be a 4 columns × 2 rows sprite sheet.
+- The full canvas must be a 2 columns × 2 rows sprite sheet.
 - Use equal-sized tiles with perfect alignment.
 - No gutters, no spacing, no borders, no frames, no labels, no captions, no text.
-- Show the same dragon in all 8 tiles.
+- Show the same dragon in all 4 tiles.
 - Keep the same camera angle, scale, framing, and silhouette in every tile.
 - Center the dragon in each tile and let it fill most of the tile.
 - Retro pixel-art only: crisp edges, no anti-aliasing, no painterly shading, no blur.
@@ -958,12 +1255,12 @@ Hard requirements:
 - No props, scenery, UI, speech bubbles, or extra characters.
 
 Emotion order is fixed:
-- Top row, left to right: happy, content, angry, tired
-- Bottom row, left to right: excited, hungry, sleepy, neutral
+- Top row, left to right: neutral, happy
+- Bottom row, left to right: angry, sleepy
 
 Positive example of the required layout:
-- [happy][content][angry][tired]
-- [excited][hungry][sleepy][neutral]"#
+- [neutral][happy]
+- [angry][sleepy]"#
 }
 
 fn build_sprite_sheet_user_prompt(description: &str) -> String {
@@ -972,7 +1269,7 @@ fn build_sprite_sheet_user_prompt(description: &str) -> String {
 
 Dragon description: {description}
 
-Render the same dragon across 8 emotion tiles with clearly distinct facial expression and body language.
+Render the same dragon across 4 emotion tiles with clearly distinct facial expression and body language.
 Do not add any text or decorative frame elements.
 Return exactly one image."#
     )
@@ -1164,6 +1461,44 @@ fn validate_judge_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{LazyLock, Mutex as StdMutex, MutexGuard};
+
+    struct ScopedEnvVar {
+        key: &'static str,
+        original: Option<String>,
+        _guard: MutexGuard<'static, ()>,
+    }
+
+    static ENV_TEST_MUTEX: LazyLock<StdMutex<()>> = LazyLock::new(|| StdMutex::new(()));
+
+    impl ScopedEnvVar {
+        fn set(key: &'static str, value: &str) -> Self {
+            let guard = ENV_TEST_MUTEX.lock().expect("lock llm env test mutex");
+            let original = std::env::var(key).ok();
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self {
+                key,
+                original,
+                _guard: guard,
+            }
+        }
+    }
+
+    impl Drop for ScopedEnvVar {
+        fn drop(&mut self) {
+            if let Some(original) = &self.original {
+                unsafe {
+                    std::env::set_var(self.key, original);
+                }
+            } else {
+                unsafe {
+                    std::env::remove_var(self.key);
+                }
+            }
+        }
+    }
 
     fn mock_judge_bundle() -> JudgeBundle {
         JudgeBundle {
@@ -1382,10 +1717,12 @@ mod tests {
         let system = build_sprite_sheet_system_instruction();
         let user = build_sprite_sheet_user_prompt("violet crystal dragon");
 
-        assert!(system.contains("4 columns × 2 rows sprite sheet"));
+        assert!(system.contains("2 columns × 2 rows sprite sheet"));
         assert!(system.contains("No gutters, no spacing, no borders"));
-        assert!(system.contains("Top row, left to right: happy, content, angry, tired"));
+        assert!(system.contains("Top row, left to right: neutral, happy"));
+        assert!(system.contains("Bottom row, left to right: angry, sleepy"));
         assert!(user.contains("Dragon description: violet crystal dragon"));
+        assert!(user.contains("Render the same dragon across 4 emotion tiles"));
     }
 
     #[test]
@@ -1444,5 +1781,40 @@ mod tests {
         let resolved = resolve_providers(&entries, "test");
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].model, "gemini-1.5-pro");
+    }
+
+    #[test]
+    fn configured_impersonation_url_prefers_explicit_env() {
+        let _impersonate = ScopedEnvVar::set(
+            "GOOGLE_IMPERSONATE_SERVICE_ACCOUNT",
+            "dragon-shift-local-kube@rna-workshop.iam.gserviceaccount.com",
+        );
+
+        let url = configured_impersonation_url(Some(
+            "https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/ignored:generateAccessToken",
+        ));
+
+        assert_eq!(
+            url.as_deref(),
+            Some(
+                "https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/dragon-shift-local-kube@rna-workshop.iam.gserviceaccount.com:generateAccessToken"
+            )
+        );
+    }
+
+    #[test]
+    fn configured_impersonation_url_uses_adc_value_when_env_missing() {
+        let _impersonate = ScopedEnvVar::set("GOOGLE_IMPERSONATE_SERVICE_ACCOUNT", "");
+
+        let url = configured_impersonation_url(Some(
+            "https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/from-adc:generateAccessToken",
+        ));
+
+        assert_eq!(
+            url.as_deref(),
+            Some(
+                "https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/from-adc:generateAccessToken"
+            )
+        );
     }
 }

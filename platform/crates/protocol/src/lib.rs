@@ -78,10 +78,6 @@ pub enum DragonEmotion {
     Angry,
     Sleepy,
     Neutral,
-    Content,
-    Tired,
-    Excited,
-    Hungry,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -107,10 +103,6 @@ pub struct SpriteSet {
     pub happy: String,
     pub angry: String,
     pub sleepy: String,
-    pub content: String,
-    pub tired: String,
-    pub excited: String,
-    pub hungry: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -954,37 +946,29 @@ mod tests {
                 .step,
             0
         );
-        assert!(
-            settings
-                .phases
-                .get(&Phase::Lobby)
-                .expect("lobby phase")
-                .allowed_commands
-                .contains(&SessionCommand::Join)
-        );
-        assert!(
-            settings
-                .phases
-                .get(&Phase::Phase0)
-                .expect("phase0 phase")
-                .allowed_commands
-                .contains(&SessionCommand::UpdatePlayerPet)
-        );
-        assert!(
-            settings
-                .phases
-                .get(&Phase::Judge)
-                .expect("judge phase")
-                .allowed_commands
-                .contains(&SessionCommand::StartVoting)
-        );
-        assert!(
-            settings
-                .phases
-                .get(&Phase::Voting)
-                .expect("voting phase")
-                .allowed_commands
-                .contains(&SessionCommand::SubmitVote)
-        );
+        assert!(settings
+            .phases
+            .get(&Phase::Lobby)
+            .expect("lobby phase")
+            .allowed_commands
+            .contains(&SessionCommand::Join));
+        assert!(settings
+            .phases
+            .get(&Phase::Phase0)
+            .expect("phase0 phase")
+            .allowed_commands
+            .contains(&SessionCommand::UpdatePlayerPet));
+        assert!(settings
+            .phases
+            .get(&Phase::Judge)
+            .expect("judge phase")
+            .allowed_commands
+            .contains(&SessionCommand::StartVoting));
+        assert!(settings
+            .phases
+            .get(&Phase::Voting)
+            .expect("voting phase")
+            .allowed_commands
+            .contains(&SessionCommand::SubmitVote));
     }
 }

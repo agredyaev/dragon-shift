@@ -36,6 +36,7 @@ base64 = "0.22"
 tempfile = "3"
 dioxus = "0.7.0"
 dioxus-web = "0.7.0"
+jsonwebtoken = "9"
 protocol = { path = "crates/protocol" }
 domain = { path = "crates/domain" }
 persistence = { path = "crates/persistence" }
