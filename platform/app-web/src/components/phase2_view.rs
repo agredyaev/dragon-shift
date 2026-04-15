@@ -5,6 +5,8 @@ use crate::flows::submit_workshop_command;
 use crate::helpers::*;
 use crate::state::{IdentityState, OperationState};
 
+const PROGRESS_STEPS: i32 = 20;
+
 #[component]
 pub fn Phase2View(
     identity: Signal<IdentityState>,
@@ -24,17 +26,21 @@ pub fn Phase2View(
         o.pending_flow.is_some() || o.pending_command.is_some() || id.session_snapshot.is_none()
     };
 
-    let title = phase2_focus_title(state);
+    let dragon_name = current_dragon(state)
+        .map(|d| d.name.clone())
+        .unwrap_or_else(|| "Unknown".to_string());
     let creator = phase2_creator_label(state);
-    let handover = phase2_handover_summary(state);
-    let care = phase2_care_copy(state);
-
     let emotion = current_dragon(state)
-        .map(|d| dragon_emotion_label(d.last_emotion))
-        .unwrap_or("");
-    let last_action = current_dragon(state)
-        .map(|d| dragon_action_label(d.last_action))
-        .unwrap_or("");
+        .map(|d| d.last_emotion)
+        .unwrap_or(protocol::DragonEmotion::Neutral);
+    let emotion_label = dragon_emotion_label(emotion);
+    let anim_class = dragon_emotion_anim_class(emotion);
+
+    let sprite_url = current_dragon(state).and_then(|d| {
+        d.custom_sprites
+            .as_ref()
+            .map(|sp| sprite_url_for_emotion(sp, d.last_emotion))
+    });
 
     let (hunger, energy, happiness) = current_dragon(state)
         .map(|d| (d.stats.hunger, d.stats.energy, d.stats.happiness))
@@ -49,169 +55,292 @@ pub fn Phase2View(
         .and_then(|d| d.speech.clone())
         .filter(|s| !s.trim().is_empty());
 
+    let handover_tags: Vec<String> = current_dragon(state)
+        .map(|d| d.handover_tags.clone())
+        .unwrap_or_default();
+
+    let achievements: Vec<String> = current_player(state)
+        .map(|p| p.achievements.clone())
+        .unwrap_or_default();
+
     // Drop read guard before rsx closures
     drop(gs);
 
     rsx! {
-        // Dragon identity
-        article { class: "roster__item roster__item--phase",
-            div {
-                p { class: "roster__name", {title} }
-                p { class: "roster__meta", {creator} }
-            }
-            span { class: "roster__status roster__status--phase status-connected", "Care" }
-        }
-        p { class: "panel__body", {care} }
-
-        // Handover notes from previous caretaker
-        div { class: "panel__body",
-            p { class: "meta", "Handover notes from previous caretaker:" }
-            p { {handover} }
-        }
-
-        // Dragon speech bubble
-        if let Some(speech_text) = speech {
-            p { class: "meta", "\u{1f4ac} " {speech_text} }
-        }
-
-        // Stats bars
+        // ---- Dragon panel (header + sprite + stats) ----
         div { class: "panel__stack",
-            p { class: "meta", "Mood: " {emotion} " | Last action: " {last_action} }
-            div { class: "stat-bars",
-                div { class: "stat-bar",
-                    span { class: "stat-bar__label", "Hunger" }
-                    div { class: "stat-bar__track",
-                        div {
-                            class: "stat-bar__fill",
-                            style: format!("width:{}%", hunger.clamp(0, 100)),
-                        }
+            // Header row with creator name and 2X DECAY badge
+            div { class: "pixel-header",
+                div {
+                    h2 { class: "pixel-header__title", {dragon_name} }
+                    p { style: "margin:4px 0 0;font-size:10px;color:#94a3b8;text-transform:uppercase;letter-spacing:0.08em;",
+                        {creator}
                     }
-                    span { class: "stat-bar__value", {hunger.to_string()} }
                 }
-                div { class: "stat-bar",
-                    span { class: "stat-bar__label", "Energy" }
-                    div { class: "stat-bar__track",
-                        div {
-                            class: "stat-bar__fill",
-                            style: format!("width:{}%", energy.clamp(0, 100)),
-                        }
+                div { style: "display:flex;align-items:center;gap:12px;",
+                    p { class: "pixel-header__title", style: "font-size:12px;", "Phase 2: New Shift" }
+                    span { class: "decay-badge decay-badge--pulse",
+                        img { class: "pixel-icon", src: "{poke_icon_url(\"clock\")}", alt: "clock", width: 16, height: 16 }
+                        "2X Decay"
                     }
-                    span { class: "stat-bar__value", {energy.to_string()} }
-                }
-                div { class: "stat-bar",
-                    span { class: "stat-bar__label", "Happy" }
-                    div { class: "stat-bar__track",
-                        div {
-                            class: "stat-bar__fill",
-                            style: format!("width:{}%", happiness.clamp(0, 100)),
-                        }
-                    }
-                    span { class: "stat-bar__value", {happiness.to_string()} }
                 }
             }
-            if on_cooldown {
-                p { class: "meta", "Action cooldown: " {cooldown.to_string()} "s" }
+
+            // Dragon sprite display
+            div { class: "dragon-stage",
+                // Speech bubble
+                if let Some(ref speech_text) = speech {
+                    div { class: "speech-bubble",
+                        p { class: "speech-bubble__text", {speech_text.clone()} }
+                        div { class: "speech-bubble__tail" }
+                    }
+                }
+                // Animated dragon
+                if let Some(ref url) = sprite_url {
+                    div { class: "{anim_class}",
+                        img {
+                            class: "dragon-stage__sprite",
+                            src: "{url}",
+                            alt: "Dragon feeling {emotion_label}",
+                        }
+                    }
+                } else {
+                    p { class: "meta", "Mood: {emotion_label}" }
+                }
+            }
+
+            // Pixel progress bars
+            // Happiness
+            div { class: "pixel-stat-row",
+                div { class: "pixel-stat-row__header",
+                    span { class: "pixel-stat-row__label",
+                        img {
+                            class: "pixel-icon",
+                            src: "{poke_icon_url(\"heart\")}",
+                            alt: "heart",
+                            width: 24, height: 24,
+                        }
+                        "Happiness"
+                    }
+                    span { class: "pixel-stat-row__value", "{happiness}%" }
+                }
+                div { class: "pixel-progress-container",
+                    {(0..PROGRESS_STEPS).map(|i| {
+                        let filled = i < (happiness as f64 / 100.0 * PROGRESS_STEPS as f64).round() as i32;
+                        let cls = if filled { "pixel-progress-bar pixel-progress-bar--pink" } else { "pixel-progress-bar pixel-progress-bar--empty" };
+                        rsx! { div { class: "{cls}", key: "{i}" } }
+                    })}
+                }
+            }
+            // Hunger
+            div { class: "pixel-stat-row",
+                div { class: "pixel-stat-row__header",
+                    span { class: "pixel-stat-row__label",
+                        img {
+                            class: "pixel-icon",
+                            src: "{poke_icon_url(\"meat\")}",
+                            alt: "meat",
+                            width: 24, height: 24,
+                        }
+                        "Hunger"
+                    }
+                    span { class: "pixel-stat-row__value", "{hunger}%" }
+                }
+                div { class: "pixel-progress-container",
+                    {(0..PROGRESS_STEPS).map(|i| {
+                        let filled = i < (hunger as f64 / 100.0 * PROGRESS_STEPS as f64).round() as i32;
+                        let cls = if filled { "pixel-progress-bar pixel-progress-bar--orange" } else { "pixel-progress-bar pixel-progress-bar--empty" };
+                        rsx! { div { class: "{cls}", key: "{i}" } }
+                    })}
+                }
+            }
+            // Energy
+            div { class: "pixel-stat-row",
+                div { class: "pixel-stat-row__header",
+                    span { class: "pixel-stat-row__label",
+                        img {
+                            class: "pixel-icon",
+                            src: "{poke_icon_url(\"zap\")}",
+                            alt: "energy",
+                            width: 24, height: 24,
+                        }
+                        "Energy"
+                    }
+                    span { class: "pixel-stat-row__value", "{energy}%" }
+                }
+                div { class: "pixel-progress-container",
+                    {(0..PROGRESS_STEPS).map(|i| {
+                        let filled = i < (energy as f64 / 100.0 * PROGRESS_STEPS as f64).round() as i32;
+                        let cls = if filled { "pixel-progress-bar pixel-progress-bar--blue" } else { "pixel-progress-bar pixel-progress-bar--empty" };
+                        rsx! { div { class: "{cls}", key: "{i}" } }
+                    })}
+                }
             }
         }
 
-        // Action buttons
+        // ---- Handover notes from previous owner (sticky notes) ----
+        if !handover_tags.is_empty() {
+            div { class: "panel__stack",
+                div { class: "pixel-header-amber",
+                    h3 { class: "pixel-header__title", style: "display:flex;align-items:center;gap:8px;",
+                        img { class: "pixel-icon", src: "{poke_icon_url(\"alert\")}", alt: "notes", width: 24, height: 24 }
+                        "Previous Owner's Notes"
+                    }
+                }
+                div { class: "handover-notes",
+                    for tag in handover_tags.iter() {
+                        div { class: "handover-note", "* {tag}" }
+                    }
+                }
+            }
+        }
+
+        // ---- Actions panel ----
         div { class: "panel__stack",
-            p { class: "meta", "Actions" }
-            div { class: "button-row",
-                button {
-                    class: "button button--secondary",
-                    "data-testid": "action-feed-meat",
-                    disabled: commands_disabled || on_cooldown,
-                    onclick: move |_| {
-                        spawn(submit_workshop_command(
-                            identity, ops, handover_tags_input, judge_bundle,
-                            SessionCommand::Action,
-                            Some(serde_json::json!({"type": "feed", "value": "meat"})),
-                        ));
-                    },
-                    "Feed meat"
-                }
-                button {
-                    class: "button button--secondary",
-                    "data-testid": "action-feed-fruit",
-                    disabled: commands_disabled || on_cooldown,
-                    onclick: move |_| {
-                        spawn(submit_workshop_command(
-                            identity, ops, handover_tags_input, judge_bundle,
-                            SessionCommand::Action,
-                            Some(serde_json::json!({"type": "feed", "value": "fruit"})),
-                        ));
-                    },
-                    "Feed fruit"
-                }
-                button {
-                    class: "button button--secondary",
-                    "data-testid": "action-feed-fish",
-                    disabled: commands_disabled || on_cooldown,
-                    onclick: move |_| {
-                        spawn(submit_workshop_command(
-                            identity, ops, handover_tags_input, judge_bundle,
-                            SessionCommand::Action,
-                            Some(serde_json::json!({"type": "feed", "value": "fish"})),
-                        ));
-                    },
-                    "Feed fish"
+            div { class: "pixel-header",
+                h3 { class: "pixel-header__title", "Actions" }
+                if on_cooldown {
+                    span { class: "cooldown-label cooldown-label--pulse",
+                        "Wait {cooldown}s..."
+                    }
                 }
             }
-            div { class: "button-row",
-                button {
-                    class: "button button--secondary",
-                    "data-testid": "action-play-fetch",
-                    disabled: commands_disabled || on_cooldown,
-                    onclick: move |_| {
-                        spawn(submit_workshop_command(
-                            identity, ops, handover_tags_input, judge_bundle,
-                            SessionCommand::Action,
-                            Some(serde_json::json!({"type": "play", "value": "fetch"})),
-                        ));
-                    },
-                    "Play fetch"
+            div { style: "padding:16px;",
+                // Feed section
+                p { class: "action-section-label", "Feed" }
+                div { class: "action-grid",
+                    button {
+                        class: "action-btn action-btn--meat",
+                        "data-testid": "action-feed-meat",
+                        disabled: commands_disabled || on_cooldown,
+                        onclick: move |_| {
+                            spawn(submit_workshop_command(
+                                identity, ops, handover_tags_input, judge_bundle,
+                                SessionCommand::Action,
+                                Some(serde_json::json!({"type": "feed", "value": "meat"})),
+                            ));
+                        },
+                        img { class: "pixel-icon", src: "{poke_icon_url(\"meat\")}", alt: "meat", width: 32, height: 32 }
+                        "Meat"
+                    }
+                    button {
+                        class: "action-btn action-btn--fruit",
+                        "data-testid": "action-feed-fruit",
+                        disabled: commands_disabled || on_cooldown,
+                        onclick: move |_| {
+                            spawn(submit_workshop_command(
+                                identity, ops, handover_tags_input, judge_bundle,
+                                SessionCommand::Action,
+                                Some(serde_json::json!({"type": "feed", "value": "fruit"})),
+                            ));
+                        },
+                        img { class: "pixel-icon", src: "{poke_icon_url(\"fruit\")}", alt: "fruit", width: 32, height: 32 }
+                        "Fruit"
+                    }
+                    button {
+                        class: "action-btn action-btn--fish",
+                        "data-testid": "action-feed-fish",
+                        disabled: commands_disabled || on_cooldown,
+                        onclick: move |_| {
+                            spawn(submit_workshop_command(
+                                identity, ops, handover_tags_input, judge_bundle,
+                                SessionCommand::Action,
+                                Some(serde_json::json!({"type": "feed", "value": "fish"})),
+                            ));
+                        },
+                        img { class: "pixel-icon", src: "{poke_icon_url(\"fish\")}", alt: "fish", width: 32, height: 32 }
+                        "Fish"
+                    }
                 }
-                button {
-                    class: "button button--secondary",
-                    "data-testid": "action-play-puzzle",
-                    disabled: commands_disabled || on_cooldown,
-                    onclick: move |_| {
-                        spawn(submit_workshop_command(
-                            identity, ops, handover_tags_input, judge_bundle,
-                            SessionCommand::Action,
-                            Some(serde_json::json!({"type": "play", "value": "puzzle"})),
-                        ));
-                    },
-                    "Play puzzle"
+                // Play section
+                p { class: "action-section-label", style: "margin-top:16px;", "Play" }
+                div { class: "action-grid",
+                    button {
+                        class: "action-btn action-btn--fetch",
+                        "data-testid": "action-play-fetch",
+                        disabled: commands_disabled || on_cooldown,
+                        onclick: move |_| {
+                            spawn(submit_workshop_command(
+                                identity, ops, handover_tags_input, judge_bundle,
+                                SessionCommand::Action,
+                                Some(serde_json::json!({"type": "play", "value": "fetch"})),
+                            ));
+                        },
+                        img { class: "pixel-icon", src: "{poke_icon_url(\"fetch\")}", alt: "fetch", width: 32, height: 32 }
+                        "Fetch"
+                    }
+                    button {
+                        class: "action-btn action-btn--puzzle",
+                        "data-testid": "action-play-puzzle",
+                        disabled: commands_disabled || on_cooldown,
+                        onclick: move |_| {
+                            spawn(submit_workshop_command(
+                                identity, ops, handover_tags_input, judge_bundle,
+                                SessionCommand::Action,
+                                Some(serde_json::json!({"type": "play", "value": "puzzle"})),
+                            ));
+                        },
+                        img { class: "pixel-icon", src: "{poke_icon_url(\"puzzle\")}", alt: "puzzle", width: 32, height: 32 }
+                        "Puzzle"
+                    }
+                    button {
+                        class: "action-btn action-btn--music",
+                        "data-testid": "action-play-music",
+                        disabled: commands_disabled || on_cooldown,
+                        onclick: move |_| {
+                            spawn(submit_workshop_command(
+                                identity, ops, handover_tags_input, judge_bundle,
+                                SessionCommand::Action,
+                                Some(serde_json::json!({"type": "play", "value": "music"})),
+                            ));
+                        },
+                        img { class: "pixel-icon", src: "{poke_icon_url(\"music\")}", alt: "music", width: 32, height: 32 }
+                        "Music"
+                    }
                 }
-                button {
-                    class: "button button--secondary",
-                    "data-testid": "action-play-music",
-                    disabled: commands_disabled || on_cooldown,
-                    onclick: move |_| {
-                        spawn(submit_workshop_command(
-                            identity, ops, handover_tags_input, judge_bundle,
-                            SessionCommand::Action,
-                            Some(serde_json::json!({"type": "play", "value": "music"})),
-                        ));
-                    },
-                    "Play music"
+                // Rest section
+                p { class: "action-section-label", style: "margin-top:16px;", "Rest" }
+                div { class: "action-grid",
+                    button {
+                        class: "action-btn action-btn--sleep",
+                        "data-testid": "action-sleep",
+                        disabled: commands_disabled || on_cooldown,
+                        onclick: move |_| {
+                            spawn(submit_workshop_command(
+                                identity, ops, handover_tags_input, judge_bundle,
+                                SessionCommand::Action,
+                                Some(serde_json::json!({"type": "sleep"})),
+                            ));
+                        },
+                        img { class: "pixel-icon", src: "{poke_icon_url(\"sleep\")}", alt: "sleep", width: 32, height: 32 }
+                        "Put to Sleep"
+                    }
                 }
             }
-            div { class: "button-row",
-                button {
-                    class: "button button--secondary",
-                    "data-testid": "action-sleep",
-                    disabled: commands_disabled || on_cooldown,
-                    onclick: move |_| {
-                        spawn(submit_workshop_command(
-                            identity, ops, handover_tags_input, judge_bundle,
-                            SessionCommand::Action,
-                            Some(serde_json::json!({"type": "sleep"})),
-                        ));
-                    },
-                    "Sleep"
+        }
+
+        // ---- Achievements panel ----
+        div { class: "panel__stack",
+            div { class: "pixel-header",
+                h3 { class: "pixel-header__title", "Achievements" }
+            }
+            div { style: "padding:16px;",
+                if achievements.is_empty() {
+                    p { class: "meta", style: "text-align:center;padding:12px;", "No achievements yet." }
+                } else {
+                    div { class: "achievements",
+                        for ach_id in achievements.iter() {
+                            if let Some((name, desc, icon)) = achievement_def(ach_id) {
+                                div { class: "achievement-card",
+                                    img { class: "pixel-icon", src: "{poke_icon_url(icon)}", alt: "{icon}", width: 32, height: 32 }
+                                    div {
+                                        p { class: "achievement-card__name", "{name}" }
+                                        p { class: "achievement-card__desc", "{desc}" }
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }

@@ -10,12 +10,18 @@ use dioxus::prelude::*;
 use components::archive_panel::ArchivePanel;
 use components::controls_panel::ControlsPanel;
 use components::create_panel::CreatePanel;
+use components::handover_view::HandoverView;
 use components::hero::Hero;
 use components::join_panel::JoinPanel;
+use components::lobby_view::LobbyView;
 use components::notice::NoticeBar;
+use components::phase0_view::Phase0View;
+use components::phase1_view::Phase1View;
 use components::session_panel::SessionPanel;
 use components::workshop_brief::WorkshopBrief;
 
+use helpers::poke_icon_url;
+use protocol::Phase;
 use realtime::bootstrap_realtime;
 use state::{ShellScreen, apply_realtime_bootstrap_error, bootstrap_state};
 
@@ -57,6 +63,48 @@ fn App() -> Element {
         id.screen == ShellScreen::Session
     };
 
+    // ---- Phase detection & day/night cycle (single read) ----
+    let (current_phase, is_daytime, game_time, is_clock_phase) = {
+        let gs = game_state.read();
+        match gs.as_ref() {
+            Some(s) => {
+                let t = s.time.rem_euclid(24);
+                (
+                    Some(s.phase),
+                    t >= 6 && t < 18,
+                    s.time,
+                    matches!(s.phase, Phase::Phase1 | Phase::Phase2),
+                )
+            }
+            None => (None, false, 0, false),
+        }
+    };
+
+    let is_lobby = render_session_panels_first && current_phase == Some(Phase::Lobby);
+    let is_phase0 = render_session_panels_first && current_phase == Some(Phase::Phase0);
+    let is_phase1 = render_session_panels_first && current_phase == Some(Phase::Phase1);
+    let is_handover = render_session_panels_first && current_phase == Some(Phase::Handover);
+    let show_clock = render_session_panels_first && is_clock_phase;
+
+    let time_string = format!("{:02}:00", game_time.rem_euclid(24));
+    let clock_icon = if is_daytime { "sun" } else { "moon" };
+    let clock_icon_url = poke_icon_url(clock_icon);
+
+    // ---- Container class ----
+    let container_class = if is_lobby {
+        "shell__container shell__container--lobby"
+    } else if is_phase0 {
+        "shell__container shell__container--phase0"
+    } else if is_phase1 {
+        "shell__container shell__container--phase1"
+    } else if is_handover {
+        "shell__container shell__container--handover"
+    } else {
+        "shell__container"
+    };
+
+    let shell_class = if is_daytime { "shell shell--day" } else { "shell shell--night" };
+
     let mut effect_identity = identity;
     let mut effect_ops = ops;
 
@@ -73,53 +121,101 @@ fn App() -> Element {
     });
 
     rsx! {
-        main { class: "shell",
-            section { class: "shell__container",
-                Hero { identity, game_state }
-                NoticeBar { ops }
-                section { class: "grid",
-                    if render_session_panels_first {
-                        // ---- Session screen ----
-                        SessionPanel {
-                            identity,
-                            game_state,
-                            ops,
-                            handover_tags_input,
-                            judge_bundle,
-                        }
-                        ControlsPanel {
-                            identity,
-                            game_state,
-                            ops,
-                            handover_tags_input,
-                            judge_bundle,
-                        }
-                        ArchivePanel { game_state, judge_bundle }
-                    } else {
-                        // ---- Home screen ----
-                        WorkshopBrief {}
-                        CreatePanel {
-                            identity,
-                            game_state,
-                            ops,
-                            create_name,
-                            phase0_minutes,
-                            phase1_minutes,
-                            phase2_minutes,
-                            join_session_code,
-                            reconnect_session_code,
-                            reconnect_token,
-                            judge_bundle,
-                        }
-                        JoinPanel {
-                            identity,
-                            game_state,
-                            ops,
-                            join_session_code,
-                            join_name,
-                            reconnect_session_code,
-                            reconnect_token,
-                            judge_bundle,
+        main { class: shell_class,
+            // Clock HUD (Phase1/Phase2 only)
+            if show_clock {
+                div { class: "clock-hud",
+                    img {
+                        class: "pixel-icon",
+                        src: "{clock_icon_url}",
+                        alt: "{clock_icon}",
+                        width: 32, height: 32,
+                    }
+                    span { class: "clock-hud__time", {time_string} }
+                }
+            }
+            section { class: container_class,
+                if is_lobby {
+                    LobbyView {
+                        identity,
+                        game_state,
+                        ops,
+                        handover_tags_input,
+                        judge_bundle,
+                    }
+                } else if is_phase0 {
+                    Phase0View {
+                        identity,
+                        game_state,
+                        ops,
+                        handover_tags_input,
+                        judge_bundle,
+                    }
+                } else if is_phase1 {
+                    NoticeBar { ops }
+                    Phase1View {
+                        identity,
+                        game_state,
+                        ops,
+                        handover_tags_input,
+                        judge_bundle,
+                    }
+                } else if is_handover {
+                    NoticeBar { ops }
+                    HandoverView {
+                        identity,
+                        game_state,
+                        ops,
+                        handover_tags_input,
+                        judge_bundle,
+                    }
+                } else {
+                    Hero { identity, game_state }
+                    NoticeBar { ops }
+                    section { class: "grid",
+                        if render_session_panels_first {
+                            // ---- Session screen ----
+                            SessionPanel {
+                                identity,
+                                game_state,
+                                ops,
+                                handover_tags_input,
+                                judge_bundle,
+                            }
+                            ControlsPanel {
+                                identity,
+                                game_state,
+                                ops,
+                                handover_tags_input,
+                                judge_bundle,
+                            }
+                            ArchivePanel { game_state, judge_bundle }
+                        } else {
+                            // ---- Home screen ----
+                            WorkshopBrief {}
+                            CreatePanel {
+                                identity,
+                                game_state,
+                                ops,
+                                create_name,
+                                phase0_minutes,
+                                phase1_minutes,
+                                phase2_minutes,
+                                join_session_code,
+                                reconnect_session_code,
+                                reconnect_token,
+                                judge_bundle,
+                            }
+                            JoinPanel {
+                                identity,
+                                game_state,
+                                ops,
+                                join_session_code,
+                                join_name,
+                                reconnect_session_code,
+                                reconnect_token,
+                                judge_bundle,
+                            }
                         }
                     }
                 }

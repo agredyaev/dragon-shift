@@ -269,6 +269,83 @@ pub fn current_dragon(state: &ClientGameState) -> Option<&ClientDragon> {
     state.dragons.get(dragon_id)
 }
 
+pub fn sprite_url_for_emotion(sprites: &SpriteSet, emotion: DragonEmotion) -> String {
+    let base64 = match emotion {
+        DragonEmotion::Happy => &sprites.happy,
+        DragonEmotion::Angry => &sprites.angry,
+        DragonEmotion::Sleepy => &sprites.sleepy,
+        DragonEmotion::Neutral => &sprites.neutral,
+    };
+    format!("data:image/png;base64,{base64}")
+}
+
+pub fn dragon_emotion_anim_class(emotion: DragonEmotion) -> &'static str {
+    match emotion {
+        DragonEmotion::Happy => "dragon-stage__mover--happy",
+        DragonEmotion::Angry => "dragon-stage__mover--angry",
+        DragonEmotion::Sleepy => "dragon-stage__mover--sleepy",
+        DragonEmotion::Neutral => "dragon-stage__mover",
+    }
+}
+
+pub fn poke_icon_url(name: &str) -> String {
+    let item = match name {
+        "heart" => "heart-scale",
+        "meat" => "leftovers",
+        "zap" => "thunder-stone",
+        "fruit" => "oran-berry",
+        "fish" => "pearl",
+        "fetch" => "poke-ball",
+        "puzzle" => "rare-candy",
+        "music" => "poke-flute",
+        "sleep" => "fluffy-tail",
+        "sun" => "sun-stone",
+        "moon" => "moon-stone",
+        "trophy" => "nugget",
+        "crown" => "kings-rock",
+        "alert" => "potion",
+        "angry" => "black-glasses",
+        "clock" => "timer-ball",
+        "sparkle" => "star-piece",
+        _ => "poke-ball",
+    };
+    format!("https://raw.githubusercontent.com/PokeAPI/sprites/master/sprites/items/{item}.png")
+}
+
+pub const ACHIEVEMENT_DEFS: &[(&str, &str, &str, &str)] = &[
+    (
+        "master_chef",
+        "Master Chef",
+        "Found favorite food on 1st try!",
+        "meat",
+    ),
+    (
+        "playful_spirit",
+        "Playful Spirit",
+        "Found favorite game on 1st try!",
+        "fetch",
+    ),
+    (
+        "dragon_whisperer",
+        "Dragon Whisperer",
+        "Happiness > 90% for 15s.",
+        "heart",
+    ),
+    (
+        "smooth_transition",
+        "Smooth Transition",
+        "Perfect handover in Phase 2.",
+        "sparkle",
+    ),
+];
+
+pub fn achievement_def(id: &str) -> Option<(&'static str, &'static str, &'static str)> {
+    ACHIEVEMENT_DEFS
+        .iter()
+        .find(|(aid, _, _, _)| *aid == id)
+        .map(|(_, name, desc, icon)| (*name, *desc, *icon))
+}
+
 pub fn dragon_action_label(action: DragonAction) -> &'static str {
     match action {
         DragonAction::Feed => "Feed",
@@ -284,10 +361,6 @@ pub fn dragon_emotion_label(emotion: DragonEmotion) -> &'static str {
         DragonEmotion::Angry => "Angry",
         DragonEmotion::Sleepy => "Sleepy",
         DragonEmotion::Neutral => "Neutral",
-        DragonEmotion::Content => "Content",
-        DragonEmotion::Tired => "Tired",
-        DragonEmotion::Excited => "Excited",
-        DragonEmotion::Hungry => "Hungry",
     }
 }
 
@@ -827,8 +900,8 @@ pub fn judge_bundle_dragon_rows(bundle: &JudgeBundle) -> Vec<JudgeBundleDragonRo
 pub mod tests {
     use super::*;
     use protocol::{
-        ClientDragon, ClientGameState, CoordinatorType, DragonAction, DragonEmotion, Phase, Player,
-        SessionMeta, WorkshopJoinSuccess, create_default_session_settings,
+        create_default_session_settings, ClientDragon, ClientGameState, CoordinatorType,
+        DragonAction, DragonEmotion, Phase, Player, SessionMeta, WorkshopJoinSuccess,
     };
     use std::collections::BTreeMap;
 
@@ -1325,10 +1398,9 @@ pub mod tests {
         assert!(rows
             .iter()
             .any(|row| row.dragon_name.starts_with("Dragon #") && row.is_current_players_dragon));
-        assert!(
-            rows.iter()
-                .any(|row| row.dragon_name.starts_with("Dragon #") && row.is_selected)
-        );
+        assert!(rows
+            .iter()
+            .any(|row| row.dragon_name.starts_with("Dragon #") && row.is_selected));
     }
 
     #[test]

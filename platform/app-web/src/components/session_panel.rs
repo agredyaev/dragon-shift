@@ -8,13 +8,9 @@ use wasm_bindgen::JsCast;
 
 use crate::helpers::*;
 use crate::realtime::bootstrap_realtime;
-use crate::state::{IdentityState, OperationState, apply_realtime_bootstrap_error};
+use crate::state::{apply_realtime_bootstrap_error, IdentityState, OperationState};
 
 use super::end_view::EndView;
-use super::handover_view::HandoverView;
-use super::lobby_view::LobbyView;
-use super::phase0_view::Phase0View;
-use super::phase1_view::Phase1View;
 use super::phase2_view::Phase2View;
 use super::voting_view::VotingView;
 
@@ -138,42 +134,8 @@ pub fn SessionPanel(
             p { class: "panel__body", {session_phase_body} }
 
             match current_phase {
-                Some(Phase::Lobby) => rsx! {
-                    LobbyView {
-                        identity: identity,
-                        game_state: game_state,
-                        ops: ops,
-                        handover_tags_input: handover_tags_input,
-                        judge_bundle: judge_bundle,
-                    }
-                },
-                Some(Phase::Phase0) => rsx! {
-                    Phase0View {
-                        identity: identity,
-                        game_state: game_state,
-                        ops: ops,
-                        handover_tags_input: handover_tags_input,
-                        judge_bundle: judge_bundle,
-                    }
-                },
-                Some(Phase::Phase1) => rsx! {
-                    Phase1View {
-                        identity: identity,
-                        game_state: game_state,
-                        ops: ops,
-                        handover_tags_input: handover_tags_input,
-                        judge_bundle: judge_bundle,
-                    }
-                },
-                Some(Phase::Handover) => rsx! {
-                    HandoverView {
-                        identity: identity,
-                        game_state: game_state,
-                        ops: ops,
-                        handover_tags_input: handover_tags_input,
-                        judge_bundle: judge_bundle,
-                    }
-                },
+                // Lobby, Phase0, Phase1, Handover are rendered by main.rs as standalone views
+                Some(Phase::Lobby | Phase::Phase0 | Phase::Phase1 | Phase::Handover) => rsx! {},
                 Some(Phase::Phase2) => rsx! {
                     Phase2View {
                         identity: identity,
