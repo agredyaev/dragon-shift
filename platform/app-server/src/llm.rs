@@ -309,6 +309,26 @@ fn gemini_text_content(role: Option<&str>, text: &str) -> GeminiContent {
     }
 }
 
+fn vertex_ai_generate_content_url(project: &str, location: &str, model: &str) -> String {
+    let host = if location == "global" {
+        "aiplatform.googleapis.com".to_string()
+    } else {
+        format!("{location}-aiplatform.googleapis.com")
+    };
+
+    format!(
+        "https://{host}/v1/projects/{project}/locations/{location}/publishers/google/models/{model}:generateContent"
+    )
+}
+
+fn vertex_ai_request_locations<'a>(location: &'a str) -> Vec<&'a str> {
+    if location == "global" {
+        vec![location]
+    } else {
+        vec![location, "global"]
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Provider pool executor
 // ---------------------------------------------------------------------------
@@ -496,16 +516,90 @@ impl LlmClient {
                         LlmError::BadRequest("GOOGLE_CLOUD_LOCATION required for vertex_ai".into())
                     })?;
                 let token = self.token_cache.get_token().await?;
-                let url = format!(
-                    "https://{location}-aiplatform.googleapis.com/v1/projects/{project}/locations/{location}/publishers/google/models/{}:generateContent",
-                    provider.model
-                );
-                self.http
-                    .post(&url)
-                    .bearer_auth(&token)
-                    .json(&request_body)
-                    .send()
-                    .await
+                for request_location in vertex_ai_request_locations(location) {
+                    let url =
+                        vertex_ai_generate_content_url(project, request_location, &provider.model);
+                    let response = match self
+                        .http
+                        .post(&url)
+                        .bearer_auth(&token)
+                        .json(&request_body)
+                        .send()
+                        .await
+                    {
+                        Ok(response) => response,
+                        Err(e) => {
+                            if request_location != "global" {
+                                warn!(
+                                    model = %provider.model,
+                                    location = request_location,
+                                    fallback_location = "global",
+                                    error = %e,
+                                    "vertex ai text request failed, retrying with global endpoint"
+                                );
+                                continue;
+                            }
+                            return Err(LlmError::ProviderUnavailable(format!("HTTP error: {e}")));
+                        }
+                    };
+
+                    let status = response.status();
+                    if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                        if request_location != "global" {
+                            warn!(
+                                model = %provider.model,
+                                location = request_location,
+                                fallback_location = "global",
+                                "vertex ai text request rate limited, retrying with global endpoint"
+                            );
+                            continue;
+                        }
+                        return Err(LlmError::RateLimited("429 from vertex_ai provider".into()));
+                    }
+                    if status.is_server_error() {
+                        if request_location != "global" {
+                            warn!(
+                                model = %provider.model,
+                                location = request_location,
+                                fallback_location = "global",
+                                status = status.as_u16(),
+                                "vertex ai text request hit server error, retrying with global endpoint"
+                            );
+                            continue;
+                        }
+                        return Err(LlmError::ProviderUnavailable(format!(
+                            "{} server error",
+                            status.as_u16()
+                        )));
+                    }
+                    if !status.is_success() {
+                        let body = response.text().await.unwrap_or_default();
+                        return Err(LlmError::ProviderUnavailable(format!(
+                            "{}: {body}",
+                            status.as_u16()
+                        )));
+                    }
+
+                    let body: GeminiResponse = response.json().await.map_err(|e| {
+                        LlmError::ProviderUnavailable(format!("response parse: {e}"))
+                    })?;
+
+                    let text = body
+                        .candidates
+                        .as_ref()
+                        .and_then(|c| c.first())
+                        .and_then(|c| c.content.as_ref())
+                        .and_then(|c| c.parts.as_ref())
+                        .and_then(|p| p.first())
+                        .and_then(|p| p.text.as_ref())
+                        .ok_or_else(|| {
+                            LlmError::ProviderUnavailable("empty response from model".to_string())
+                        })?;
+
+                    return Ok(text.clone());
+                }
+
+                return Err(LlmError::RateLimited("429 from vertex_ai provider".into()));
             }
             LlmProviderKind::ApiKey => {
                 let api_key = provider.api_key.as_deref().ok_or_else(|| {
@@ -611,11 +705,6 @@ impl LlmClient {
             })?;
         let token = self.token_cache.get_token().await?;
 
-        let url = format!(
-            "https://{location}-aiplatform.googleapis.com/v1/projects/{project}/locations/{location}/publishers/google/models/{}:generateContent",
-            provider.model
-        );
-
         let request_body = GeminiRequest {
             system_instruction: system_instruction.map(|text| gemini_text_content(None, text)),
             contents: vec![gemini_text_content(Some("user"), prompt)],
@@ -627,39 +716,78 @@ impl LlmClient {
             }),
         };
 
-        let response = self
-            .http
-            .post(&url)
-            .bearer_auth(&token)
-            .json(&request_body)
-            .send()
-            .await
-            .map_err(|e| LlmError::ProviderUnavailable(format!("HTTP error: {e}")))?;
+        for request_location in vertex_ai_request_locations(location) {
+            let url = vertex_ai_generate_content_url(project, request_location, &provider.model);
+            let response = match self
+                .http
+                .post(&url)
+                .bearer_auth(&token)
+                .json(&request_body)
+                .send()
+                .await
+            {
+                Ok(response) => response,
+                Err(e) => {
+                    if request_location != "global" {
+                        warn!(
+                            model = %provider.model,
+                            location = request_location,
+                            fallback_location = "global",
+                            error = %e,
+                            "vertex ai image request failed, retrying with global endpoint"
+                        );
+                        continue;
+                    }
+                    return Err(LlmError::ProviderUnavailable(format!("HTTP error: {e}")));
+                }
+            };
 
-        let status = response.status();
-        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            return Err(LlmError::RateLimited("429 from vertex_ai image".into()));
-        }
-        if status.is_server_error() {
-            return Err(LlmError::ProviderUnavailable(format!(
-                "{} server error",
-                status.as_u16()
-            )));
-        }
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            return Err(LlmError::ProviderUnavailable(format!(
-                "{}: {body}",
-                status.as_u16()
-            )));
+            let status = response.status();
+            if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                if request_location != "global" {
+                    warn!(
+                        model = %provider.model,
+                        location = request_location,
+                        fallback_location = "global",
+                        "vertex ai image rate limited, retrying with global endpoint"
+                    );
+                    continue;
+                }
+                return Err(LlmError::RateLimited("429 from vertex_ai image".into()));
+            }
+            if status.is_server_error() {
+                if request_location != "global" {
+                    warn!(
+                        model = %provider.model,
+                        location = request_location,
+                        fallback_location = "global",
+                        status = status.as_u16(),
+                        "vertex ai image request hit server error, retrying with global endpoint"
+                    );
+                    continue;
+                }
+                return Err(LlmError::ProviderUnavailable(format!(
+                    "{} server error",
+                    status.as_u16()
+                )));
+            }
+            if !status.is_success() {
+                let body = response.text().await.unwrap_or_default();
+                return Err(LlmError::ProviderUnavailable(format!(
+                    "{}: {body}",
+                    status.as_u16()
+                )));
+            }
+
+            let body: GeminiResponse = response
+                .json()
+                .await
+                .map_err(|e| LlmError::ProviderUnavailable(format!("response parse: {e}")))?;
+
+            return extract_gemini_image(&body);
         }
 
-        let body: GeminiResponse = response
-            .json()
-            .await
-            .map_err(|e| LlmError::ProviderUnavailable(format!("response parse: {e}")))?;
-
-        extract_gemini_image(&body)
+        Err(LlmError::RateLimited("429 from vertex_ai image".into()))
     }
 
     async fn call_api_key_image(
@@ -1270,6 +1398,27 @@ mod tests {
         assert!(system.contains("creativityScore is a separate descriptive dimension"));
         assert!(user.contains("Return exactly 2 dragonEvaluations"));
         assert!(user.contains("Preserve each dragonId exactly"));
+    }
+
+    #[test]
+    fn vertex_ai_generate_content_url_supports_regional_and_global_locations() {
+        assert_eq!(
+            vertex_ai_generate_content_url("proj-1", "europe-west4", "gemini-2.5-flash-image"),
+            "https://europe-west4-aiplatform.googleapis.com/v1/projects/proj-1/locations/europe-west4/publishers/google/models/gemini-2.5-flash-image:generateContent"
+        );
+        assert_eq!(
+            vertex_ai_generate_content_url("proj-1", "global", "gemini-2.5-flash-image"),
+            "https://aiplatform.googleapis.com/v1/projects/proj-1/locations/global/publishers/google/models/gemini-2.5-flash-image:generateContent"
+        );
+    }
+
+    #[test]
+    fn vertex_ai_request_locations_adds_global_fallback_for_regional_endpoints() {
+        assert_eq!(
+            vertex_ai_request_locations("europe-west4"),
+            vec!["europe-west4", "global"]
+        );
+        assert_eq!(vertex_ai_request_locations("global"), vec!["global"]);
     }
 
     #[test]
