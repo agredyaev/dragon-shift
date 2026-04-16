@@ -6,6 +6,7 @@ import {
   createWorkshop,
   joinWorkshop,
   newPlayerContext,
+  openCharacterCreation,
   readReconnectToken,
   saveDragonProfile,
   voteForVisibleDragon,
@@ -83,9 +84,7 @@ test.describe('browser restart reconnect proof', () => {
       const workshopCode = await createWorkshop(host.page, 'Alice')
       await joinWorkshop(guest.page, workshopCode, 'Bob')
 
-      await host.page.getByTestId('start-phase0-button').click()
-      await expect(host.page.locator('body')).toContainText('Character creation')
-      await expect(guest.page.locator('body')).toContainText('Character creation')
+      await openCharacterCreation(host.page, guest.page)
 
       await saveDragonProfile(host.page, 'A lantern-scaled dragon with ember whiskers.')
       await saveDragonProfile(guest.page, 'A mint dragon with ribbon fins and calm eyes.')
