@@ -40,7 +40,7 @@
 - `GCP_SERVICE_ACCOUNT_EMAIL` - repository secret for the GitHub Actions Terraform service account email
 - `TF_PRODUCTION_DB_PASSWORD` - repository secret for the Cloud SQL application password
 - `TF_GEMINI_API_KEY` - optional primary repository secret for `api_key` mode
-- `TF_GEMINI_API_KEY_1` ... `TF_GEMINI_API_KEY_5` - optional additional repository secrets for `api_key` mode when spreading judge/image traffic across multiple Gemini keys
+- `TF_GEMINI_API_KEY_1` ... `TF_GEMINI_API_KEY_15` - optional additional repository secrets for `api_key` mode when spreading judge/image traffic across multiple Gemini keys
 
 ## Manual Non-Production Helm Inputs
 - `KUBECONFIG_B64` - base64 kubeconfig for the target non-production environment

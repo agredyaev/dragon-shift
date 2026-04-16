@@ -16,6 +16,11 @@ use crate::state::{
 };
 use protocol::WorkshopCreateConfig;
 
+pub enum SpriteSheetSubmitError {
+    Preflight(String),
+    Request(String),
+}
+
 pub async fn submit_create_flow(
     mut identity: Signal<IdentityState>,
     mut game_state: Signal<Option<ClientGameState>>,
@@ -439,24 +444,24 @@ pub async fn submit_sprite_sheet_request(
     mut ops: Signal<OperationState>,
     mut sprite_result: Signal<Option<SpriteSet>>,
     description: String,
-) {
+) -> Result<(), SpriteSheetSubmitError> {
     let (base_url, snapshot) = {
         let id = identity.read();
         (id.api_base_url.clone(), id.session_snapshot.clone())
     };
 
     let Some(snapshot) = snapshot else {
+        let message = "Connect to a workshop before generating sprites.".to_string();
         ops.with_mut(|o| {
-            o.notice = Some(error_notice(
-                "Connect to a workshop before generating sprites.",
-            ))
+            o.notice = Some(error_notice(&message))
         });
-        return;
+        return Err(SpriteSheetSubmitError::Preflight(message));
     };
 
     if description.trim().is_empty() {
-        ops.with_mut(|o| o.notice = Some(error_notice("Enter a dragon description.")));
-        return;
+        let message = "Enter a dragon description.".to_string();
+        ops.with_mut(|o| o.notice = Some(error_notice(&message)));
+        return Err(SpriteSheetSubmitError::Preflight(message));
     }
 
     ops.with_mut(|o| {
@@ -473,11 +478,13 @@ pub async fn submit_sprite_sheet_request(
             ops.with_mut(|o| {
                 o.notice = Some(info_notice("Dragon sprites generated!"));
             });
+            Ok(())
         }
         Err(error) => {
             ops.with_mut(|o| {
                 o.notice = Some(error_notice(&format!("Sprite generation failed: {error}")));
             });
+            Err(SpriteSheetSubmitError::Request(error))
         }
     }
 }

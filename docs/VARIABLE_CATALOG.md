@@ -36,7 +36,7 @@
 - `database.existingSecretName` - Kubernetes secret name for `DATABASE_URL`
 
 ## Notes
-- LLM provider pools are configured as ordered arrays in Helm values (`judgeProviders` / `imageProviders`). Failover happens left-to-right on 429 or provider failure.
+- LLM provider pools are configured as ordered arrays in Helm values (`judgeProviders` / `imageProviders`). The runtime starts each request from a round-robin provider index and then fails over left-to-right on 429 or provider failure.
 - `vertex_ai` providers in the current runtime use the in-cluster Google metadata server with Workload Identity and require no API key secret.
 - `api_key` providers read their key from a Kubernetes Secret referenced by `apiKeySecretName` / `apiKeySecretKey` in the provider entry.
 - GKE Workload Identity additionally requires the corresponding Google IAM binding for the Kubernetes service account principal.
@@ -104,4 +104,4 @@
 - `GCP_SERVICE_ACCOUNT_EMAIL` - repository secret for the GitHub Actions Terraform service account email
 - `TF_PRODUCTION_DB_PASSWORD` - repository secret for the Cloud SQL application password
 - `TF_GEMINI_API_KEY` - optional primary repository secret required only when `TF_LLM_PROVIDER_TYPE=api_key`
-- `TF_GEMINI_API_KEY_1` ... `TF_GEMINI_API_KEY_5` - optional additional repository secrets for multi-key `api_key` deployments
+- `TF_GEMINI_API_KEY_1` ... `TF_GEMINI_API_KEY_15` - optional additional repository secrets for multi-key `api_key` deployments; deploy automation compacts the non-empty numbered secrets into a dense provider list, so numbering gaps are ignored and duplicate keys are not deduplicated

@@ -350,6 +350,16 @@ jobs:
           TF_GEMINI_API_KEY_3: ${{ secrets.TF_GEMINI_API_KEY_3 }}
           TF_GEMINI_API_KEY_4: ${{ secrets.TF_GEMINI_API_KEY_4 }}
           TF_GEMINI_API_KEY_5: ${{ secrets.TF_GEMINI_API_KEY_5 }}
+          TF_GEMINI_API_KEY_6: ${{ secrets.TF_GEMINI_API_KEY_6 }}
+          TF_GEMINI_API_KEY_7: ${{ secrets.TF_GEMINI_API_KEY_7 }}
+          TF_GEMINI_API_KEY_8: ${{ secrets.TF_GEMINI_API_KEY_8 }}
+          TF_GEMINI_API_KEY_9: ${{ secrets.TF_GEMINI_API_KEY_9 }}
+          TF_GEMINI_API_KEY_10: ${{ secrets.TF_GEMINI_API_KEY_10 }}
+          TF_GEMINI_API_KEY_11: ${{ secrets.TF_GEMINI_API_KEY_11 }}
+          TF_GEMINI_API_KEY_12: ${{ secrets.TF_GEMINI_API_KEY_12 }}
+          TF_GEMINI_API_KEY_13: ${{ secrets.TF_GEMINI_API_KEY_13 }}
+          TF_GEMINI_API_KEY_14: ${{ secrets.TF_GEMINI_API_KEY_14 }}
+          TF_GEMINI_API_KEY_15: ${{ secrets.TF_GEMINI_API_KEY_15 }}
           IMAGE_REPOSITORY: ${{ needs.publish.outputs.image_repository }}
           IMAGE_DIGEST: ${{ needs.publish.outputs.image_digest }}
           IMAGE_TAG: ${{ needs.publish.outputs.image_tag }}
