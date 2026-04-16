@@ -229,6 +229,21 @@ impl WorkshopSession {
         Ok(())
     }
 
+    pub fn update_player_sprite_draft(
+        &mut self,
+        player_id: &str,
+        description: String,
+        sprites: SpriteSet,
+    ) -> Result<(), DomainError> {
+        let Some(player) = self.players.get_mut(player_id) else {
+            return Err(DomainError::ActionNotAllowed);
+        };
+        player.pet_description = Some(description);
+        player.custom_sprites = Some(sprites);
+        self.touch();
+        Ok(())
+    }
+
     pub fn transition_to(&mut self, next: Phase) -> Result<(), DomainError> {
         if !can_transition(self.phase, next) {
             return Err(DomainError::InvalidSessionTransition {
@@ -1397,6 +1412,37 @@ mod tests {
         assert_eq!(
             dragon.discovery_observations.last().map(String::as_str),
             Some("note-7")
+        );
+    }
+
+    #[test]
+    fn update_player_sprite_draft_keeps_player_not_ready() {
+        let mut session = WorkshopSession::new(
+            Uuid::new_v4(),
+            SessionCode("123456".into()),
+            ts(1),
+            config(),
+        );
+        session.add_player(player("p1", true, 10));
+        enter_phase0(&mut session);
+
+        let sprites = SpriteSet {
+            neutral: "neutral_b64".into(),
+            happy: "happy_b64".into(),
+            angry: "angry_b64".into(),
+            sleepy: "sleepy_b64".into(),
+        };
+
+        session
+            .update_player_sprite_draft("p1", "Crystal dragon".into(), sprites.clone())
+            .expect("save sprite draft");
+
+        let player = session.players.get("p1").expect("player p1");
+        assert_eq!(player.pet_description.as_deref(), Some("Crystal dragon"));
+        assert_eq!(player.custom_sprites.as_ref(), Some(&sprites));
+        assert!(
+            !player.is_ready,
+            "phase0 sprite draft persistence must not auto-mark the player ready"
         );
     }
 

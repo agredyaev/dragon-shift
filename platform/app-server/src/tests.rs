@@ -8,7 +8,7 @@ use crate::{
     http::allocate_session_code,
     llm::LlmPoolConfig,
     parse_session_update_notification,
-    ws::emit_phase_warning_notices,
+    ws::{advance_game_ticks, emit_phase_warning_notices},
 };
 use axum::{
     Router,
@@ -318,6 +318,7 @@ struct FaultyStore {
     fail_renew_session_lease: AtomicBool,
     fail_claim_realtime_connection: AtomicBool,
     load_session_by_code_calls: AtomicUsize,
+    save_session_calls: AtomicUsize,
 }
 
 impl FaultyStore {
@@ -369,6 +370,10 @@ impl FaultyStore {
     fn load_calls(&self) -> usize {
         self.load_session_by_code_calls.load(Ordering::SeqCst)
     }
+
+    fn save_session_calls(&self) -> usize {
+        self.save_session_calls.load(Ordering::SeqCst)
+    }
 }
 
 impl SessionStore for FaultyStore {
@@ -405,6 +410,7 @@ impl SessionStore for FaultyStore {
         &self,
         session: &WorkshopSession,
     ) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + '_>> {
+        self.save_session_calls.fetch_add(1, Ordering::SeqCst);
         self.inner.save_session(session)
     }
 
@@ -2698,10 +2704,7 @@ async fn create_workshop_endpoint_returns_join_success() {
                 .players
                 .get(&success.player_id)
                 .expect("host player in state");
-            assert_eq!(
-                host.pet_description.as_deref(),
-                None
-            );
+            assert_eq!(host.pet_description.as_deref(), None);
         }
         WorkshopJoinResult::Error(error) => panic!("expected success, got error: {}", error.error),
     }
@@ -3350,10 +3353,7 @@ async fn join_workshop_endpoint_returns_join_success_for_lobby_session() {
                 .players
                 .get(&success.player_id)
                 .expect("joined player in state");
-            assert_eq!(
-                joined.pet_description.as_deref(),
-                None
-            );
+            assert_eq!(joined.pet_description.as_deref(), None);
         }
         WorkshopJoinResult::Error(error) => panic!("expected success, got error: {}", error.error),
     }
@@ -7015,6 +7015,80 @@ async fn workshop_command_reveals_voting_results_after_all_votes() {
 }
 
 #[tokio::test]
+async fn advance_game_ticks_updates_cached_session_without_persisting_each_tick() {
+    let store = Arc::new(FaultyStore::new());
+    let state = test_state_with_store(store.clone());
+
+    let mut session = WorkshopSession::new(
+        Uuid::new_v4(),
+        SessionCode("955555".into()),
+        Utc::now(),
+        protocol::WorkshopCreateConfig::default(),
+    );
+
+    let mut host = session_player("player-1", "Alice", 1);
+    host.is_host = true;
+    let guest = session_player("player-2", "Bob", 2);
+    session.add_player(host);
+    session.add_player(guest);
+
+    session.transition_to(protocol::Phase::Phase0).unwrap();
+    session
+        .update_player_pet(
+            "player-1",
+            "Coral dragon".to_string(),
+            Some(protocol::SpriteSet {
+                neutral: "neutral_b64".into(),
+                happy: "happy_b64".into(),
+                angry: "angry_b64".into(),
+                sleepy: "sleepy_b64".into(),
+            }),
+        )
+        .unwrap();
+    session
+        .update_player_pet("player-2", "Moss dragon".to_string(), None)
+        .unwrap();
+    session
+        .begin_phase1(&[
+            domain::Phase1Assignment {
+                player_id: "player-1".into(),
+                dragon_id: "dragon-1".into(),
+            },
+            domain::Phase1Assignment {
+                player_id: "player-2".into(),
+                dragon_id: "dragon-2".into(),
+            },
+        ])
+        .unwrap();
+
+    let original_time = session.time;
+    state
+        .store
+        .save_session(&session)
+        .await
+        .expect("persist initial session");
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(session.code.0.clone(), session);
+
+    let baseline_save_calls = store.save_session_calls();
+
+    advance_game_ticks(&state).await;
+
+    let cached = state.sessions.lock().await;
+    let updated = cached.get("955555").expect("cached session after tick");
+    assert_eq!(updated.phase, protocol::Phase::Phase1);
+    assert_eq!(updated.time, (original_time + 1) % 24);
+    assert_eq!(
+        store.save_session_calls(),
+        baseline_save_calls,
+        "phase ticks should no longer persist the full session on every second"
+    );
+}
+
+#[tokio::test]
 async fn workshop_command_rejects_non_host_reset_game() {
     let app = build_app(test_state());
     let create_response = app
@@ -9181,5 +9255,205 @@ fn to_client_game_state_includes_dragons_and_voting_details() {
             .as_ref()
             .is_some_and(|voting| voting.current_player_vote_dragon_id.as_deref()
                 == Some(bob_dragon_id.as_str()))
+    );
+}
+
+#[test]
+fn to_client_game_state_propagates_custom_sprites_to_dragon() {
+    let timestamp = chrono::DateTime::from_timestamp(1, 0).expect("valid timestamp");
+    let mut session = WorkshopSession::new(
+        Uuid::new_v4(),
+        SessionCode("123456".into()),
+        timestamp,
+        protocol::WorkshopCreateConfig::default(),
+    );
+    let mut alice = session_player("p1", "Alice", 1);
+    alice.is_host = true;
+    let sprites = protocol::SpriteSet {
+        neutral: "neutral_b64".to_string(),
+        happy: "happy_b64".to_string(),
+        angry: "angry_b64".to_string(),
+        sleepy: "sleepy_b64".to_string(),
+    };
+    alice.custom_sprites = Some(sprites.clone());
+    alice.pet_description = Some("A fiery red dragon".to_string());
+    let bob = session_player("p2", "Bob", 2);
+    session.add_player(alice);
+    session.add_player(bob);
+
+    session
+        .transition_to(protocol::Phase::Phase0)
+        .expect("enter phase0");
+    session
+        .begin_phase1(&[
+            domain::Phase1Assignment {
+                player_id: "p1".into(),
+                dragon_id: "dragon-p1".into(),
+            },
+            domain::Phase1Assignment {
+                player_id: "p2".into(),
+                dragon_id: "dragon-p2".into(),
+            },
+        ])
+        .expect("begin phase1");
+
+    let client_state = to_client_game_state(&session, "p1");
+
+    // Alice's dragon should carry her custom sprites.
+    let alice_dragon_id = client_state
+        .players
+        .get("p1")
+        .and_then(|p| p.current_dragon_id.clone())
+        .expect("alice assigned to a dragon");
+    let alice_dragon = client_state
+        .dragons
+        .get(&alice_dragon_id)
+        .expect("alice dragon present");
+    assert!(
+        alice_dragon.custom_sprites.is_some(),
+        "dragon created from a player with sprites must carry those sprites"
+    );
+    let dragon_sprites = alice_dragon.custom_sprites.as_ref().unwrap();
+    assert_eq!(dragon_sprites.neutral, "neutral_b64");
+    assert_eq!(dragon_sprites.happy, "happy_b64");
+    assert_eq!(dragon_sprites.angry, "angry_b64");
+    assert_eq!(dragon_sprites.sleepy, "sleepy_b64");
+
+    // Bob's dragon should have no sprites (Bob never generated any).
+    let bob_dragon_id = client_state
+        .players
+        .get("p2")
+        .and_then(|p| p.current_dragon_id.clone())
+        .expect("bob assigned to a dragon");
+    let bob_dragon = client_state
+        .dragons
+        .get(&bob_dragon_id)
+        .expect("bob dragon present");
+    assert!(
+        bob_dragon.custom_sprites.is_none(),
+        "dragon created from a player without sprites must have no sprites"
+    );
+}
+
+#[test]
+fn to_client_game_state_normalizes_white_sprite_backgrounds() {
+    use base64::Engine as _;
+    use image::{DynamicImage, ImageBuffer, ImageFormat, Rgba};
+    use std::io::Cursor;
+
+    let timestamp = chrono::DateTime::from_timestamp(1, 0).expect("valid timestamp");
+    let mut session = WorkshopSession::new(
+        Uuid::new_v4(),
+        SessionCode("123456".into()),
+        timestamp,
+        protocol::WorkshopCreateConfig::default(),
+    );
+    let mut alice = session_player("p1", "Alice", 1);
+    alice.is_host = true;
+
+    let mut sprite = ImageBuffer::from_pixel(6, 6, Rgba([255, 255, 255, 255]));
+    for y in 1..5 {
+        for x in 1..5 {
+            sprite.put_pixel(x, y, Rgba([16, 32, 64, 255]));
+        }
+    }
+
+    let mut png = Vec::new();
+    DynamicImage::ImageRgba8(sprite)
+        .write_to(&mut Cursor::new(&mut png), ImageFormat::Png)
+        .expect("encode sprite png");
+    let base64_sprite = base64::engine::general_purpose::STANDARD.encode(png);
+
+    alice.custom_sprites = Some(protocol::SpriteSet {
+        neutral: base64_sprite.clone(),
+        happy: base64_sprite.clone(),
+        angry: base64_sprite.clone(),
+        sleepy: base64_sprite.clone(),
+    });
+    alice.pet_description = Some("A fiery red dragon".to_string());
+    let bob = session_player("p2", "Bob", 2);
+    session.add_player(alice);
+    session.add_player(bob);
+
+    session
+        .transition_to(protocol::Phase::Phase0)
+        .expect("enter phase0");
+    session
+        .begin_phase1(&[
+            domain::Phase1Assignment {
+                player_id: "p1".into(),
+                dragon_id: "dragon-p1".into(),
+            },
+            domain::Phase1Assignment {
+                player_id: "p2".into(),
+                dragon_id: "dragon-p2".into(),
+            },
+        ])
+        .expect("begin phase1");
+
+    let client_state = to_client_game_state(&session, "p1");
+    let alice_dragon_id = client_state
+        .players
+        .get("p1")
+        .and_then(|p| p.current_dragon_id.clone())
+        .expect("alice assigned to a dragon");
+    let normalized = client_state
+        .dragons
+        .get(&alice_dragon_id)
+        .and_then(|dragon| dragon.custom_sprites.as_ref())
+        .map(|sprites| sprites.neutral.clone())
+        .expect("normalized neutral sprite");
+
+    let normalized = base64::engine::general_purpose::STANDARD
+        .decode(normalized)
+        .expect("decode normalized sprite");
+    let normalized = image::load_from_memory_with_format(&normalized, ImageFormat::Png)
+        .expect("decode normalized png")
+        .to_rgba8();
+
+    assert_eq!(
+        normalized.get_pixel(0, 0)[3],
+        0,
+        "white edge background should become transparent"
+    );
+    assert_eq!(normalized.get_pixel(2, 2).0, [16, 32, 64, 255]);
+}
+
+#[test]
+fn phase0_sprite_draft_persists_without_marking_player_ready() {
+    let timestamp = chrono::DateTime::from_timestamp(1, 0).expect("valid timestamp");
+    let mut session = WorkshopSession::new(
+        Uuid::new_v4(),
+        SessionCode("123456".into()),
+        timestamp,
+        protocol::WorkshopCreateConfig::default(),
+    );
+    let mut alice = session_player("p1", "Alice", 1);
+    alice.is_host = true;
+    session.add_player(alice);
+    session
+        .transition_to(protocol::Phase::Phase0)
+        .expect("enter phase0");
+
+    let sprites = protocol::SpriteSet {
+        neutral: "neutral_b64".to_string(),
+        happy: "happy_b64".to_string(),
+        angry: "angry_b64".to_string(),
+        sleepy: "sleepy_b64".to_string(),
+    };
+
+    session
+        .update_player_sprite_draft("p1", "A fiery red dragon".into(), sprites.clone())
+        .expect("save sprite draft");
+
+    let player = session.players.get("p1").expect("player exists");
+    assert_eq!(
+        player.pet_description.as_deref(),
+        Some("A fiery red dragon")
+    );
+    assert_eq!(player.custom_sprites.as_ref(), Some(&sprites));
+    assert!(
+        !player.is_ready,
+        "sprite generation draft save must not auto-mark player ready"
     );
 }

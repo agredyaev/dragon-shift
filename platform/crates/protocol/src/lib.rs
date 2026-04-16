@@ -43,6 +43,7 @@ pub enum SessionCommand {
     SubmitVote,
     RevealVotingResults,
     ResetGame,
+    EndSession,
     LeaveWorkshop,
 }
 
@@ -829,6 +830,7 @@ pub fn create_session_settings(config: &WorkshopCreateConfig) -> SessionSettings
                 SessionCommand::SubmitVote,
                 SessionCommand::RevealVotingResults,
                 SessionCommand::ResetGame,
+                SessionCommand::EndSession,
             ],
         },
     );

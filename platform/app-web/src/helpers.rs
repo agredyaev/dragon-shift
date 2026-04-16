@@ -42,18 +42,22 @@ pub struct EndVoteResultRow {
 pub struct EndPlayerScoreRow {
     pub placement_label: String,
     pub player_name: String,
-    pub score_label: String,
-    pub achievements_label: String,
-    pub judge_feedback_label: String,
+    pub phase1_score_label: String,
+    pub phase2_score_label: String,
+    pub total_score_label: String,
+    pub judge_status: &'static str,
+    pub judge_status_tooltip: String,
     pub is_winner: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct JudgeFeedbackRow {
-    pub dragon_name: String,
-    pub observation_score_label: String,
-    pub care_score_label: String,
-    pub feedback: String,
+pub struct GameOverPlayerRow {
+    pub placement: usize,
+    pub placement_label: String,
+    pub player_name: String,
+    pub score_label: String,
+    pub achievement_badges: Vec<(&'static str, &'static str)>,
+    pub is_winner: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -122,6 +126,7 @@ pub fn pending_command_label(command: SessionCommand) -> &'static str {
         SessionCommand::StartVoting => "Opening design voting…",
         SessionCommand::RevealVotingResults => "Revealing results…",
         SessionCommand::ResetGame => "Resetting workshop…",
+        SessionCommand::EndSession => "Ending session…",
         _ => "Sending command…",
     }
 }
@@ -583,81 +588,6 @@ pub fn voting_status_copy(state: &ClientGameState) -> String {
     }
 }
 
-pub fn judge_feedback_rows(state: &ClientGameState) -> Vec<JudgeFeedbackRow> {
-    let mut dragons = state.dragons.values().collect::<Vec<_>>();
-    dragons.sort_by(|left, right| {
-        let left_total =
-            left.judge_observation_score.unwrap_or(0) + left.judge_care_score.unwrap_or(0);
-        let right_total =
-            right.judge_observation_score.unwrap_or(0) + right.judge_care_score.unwrap_or(0);
-        right_total
-            .cmp(&left_total)
-            .then_with(|| {
-                left.name
-                    .to_ascii_lowercase()
-                    .cmp(&right.name.to_ascii_lowercase())
-            })
-            .then_with(|| left.id.cmp(&right.id))
-    });
-
-    dragons
-        .into_iter()
-        .filter(|dragon| {
-            dragon.judge_observation_score.is_some()
-                || dragon.judge_care_score.is_some()
-                || dragon
-                    .judge_feedback
-                    .as_deref()
-                    .is_some_and(|feedback| !feedback.trim().is_empty())
-        })
-        .map(|dragon| JudgeFeedbackRow {
-            dragon_name: dragon.name.clone(),
-            observation_score_label: format!("{} obs", dragon.judge_observation_score.unwrap_or(0)),
-            care_score_label: format!("{} care", dragon.judge_care_score.unwrap_or(0)),
-            feedback: dragon
-                .judge_feedback
-                .clone()
-                .unwrap_or_else(|| "No judge feedback yet.".to_string()),
-        })
-        .collect()
-}
-
-fn player_judge_feedback_label(state: &ClientGameState, player_id: &str) -> String {
-    let mut labels = state
-        .dragons
-        .values()
-        .filter_map(|dragon| {
-            let feedback = dragon.judge_feedback.as_deref()?.trim();
-            if feedback.is_empty() {
-                return None;
-            }
-
-            let is_creator = dragon.original_owner_id.as_deref() == Some(player_id);
-            let is_caretaker = dragon.current_owner_id.as_deref() == Some(player_id);
-
-            if is_creator && is_caretaker {
-                Some(format!(
-                    "Created and cared for {}: {}",
-                    dragon.name, feedback
-                ))
-            } else if is_creator {
-                Some(format!("Created {}: {}", dragon.name, feedback))
-            } else if is_caretaker {
-                Some(format!("Cared for {}: {}", dragon.name, feedback))
-            } else {
-                None
-            }
-        })
-        .collect::<Vec<_>>();
-
-    labels.sort();
-    if labels.is_empty() {
-        "No judge feedback yet".to_string()
-    } else {
-        labels.join(" | ")
-    }
-}
-
 pub fn voting_reveal_ready(state: &ClientGameState) -> bool {
     state
         .voting
@@ -793,19 +723,112 @@ pub fn end_player_score_rows(state: &ClientGameState) -> Vec<EndPlayerScoreRow> 
     players
         .into_iter()
         .enumerate()
-        .map(|(index, player)| EndPlayerScoreRow {
-            placement_label: format!("#{}", index + 1),
-            player_name: player.name.clone(),
-            score_label: format!("{} pts", player.score),
-            achievements_label: if player.achievements.is_empty() {
-                "No achievements yet".to_string()
-            } else {
-                format!("{} achievement(s)", player.achievements.len())
-            },
-            judge_feedback_label: player_judge_feedback_label(state, &player.id),
-            is_winner: index == 0,
+        .map(|(index, player)| {
+            let (obs, care, issues) = player_phase_scores(state, &player.id);
+            let is_good = issues.is_empty();
+            EndPlayerScoreRow {
+                placement_label: format!("#{}", index + 1),
+                player_name: player.name.clone(),
+                phase1_score_label: format!("{}", obs),
+                phase2_score_label: format!("{}", care),
+                total_score_label: format!("{} pts", player.score),
+                judge_status: if is_good { "Good" } else { "Bad" },
+                judge_status_tooltip: if is_good {
+                    String::new()
+                } else {
+                    issues.join(" | ")
+                },
+                is_winner: index == 0,
+            }
         })
         .collect()
+}
+
+pub fn game_over_player_rows(state: &ClientGameState) -> Vec<GameOverPlayerRow> {
+    let mut players = state.players.values().collect::<Vec<_>>();
+    players.sort_by(|left, right| {
+        right
+            .score
+            .cmp(&left.score)
+            .then_with(|| right.achievements.len().cmp(&left.achievements.len()))
+            .then_with(|| {
+                left.name
+                    .to_ascii_lowercase()
+                    .cmp(&right.name.to_ascii_lowercase())
+            })
+            .then_with(|| left.id.cmp(&right.id))
+    });
+
+    players
+        .into_iter()
+        .take(5)
+        .enumerate()
+        .map(|(index, player)| {
+            let badges: Vec<(&str, &str)> = player
+                .achievements
+                .iter()
+                .filter_map(|id| achievement_def(id).map(|(name, _desc, icon)| (name, icon)))
+                .collect();
+            GameOverPlayerRow {
+                placement: index + 1,
+                placement_label: format!("#{}", index + 1),
+                player_name: player.name.clone(),
+                score_label: format!("{} pts", player.score),
+                achievement_badges: badges,
+                is_winner: index == 0,
+            }
+        })
+        .collect()
+}
+
+/// Returns (observation_score_sum, care_score_sum, issues) for a player.
+/// observation_score comes from dragons the player created (Phase 1).
+/// care_score comes from dragons the player cared for (Phase 2).
+/// Issues list problems the judge identified in the feedback.
+fn player_phase_scores(state: &ClientGameState, player_id: &str) -> (i32, i32, Vec<String>) {
+    let mut obs_total = 0i32;
+    let mut care_total = 0i32;
+    let mut issues = Vec::new();
+
+    for dragon in state.dragons.values() {
+        let is_creator = dragon.original_owner_id.as_deref() == Some(player_id);
+        let is_caretaker = dragon.current_owner_id.as_deref() == Some(player_id);
+
+        if is_creator {
+            let obs = dragon.judge_observation_score.unwrap_or(0);
+            obs_total += obs;
+            if obs < 40 {
+                let feedback = dragon
+                    .judge_feedback
+                    .as_deref()
+                    .filter(|f| !f.trim().is_empty());
+                issues.push(format!(
+                    "Poor observations for {} ({}pts){}",
+                    dragon.name,
+                    obs,
+                    feedback.map(|f| format!(": {f}")).unwrap_or_default()
+                ));
+            }
+        }
+        if is_caretaker {
+            let care = dragon.judge_care_score.unwrap_or(0);
+            care_total += care;
+            if care < 40 {
+                let feedback = dragon
+                    .judge_feedback
+                    .as_deref()
+                    .filter(|f| !f.trim().is_empty());
+                issues.push(format!(
+                    "Poor care for {} ({}pts){}",
+                    dragon.name,
+                    care,
+                    feedback.map(|f| format!(": {f}")).unwrap_or_default()
+                ));
+            }
+        }
+    }
+
+    (obs_total, care_total, issues)
 }
 
 // ---------------------------------------------------------------------------
@@ -1429,7 +1452,7 @@ pub mod tests {
         assert_eq!(vote_rows[0].creator_name, "Bob");
         assert_eq!(vote_rows[0].votes_label, "2 votes");
         assert_eq!(score_rows[0].player_name, "Bob");
-        assert_eq!(score_rows[0].score_label, "18 pts");
+        assert_eq!(score_rows[0].total_score_label, "18 pts");
         assert!(score_rows[0].is_winner);
     }
 

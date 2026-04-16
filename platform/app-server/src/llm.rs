@@ -1,9 +1,9 @@
 use chrono::{DateTime, Utc};
+use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use protocol::{
     JudgeBundle, LlmDragonEvaluation, LlmJudgeEvaluation, LlmProviderEntry, LlmProviderKind,
     SpriteSet,
 };
-use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use serde::{Deserialize, Serialize};
 use std::{
     env, fs,
@@ -333,7 +333,9 @@ impl GceTokenCache {
     }
 }
 
-fn load_google_application_credentials(path: &str) -> Result<GoogleApplicationCredentials, LlmError> {
+fn load_google_application_credentials(
+    path: &str,
+) -> Result<GoogleApplicationCredentials, LlmError> {
     let raw = fs::read_to_string(path).map_err(|e| {
         LlmError::ProviderUnavailable(format!(
             "read GOOGLE_APPLICATION_CREDENTIALS file {path}: {e}"
@@ -410,9 +412,10 @@ async fn fetch_service_account_token(
         )));
     }
 
-    response.json().await.map_err(|e| {
-        LlmError::ProviderUnavailable(format!("service account token parse: {e}"))
-    })
+    response
+        .json()
+        .await
+        .map_err(|e| LlmError::ProviderUnavailable(format!("service account token parse: {e}")))
 }
 
 async fn fetch_authorized_user_token(
@@ -441,9 +444,10 @@ async fn fetch_authorized_user_token(
         )));
     }
 
-    response.json().await.map_err(|e| {
-        LlmError::ProviderUnavailable(format!("authorized user token parse: {e}"))
-    })
+    response
+        .json()
+        .await
+        .map_err(|e| LlmError::ProviderUnavailable(format!("authorized user token parse: {e}")))
 }
 
 async fn fetch_impersonated_service_account_token(
@@ -462,7 +466,9 @@ async fn fetch_impersonated_service_account_token(
         .timeout(Duration::from_secs(10))
         .send()
         .await
-        .map_err(|e| LlmError::ProviderUnavailable(format!("service account impersonation HTTP: {e}")))?;
+        .map_err(|e| {
+            LlmError::ProviderUnavailable(format!("service account impersonation HTTP: {e}"))
+        })?;
 
     let status = response.status();
     if !status.is_success() {
@@ -632,7 +638,11 @@ fn extract_gemini_text(body: &GeminiResponse) -> Result<String, LlmError> {
     };
 
     for candidate in candidates {
-        if let Some(parts) = candidate.content.as_ref().and_then(|content| content.parts.as_ref()) {
+        if let Some(parts) = candidate
+            .content
+            .as_ref()
+            .and_then(|content| content.parts.as_ref())
+        {
             let text = parts
                 .iter()
                 .filter_map(|part| part.text.as_deref())
@@ -651,7 +661,10 @@ fn extract_gemini_text(body: &GeminiResponse) -> Result<String, LlmError> {
     let detail = if finish_reasons.is_empty() {
         "empty response from model".to_string()
     } else {
-        format!("empty response from model (finish reasons: {})", finish_reasons.join(", "))
+        format!(
+            "empty response from model (finish reasons: {})",
+            finish_reasons.join(", ")
+        )
     };
     Err(LlmError::ProviderUnavailable(detail))
 }
@@ -1204,6 +1217,85 @@ fn extract_gemini_image(body: &GeminiResponse) -> Result<(String, String), LlmEr
     ))
 }
 
+pub(crate) fn normalize_sprite_base64(image_base64: &str) -> Result<String, LlmError> {
+    use base64::Engine as _;
+    use image::{DynamicImage, ImageFormat, ImageReader};
+    use std::collections::VecDeque;
+    use std::io::Cursor;
+
+    let raw = base64::engine::general_purpose::STANDARD
+        .decode(image_base64)
+        .map_err(|e| LlmError::BadRequest(format!("failed to decode sprite base64: {e}")))?;
+
+    let mut rgba = ImageReader::with_format(Cursor::new(&raw), ImageFormat::Png)
+        .decode()
+        .or_else(|_| {
+            ImageReader::new(Cursor::new(&raw))
+                .with_guessed_format()
+                .map_err(|e| LlmError::BadRequest(format!("failed to guess image format: {e}")))?
+                .decode()
+                .map_err(|e| LlmError::BadRequest(format!("failed to decode sprite image: {e}")))
+        })?
+        .to_rgba8();
+
+    let (width, height) = rgba.dimensions();
+    if width == 0 || height == 0 {
+        return Err(LlmError::BadRequest("sprite image cannot be empty".into()));
+    }
+
+    let mut queue = VecDeque::new();
+    let mut visited = vec![false; (width as usize) * (height as usize)];
+
+    let idx = |x: u32, y: u32| (y as usize) * (width as usize) + (x as usize);
+    let is_near_white =
+        |pixel: &image::Rgba<u8>| pixel[0] > 220 && pixel[1] > 220 && pixel[2] > 220;
+
+    let enqueue = |x: u32,
+                   y: u32,
+                   rgba: &image::RgbaImage,
+                   queue: &mut VecDeque<(u32, u32)>,
+                   visited: &mut [bool]| {
+        let index = idx(x, y);
+        if !visited[index] && is_near_white(rgba.get_pixel(x, y)) {
+            visited[index] = true;
+            queue.push_back((x, y));
+        }
+    };
+
+    for x in 0..width {
+        enqueue(x, 0, &rgba, &mut queue, &mut visited);
+        enqueue(x, height - 1, &rgba, &mut queue, &mut visited);
+    }
+    for y in 0..height {
+        enqueue(0, y, &rgba, &mut queue, &mut visited);
+        enqueue(width - 1, y, &rgba, &mut queue, &mut visited);
+    }
+
+    while let Some((x, y)) = queue.pop_front() {
+        rgba.get_pixel_mut(x, y)[3] = 0;
+
+        if x > 0 {
+            enqueue(x - 1, y, &rgba, &mut queue, &mut visited);
+        }
+        if x + 1 < width {
+            enqueue(x + 1, y, &rgba, &mut queue, &mut visited);
+        }
+        if y > 0 {
+            enqueue(x, y - 1, &rgba, &mut queue, &mut visited);
+        }
+        if y + 1 < height {
+            enqueue(x, y + 1, &rgba, &mut queue, &mut visited);
+        }
+    }
+
+    let mut buf = Vec::new();
+    DynamicImage::ImageRgba8(rgba)
+        .write_to(&mut Cursor::new(&mut buf), ImageFormat::Png)
+        .map_err(|e| LlmError::BadRequest(format!("failed to encode normalized sprite: {e}")))?;
+
+    Ok(base64::engine::general_purpose::STANDARD.encode(buf))
+}
+
 // ---------------------------------------------------------------------------
 // Sprite sheet slicing: base64 → 4 emotion frames → SpriteSet
 // ---------------------------------------------------------------------------
@@ -1216,7 +1308,7 @@ fn extract_gemini_image(body: &GeminiResponse) -> Result<(String, String), LlmEr
 /// the AI might draw, matching the initial-version slicing approach.
 fn slice_sprite_sheet(image_base64: &str) -> Result<SpriteSet, LlmError> {
     use base64::Engine as _;
-    use image::{GenericImageView, ImageFormat, ImageReader};
+    use image::{DynamicImage, GenericImageView, ImageFormat, ImageReader};
     use std::io::Cursor;
 
     let raw = base64::engine::general_purpose::STANDARD
@@ -1256,11 +1348,11 @@ fn slice_sprite_sheet(image_base64: &str) -> Result<SpriteSet, LlmError> {
     let encode_tile = |col: u32, row: u32| -> Result<String, LlmError> {
         let sx = col * tile_w + margin_x;
         let sy = row * tile_h + margin_y;
-        let tile = img.crop_imm(sx, sy, cropped_w, cropped_h);
         let mut buf = Vec::new();
-        tile.write_to(&mut Cursor::new(&mut buf), ImageFormat::Png)
+        DynamicImage::ImageRgba8(img.crop_imm(sx, sy, cropped_w, cropped_h).to_rgba8())
+            .write_to(&mut Cursor::new(&mut buf), ImageFormat::Png)
             .map_err(|e| LlmError::BadRequest(format!("failed to encode tile: {e}")))?;
-        Ok(base64::engine::general_purpose::STANDARD.encode(&buf))
+        normalize_sprite_base64(&base64::engine::general_purpose::STANDARD.encode(&buf))
     };
 
     Ok(SpriteSet {
@@ -1779,6 +1871,88 @@ mod tests {
         assert!(user.contains("Description: violet crystal dragon"));
         assert!(user.contains("Top-left: Neutral"));
         assert!(user.contains("Bottom-right: Sleepy"));
+    }
+
+    #[test]
+    fn slice_sprite_sheet_converts_edge_connected_background_to_transparent() {
+        use base64::Engine as _;
+        use image::{DynamicImage, ImageBuffer, ImageFormat, Rgba};
+        use std::io::Cursor;
+
+        let mut sheet = ImageBuffer::from_pixel(20, 20, Rgba([255, 255, 255, 255]));
+
+        for y in 4..6 {
+            for x in 4..6 {
+                sheet.put_pixel(x, y, Rgba([32, 64, 96, 255]));
+            }
+        }
+
+        let mut png = Vec::new();
+        DynamicImage::ImageRgba8(sheet)
+            .write_to(&mut Cursor::new(&mut png), ImageFormat::Png)
+            .expect("encode sprite sheet");
+
+        let sprites = slice_sprite_sheet(&base64::engine::general_purpose::STANDARD.encode(png))
+            .expect("slice sprite sheet");
+
+        let neutral = base64::engine::general_purpose::STANDARD
+            .decode(sprites.neutral)
+            .expect("decode neutral sprite");
+        let neutral = image::load_from_memory_with_format(&neutral, ImageFormat::Png)
+            .expect("decode neutral png")
+            .to_rgba8();
+
+        assert_eq!(
+            neutral.get_pixel(0, 0)[3],
+            0,
+            "white background should be transparent"
+        );
+        assert!(
+            neutral.pixels().any(|pixel| pixel.0 == [32, 64, 96, 255]),
+            "colored sprite pixels must remain opaque"
+        );
+    }
+
+    #[test]
+    fn normalize_sprite_base64_keeps_internal_white_details_opaque() {
+        use base64::Engine as _;
+        use image::{DynamicImage, ImageBuffer, ImageFormat, Rgba};
+        use std::io::Cursor;
+
+        let mut sprite = ImageBuffer::from_pixel(6, 6, Rgba([255, 255, 255, 255]));
+        for y in 1..5 {
+            for x in 1..5 {
+                sprite.put_pixel(x, y, Rgba([32, 64, 96, 255]));
+            }
+        }
+        sprite.put_pixel(3, 3, Rgba([255, 255, 255, 255]));
+
+        let mut png = Vec::new();
+        DynamicImage::ImageRgba8(sprite)
+            .write_to(&mut Cursor::new(&mut png), ImageFormat::Png)
+            .expect("encode sprite png");
+
+        let normalized =
+            normalize_sprite_base64(&base64::engine::general_purpose::STANDARD.encode(png))
+                .expect("normalize sprite");
+
+        let normalized = base64::engine::general_purpose::STANDARD
+            .decode(normalized)
+            .expect("decode normalized sprite");
+        let normalized = image::load_from_memory_with_format(&normalized, ImageFormat::Png)
+            .expect("decode normalized png")
+            .to_rgba8();
+
+        assert_eq!(
+            normalized.get_pixel(0, 0)[3],
+            0,
+            "outer background should be transparent"
+        );
+        assert_eq!(
+            normalized.get_pixel(3, 3).0,
+            [255, 255, 255, 255],
+            "internal white sprite details must remain opaque"
+        );
     }
 
     #[test]

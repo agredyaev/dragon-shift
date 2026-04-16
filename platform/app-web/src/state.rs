@@ -502,6 +502,7 @@ pub fn command_success_message(command: SessionCommand) -> &'static str {
         SessionCommand::StartVoting => "Design voting started.",
         SessionCommand::RevealVotingResults => "Voting results revealed.",
         SessionCommand::ResetGame => "Workshop reset.",
+        SessionCommand::EndSession => "Session ended.",
         _ => "Command sent.",
     }
 }
@@ -516,6 +517,7 @@ fn command_completed_by_phase_update(command: SessionCommand, phase: Phase) -> b
             | (SessionCommand::EndGame, Phase::Judge)
             | (SessionCommand::StartVoting, Phase::Voting)
             | (SessionCommand::RevealVotingResults, Phase::End)
+            | (SessionCommand::EndSession, Phase::End)
             | (SessionCommand::ResetGame, Phase::Lobby)
     )
 }
@@ -598,7 +600,7 @@ fn should_clear_session_snapshot(error: &str) -> bool {
     )
 }
 
-fn clear_session_identity(identity: &mut IdentityState) {
+pub fn clear_session_identity(identity: &mut IdentityState) {
     identity.screen = ShellScreen::Home;
     identity.connection_status = ConnectionStatus::Offline;
     identity.identity = None;

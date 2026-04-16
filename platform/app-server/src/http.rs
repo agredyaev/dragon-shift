@@ -1312,6 +1312,38 @@ pub(crate) async fn workshop_command(
 
                 successful_workshop_command(&mut should_broadcast)
             }
+            SessionCommand::EndSession => {
+                if session.host_player_id.as_deref() != Some(identity.player_id.as_str()) {
+                    return bad_command_request("Only the host can end the session.");
+                }
+                if session.phase != protocol::Phase::Voting {
+                    return bad_command_request("Session can only be ended during voting.");
+                }
+                if let Err(error) = session.finalize_voting() {
+                    return bad_command_request(&error.to_string());
+                }
+                session_to_persist = Some(session.clone());
+                artifact_to_append = Some(SessionArtifactRecord {
+                    id: random_prefixed_id("artifact"),
+                    session_id: session.id.to_string(),
+                    phase: session.phase,
+                    step: phase_step(session.phase),
+                    kind: SessionArtifactKind::VotingFinalized,
+                    player_id: Some(identity.player_id.clone()),
+                    created_at: Utc::now().to_rfc3339(),
+                    payload: json!({
+                        "toPhase": "end",
+                        "endedEarly": true,
+                        "playerScores": session
+                            .players
+                            .iter()
+                            .map(|(player_id, player)| (player_id.clone(), player.score))
+                            .collect::<BTreeMap<_, _>>()
+                    }),
+                });
+
+                successful_workshop_command(&mut should_broadcast)
+            }
             SessionCommand::ResetGame => {
                 if session.host_player_id.as_deref() != Some(identity.player_id.as_str()) {
                     return bad_command_request("Only the host can reset the workshop.");
@@ -1929,14 +1961,36 @@ pub(crate) async fn generate_sprite_sheet(
         return internal_sprite_sheet_error(format!("failed to touch player identity: {error}"));
     }
 
-    let phase = {
-        match ensure_session_cached(&state, session_code).await {
-            Ok(true) => {}
-            Ok(false) => return bad_sprite_sheet_request("Workshop not found."),
+    let (_, _write_guard, write_lease) =
+        match SessionWriteLease::acquire(&state, session_code).await {
+            Ok(guard) => guard,
             Err(error) => {
-                return internal_sprite_sheet_error(format!("failed to load session: {error}"));
+                return internal_sprite_sheet_error(format!(
+                    "failed to acquire session lease: {error}"
+                ));
             }
+        };
+    if let Err(error) = write_lease.ensure_active() {
+        return internal_sprite_sheet_error(format!(
+            "lost session lease before sprite generation load: {error}"
+        ));
+    }
+
+    match reload_cached_session(&state, session_code).await {
+        Ok(true) => {}
+        Ok(false) => return bad_sprite_sheet_request("Workshop not found."),
+        Err(error) => {
+            return internal_sprite_sheet_error(format!("failed to load session: {error}"));
         }
+    }
+
+    if let Err(error) = write_lease.ensure_active() {
+        return internal_sprite_sheet_error(format!(
+            "lost session lease before sprite generation validation: {error}"
+        ));
+    }
+
+    {
         let sessions = state.sessions.lock().await;
         let Some(session) = sessions.get(session_code) else {
             return bad_sprite_sheet_request("Workshop not found.");
@@ -1944,13 +1998,11 @@ pub(crate) async fn generate_sprite_sheet(
         if session.players.get(&identity.player_id).is_none() {
             return bad_sprite_sheet_request("Session identity is invalid or expired.");
         }
-        session.phase
-    };
-
-    if phase != protocol::Phase::Phase0 {
-        return bad_sprite_sheet_request(
-            "Dragon sprites can only be generated during character creation.",
-        );
+        if session.phase != protocol::Phase::Phase0 {
+            return bad_sprite_sheet_request(
+                "Dragon sprites can only be generated during character creation.",
+            );
+        }
     }
 
     let description = request.description.trim();
@@ -1964,6 +2016,65 @@ pub(crate) async fn generate_sprite_sheet(
             return internal_sprite_sheet_error(format!("sprite sheet generation failed: {error}"));
         }
     };
+
+    let (session_before, session_to_persist, artifact_to_append) = {
+        let mut sessions = state.sessions.lock().await;
+        let Some(session) = sessions.get_mut(session_code) else {
+            return bad_sprite_sheet_request("Workshop not found.");
+        };
+        let session_before = session.clone();
+        if session.players.get(&identity.player_id).is_none() {
+            return bad_sprite_sheet_request("Session identity is invalid or expired.");
+        }
+        if session.phase != protocol::Phase::Phase0 {
+            return bad_sprite_sheet_request(
+                "Dragon sprites can only be generated during character creation.",
+            );
+        }
+        if let Err(error) = session.update_player_sprite_draft(
+            &identity.player_id,
+            description.to_string(),
+            sprites.clone(),
+        ) {
+            return bad_sprite_sheet_request(&error.to_string());
+        }
+        let artifact = SessionArtifactRecord {
+            id: random_prefixed_id("artifact"),
+            session_id: session.id.to_string(),
+            phase: session.phase,
+            step: phase_step(session.phase),
+            kind: SessionArtifactKind::PetProfileUpdated,
+            player_id: Some(identity.player_id.clone()),
+            created_at: Utc::now().to_rfc3339(),
+            payload: json!({
+                "hasSprites": true,
+                "draftOnly": true,
+            }),
+        };
+        (session_before, session.clone(), artifact)
+    };
+
+    if let Err(error) = write_lease.ensure_active() {
+        let mut sessions = state.sessions.lock().await;
+        sessions.insert(session_code.to_string(), session_before);
+        return internal_sprite_sheet_error(format!(
+            "lost session lease before sprite draft persist: {error}"
+        ));
+    }
+
+    if let Err(error) = state
+        .store
+        .save_session_with_artifact(&session_to_persist, &artifact_to_append)
+        .await
+    {
+        let mut sessions = state.sessions.lock().await;
+        sessions.insert(session_code.to_string(), session_before);
+        return internal_sprite_sheet_error(format!("failed to persist sprite draft: {error}"));
+    }
+
+    drop(_write_guard);
+    drop(write_lease);
+    broadcast_session_state(&state, session_code, None).await;
 
     (
         StatusCode::OK,

@@ -112,7 +112,11 @@ fn App() -> Element {
     // Day/night background only applies during clock phases (Phase1/Phase2).
     // Home screen (no game_state) and other phases use the neutral shell background.
     let shell_class = if is_clock_phase {
-        if is_daytime { "shell shell--day" } else { "shell shell--night" }
+        if is_daytime {
+            "shell shell--day"
+        } else {
+            "shell shell--night"
+        }
     } else {
         "shell"
     };

@@ -148,6 +148,15 @@ pub fn VotingView(
                     "Reveal results"
                 }
                 button {
+                    class: "button button--danger",
+                    "data-testid": "end-session-button",
+                    disabled: commands_disabled,
+                    onclick: move |_| {
+                        spawn(submit_workshop_command(identity, ops, handover_tags_input, judge_bundle, SessionCommand::EndSession, None));
+                    },
+                    "End game"
+                }
+                button {
                     class: "button button--secondary",
                     "data-testid": "reset-game-button",
                     disabled: commands_disabled,

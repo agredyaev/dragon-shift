@@ -386,6 +386,10 @@
         background: #38bdf8;
         color: #082f49;
     }
+    .button--danger {
+        background: #f43f5e;
+        color: #fff;
+    }
     .notice {
         border-radius: 0;
         padding: 14px 16px;
@@ -699,6 +703,117 @@
             inset -4px -4px 0 0 rgba(255,255,255,0.72),
             0 0 0 0 transparent;
         transform: translate(2px, 2px);
+    }
+    /* ---- Leaderboard table ---- */
+    .leaderboard {
+        border: 4px solid #0f172a;
+        background: #ffffff;
+        box-shadow:
+            inset 3px 3px 0 0 rgba(255,255,255,0.72),
+            inset -3px -3px 0 0 rgba(0,0,0,0.08),
+            4px 4px 0 0 rgba(0,0,0,0.24);
+    }
+    .leaderboard__header {
+        display: grid;
+        grid-template-columns: 40px 1fr 60px 60px 72px 64px;
+        gap: 0;
+        padding: 10px 14px;
+        background: #0f172a;
+        color: #f8fafc;
+        font-family: var(--font-display);
+        font-size: 10px;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+    }
+    .leaderboard__row {
+        display: grid;
+        grid-template-columns: 40px 1fr 60px 60px 72px 64px;
+        gap: 0;
+        padding: 10px 14px;
+        align-items: center;
+        border-top: 2px solid #e2e8f0;
+    }
+    .leaderboard__row:first-of-type {
+        border-top: none;
+    }
+    .leaderboard__row--winner {
+        background: #fffbeb;
+    }
+    .leaderboard__col {
+        font-family: var(--font-body);
+        font-size: 12px;
+        color: #0f172a;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+    }
+    .leaderboard__col--rank {
+        font-family: var(--font-display);
+        font-size: 12px;
+        font-weight: 700;
+        text-transform: uppercase;
+    }
+    .leaderboard__col--name {
+        font-family: var(--font-display);
+        font-size: 12px;
+        font-weight: 700;
+        text-transform: uppercase;
+    }
+    .leaderboard__col--score {
+        text-align: center;
+        font-variant-numeric: tabular-nums;
+    }
+    .leaderboard__col--total {
+        text-align: center;
+        font-family: var(--font-display);
+        font-weight: 700;
+        font-variant-numeric: tabular-nums;
+    }
+    .leaderboard__col--status {
+        text-align: center;
+        font-family: var(--font-display);
+        font-size: 10px;
+        text-transform: uppercase;
+        letter-spacing: 0.06em;
+    }
+    .leaderboard__status--good {
+        color: #166534;
+    }
+    .leaderboard__status--bad {
+        color: #991b1b;
+        cursor: default;
+    }
+    .leaderboard__tooltip-anchor {
+        position: relative;
+    }
+    .leaderboard__tooltip {
+        display: none;
+        position: absolute;
+        right: 0;
+        top: 100%;
+        margin-top: 6px;
+        z-index: 10;
+        min-width: 220px;
+        max-width: 320px;
+        padding: 10px 12px;
+        font-family: var(--font-body);
+        font-size: 11px;
+        text-transform: none;
+        letter-spacing: normal;
+        line-height: 1.6;
+        color: #1e293b;
+        white-space: normal;
+        background: #fff1f2;
+        border: 3px solid #991b1b;
+        box-shadow: 3px 3px 0 0 rgba(0,0,0,0.18);
+    }
+    .leaderboard__tooltip-anchor:hover .leaderboard__tooltip {
+        display: block;
+    }
+    /* Creativity leaderboard uses a 4-column grid */
+    .leaderboard--creativity .leaderboard__header,
+    .leaderboard--creativity .leaderboard__row {
+        grid-template-columns: 40px 1fr 1fr 72px;
     }
     /* ---- Scoring methodology (end view) ---- */
     .scoring-method {
@@ -1459,4 +1574,101 @@
         .phase0-card__title {
             font-size: clamp(24px, 6vw, 36px);
         }
+    }
+
+    /* ---------------------------------------------------------------
+       Game Over overlay
+       --------------------------------------------------------------- */
+    .game-over {
+        text-align: center;
+        padding: 32px 16px;
+    }
+    .game-over__title {
+        font-size: clamp(32px, 8vw, 48px);
+        font-weight: 900;
+        letter-spacing: 0.15em;
+        text-transform: uppercase;
+        color: #f43f5e;
+        text-shadow: 3px 3px 0 rgba(0,0,0,0.4);
+        margin: 0 0 8px;
+    }
+    .game-over__subtitle {
+        font-size: clamp(18px, 4vw, 24px);
+        font-weight: 900;
+        letter-spacing: 0.15em;
+        text-transform: uppercase;
+        color: #fbbf24;
+        text-shadow: 2px 2px 0 rgba(0,0,0,0.3);
+        margin: 0 0 24px;
+    }
+    .game-over__list {
+        text-align: left;
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+        margin-bottom: 24px;
+    }
+    .game-over__player {
+        padding: 16px 20px;
+        border: 4px solid #334155;
+        background: #0f172a;
+    }
+    .game-over__player--winner {
+        background: rgba(120,53,15,0.4);
+        border-color: #fbbf24;
+    }
+    .game-over__player-header {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        margin-bottom: 4px;
+    }
+    .game-over__name {
+        font-weight: 900;
+        font-size: 18px;
+        text-transform: uppercase;
+        letter-spacing: 0.1em;
+        color: #cbd5e1;
+    }
+    .game-over__name--winner {
+        color: #fbbf24;
+    }
+    .game-over__crown {
+        margin-right: 6px;
+        display: inline-block;
+        animation: bounce-crown 1s infinite;
+    }
+    @keyframes bounce-crown {
+        0%, 100% { transform: translateY(0); }
+        50% { transform: translateY(-4px); }
+    }
+    .game-over__score {
+        font-weight: 900;
+        font-size: 22px;
+        color: #34d399;
+    }
+    .game-over__score--winner {
+        color: #fbbf24;
+    }
+    .game-over__achievements {
+        display: flex;
+        gap: 6px;
+        flex-wrap: wrap;
+        margin-top: 8px;
+    }
+    .game-over__badge {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        background: #1e293b;
+        border: 2px solid #475569;
+        padding: 3px 10px;
+        font-weight: 700;
+        font-size: 12px;
+        color: #cbd5e1;
+    }
+    .game-over__badge-icon {
+        width: 16px;
+        height: 16px;
+        image-rendering: pixelated;
     }

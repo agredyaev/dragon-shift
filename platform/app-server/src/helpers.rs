@@ -1,3 +1,4 @@
+use crate::llm::normalize_sprite_base64;
 use chrono::Utc;
 use domain::{PlayerAction, SessionDragon, WorkshopSession};
 use protocol::{
@@ -24,6 +25,16 @@ pub(crate) fn phase_label(phase: protocol::Phase) -> &'static str {
 
 pub(crate) fn random_prefixed_id(prefix: &str) -> String {
     format!("{prefix}_{}", Uuid::new_v4().simple())
+}
+
+fn normalized_sprite_set(sprites: &protocol::SpriteSet) -> protocol::SpriteSet {
+    protocol::SpriteSet {
+        neutral: normalize_sprite_base64(&sprites.neutral)
+            .unwrap_or_else(|_| sprites.neutral.clone()),
+        happy: normalize_sprite_base64(&sprites.happy).unwrap_or_else(|_| sprites.happy.clone()),
+        angry: normalize_sprite_base64(&sprites.angry).unwrap_or_else(|_| sprites.angry.clone()),
+        sleepy: normalize_sprite_base64(&sprites.sleepy).unwrap_or_else(|_| sprites.sleepy.clone()),
+    }
 }
 
 fn client_dragon_visuals(dragon: &SessionDragon) -> DragonVisuals {
@@ -134,6 +145,17 @@ pub(crate) fn to_client_game_state(
     session: &WorkshopSession,
     current_player_id: &str,
 ) -> ClientGameState {
+    let normalized_player_sprites: BTreeMap<String, Option<protocol::SpriteSet>> = session
+        .players
+        .iter()
+        .map(|(player_id, player)| {
+            (
+                player_id.clone(),
+                player.custom_sprites.as_ref().map(normalized_sprite_set),
+            )
+        })
+        .collect();
+
     let players = session
         .players
         .iter()
@@ -150,7 +172,7 @@ pub(crate) fn to_client_game_state(
                     is_ready: player.is_ready,
                     is_connected: player.is_connected,
                     pet_description: player.pet_description.clone(),
-                    custom_sprites: player.custom_sprites.clone(),
+                    custom_sprites: normalized_player_sprites.get(player_id).cloned().flatten(),
                 },
             )
         })
@@ -190,10 +212,10 @@ pub(crate) fn to_client_game_state(
                     speech: dragon.speech.clone(),
                     speech_timer: dragon.speech_timer,
                     action_cooldown: dragon.action_cooldown,
-                    custom_sprites: session
-                        .players
+                    custom_sprites: normalized_player_sprites
                         .get(&dragon.original_owner_id)
-                        .and_then(|player| player.custom_sprites.clone()),
+                        .cloned()
+                        .flatten(),
                     judge_observation_score: dragon.judge_observation_score,
                     judge_care_score: dragon.judge_care_score,
                     judge_feedback: dragon.judge_feedback.clone(),
