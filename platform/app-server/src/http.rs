@@ -1974,36 +1974,36 @@ pub(crate) async fn generate_sprite_sheet(
         return internal_sprite_sheet_error(format!("failed to touch player identity: {error}"));
     }
 
-    let (_, _write_guard, write_lease) =
-        match SessionWriteLease::acquire(&state, session_code).await {
-            Ok(guard) => guard,
-            Err(error) => {
-                return internal_sprite_sheet_error(format!(
-                    "failed to acquire session lease: {error}"
-                ));
-            }
-        };
-    if let Err(error) = write_lease.ensure_active() {
-        return internal_sprite_sheet_error(format!(
-            "lost session lease before sprite generation load: {error}"
-        ));
-    }
-
-    match reload_cached_session(&state, session_code).await {
-        Ok(true) => {}
-        Ok(false) => return bad_sprite_sheet_request("Workshop not found."),
-        Err(error) => {
-            return internal_sprite_sheet_error(format!("failed to load session: {error}"));
-        }
-    }
-
-    if let Err(error) = write_lease.ensure_active() {
-        return internal_sprite_sheet_error(format!(
-            "lost session lease before sprite generation validation: {error}"
-        ));
-    }
-
     {
+        let (_, _write_guard, write_lease) =
+            match SessionWriteLease::acquire(&state, session_code).await {
+                Ok(guard) => guard,
+                Err(error) => {
+                    return internal_sprite_sheet_error(format!(
+                        "failed to acquire session lease: {error}"
+                    ));
+                }
+            };
+        if let Err(error) = write_lease.ensure_active() {
+            return internal_sprite_sheet_error(format!(
+                "lost session lease before sprite generation load: {error}"
+            ));
+        }
+
+        match reload_cached_session(&state, session_code).await {
+            Ok(true) => {}
+            Ok(false) => return bad_sprite_sheet_request("Workshop not found."),
+            Err(error) => {
+                return internal_sprite_sheet_error(format!("failed to load session: {error}"));
+            }
+        }
+
+        if let Err(error) = write_lease.ensure_active() {
+            return internal_sprite_sheet_error(format!(
+                "lost session lease before sprite generation validation: {error}"
+            ));
+        }
+
         let sessions = state.sessions.lock().await;
         let Some(session) = sessions.get(session_code) else {
             return bad_sprite_sheet_request("Workshop not found.");
@@ -2029,6 +2029,37 @@ pub(crate) async fn generate_sprite_sheet(
             return internal_sprite_sheet_error(format!("sprite sheet generation failed: {error}"));
         }
     };
+
+    let (_, _write_guard, write_lease) = match SessionWriteLease::acquire(&state, session_code).await
+    {
+        Ok(guard) => guard,
+        Err(error) => {
+            return internal_sprite_sheet_error(format!(
+                "failed to acquire session lease before sprite draft save: {error}"
+            ));
+        }
+    };
+    if let Err(error) = write_lease.ensure_active() {
+        return internal_sprite_sheet_error(format!(
+            "lost session lease before sprite draft reload: {error}"
+        ));
+    }
+
+    match reload_cached_session(&state, session_code).await {
+        Ok(true) => {}
+        Ok(false) => return bad_sprite_sheet_request("Workshop not found."),
+        Err(error) => {
+            return internal_sprite_sheet_error(format!(
+                "failed to reload session before sprite draft save: {error}"
+            ));
+        }
+    }
+
+    if let Err(error) = write_lease.ensure_active() {
+        return internal_sprite_sheet_error(format!(
+            "lost session lease before sprite draft validation: {error}"
+        ));
+    }
 
     let (session_before, session_to_persist, artifact_to_append) = {
         let mut sessions = state.sessions.lock().await;
