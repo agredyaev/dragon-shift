@@ -7,7 +7,10 @@ use protocol::{
 use serde::{Deserialize, Serialize};
 use std::{
     env, fs,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::Mutex;
@@ -689,6 +692,12 @@ fn vertex_ai_request_locations<'a>(location: &'a str) -> Vec<&'a str> {
     }
 }
 
+fn provider_attempt_indices(provider_count: usize, start_index: usize) -> Vec<usize> {
+    (0..provider_count)
+        .map(|offset| (start_index + offset) % provider_count)
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // Provider pool executor
 // ---------------------------------------------------------------------------
@@ -698,6 +707,8 @@ pub(crate) struct LlmClient {
     config: Arc<LlmPoolConfig>,
     http: reqwest::Client,
     token_cache: GceTokenCache,
+    judge_provider_cursor: Arc<AtomicUsize>,
+    image_provider_cursor: Arc<AtomicUsize>,
 }
 
 impl LlmClient {
@@ -711,6 +722,8 @@ impl LlmClient {
             config: Arc::new(config),
             http,
             token_cache,
+            judge_provider_cursor: Arc::new(AtomicUsize::new(0)),
+            image_provider_cursor: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -728,10 +741,15 @@ impl LlmClient {
         let system_instruction = build_judge_system_instruction();
         let prompt = build_judge_user_prompt(bundle);
         let mut last_error = String::new();
+        let start_index = self
+            .judge_provider_cursor
+            .fetch_add(1, Ordering::Relaxed);
 
-        for (i, provider) in self.config.judge_providers.iter().enumerate() {
+        for provider_index in provider_attempt_indices(self.config.judge_providers.len(), start_index)
+        {
+            let provider = &self.config.judge_providers[provider_index];
             info!(
-                provider_index = i,
+                provider_index,
                 provider_kind = ?provider.kind,
                 model = %provider.model,
                 "attempting judge provider"
@@ -745,7 +763,7 @@ impl LlmClient {
                     Ok(evaluation) => return Ok(evaluation),
                     Err(e) => {
                         warn!(
-                            provider_index = i,
+                            provider_index,
                             error = %e,
                             "judge provider returned unparseable response, failing over"
                         );
@@ -755,7 +773,7 @@ impl LlmClient {
                 },
                 Err(e) if e.is_failover_eligible() => {
                     warn!(
-                        provider_index = i,
+                        provider_index,
                         error = %e,
                         "judge provider failed, failing over"
                     );
@@ -793,10 +811,15 @@ impl LlmClient {
         }
 
         let mut last_error = String::new();
+        let start_index = self
+            .image_provider_cursor
+            .fetch_add(1, Ordering::Relaxed);
 
-        for (i, provider) in self.config.image_providers.iter().enumerate() {
+        for provider_index in provider_attempt_indices(self.config.image_providers.len(), start_index)
+        {
+            let provider = &self.config.image_providers[provider_index];
             info!(
-                provider_index = i,
+                provider_index,
                 provider_kind = ?provider.kind,
                 model = %provider.model,
                 "attempting image provider"
@@ -809,7 +832,7 @@ impl LlmClient {
                 Ok((base64, mime)) => return Ok((base64, mime)),
                 Err(e) if e.is_failover_eligible() => {
                     warn!(
-                        provider_index = i,
+                        provider_index,
                         error = %e,
                         "image provider failed, failing over"
                     );
