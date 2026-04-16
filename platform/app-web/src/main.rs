@@ -17,7 +17,6 @@ use components::notice::NoticeBar;
 use components::phase0_view::Phase0View;
 use components::phase1_view::Phase1View;
 use components::phase2_view::Phase2View;
-use components::voting_view::VotingView;
 use components::workshop_brief::WorkshopBrief;
 
 use helpers::poke_icon_url;
@@ -188,7 +187,7 @@ fn App() -> Element {
                     }
                 } else if is_voting {
                     NoticeBar { ops }
-                    VotingView {
+                    EndView {
                         identity,
                         game_state,
                         ops,

@@ -1186,11 +1186,13 @@ pub(crate) async fn workshop_command(
                 if session.host_player_id.as_deref() != Some(identity.player_id.as_str()) {
                     return bad_command_request("Only the host can end the workshop.");
                 }
-                if session.phase != protocol::Phase::Phase2 {
-                    return bad_command_request("Judge review can only begin from Phase 2.");
+                if !matches!(session.phase, protocol::Phase::Phase2 | protocol::Phase::Judge) {
+                    return bad_command_request("Design voting can only begin from Phase 2.");
                 }
-                // Award phase-end achievements before transitioning
                 session.award_phase_end_achievements();
+                if let Err(error) = session.enter_voting() {
+                    return bad_command_request(&error.to_string());
+                }
                 session_to_persist = Some(session.clone());
                 artifact_to_append = Some(SessionArtifactRecord {
                     id: random_prefixed_id("artifact"),
@@ -1200,7 +1202,11 @@ pub(crate) async fn workshop_command(
                     kind: SessionArtifactKind::ActionProcessed,
                     player_id: Some(identity.player_id.clone()),
                     created_at: Utc::now().to_rfc3339(),
-                    payload: json!({ "command": "endGame", "judgeQueued": true }),
+                    payload: json!({
+                        "command": "endGame",
+                        "judgeQueued": true,
+                        "toPhase": "voting"
+                    }),
                 });
 
                 successful_workshop_command(&mut should_broadcast)
@@ -1209,14 +1215,10 @@ pub(crate) async fn workshop_command(
                 if session.host_player_id.as_deref() != Some(identity.player_id.as_str()) {
                     return bad_command_request("Only the host can open the design vote.");
                 }
-                if session.phase != protocol::Phase::Judge {
-                    return bad_command_request("Design voting can only begin after judge review.");
+                if session.phase != protocol::Phase::Phase2 {
+                    return bad_command_request("Design voting can only begin from Phase 2.");
                 }
-                let immediate_finalize = match session.enter_voting() {
-                    Ok(immediate_finalize) => immediate_finalize,
-                    Err(error) => return bad_command_request(&error.to_string()),
-                };
-                if immediate_finalize && let Err(error) = session.finalize_voting() {
+                if let Err(error) = session.enter_voting() {
                     return bad_command_request(&error.to_string());
                 }
                 session_to_persist = Some(session.clone());
@@ -1228,7 +1230,7 @@ pub(crate) async fn workshop_command(
                     kind: SessionArtifactKind::PhaseChanged,
                     player_id: Some(identity.player_id.clone()),
                     created_at: Utc::now().to_rfc3339(),
-                    payload: json!({ "toPhase": if immediate_finalize { "end" } else { "voting" } }),
+                    payload: json!({ "toPhase": "voting" }),
                 });
 
                 successful_workshop_command(&mut should_broadcast)
@@ -1283,12 +1285,7 @@ pub(crate) async fn workshop_command(
                 if session.phase != protocol::Phase::Voting {
                     return bad_command_request("Results can only be revealed during voting.");
                 }
-                if let Some(voting) = session.voting.as_ref()
-                    && voting.votes_by_player_id.len() < voting.eligible_player_ids.len()
-                {
-                    return bad_command_request("Wait until every eligible player has voted.");
-                }
-                if let Err(error) = session.finalize_voting() {
+                if let Err(error) = session.reveal_voting_results() {
                     return bad_command_request(&error.to_string());
                 }
                 session_to_persist = Some(session.clone());
@@ -1301,7 +1298,7 @@ pub(crate) async fn workshop_command(
                     player_id: Some(identity.player_id.clone()),
                     created_at: Utc::now().to_rfc3339(),
                     payload: json!({
-                        "toPhase": "end",
+                        "resultsRevealed": true,
                         "playerScores": session
                             .players
                             .iter()
@@ -1460,14 +1457,30 @@ pub(crate) async fn workshop_command(
     drop(_write_guard);
     drop(write_lease);
 
-    if should_broadcast && !should_run_judge {
+    if should_broadcast {
         broadcast_session_state(&state, session_code, None).await;
     }
 
     if should_run_judge {
-        if let Err(error) = run_judge_for_session(&state, session_code, &identity.player_id).await {
-            return internal_command_error(error);
-        }
+        let background_state = state.clone();
+        let background_session_code = session_code.to_string();
+        let background_player_id = identity.player_id.clone();
+        tokio::spawn(async move {
+            if let Err(error) = run_judge_for_session(
+                &background_state,
+                &background_session_code,
+                &background_player_id,
+            )
+            .await
+            {
+                tracing::error!(
+                    session_code = %background_session_code,
+                    player_id = %background_player_id,
+                    %error,
+                    "background judge run failed"
+                );
+            }
+        });
     }
 
     tracing::info!(

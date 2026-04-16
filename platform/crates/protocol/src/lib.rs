@@ -245,6 +245,8 @@ pub struct VoteResult {
 pub struct ServerVotingState {
     pub eligible_player_ids: Vec<String>,
     pub votes_by_player_id: BTreeMap<String, String>,
+    #[serde(default)]
+    pub results_revealed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -253,6 +255,8 @@ pub struct ClientVotingState {
     pub eligible_count: i32,
     pub submitted_count: i32,
     pub current_player_vote_dragon_id: Option<String>,
+    #[serde(default)]
+    pub results_revealed: bool,
     pub results: Option<Vec<VoteResult>>,
 }
 

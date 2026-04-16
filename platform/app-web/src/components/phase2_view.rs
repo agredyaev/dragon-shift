@@ -371,7 +371,7 @@ pub fn Phase2View(
                                         None,
                                     ));
                                 },
-                                "Run Judge Review"
+                                "Open scoring"
                             }
                             button {
                                 class: "button button--secondary",

@@ -40,17 +40,6 @@ pub fn Phase0View(
         use_signal(|| current_player(state).and_then(|player| player.custom_sprites.clone()));
     let mut generating = use_signal(|| false);
     let mut saving = use_signal(|| false);
-    let mut generation_count = use_signal(|| {
-        // If player already has sprites, they used at least 1 generation
-        if current_player(state)
-            .and_then(|p| p.custom_sprites.as_ref())
-            .is_some()
-        {
-            1_u32
-        } else {
-            0_u32
-        }
-    });
 
     let is_host = current_player(state).map(|p| p.is_host).unwrap_or(false);
     let commands_disabled = {
@@ -59,7 +48,6 @@ pub fn Phase0View(
     };
     let has_sprites = generated_sprites.read().is_some();
     let description_empty = dragon_description.read().trim().is_empty();
-    let can_regenerate = *generation_count.read() < 2;
 
     drop(gs);
 
@@ -97,7 +85,6 @@ pub fn Phase0View(
                             generating.set(true);
                             spawn(async move {
                                 submit_sprite_sheet_request(identity, ops, generated_sprites, desc).await;
-                                generation_count += 1;
                                 generating.set(false);
                             });
                         }
@@ -157,25 +144,6 @@ pub fn Phase0View(
                         }
                     },
                     if *saving.read() { "Saving..." } else { "Looks good!" }
-                }
-                if can_regenerate {
-                    button {
-                        class: "button button--secondary phase0-action-button",
-                        disabled: commands_disabled || *generating.read() || description_empty,
-                        onclick: {
-                            let desc = dragon_description.read().clone();
-                            move |_| {
-                                let desc = desc.clone();
-                                generating.set(true);
-                                spawn(async move {
-                                    submit_sprite_sheet_request(identity, ops, generated_sprites, desc).await;
-                                    generation_count += 1;
-                                    generating.set(false);
-                                });
-                            }
-                        },
-                        if *generating.read() { "Drawing..." } else { "Regenerate" }
-                    }
                 }
             }
 

@@ -2,10 +2,10 @@ use crate::llm::normalize_sprite_base64;
 use chrono::Utc;
 use domain::{PlayerAction, SessionDragon, WorkshopSession};
 use protocol::{
-    ActionPayload, ActiveTime, ClientDragon, ClientGameState, ClientVotingState, DragonStats,
-    DragonVisuals, FoodType, JudgeActionTrace, JudgeBundle, JudgeDragonBundle, JudgeHandoverChain,
-    JudgePlayerSummary, PlayType, Player, SessionArtifactKind, SessionArtifactRecord, SessionMeta,
-    VoteResult, create_session_settings,
+    create_session_settings, ActionPayload, ActiveTime, ClientDragon, ClientGameState,
+    ClientVotingState, DragonStats, DragonVisuals, FoodType, JudgeActionTrace, JudgeBundle,
+    JudgeDragonBundle, JudgeHandoverChain, JudgePlayerSummary, PlayType, Player,
+    SessionArtifactKind, SessionArtifactRecord, SessionMeta, VoteResult,
 };
 use std::collections::BTreeMap;
 use uuid::Uuid;
@@ -117,8 +117,7 @@ fn client_voting_state(
             counts
         },
     );
-    let results = if session.phase == protocol::Phase::End && !voting.eligible_player_ids.is_empty()
-    {
+    let results = if voting.results_revealed && !voting.eligible_player_ids.is_empty() {
         Some(
             session
                 .dragons
@@ -137,6 +136,7 @@ fn client_voting_state(
         eligible_count: voting.eligible_player_ids.len() as i32,
         submitted_count: voting.votes_by_player_id.len() as i32,
         current_player_vote_dragon_id: voting.votes_by_player_id.get(current_player_id).cloned(),
+        results_revealed: voting.results_revealed,
         results,
     })
 }
@@ -182,7 +182,10 @@ pub(crate) fn to_client_game_state(
         .dragons
         .iter()
         .map(|(dragon_id, dragon)| {
-            let hide_owner_identity = session.phase == protocol::Phase::Voting;
+            let hide_owner_identity = matches!(
+                session.phase,
+                protocol::Phase::Voting if !session.voting.as_ref().is_some_and(|v| v.results_revealed)
+            );
             (
                 dragon_id.clone(),
                 ClientDragon {

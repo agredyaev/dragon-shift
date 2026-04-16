@@ -26,8 +26,8 @@ use persistence::{
 use protocol::{
     ClientWsMessage, CoordinatorType, DragonStats, JoinWorkshopRequest, NoticeLevel,
     ServerWsMessage, SessionArtifactKind, SessionArtifactRecord, SessionCommand, SessionEnvelope,
-    WorkshopCommandRequest, WorkshopCommandResult, WorkshopJoinResult, WorkshopJudgeBundleResult,
-};
+        WorkshopCommandRequest, WorkshopCommandResult, WorkshopJoinResult, WorkshopJudgeBundleResult,
+    };
 use security::{DEFAULT_RUST_SESSION_CODE_PREFIX, OriginPolicyOptions, create_origin_policy};
 use sqlx::PgPool;
 use std::{
@@ -2524,10 +2524,6 @@ async fn workshop_judge_bundle_returns_bundle_for_completed_session() {
             r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"endGame"}}"#,
             session_code, create_success.reconnect_token
         ),
-        format!(
-            r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"startVoting"}}"#,
-            session_code, create_success.reconnect_token
-        ),
     ] {
         let response = app
             .clone()
@@ -2594,9 +2590,26 @@ async fn workshop_judge_bundle_returns_bundle_for_completed_session() {
                      .body(Body::from(format!(r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"revealVotingResults"}}"#, session_code, create_success.reconnect_token)))
                      .expect("build reveal results request"),
              )
-             .await
-             .expect("call revealVotingResults command");
+              .await
+              .expect("call revealVotingResults command");
     assert_eq!(reveal_response.status(), StatusCode::OK);
+
+    let end_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops/command")
+                .header("content-type", "application/json")
+                .body(Body::from(format!(
+                    r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"endSession"}}"#,
+                    session_code, create_success.reconnect_token
+                )))
+                .expect("build end session request"),
+        )
+        .await
+        .expect("call endSession command");
+    assert_eq!(end_response.status(), StatusCode::OK);
 
     state
         .store
@@ -5841,7 +5854,7 @@ async fn workshop_command_rejects_end_game_outside_phase2() {
         serde_json::from_slice(&body).expect("parse command result");
     match result {
         WorkshopCommandResult::Error(error) => {
-            assert_eq!(error.error, "Judge review can only begin from Phase 2.");
+            assert_eq!(error.error, "Design voting can only begin from Phase 2.");
         }
         WorkshopCommandResult::Success(_) => panic!("expected error response"),
     }
@@ -6028,7 +6041,7 @@ async fn workshop_command_rejects_non_host_end_game() {
 }
 
 #[tokio::test]
-async fn workshop_command_enters_judge_when_host_ends_multiplayer_phase2() {
+async fn workshop_command_enters_voting_and_runs_judge_in_background_when_host_ends_multiplayer_phase2() {
     let state = test_state();
     let app = build_app(state.clone());
     let create_response = app
@@ -6148,10 +6161,12 @@ async fn workshop_command_enters_judge_when_host_ends_multiplayer_phase2() {
 
     let sessions = state.sessions.lock().await;
     let session = sessions.get(&session_code).expect("session exists");
-    assert_eq!(session.phase, protocol::Phase::Judge);
-    assert!(session.voting.is_none());
+    assert_eq!(session.phase, protocol::Phase::Voting);
+    assert!(session.voting.is_some());
     let session_id = session.id.to_string();
     drop(sessions);
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     let artifacts = state
         .store
@@ -6355,10 +6370,6 @@ async fn workshop_command_rejects_self_vote_in_voting() {
             r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"endGame"}}"#,
             session_code, create_success.reconnect_token
         ),
-        format!(
-            r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"startVoting"}}"#,
-            session_code, create_success.reconnect_token
-        ),
     ] {
         let response = app
             .clone()
@@ -6487,10 +6498,6 @@ async fn workshop_command_accepts_valid_vote_in_voting() {
         ),
         format!(
             r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"endGame"}}"#,
-            session_code, create_success.reconnect_token
-        ),
-        format!(
-            r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"startVoting"}}"#,
             session_code, create_success.reconnect_token
         ),
     ] {
@@ -6675,10 +6682,6 @@ async fn workshop_command_rejects_non_host_reveal_results() {
             r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"endGame"}}"#,
             session_code, create_success.reconnect_token
         ),
-        format!(
-            r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"startVoting"}}"#,
-            session_code, create_success.reconnect_token
-        ),
     ] {
         let response = app
             .clone()
@@ -6722,7 +6725,7 @@ async fn workshop_command_rejects_non_host_reveal_results() {
 }
 
 #[tokio::test]
-async fn workshop_command_rejects_reveal_results_while_votes_are_pending() {
+async fn workshop_command_allows_reveal_results_while_votes_are_pending() {
     let app = build_app(test_state());
     let create_response = app
         .clone()
@@ -6799,10 +6802,6 @@ async fn workshop_command_rejects_reveal_results_while_votes_are_pending() {
             r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"endGame"}}"#,
             session_code, create_success.reconnect_token
         ),
-        format!(
-            r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"startVoting"}}"#,
-            session_code, create_success.reconnect_token
-        ),
     ] {
         let response = app
             .clone()
@@ -6831,17 +6830,17 @@ async fn workshop_command_rejects_reveal_results_while_votes_are_pending() {
              .await
              .expect("call command endpoint");
 
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(response.status(), StatusCode::OK);
     let body = to_bytes(response.into_body(), usize::MAX)
         .await
         .expect("read command body");
     let result: WorkshopCommandResult =
         serde_json::from_slice(&body).expect("parse command result");
     match result {
+        WorkshopCommandResult::Success(success) => assert!(success.ok),
         WorkshopCommandResult::Error(error) => {
-            assert_eq!(error.error, "Wait until every eligible player has voted.");
+            panic!("expected success, got error: {}", error.error)
         }
-        WorkshopCommandResult::Success(_) => panic!("expected error response"),
     }
 }
 
@@ -6922,10 +6921,6 @@ async fn workshop_command_reveals_voting_results_after_all_votes() {
         ),
         format!(
             r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"endGame"}}"#,
-            session_code, create_success.reconnect_token
-        ),
-        format!(
-            r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"startVoting"}}"#,
             session_code, create_success.reconnect_token
         ),
     ] {
@@ -7010,7 +7005,11 @@ async fn workshop_command_reveals_voting_results_after_all_votes() {
 
     let sessions = state.sessions.lock().await;
     let session = sessions.get(&session_code).expect("session exists");
-    assert_eq!(session.phase, protocol::Phase::End);
+    assert_eq!(session.phase, protocol::Phase::Voting);
+    assert!(session
+        .voting
+        .as_ref()
+        .is_some_and(|voting| voting.results_revealed));
     assert!(session.players.values().all(|player| player.score >= 0));
 }
 

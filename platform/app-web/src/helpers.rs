@@ -21,6 +21,7 @@ pub struct LobbyPlayerRow {
 pub struct VotingOptionRow {
     pub dragon_id: String,
     pub dragon_name: String,
+    pub real_dragon_name: String,
     pub is_selected: bool,
     pub is_current_players_dragon: bool,
     pub color_primary: String,
@@ -122,9 +123,9 @@ pub fn pending_command_label(command: SessionCommand) -> &'static str {
         SessionCommand::StartHandover => "Starting handover…",
         SessionCommand::SubmitTags => "Saving handover tags…",
         SessionCommand::StartPhase2 => "Starting Phase 2…",
-        SessionCommand::EndGame => "Running judge review…",
+        SessionCommand::EndGame => "Opening design voting…",
         SessionCommand::StartVoting => "Opening design voting…",
-        SessionCommand::RevealVotingResults => "Revealing results…",
+        SessionCommand::RevealVotingResults => "Finishing voting…",
         SessionCommand::ResetGame => "Resetting workshop…",
         SessionCommand::EndSession => "Ending session…",
         _ => "Sending command…",
@@ -177,10 +178,10 @@ pub fn phase_screen_body(phase: Phase) -> &'static str {
             "Use the handover notes to guide care actions and keep the dragon thriving."
         }
         Phase::Judge => {
-            "Review the mechanics scores and judge feedback before the host opens the anonymous design vote."
+            "Judge scoring is syncing in the background while the workshop moves into the final reveal flow."
         }
         Phase::Voting => {
-            "Cast an anonymous design vote, track submission progress, and wait for the host to reveal the standings."
+            "Cast an anonymous design vote, track submission progress, and wait for the host to finish the reveal when ready."
         }
         Phase::End => {
             "Review creative awards and final standings, then let the host reset when the workshop is complete."
@@ -578,11 +579,10 @@ pub fn voting_status_copy(state: &ClientGameState) -> String {
     };
 
     if voting.current_player_vote_dragon_id.is_some() {
-        if voting.submitted_count >= voting.eligible_count {
-            "Vote submitted. Host can reveal the results now.".to_string()
-        } else {
-            "Vote submitted. Waiting for the remaining players before reveal.".to_string()
-        }
+        format!(
+            "Vote submitted. {} of {} eligible votes are in; the host can finish voting at any time.",
+            voting.submitted_count, voting.eligible_count
+        )
     } else {
         "Choose the most creative dragon design that is not currently assigned to you.".to_string()
     }
@@ -592,8 +592,19 @@ pub fn voting_reveal_ready(state: &ClientGameState) -> bool {
     state
         .voting
         .as_ref()
-        .map(|voting| voting.eligible_count > 0 && voting.submitted_count >= voting.eligible_count)
+        .map(|voting| voting.eligible_count >= 0)
         .unwrap_or(false)
+}
+
+fn has_judge_scores(state: &ClientGameState) -> bool {
+    state.dragons.values().any(|dragon| {
+        dragon.judge_observation_score.is_some()
+            || dragon.judge_care_score.is_some()
+            || dragon
+                .judge_feedback
+                .as_deref()
+                .is_some_and(|feedback| !feedback.trim().is_empty())
+    })
 }
 
 pub fn voting_option_rows(state: &ClientGameState) -> Vec<VotingOptionRow> {
@@ -617,6 +628,7 @@ pub fn voting_option_rows(state: &ClientGameState) -> Vec<VotingOptionRow> {
         .map(|(index, dragon)| VotingOptionRow {
             dragon_id: dragon.id.clone(),
             dragon_name: format!("Dragon #{}", index + 1),
+            real_dragon_name: dragon.name.clone(),
             is_selected: current_vote_dragon_id == Some(dragon.id.as_str()),
             is_current_players_dragon: current_player_dragon_id == Some(dragon.id.as_str()),
             color_primary: dragon.visuals.color_p.clone(),
@@ -626,6 +638,30 @@ pub fn voting_option_rows(state: &ClientGameState) -> Vec<VotingOptionRow> {
             custom_sprites: dragon.custom_sprites.clone(),
         })
         .collect()
+}
+
+pub fn voting_results_revealed(state: &ClientGameState) -> bool {
+    state
+        .voting
+        .as_ref()
+        .map(|voting| voting.results_revealed)
+        .unwrap_or(false)
+}
+
+pub fn scoring_status_copy(state: &ClientGameState) -> String {
+    if state.phase == Phase::End {
+        return "Game over is ready. Review the final standings below.".to_string();
+    }
+
+    if voting_results_revealed(state) {
+        if has_judge_scores(state) {
+            "Design voting is finished. You can review the creative leaderboard or open the score view.".to_string()
+        } else {
+            "Design voting is finished. Judge scoring is still syncing, so the score view will fill in shortly.".to_string()
+        }
+    } else {
+        voting_status_copy(state)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -699,13 +735,24 @@ pub fn end_results_status_copy(state: &ClientGameState) -> String {
         return "Results will appear once the host reveals the creative vote.".to_string();
     };
 
-    format!(
-        "Creative awards locked in. {} leads the reveal and the final standings are ready.",
-        top_result.dragon_name
-    )
+    if has_judge_scores(state) {
+        format!(
+            "Creative awards locked in. {} leads the reveal and the mechanics leaderboard is ready.",
+            top_result.dragon_name
+        )
+    } else {
+        format!(
+            "Creative awards locked in. {} leads the reveal while judge scoring finishes in the background.",
+            top_result.dragon_name
+        )
+    }
 }
 
 pub fn end_player_score_rows(state: &ClientGameState) -> Vec<EndPlayerScoreRow> {
+    if !has_judge_scores(state) {
+        return Vec::new();
+    }
+
     let mut players = state.players.values().collect::<Vec<_>>();
     players.sort_by(|left, right| {
         right
@@ -745,6 +792,10 @@ pub fn end_player_score_rows(state: &ClientGameState) -> Vec<EndPlayerScoreRow> 
 }
 
 pub fn game_over_player_rows(state: &ClientGameState) -> Vec<GameOverPlayerRow> {
+    if !has_judge_scores(state) {
+        return Vec::new();
+    }
+
     let mut players = state.players.values().collect::<Vec<_>>();
     players.sort_by(|left, right| {
         right
@@ -761,7 +812,7 @@ pub fn game_over_player_rows(state: &ClientGameState) -> Vec<GameOverPlayerRow> 
 
     players
         .into_iter()
-        .take(5)
+        .take(3)
         .enumerate()
         .map(|(index, player)| {
             let badges: Vec<(&str, &str)> = player
@@ -781,54 +832,46 @@ pub fn game_over_player_rows(state: &ClientGameState) -> Vec<GameOverPlayerRow> 
         .collect()
 }
 
-/// Returns (observation_score_sum, care_score_sum, issues) for a player.
+/// Returns (observation_score_sum, care_score_sum, judge_comments) for a player.
 /// observation_score comes from dragons the player created (Phase 1).
 /// care_score comes from dragons the player cared for (Phase 2).
-/// Issues list problems the judge identified in the feedback.
 fn player_phase_scores(state: &ClientGameState, player_id: &str) -> (i32, i32, Vec<String>) {
     let mut obs_total = 0i32;
     let mut care_total = 0i32;
-    let mut issues = Vec::new();
+    let mut judge_comments = Vec::new();
 
     for dragon in state.dragons.values() {
         let is_creator = dragon.original_owner_id.as_deref() == Some(player_id);
         let is_caretaker = dragon.current_owner_id.as_deref() == Some(player_id);
+        let feedback = dragon
+            .judge_feedback
+            .as_deref()
+            .filter(|text| !text.trim().is_empty())
+            .map(str::trim);
 
         if is_creator {
             let obs = dragon.judge_observation_score.unwrap_or(0);
             obs_total += obs;
-            if obs < 40 {
-                let feedback = dragon
-                    .judge_feedback
-                    .as_deref()
-                    .filter(|f| !f.trim().is_empty());
-                issues.push(format!(
-                    "Poor observations for {} ({}pts){}",
-                    dragon.name,
-                    obs,
-                    feedback.map(|f| format!(": {f}")).unwrap_or_default()
+            if let Some(feedback) = feedback {
+                judge_comments.push(format!(
+                    "Phase 1 / {} ({} pts): {}",
+                    dragon.name, obs, feedback
                 ));
             }
         }
         if is_caretaker {
             let care = dragon.judge_care_score.unwrap_or(0);
             care_total += care;
-            if care < 40 {
-                let feedback = dragon
-                    .judge_feedback
-                    .as_deref()
-                    .filter(|f| !f.trim().is_empty());
-                issues.push(format!(
-                    "Poor care for {} ({}pts){}",
-                    dragon.name,
-                    care,
-                    feedback.map(|f| format!(": {f}")).unwrap_or_default()
+            if let Some(feedback) = feedback {
+                judge_comments.push(format!(
+                    "Phase 2 / {} ({} pts): {}",
+                    dragon.name, care, feedback
                 ));
             }
         }
     }
 
-    (obs_total, care_total, issues)
+    (obs_total, care_total, judge_comments)
 }
 
 // ---------------------------------------------------------------------------
@@ -1083,6 +1126,7 @@ pub mod tests {
             eligible_count: 2,
             submitted_count: 1,
             current_player_vote_dragon_id: Some("dragon-2".to_string()),
+            results_revealed: false,
             results: None,
         });
         state
@@ -1103,10 +1147,41 @@ pub mod tests {
             .get_mut("player-2")
             .expect("player-2")
             .achievements = vec!["creative_pick".to_string(), "steady_hands".to_string()];
+        state
+            .dragons
+            .get_mut("dragon-1")
+            .expect("dragon-1")
+            .judge_observation_score = Some(5);
+        state
+            .dragons
+            .get_mut("dragon-1")
+            .expect("dragon-1")
+            .judge_care_score = Some(7);
+        state
+            .dragons
+            .get_mut("dragon-1")
+            .expect("dragon-1")
+            .judge_feedback = Some("Solid handover.".to_string());
+        state
+            .dragons
+            .get_mut("dragon-2")
+            .expect("dragon-2")
+            .judge_observation_score = Some(8);
+        state
+            .dragons
+            .get_mut("dragon-2")
+            .expect("dragon-2")
+            .judge_care_score = Some(10);
+        state
+            .dragons
+            .get_mut("dragon-2")
+            .expect("dragon-2")
+            .judge_feedback = Some("Strong recovery and care.".to_string());
         state.voting = Some(protocol::ClientVotingState {
             eligible_count: 2,
             submitted_count: 2,
             current_player_vote_dragon_id: Some("dragon-2".to_string()),
+            results_revealed: true,
             results: Some(vec![
                 protocol::VoteResult {
                     dragon_id: "dragon-2".to_string(),
@@ -1408,9 +1483,9 @@ pub mod tests {
         assert_eq!(voting_progress_label(&state), "1 / 2 votes submitted");
         assert_eq!(
             voting_status_copy(&state),
-            "Vote submitted. Waiting for the remaining players before reveal."
+            "Vote submitted. 1 of 2 eligible votes are in; the host can finish voting at any time."
         );
-        assert!(!voting_reveal_ready(&state));
+        assert!(voting_reveal_ready(&state));
         assert_eq!(rows.len(), 2);
         assert!(rows
             .iter()
@@ -1427,13 +1502,14 @@ pub mod tests {
             eligible_count: 2,
             submitted_count: 2,
             current_player_vote_dragon_id: Some("dragon-2".to_string()),
+            results_revealed: false,
             results: None,
         });
 
         assert!(voting_reveal_ready(&state));
         assert_eq!(
             voting_status_copy(&state),
-            "Vote submitted. Host can reveal the results now."
+            "Vote submitted. 2 of 2 eligible votes are in; the host can finish voting at any time."
         );
     }
 
@@ -1445,7 +1521,7 @@ pub mod tests {
 
         assert_eq!(
             end_results_status_copy(&state),
-            "Creative awards locked in. Nova leads the reveal and the final standings are ready."
+            "Creative awards locked in. Nova leads the reveal and the mechanics leaderboard is ready."
         );
         assert_eq!(vote_rows.len(), 2);
         assert_eq!(vote_rows[0].dragon_name, "Nova");
@@ -1468,7 +1544,20 @@ pub mod tests {
             "Results will appear once the host reveals the creative vote."
         );
         assert!(end_vote_result_rows(&state).is_empty());
-        assert_eq!(end_player_score_rows(&state)[0].player_name, "Alice");
+        assert!(end_player_score_rows(&state).is_empty());
+    }
+
+    #[test]
+    fn game_over_rows_limit_to_top_three_when_scores_are_ready() {
+        let mut state = scaled_end_state();
+        for dragon in state.dragons.values_mut() {
+            dragon.judge_observation_score = Some(10);
+            dragon.judge_care_score = Some(10);
+        }
+
+        let rows = game_over_player_rows(&state);
+
+        assert_eq!(rows.len(), 3);
     }
 
     #[test]
@@ -1567,6 +1656,7 @@ pub mod tests {
             eligible_count: BUDGET_PLAYERS as i32,
             submitted_count: BUDGET_PLAYERS as i32,
             current_player_vote_dragon_id: Some("dragon-2".to_string()),
+            results_revealed: true,
             results: Some(results),
         });
         state
