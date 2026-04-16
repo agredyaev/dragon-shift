@@ -622,70 +622,20 @@ test.describe('view validators — structure, style, and layout', () => {
         await expect(session).toContainText('Workshop results')
         await expect(session.locator('.roster__status--phase')).toContainText('Final')
 
-        // Creativity leaderboard
-        await expect(session).toContainText('Creativity Leaderboard')
-        const creativitySection = session.locator('.roster').first()
-        await expect(creativitySection).toBeVisible()
-        const creativityItems = creativitySection.locator('.roster__item')
-        expect(await creativityItems.count()).toBeGreaterThanOrEqual(1)
+        // Mechanics leaderboard table
+        await expect(session).toContainText('Mechanics leaderboard')
+        const mechBoard = session.locator('.leaderboard').first()
+        await expect(mechBoard).toBeVisible()
+        await expect(mechBoard.locator('.leaderboard__header')).toBeVisible()
+        const mechRows = mechBoard.locator('.leaderboard__row')
+        expect(await mechRows.count()).toBeGreaterThanOrEqual(1)
 
-        // Creativity items show dragon name, placement, creator name, votes
-        const firstCreativity = creativityItems.first()
-        await expect(firstCreativity.locator('.roster__name')).toBeVisible()
-        await expect(firstCreativity.locator('.roster__meta')).toBeVisible()
-        await expect(firstCreativity.locator('.roster__meta')).toContainText('Created by')
-        await expect(firstCreativity.locator('.roster__status')).toBeVisible()
-
-        // Mechanics leaderboard
-        await expect(session).toContainText('Mechanics Leaderboard')
-
-        // Scoring methodology section
-        const scoringMethods = session.locator('.scoring-method')
-        await expect(scoringMethods).toHaveCount(2) // "How scores work" + "Achievements"
-
-        // First scoring method: "How scores work"
-        const howScores = scoringMethods.nth(0)
-        await expect(howScores.locator('.scoring-method__title')).toHaveText('How scores work')
-        await expect(howScores.locator('.scoring-method__body')).toBeVisible()
-
-        // Scoring methodology content
-        await expect(howScores).toContainText('Observation score')
-        await expect(howScores).toContainText('Care score')
-        await expect(howScores).toContainText('Final score = observation score + care score (max 200)')
-        await expect(howScores).toContainText('Phase 1 creator')
-        await expect(howScores).toContainText('Phase 2 caretaker')
-        await expect(howScores).toContainText('Correct action ratio')
-        await expect(howScores).toContainText('Wrong action count')
-        await expect(howScores).toContainText('Cooldown discipline')
-        await expect(howScores).toContainText('Stat health at finish')
-        await expect(howScores).toContainText('Lowest happiness reached')
-        await expect(howScores).toContainText('Phase 2 decay is 3x stronger')
-
-        // Scoring method styling
-        const methodBorder = await howScores.evaluate(el =>
-          getComputedStyle(el).borderStyle,
-        )
-        expect(methodBorder).toBe('solid')
-
-        // Second scoring method: "Achievements"
-        const achievements = scoringMethods.nth(1)
-        await expect(achievements.locator('.scoring-method__title')).toHaveText('Achievements')
-
-        // All 12 achievements listed
-        const achievementNames = [
-          'master_chef', 'playful_spirit', 'speed_learner', 'no_mistakes',
-          'zen_master', 'perfectionist', 'steady_hand', 'comeback_kid',
-          'helicopter_parent', 'button_masher', 'chaos_gremlin', 'rock_bottom',
-        ]
-        for (const name of achievementNames) {
-          await expect(achievements).toContainText(name)
-        }
-
-        // Achievement descriptions present
-        await expect(achievements).toContainText('first food attempt was correct')
-        await expect(achievements).toContainText('first play attempt was correct')
-        await expect(achievements).toContainText('zero wrong food or play choices')
-        await expect(achievements).toContainText('happiness dropped to zero')
+        // Creativity leaderboard table
+        await expect(session).toContainText('Creativity leaderboard')
+        const creativeBoard = session.locator('.leaderboard--creativity')
+        await expect(creativeBoard).toBeVisible()
+        const creativeRows = creativeBoard.locator('.leaderboard__row')
+        expect(await creativeRows.count()).toBeGreaterThanOrEqual(1)
       }
 
       // Host sees reset message

@@ -340,7 +340,9 @@ test.describe.serial('visual validators', () => {
               fn: async currentPage => {
                 await expect(currentPage.getByTestId('session-panel')).toContainText('Character creation')
                 await expect(currentPage.getByTestId('dragon-description-input')).toBeVisible()
-                await expect(currentPage.getByTestId('sprite-preview-image')).toBeVisible()
+                const previewImages = currentPage.getByTestId('session-panel').locator('.sprite-grid__image')
+                await expect(previewImages).toHaveCount(4)
+                await expect(previewImages.first()).toBeVisible()
                 await expect(currentPage.getByTestId('save-dragon-button')).toBeVisible()
                 return {
                   summary: 'Phase 0 character creation is usable',
@@ -553,7 +555,7 @@ test.describe.serial('visual validators', () => {
               label: 'end-leaderboards',
               fn: async currentPage => {
                 await expect(currentPage.getByTestId('session-panel')).toContainText('Workshop results')
-                await expect(currentPage.getByTestId('session-panel')).toContainText('Creativity Leaderboard')
+                await expect(currentPage.getByTestId('session-panel')).toContainText('Creativity leaderboard')
                 await expect(currentPage.getByTestId('session-panel')).toContainText('Mechanics leaderboard')
                 return {
                   summary: 'End screen shows split leaderboards',
