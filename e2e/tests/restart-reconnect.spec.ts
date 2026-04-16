@@ -4,6 +4,7 @@ import { expect, test, type APIRequestContext } from '@playwright/test'
 
 import {
   createWorkshop,
+  generateDragonSprites,
   joinWorkshop,
   newPlayerContext,
   openCharacterCreation,
@@ -85,6 +86,9 @@ test.describe('browser restart reconnect proof', () => {
       await joinWorkshop(guest.page, workshopCode, 'Bob')
 
       await openCharacterCreation(host.page, guest.page)
+
+      await generateDragonSprites(host.page)
+      await generateDragonSprites(guest.page)
 
       await saveDragonProfile(host.page, 'A lantern-scaled dragon with ember whiskers.')
       await saveDragonProfile(guest.page, 'A mint dragon with ribbon fins and calm eyes.')
