@@ -39,6 +39,11 @@ LLM_JUDGE_MODEL="${TF_LLM_JUDGE_MODEL:-gemini-2.5-flash}"
 LLM_IMAGE_MODEL="${TF_LLM_IMAGE_MODEL:-gemini-2.5-flash-image}"
 RUST_LOG="${TF_RUST_LOG:-info,tower_http=debug}"
 GEMINI_API_KEY="${TF_GEMINI_API_KEY:-}"
+GEMINI_API_KEY_1="${TF_GEMINI_API_KEY_1:-}"
+GEMINI_API_KEY_2="${TF_GEMINI_API_KEY_2:-}"
+GEMINI_API_KEY_3="${TF_GEMINI_API_KEY_3:-}"
+GEMINI_API_KEY_4="${TF_GEMINI_API_KEY_4:-}"
+GEMINI_API_KEY_5="${TF_GEMINI_API_KEY_5:-}"
 DATABASE_POOL_SIZE="${TF_DATABASE_POOL_SIZE:-}"
 APP_CPU_REQUEST="${TF_APP_CPU_REQUEST:-}"
 APP_CPU_LIMIT="${TF_APP_CPU_LIMIT:-}"
@@ -249,6 +254,24 @@ if [[ -n "${GEMINI_API_KEY}" ]]; then
   gemini_api_key_json=$',\n  "gemini_api_key": "'"$(json_escape "${GEMINI_API_KEY}")"'"'
 fi
 
+gemini_api_keys_json=""
+gemini_api_keys=()
+for key in "${GEMINI_API_KEY_1}" "${GEMINI_API_KEY_2}" "${GEMINI_API_KEY_3}" "${GEMINI_API_KEY_4}" "${GEMINI_API_KEY_5}"; do
+  if [[ -n "${key}" ]]; then
+    gemini_api_keys+=("\"$(json_escape "${key}")\"")
+  fi
+done
+if (( ${#gemini_api_keys[@]} > 0 )); then
+  gemini_api_keys_json=$',\n  "gemini_api_keys": ['
+  for ((i=0; i<${#gemini_api_keys[@]}; i++)); do
+    if (( i > 0 )); then
+      gemini_api_keys_json+=', '
+    fi
+    gemini_api_keys_json+="${gemini_api_keys[$i]}"
+  done
+  gemini_api_keys_json+=']'
+fi
+
 cat >"${PLATFORM_VARS_FILE}" <<EOF
 {
   "project_id": "$(json_escape "${PROJECT_ID}")",
@@ -274,7 +297,7 @@ cat >"${PLATFORM_VARS_FILE}" <<EOF
   "kubeconfig_path": "$(json_escape "${KUBECONFIG_PATH}")",
   "labels": {
     "owner": "platform"
-  }${notification_channel_json}${gemini_api_key_json}${platform_database_pool_json}${platform_app_cpu_request_json}${platform_app_cpu_limit_json}${platform_app_memory_request_json}${platform_app_memory_limit_json}${platform_create_rate_limit_json}${platform_join_rate_limit_json}${platform_command_rate_limit_json}${platform_websocket_rate_limit_json}
+  }${notification_channel_json}${gemini_api_key_json}${gemini_api_keys_json}${platform_database_pool_json}${platform_app_cpu_request_json}${platform_app_cpu_limit_json}${platform_app_memory_request_json}${platform_app_memory_limit_json}${platform_create_rate_limit_json}${platform_join_rate_limit_json}${platform_command_rate_limit_json}${platform_websocket_rate_limit_json}
 }
 EOF
 

@@ -222,6 +222,13 @@ variable "gemini_api_key" {
   sensitive   = true
 }
 
+variable "gemini_api_keys" {
+  description = "Optional additional Gemini API keys for api_key mode. Production automation can populate this list from multiple GitHub secrets to spread requests across several provider entries."
+  type        = list(string)
+  default     = []
+  sensitive   = true
+}
+
 variable "google_cloud_project" {
   description = "Google Cloud project ID passed to the app runtime for Vertex AI calls. Required for vertex_ai providers and defaults to var.project_id in production automation."
   type        = string
@@ -257,8 +264,10 @@ variable "llm_provider_type" {
   }
 
   validation {
-    condition     = var.llm_provider_type != "api_key" || trimspace(var.gemini_api_key) != ""
-    error_message = "gemini_api_key must be set when llm_provider_type is api_key."
+    condition = var.llm_provider_type != "api_key" || (
+      trimspace(var.gemini_api_key) != "" || length(compact([for key in var.gemini_api_keys : trimspace(key)])) > 0
+    )
+    error_message = "gemini_api_key or gemini_api_keys must be set when llm_provider_type is api_key."
   }
 }
 

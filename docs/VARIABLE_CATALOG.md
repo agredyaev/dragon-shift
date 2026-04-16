@@ -103,4 +103,5 @@
 - `GCP_WORKLOAD_IDENTITY_PROVIDER` - repository secret for the Google Workload Identity Provider resource name
 - `GCP_SERVICE_ACCOUNT_EMAIL` - repository secret for the GitHub Actions Terraform service account email
 - `TF_PRODUCTION_DB_PASSWORD` - repository secret for the Cloud SQL application password
-- `TF_GEMINI_API_KEY` - optional repository secret required only when `TF_LLM_PROVIDER_TYPE=api_key`
+- `TF_GEMINI_API_KEY` - optional primary repository secret required only when `TF_LLM_PROVIDER_TYPE=api_key`
+- `TF_GEMINI_API_KEY_1` ... `TF_GEMINI_API_KEY_5` - optional additional repository secrets for multi-key `api_key` deployments

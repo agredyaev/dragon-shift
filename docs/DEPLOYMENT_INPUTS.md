@@ -39,7 +39,8 @@
 - `GCP_WORKLOAD_IDENTITY_PROVIDER` - repository secret for the Google Workload Identity Provider resource name
 - `GCP_SERVICE_ACCOUNT_EMAIL` - repository secret for the GitHub Actions Terraform service account email
 - `TF_PRODUCTION_DB_PASSWORD` - repository secret for the Cloud SQL application password
-- `TF_GEMINI_API_KEY` - optional repository secret only for `api_key` mode
+- `TF_GEMINI_API_KEY` - optional primary repository secret for `api_key` mode
+- `TF_GEMINI_API_KEY_1` ... `TF_GEMINI_API_KEY_5` - optional additional repository secrets for `api_key` mode when spreading judge/image traffic across multiple Gemini keys
 
 ## Manual Non-Production Helm Inputs
 - `KUBECONFIG_B64` - base64 kubeconfig for the target non-production environment
@@ -73,7 +74,7 @@
 - `database.existingSecretKey` - Kubernetes secret key name
 
 ## Notes
-- LLM provider pools are configured as ordered arrays. Failover happens left-to-right on 429 or provider failure.
+- LLM provider pools are configured as ordered arrays. The runtime now starts each request from a round-robin provider index and still fails over left-to-right on 429 or provider failure.
 - `vertex_ai` providers in the current runtime use the in-cluster Google metadata server and Workload Identity wiring; they do not use a generic local ADC chain.
 - `api_key` providers read their key from a Kubernetes Secret referenced in the provider entry.
 - GKE Workload Identity also requires the matching IAM binding (`roles/iam.workloadIdentityUser`) from the Kubernetes service account to the target Google service account.

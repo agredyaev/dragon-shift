@@ -345,6 +345,11 @@ jobs:
           TF_WEBSOCKET_RATE_LIMIT_MAX: ${{ vars.TF_WEBSOCKET_RATE_LIMIT_MAX }}
           TF_PRODUCTION_DB_PASSWORD: ${{ secrets.TF_PRODUCTION_DB_PASSWORD }}
           TF_GEMINI_API_KEY: ${{ secrets.TF_GEMINI_API_KEY }}
+          TF_GEMINI_API_KEY_1: ${{ secrets.TF_GEMINI_API_KEY_1 }}
+          TF_GEMINI_API_KEY_2: ${{ secrets.TF_GEMINI_API_KEY_2 }}
+          TF_GEMINI_API_KEY_3: ${{ secrets.TF_GEMINI_API_KEY_3 }}
+          TF_GEMINI_API_KEY_4: ${{ secrets.TF_GEMINI_API_KEY_4 }}
+          TF_GEMINI_API_KEY_5: ${{ secrets.TF_GEMINI_API_KEY_5 }}
           IMAGE_REPOSITORY: ${{ needs.publish.outputs.image_repository }}
           IMAGE_DIGEST: ${{ needs.publish.outputs.image_digest }}
           IMAGE_TAG: ${{ needs.publish.outputs.image_tag }}

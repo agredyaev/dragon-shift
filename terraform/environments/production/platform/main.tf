@@ -2,6 +2,10 @@ locals {
   notification_channel_id = trimspace(var.notification_channel_id)
   managed_dns_enabled     = var.hostname_mode == "managed_dns"
   app_hostname            = var.hostname_mode == "nip_io" ? format("%s.%s.nip.io", trimspace(var.nip_io_label), google_compute_global_address.ingress.address) : trimspace(var.hostname)
+  gemini_api_keys = compact(concat(
+    trimspace(var.gemini_api_key) != "" ? [trimspace(var.gemini_api_key)] : [],
+    [for key in var.gemini_api_keys : trimspace(key)],
+  ))
   has_app_resource_overrides = anytrue([
     var.app_cpu_request != null,
     var.app_cpu_limit != null,
@@ -232,7 +236,7 @@ resource "kubernetes_secret" "database_url" {
 }
 
 resource "kubernetes_secret" "llm" {
-  count = var.llm_provider_type == "api_key" ? 1 : 0
+  count = var.llm_provider_type == "api_key" && length(local.gemini_api_keys) > 0 ? 1 : 0
 
   metadata {
     name      = "dragon-shift-llm"
@@ -244,10 +248,16 @@ resource "kubernetes_secret" "llm" {
     }
   }
 
-  data = {
-    LLM_JUDGE_API_KEY_0 = var.gemini_api_key
-    LLM_IMAGE_API_KEY_0 = var.gemini_api_key
-  }
+  data = merge(
+    {
+      for index, key in local.gemini_api_keys :
+      format("LLM_JUDGE_API_KEY_%d", index) => key
+    },
+    {
+      for index, key in local.gemini_api_keys :
+      format("LLM_IMAGE_API_KEY_%d", index) => key
+    },
+  )
 
   depends_on = [kubernetes_namespace.app]
 }
@@ -426,11 +436,11 @@ resource "helm_release" "app" {
         googleCloudProject    = var.llm_provider_type == "vertex_ai" ? (var.google_cloud_project != "" ? var.google_cloud_project : var.project_id) : ""
         googleCloudLocation   = var.llm_provider_type == "vertex_ai" ? (var.google_cloud_location != "" ? var.google_cloud_location : var.region) : ""
         judgeProviders = var.llm_provider_type == "api_key" ? [
-          {
+          for index, _key in local.gemini_api_keys : {
             type             = "api_key"
             model            = var.llm_judge_model
             apiKeySecretName = "dragon-shift-llm"
-            apiKeySecretKey  = "LLM_JUDGE_API_KEY_0"
+            apiKeySecretKey  = format("LLM_JUDGE_API_KEY_%d", index)
           }
           ] : [
           {
@@ -439,11 +449,11 @@ resource "helm_release" "app" {
           }
         ]
         imageProviders = var.llm_provider_type == "api_key" ? [
-          {
+          for index, _key in local.gemini_api_keys : {
             type             = "api_key"
             model            = var.llm_image_model
             apiKeySecretName = "dragon-shift-llm"
-            apiKeySecretKey  = "LLM_IMAGE_API_KEY_0"
+            apiKeySecretKey  = format("LLM_IMAGE_API_KEY_%d", index)
           }
           ] : [
           {
