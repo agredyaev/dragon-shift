@@ -333,6 +333,16 @@ jobs:
           TF_LLM_JUDGE_MODEL: ${{ vars.TF_LLM_JUDGE_MODEL }}
           TF_LLM_IMAGE_MODEL: ${{ vars.TF_LLM_IMAGE_MODEL }}
           TF_RUST_LOG: ${{ vars.TF_RUST_LOG }}
+          TF_DB_TIER: ${{ vars.TF_DB_TIER }}
+          TF_DATABASE_POOL_SIZE: ${{ vars.TF_DATABASE_POOL_SIZE }}
+          TF_APP_CPU_REQUEST: ${{ vars.TF_APP_CPU_REQUEST }}
+          TF_APP_CPU_LIMIT: ${{ vars.TF_APP_CPU_LIMIT }}
+          TF_APP_MEMORY_REQUEST: ${{ vars.TF_APP_MEMORY_REQUEST }}
+          TF_APP_MEMORY_LIMIT: ${{ vars.TF_APP_MEMORY_LIMIT }}
+          TF_CREATE_RATE_LIMIT_MAX: ${{ vars.TF_CREATE_RATE_LIMIT_MAX }}
+          TF_JOIN_RATE_LIMIT_MAX: ${{ vars.TF_JOIN_RATE_LIMIT_MAX }}
+          TF_COMMAND_RATE_LIMIT_MAX: ${{ vars.TF_COMMAND_RATE_LIMIT_MAX }}
+          TF_WEBSOCKET_RATE_LIMIT_MAX: ${{ vars.TF_WEBSOCKET_RATE_LIMIT_MAX }}
           TF_PRODUCTION_DB_PASSWORD: ${{ secrets.TF_PRODUCTION_DB_PASSWORD }}
           TF_GEMINI_API_KEY: ${{ secrets.TF_GEMINI_API_KEY }}
           IMAGE_REPOSITORY: ${{ needs.publish.outputs.image_repository }}

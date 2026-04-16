@@ -60,6 +60,11 @@
 - `image_repository` - deployed image repository
 - `image_digest` - deployed image digest
 - `image_tag` - deployed image tag
+- `database_pool_size` - runtime `DATABASE_POOL_SIZE` override for production
+- `app_cpu_request` - optional production app pod CPU request override
+- `app_cpu_limit` - optional production app pod CPU limit override
+- `app_memory_request` - optional production app pod memory request override
+- `app_memory_limit` - optional production app pod memory limit override
 - `notification_channel_id` - optional Monitoring notification channel override; automated production deploys default to the foundation stack output
 - `kubeconfig_path` - optional kubeconfig path for platform apply
 - `kubeconfig_context` - optional kubeconfig context name
@@ -85,6 +90,17 @@
 - `TF_LLM_JUDGE_MODEL` - optional repository variable overriding the judge model
 - `TF_LLM_IMAGE_MODEL` - optional repository variable overriding the image model
 - `TF_RUST_LOG` - optional repository variable overriding runtime `RUST_LOG`
+- `TF_DB_TIER` - optional repository variable overriding the Cloud SQL machine tier
+- `TF_DATABASE_POOL_SIZE` - optional repository variable overriding runtime `DATABASE_POOL_SIZE`
+- `TF_APP_CPU_REQUEST` - optional repository variable overriding the app pod CPU request
+- `TF_APP_CPU_LIMIT` - optional repository variable overriding the app pod CPU limit
+- `TF_APP_MEMORY_REQUEST` - optional repository variable overriding the app pod memory request
+- `TF_APP_MEMORY_LIMIT` - optional repository variable overriding the app pod memory limit
+- `TF_CREATE_RATE_LIMIT_MAX` - optional repository variable overriding the create-workshop rate limit
+- `TF_JOIN_RATE_LIMIT_MAX` - optional repository variable overriding the join/reconnect rate limit
+- `TF_COMMAND_RATE_LIMIT_MAX` - optional repository variable overriding the workshop command rate limit
+- `TF_WEBSOCKET_RATE_LIMIT_MAX` - optional repository variable overriding the websocket rate limit
 - `GCP_WORKLOAD_IDENTITY_PROVIDER` - repository secret for the Google Workload Identity Provider resource name
 - `GCP_SERVICE_ACCOUNT_EMAIL` - repository secret for the GitHub Actions Terraform service account email
 - `TF_PRODUCTION_DB_PASSWORD` - repository secret for the Cloud SQL application password
+- `TF_GEMINI_API_KEY` - optional repository secret required only when `TF_LLM_PROVIDER_TYPE=api_key`

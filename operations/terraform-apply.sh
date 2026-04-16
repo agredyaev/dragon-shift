@@ -9,6 +9,7 @@ PROJECT_ID="${GCP_PROJECT_ID:?GCP_PROJECT_ID is required}"
 REGION="${GCP_REGION:-europe-west4}"
 SUPPORT_EMAIL="${TF_SUPPORT_EMAIL:?TF_SUPPORT_EMAIL is required}"
 DB_PASSWORD="${TF_PRODUCTION_DB_PASSWORD:?TF_PRODUCTION_DB_PASSWORD is required}"
+DB_TIER="${TF_DB_TIER:-}"
 IMAGE_REPOSITORY="${IMAGE_REPOSITORY:-ghcr.io/agredyaev/dragon-shift}"
 IMAGE_DIGEST="${IMAGE_DIGEST:-}"
 IMAGE_TAG="${IMAGE_TAG:-main}"
@@ -38,6 +39,15 @@ LLM_JUDGE_MODEL="${TF_LLM_JUDGE_MODEL:-gemini-2.5-flash}"
 LLM_IMAGE_MODEL="${TF_LLM_IMAGE_MODEL:-gemini-2.5-flash-image}"
 RUST_LOG="${TF_RUST_LOG:-info,tower_http=debug}"
 GEMINI_API_KEY="${TF_GEMINI_API_KEY:-}"
+DATABASE_POOL_SIZE="${TF_DATABASE_POOL_SIZE:-}"
+APP_CPU_REQUEST="${TF_APP_CPU_REQUEST:-}"
+APP_CPU_LIMIT="${TF_APP_CPU_LIMIT:-}"
+APP_MEMORY_REQUEST="${TF_APP_MEMORY_REQUEST:-}"
+APP_MEMORY_LIMIT="${TF_APP_MEMORY_LIMIT:-}"
+CREATE_RATE_LIMIT_MAX="${TF_CREATE_RATE_LIMIT_MAX:-}"
+JOIN_RATE_LIMIT_MAX="${TF_JOIN_RATE_LIMIT_MAX:-}"
+COMMAND_RATE_LIMIT_MAX="${TF_COMMAND_RATE_LIMIT_MAX:-}"
+WEBSOCKET_RATE_LIMIT_MAX="${TF_WEBSOCKET_RATE_LIMIT_MAX:-}"
 
 if [[ -z "${IMAGE_DIGEST}" && -z "${IMAGE_TAG}" ]]; then
   printf 'Either IMAGE_DIGEST or IMAGE_TAG must be set.\n' >&2
@@ -52,6 +62,18 @@ require_boolean() {
     true|false) ;;
     *)
       printf '%s must be true or false.\n' "${name}" >&2
+      exit 1
+      ;;
+  esac
+}
+
+require_integer() {
+  local name="$1"
+  local value="$2"
+
+  case "${value}" in
+    ''|*[!0-9]*)
+      printf '%s must be a non-negative integer.\n' "${name}" >&2
       exit 1
       ;;
   esac
@@ -104,11 +126,77 @@ require_boolean "TF_ENABLE_CLOUD_ARMOR" "${ENABLE_CLOUD_ARMOR}"
 require_boolean "TF_ENABLE_UPTIME_CHECKS" "${ENABLE_UPTIME_CHECKS}"
 require_boolean "TF_VERIFY_PUBLIC_EDGE" "${VERIFY_PUBLIC_EDGE}"
 
+if [[ -n "${DATABASE_POOL_SIZE}" ]]; then
+  require_integer "TF_DATABASE_POOL_SIZE" "${DATABASE_POOL_SIZE}"
+fi
+if [[ -n "${CREATE_RATE_LIMIT_MAX}" ]]; then
+  require_integer "TF_CREATE_RATE_LIMIT_MAX" "${CREATE_RATE_LIMIT_MAX}"
+fi
+if [[ -n "${JOIN_RATE_LIMIT_MAX}" ]]; then
+  require_integer "TF_JOIN_RATE_LIMIT_MAX" "${JOIN_RATE_LIMIT_MAX}"
+fi
+if [[ -n "${COMMAND_RATE_LIMIT_MAX}" ]]; then
+  require_integer "TF_COMMAND_RATE_LIMIT_MAX" "${COMMAND_RATE_LIMIT_MAX}"
+fi
+if [[ -n "${WEBSOCKET_RATE_LIMIT_MAX}" ]]; then
+  require_integer "TF_WEBSOCKET_RATE_LIMIT_MAX" "${WEBSOCKET_RATE_LIMIT_MAX}"
+fi
+
 FOUNDATION_VARS_FILE="${TMP_DIR}/foundation.auto.tfvars.json"
 PLATFORM_VARS_FILE="${TMP_DIR}/platform.auto.tfvars.json"
 BOOTSTRAP_STATE="${TMP_DIR}/bootstrap.tfstate"
 KUBECONFIG_PATH="${TMP_DIR}/kubeconfig"
 PORT_FORWARD_LOG="${TMP_DIR}/port-forward.log"
+
+foundation_db_tier_json=""
+if [[ -n "${DB_TIER}" ]]; then
+  foundation_db_tier_json=$',\n  "db_tier": "'"$(json_escape "${DB_TIER}")"'"'
+fi
+
+platform_database_pool_json=""
+if [[ -n "${DATABASE_POOL_SIZE}" ]]; then
+  platform_database_pool_json=$',\n  "database_pool_size": '"${DATABASE_POOL_SIZE}"
+fi
+
+platform_app_cpu_request_json=""
+if [[ -n "${APP_CPU_REQUEST}" ]]; then
+  platform_app_cpu_request_json=$',\n  "app_cpu_request": "'"$(json_escape "${APP_CPU_REQUEST}")"'"'
+fi
+
+platform_app_cpu_limit_json=""
+if [[ -n "${APP_CPU_LIMIT}" ]]; then
+  platform_app_cpu_limit_json=$',\n  "app_cpu_limit": "'"$(json_escape "${APP_CPU_LIMIT}")"'"'
+fi
+
+platform_app_memory_request_json=""
+if [[ -n "${APP_MEMORY_REQUEST}" ]]; then
+  platform_app_memory_request_json=$',\n  "app_memory_request": "'"$(json_escape "${APP_MEMORY_REQUEST}")"'"'
+fi
+
+platform_app_memory_limit_json=""
+if [[ -n "${APP_MEMORY_LIMIT}" ]]; then
+  platform_app_memory_limit_json=$',\n  "app_memory_limit": "'"$(json_escape "${APP_MEMORY_LIMIT}")"'"'
+fi
+
+platform_create_rate_limit_json=""
+if [[ -n "${CREATE_RATE_LIMIT_MAX}" ]]; then
+  platform_create_rate_limit_json=$',\n  "create_rate_limit_max": '"${CREATE_RATE_LIMIT_MAX}"
+fi
+
+platform_join_rate_limit_json=""
+if [[ -n "${JOIN_RATE_LIMIT_MAX}" ]]; then
+  platform_join_rate_limit_json=$',\n  "join_rate_limit_max": '"${JOIN_RATE_LIMIT_MAX}"
+fi
+
+platform_command_rate_limit_json=""
+if [[ -n "${COMMAND_RATE_LIMIT_MAX}" ]]; then
+  platform_command_rate_limit_json=$',\n  "command_rate_limit_max": '"${COMMAND_RATE_LIMIT_MAX}"
+fi
+
+platform_websocket_rate_limit_json=""
+if [[ -n "${WEBSOCKET_RATE_LIMIT_MAX}" ]]; then
+  platform_websocket_rate_limit_json=$',\n  "websocket_rate_limit_max": '"${WEBSOCKET_RATE_LIMIT_MAX}"
+fi
 
 authorized_network_entries=()
 authorized_network_entries+=("{\"cidr_block\":\"$(json_escape "${RUNNER_PUBLIC_IPV4}/32")\",\"display_name\":\"automation-runner\"}")
@@ -147,7 +235,7 @@ cat >"${FOUNDATION_VARS_FILE}" <<EOF
   "master_authorized_networks": [${authorized_networks_json}],
   "labels": {
     "owner": "platform"
-  }
+  }${foundation_db_tier_json}
 }
 EOF
 
@@ -186,7 +274,7 @@ cat >"${PLATFORM_VARS_FILE}" <<EOF
   "kubeconfig_path": "$(json_escape "${KUBECONFIG_PATH}")",
   "labels": {
     "owner": "platform"
-  }${notification_channel_json}${gemini_api_key_json}
+  }${notification_channel_json}${gemini_api_key_json}${platform_database_pool_json}${platform_app_cpu_request_json}${platform_app_cpu_limit_json}${platform_app_memory_request_json}${platform_app_memory_limit_json}${platform_create_rate_limit_json}${platform_join_rate_limit_json}${platform_command_rate_limit_json}${platform_websocket_rate_limit_json}
 }
 EOF
 

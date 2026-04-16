@@ -103,6 +103,30 @@ variable "database_pool_size" {
   default     = 10
 }
 
+variable "app_cpu_request" {
+  description = "Optional CPU request override for the production app pod. When null, the Helm chart default is used."
+  type        = string
+  default     = null
+}
+
+variable "app_cpu_limit" {
+  description = "Optional CPU limit override for the production app pod. When null, the Helm chart default is used."
+  type        = string
+  default     = null
+}
+
+variable "app_memory_request" {
+  description = "Optional memory request override for the production app pod. When null, the Helm chart default is used."
+  type        = string
+  default     = null
+}
+
+variable "app_memory_limit" {
+  description = "Optional memory limit override for the production app pod. When null, the Helm chart default is used."
+  type        = string
+  default     = null
+}
+
 variable "rust_session_code_prefix" {
   description = "Single-digit session code prefix."
   type        = string

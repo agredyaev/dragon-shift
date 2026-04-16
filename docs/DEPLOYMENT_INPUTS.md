@@ -17,6 +17,7 @@
 - `TF_NIP_IO_LABEL` - repository variable for the `nip.io` hostname label
 - `TF_ENABLE_CLOUD_ARMOR` - repository variable to disable Cloud Armor when quota is unavailable
 - `TF_ENABLE_UPTIME_CHECKS` - repository variable to opt into Monitoring uptime checks
+- `TF_NOTIFICATION_CHANNEL_ID` - optional repository variable overriding the foundation stack notification channel output
 - `TF_EXTRA_MASTER_AUTHORIZED_CIDRS` - repository variable with extra operator IPv4 CIDRs, comma-separated
 - `TF_VERIFY_PUBLIC_EDGE` - repository variable to require public HTTPS and browser smoke validation
 - `TF_GOOGLE_CLOUD_PROJECT` - optional repository variable overriding the runtime Vertex AI project id; defaults to `GCP_PROJECT_ID`
@@ -25,6 +26,16 @@
 - `TF_LLM_JUDGE_MODEL` - optional judge model override
 - `TF_LLM_IMAGE_MODEL` - optional image model override
 - `TF_RUST_LOG` - optional runtime `RUST_LOG` override
+- `TF_DB_TIER` - optional Cloud SQL machine tier override for the foundation stack
+- `TF_DATABASE_POOL_SIZE` - optional runtime `DATABASE_POOL_SIZE` override for the app pod
+- `TF_APP_CPU_REQUEST` - optional app pod CPU request override
+- `TF_APP_CPU_LIMIT` - optional app pod CPU limit override
+- `TF_APP_MEMORY_REQUEST` - optional app pod memory request override
+- `TF_APP_MEMORY_LIMIT` - optional app pod memory limit override
+- `TF_CREATE_RATE_LIMIT_MAX` - optional runtime create-workshop rate limit override
+- `TF_JOIN_RATE_LIMIT_MAX` - optional runtime join/reconnect rate limit override
+- `TF_COMMAND_RATE_LIMIT_MAX` - optional runtime workshop command rate limit override
+- `TF_WEBSOCKET_RATE_LIMIT_MAX` - optional runtime websocket rate limit override
 - `GCP_WORKLOAD_IDENTITY_PROVIDER` - repository secret for the Google Workload Identity Provider resource name
 - `GCP_SERVICE_ACCOUNT_EMAIL` - repository secret for the GitHub Actions Terraform service account email
 - `TF_PRODUCTION_DB_PASSWORD` - repository secret for the Cloud SQL application password

@@ -2,6 +2,22 @@ locals {
   notification_channel_id = trimspace(var.notification_channel_id)
   managed_dns_enabled     = var.hostname_mode == "managed_dns"
   app_hostname            = var.hostname_mode == "nip_io" ? format("%s.%s.nip.io", trimspace(var.nip_io_label), google_compute_global_address.ingress.address) : trimspace(var.hostname)
+  has_app_resource_overrides = anytrue([
+    var.app_cpu_request != null,
+    var.app_cpu_limit != null,
+    var.app_memory_request != null,
+    var.app_memory_limit != null,
+  ])
+  app_resources = {
+    requests = merge(
+      var.app_cpu_request != null ? { cpu = var.app_cpu_request } : {},
+      var.app_memory_request != null ? { memory = var.app_memory_request } : {},
+    )
+    limits = merge(
+      var.app_cpu_limit != null ? { cpu = var.app_cpu_limit } : {},
+      var.app_memory_limit != null ? { memory = var.app_memory_limit } : {},
+    )
+  }
 
   common_labels = merge(
     {
@@ -366,93 +382,96 @@ resource "helm_release" "app" {
   timeout           = 900
   wait              = true
 
-  values = [yamlencode({
-    image = {
-      repository = var.image_repository
-      digest     = local.use_image_digest ? var.image_digest : ""
-      tag        = local.use_image_digest ? "ignored" : var.image_tag
-    }
-    ingress = {
-      enabled   = true
-      className = "gce"
-      host      = local.app_hostname
-      annotations = {
-        "kubernetes.io/ingress.global-static-ip-name" = google_compute_global_address.ingress.name
-        "networking.gke.io/managed-certificates"      = kubernetes_manifest.managed_certificate.manifest.metadata.name
-        "kubernetes.io/ingress.allow-http"            = "false"
+  values = [yamlencode(merge(
+    {
+      image = {
+        repository = var.image_repository
+        digest     = local.use_image_digest ? var.image_digest : ""
+        tag        = local.use_image_digest ? "ignored" : var.image_tag
       }
-      tls = {
-        enabled    = false
-        secretName = ""
+      ingress = {
+        enabled   = true
+        className = "gce"
+        host      = local.app_hostname
+        annotations = {
+          "kubernetes.io/ingress.global-static-ip-name" = google_compute_global_address.ingress.name
+          "networking.gke.io/managed-certificates"      = kubernetes_manifest.managed_certificate.manifest.metadata.name
+          "kubernetes.io/ingress.allow-http"            = "false"
+        }
+        tls = {
+          enabled    = false
+          secretName = ""
+        }
       }
-    }
-    service = {
-      type       = "ClusterIP"
-      port       = 80
-      targetPort = 3000
-      annotations = {
-        "cloud.google.com/backend-config" = jsonencode({ default = kubernetes_manifest.backend_config.manifest.metadata.name })
-        "cloud.google.com/neg"            = jsonencode({ ingress = true })
+      service = {
+        type       = "ClusterIP"
+        port       = 80
+        targetPort = 3000
+        annotations = {
+          "cloud.google.com/backend-config" = jsonencode({ default = kubernetes_manifest.backend_config.manifest.metadata.name })
+          "cloud.google.com/neg"            = jsonencode({ ingress = true })
+        }
       }
-    }
-    app = {
-      allowedOrigins        = format("https://%s", local.app_hostname)
-      viteAppUrl            = format("https://%s", local.app_hostname)
-      rustLog               = var.rust_log
-      rustSessionCodePrefix = var.rust_session_code_prefix
-      trustForwardedFor     = var.trust_forwarded_for
-      databasePoolSize      = var.database_pool_size
-      createRateLimitMax    = var.create_rate_limit_max
-      joinRateLimitMax      = var.join_rate_limit_max
-      commandRateLimitMax   = var.command_rate_limit_max
-      socketRateLimitMax    = var.websocket_rate_limit_max
-      googleCloudProject    = var.llm_provider_type == "vertex_ai" ? (var.google_cloud_project != "" ? var.google_cloud_project : var.project_id) : ""
-      googleCloudLocation   = var.llm_provider_type == "vertex_ai" ? (var.google_cloud_location != "" ? var.google_cloud_location : var.region) : ""
-      judgeProviders = var.llm_provider_type == "api_key" ? [
-        {
-          type             = "api_key"
-          model            = var.llm_judge_model
-          apiKeySecretName = "dragon-shift-llm"
-          apiKeySecretKey  = "LLM_JUDGE_API_KEY_0"
-        }
-        ] : [
-        {
-          type  = "vertex_ai"
-          model = var.llm_judge_model
-        }
-      ]
-      imageProviders = var.llm_provider_type == "api_key" ? [
-        {
-          type             = "api_key"
-          model            = var.llm_image_model
-          apiKeySecretName = "dragon-shift-llm"
-          apiKeySecretKey  = "LLM_IMAGE_API_KEY_0"
-        }
-        ] : [
-        {
-          type  = "vertex_ai"
-          model = var.llm_image_model
-        }
-      ]
-    }
-    database = {
-      existingSecretName = kubernetes_secret.database_url.metadata[0].name
-      existingSecretKey  = "DATABASE_URL"
-    }
-    postgresql = {
-      enabled = false
-    }
-    replicaCount = 1
-    serviceAccount = {
-      create                       = false
-      name                         = kubernetes_service_account.app.metadata[0].name
-      automountServiceAccountToken = var.llm_provider_type == "vertex_ai"
-    }
-    podDisruptionBudget = {
-      enabled      = true
-      minAvailable = 1
-    }
-  })]
+      app = {
+        allowedOrigins        = format("https://%s", local.app_hostname)
+        viteAppUrl            = format("https://%s", local.app_hostname)
+        rustLog               = var.rust_log
+        rustSessionCodePrefix = var.rust_session_code_prefix
+        trustForwardedFor     = var.trust_forwarded_for
+        databasePoolSize      = var.database_pool_size
+        createRateLimitMax    = var.create_rate_limit_max
+        joinRateLimitMax      = var.join_rate_limit_max
+        commandRateLimitMax   = var.command_rate_limit_max
+        socketRateLimitMax    = var.websocket_rate_limit_max
+        googleCloudProject    = var.llm_provider_type == "vertex_ai" ? (var.google_cloud_project != "" ? var.google_cloud_project : var.project_id) : ""
+        googleCloudLocation   = var.llm_provider_type == "vertex_ai" ? (var.google_cloud_location != "" ? var.google_cloud_location : var.region) : ""
+        judgeProviders = var.llm_provider_type == "api_key" ? [
+          {
+            type             = "api_key"
+            model            = var.llm_judge_model
+            apiKeySecretName = "dragon-shift-llm"
+            apiKeySecretKey  = "LLM_JUDGE_API_KEY_0"
+          }
+          ] : [
+          {
+            type  = "vertex_ai"
+            model = var.llm_judge_model
+          }
+        ]
+        imageProviders = var.llm_provider_type == "api_key" ? [
+          {
+            type             = "api_key"
+            model            = var.llm_image_model
+            apiKeySecretName = "dragon-shift-llm"
+            apiKeySecretKey  = "LLM_IMAGE_API_KEY_0"
+          }
+          ] : [
+          {
+            type  = "vertex_ai"
+            model = var.llm_image_model
+          }
+        ]
+      }
+      database = {
+        existingSecretName = kubernetes_secret.database_url.metadata[0].name
+        existingSecretKey  = "DATABASE_URL"
+      }
+      postgresql = {
+        enabled = false
+      }
+      replicaCount = 1
+      serviceAccount = {
+        create                       = false
+        name                         = kubernetes_service_account.app.metadata[0].name
+        automountServiceAccountToken = var.llm_provider_type == "vertex_ai"
+      }
+      podDisruptionBudget = {
+        enabled      = true
+        minAvailable = 1
+      }
+    },
+    local.has_app_resource_overrides ? { resources = local.app_resources } : {},
+  ))]
 
   depends_on = [
     kubernetes_manifest.backend_config,
