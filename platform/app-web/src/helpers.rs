@@ -183,12 +183,6 @@ pub fn phase_screen_body(phase: Phase) -> &'static str {
     }
 }
 
-pub fn fallback_pet_description(player_name: &str) -> String {
-    format!(
-        "A plain training-manikin dragon for {player_name}: neutral gray scales, simple proportions, and no distinctive personality yet."
-    )
-}
-
 pub fn phase_duration_seconds(state: &ClientGameState) -> Option<i32> {
     state
         .session

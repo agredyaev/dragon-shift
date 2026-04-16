@@ -34,12 +34,6 @@ use crate::helpers::{
 };
 use crate::ws::broadcast_session_state;
 
-fn default_player_pet_description(player_name: &str) -> String {
-    format!(
-        "A plain training-manikin dragon for {player_name}: neutral gray scales, simple proportions, and no distinctive personality yet."
-    )
-}
-
 fn clamp_score(score: i32) -> i32 {
     score.clamp(0, 100)
 }
@@ -274,11 +268,17 @@ async fn run_judge_for_session(
 
     let bundle = build_judge_bundle(&session, &artifacts);
     let evaluation = if state.config.llm_pool.is_judge_configured() {
-        state
-            .llm_client
-            .judge(&bundle)
-            .await
-            .map_err(|error| format!("LLM judge failed: {error}"))?
+        match state.llm_client.judge(&bundle).await {
+            Ok(evaluation) => evaluation,
+            Err(error) => {
+                tracing::warn!(
+                    %session_code,
+                    %error,
+                    "LLM judge failed, using deterministic local fallback"
+                );
+                deterministic_local_judge_evaluation(&bundle)
+            }
+        }
     } else {
         tracing::info!(%session_code, "using deterministic local judge fallback");
         deterministic_local_judge_evaluation(&bundle)
@@ -470,7 +470,7 @@ pub(crate) async fn create_workshop(
     let host_player = SessionPlayer {
         id: player_id.clone(),
         name: normalized_name.to_string(),
-        pet_description: Some(default_player_pet_description(normalized_name)),
+        pet_description: None,
         custom_sprites: None,
         is_host: true,
         is_connected: true,
@@ -718,7 +718,7 @@ pub(crate) async fn join_workshop(
         let player = SessionPlayer {
             id: player_id.clone(),
             name: normalized_name.clone(),
-            pet_description: Some(default_player_pet_description(&normalized_name)),
+            pet_description: None,
             custom_sprites: None,
             is_host: false,
             is_connected: true,

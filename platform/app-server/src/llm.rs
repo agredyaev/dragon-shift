@@ -575,11 +575,15 @@ struct GeminiGenerationConfig {
 #[derive(Deserialize)]
 struct GeminiResponse {
     candidates: Option<Vec<GeminiCandidate>>,
+    #[serde(rename = "promptFeedback")]
+    prompt_feedback: Option<GeminiPromptFeedback>,
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct GeminiCandidate {
     content: Option<GeminiResponseContent>,
+    finish_reason: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -601,6 +605,12 @@ struct GeminiInlineData {
     data: Option<String>,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GeminiPromptFeedback {
+    block_reason: Option<String>,
+}
+
 fn gemini_text_content(role: Option<&str>, text: &str) -> GeminiContent {
     GeminiContent {
         role: role.map(str::to_string),
@@ -608,6 +618,42 @@ fn gemini_text_content(role: Option<&str>, text: &str) -> GeminiContent {
             text: text.to_string(),
         }],
     }
+}
+
+fn extract_gemini_text(body: &GeminiResponse) -> Result<String, LlmError> {
+    let Some(candidates) = body.candidates.as_ref() else {
+        return Err(LlmError::ProviderUnavailable(
+            body.prompt_feedback
+                .as_ref()
+                .and_then(|feedback| feedback.block_reason.as_deref())
+                .map(|reason| format!("model returned no candidates (block reason: {reason})"))
+                .unwrap_or_else(|| "model returned no candidates".to_string()),
+        ));
+    };
+
+    for candidate in candidates {
+        if let Some(parts) = candidate.content.as_ref().and_then(|content| content.parts.as_ref()) {
+            let text = parts
+                .iter()
+                .filter_map(|part| part.text.as_deref())
+                .map(str::trim)
+                .find(|text| !text.is_empty());
+            if let Some(text) = text {
+                return Ok(text.to_string());
+            }
+        }
+    }
+
+    let finish_reasons = candidates
+        .iter()
+        .filter_map(|candidate| candidate.finish_reason.as_deref())
+        .collect::<Vec<_>>();
+    let detail = if finish_reasons.is_empty() {
+        "empty response from model".to_string()
+    } else {
+        format!("empty response from model (finish reasons: {})", finish_reasons.join(", "))
+    };
+    Err(LlmError::ProviderUnavailable(detail))
 }
 
 fn vertex_ai_generate_content_url(project: &str, location: &str, model: &str) -> String {
@@ -768,7 +814,7 @@ impl LlmClient {
     }
 
     // -----------------------------------------------------------------------
-    // Sprite sheet generation: prompt → 4x2 grid → 8 base64 frames
+    // Sprite sheet generation: prompt → 2x2 grid → 4 base64 frames
     // -----------------------------------------------------------------------
 
     pub(crate) async fn generate_sprite_sheet(
@@ -885,19 +931,7 @@ impl LlmClient {
                         LlmError::ProviderUnavailable(format!("response parse: {e}"))
                     })?;
 
-                    let text = body
-                        .candidates
-                        .as_ref()
-                        .and_then(|c| c.first())
-                        .and_then(|c| c.content.as_ref())
-                        .and_then(|c| c.parts.as_ref())
-                        .and_then(|p| p.first())
-                        .and_then(|p| p.text.as_ref())
-                        .ok_or_else(|| {
-                            LlmError::ProviderUnavailable("empty response from model".to_string())
-                        })?;
-
-                    return Ok(text.clone());
+                    return extract_gemini_text(&body);
                 }
 
                 return Err(LlmError::RateLimited("429 from vertex_ai provider".into()));
@@ -951,19 +985,7 @@ impl LlmClient {
             .await
             .map_err(|e| LlmError::ProviderUnavailable(format!("response parse: {e}")))?;
 
-        let text = body
-            .candidates
-            .as_ref()
-            .and_then(|c| c.first())
-            .and_then(|c| c.content.as_ref())
-            .and_then(|c| c.parts.as_ref())
-            .and_then(|p| p.first())
-            .and_then(|p| p.text.as_ref())
-            .ok_or_else(|| {
-                LlmError::ProviderUnavailable("empty response from model".to_string())
-            })?;
-
-        Ok(text.clone())
+        extract_gemini_text(&body)
     }
 
     // -----------------------------------------------------------------------
@@ -1189,6 +1211,9 @@ fn extract_gemini_image(body: &GeminiResponse) -> Result<(String, String), LlmEr
 /// Layout: 2 columns × 2 rows.
 /// Top-left: neutral, Top-right: happy
 /// Bottom-left: angry, Bottom-right: sleepy
+///
+/// Crops 5% margins from each quadrant edge to remove any grid lines
+/// the AI might draw, matching the initial-version slicing approach.
 fn slice_sprite_sheet(image_base64: &str) -> Result<SpriteSet, LlmError> {
     use base64::Engine as _;
     use image::{GenericImageView, ImageFormat, ImageReader};
@@ -1221,8 +1246,17 @@ fn slice_sprite_sheet(image_base64: &str) -> Result<SpriteSet, LlmError> {
         )));
     }
 
+    // Crop 5% from each edge of every quadrant to remove any grid lines
+    // the AI might draw (matches initial-version extractQuadrant logic).
+    let margin_x = (tile_w as f64 * 0.05) as u32;
+    let margin_y = (tile_h as f64 * 0.05) as u32;
+    let cropped_w = tile_w - margin_x * 2;
+    let cropped_h = tile_h - margin_y * 2;
+
     let encode_tile = |col: u32, row: u32| -> Result<String, LlmError> {
-        let tile = img.crop_imm(col * tile_w, row * tile_h, tile_w, tile_h);
+        let sx = col * tile_w + margin_x;
+        let sy = row * tile_h + margin_y;
+        let tile = img.crop_imm(sx, sy, cropped_w, cropped_h);
         let mut buf = Vec::new();
         tile.write_to(&mut Cursor::new(&mut buf), ImageFormat::Png)
             .map_err(|e| LlmError::BadRequest(format!("failed to encode tile: {e}")))?;
@@ -1239,34 +1273,19 @@ fn slice_sprite_sheet(image_base64: &str) -> Result<SpriteSet, LlmError> {
 
 fn build_sprite_sheet_system_instruction() -> &'static str {
     r#"You are a sprite-sheet generator for a pixel-art dragon game.
-
-Your output will be sliced mechanically into 4 equal tiles, so layout accuracy is mandatory.
-
-Subject: 2D pixel art cute baby dragon.
-
-Hard requirements:
-- Return exactly one image.
-- The full canvas must be a 2 columns x 2 rows sprite sheet.
-- Use equal-sized tiles with perfect alignment.
-- No gutters, no spacing, no borders, no frames, no labels, no captions, no text.
-- Show the same dragon in all 4 tiles.
-- Keep the same camera angle, scale, framing, and silhouette in every tile.
-- Center the dragon in each tile and let it fill most of the tile.
-- Retro pixel-art style: crisp edges, no anti-aliasing, no blur.
-- Background must be transparent or a uniform dark flat background.
-- No props, scenery, UI, speech bubbles, or extra characters.
-
-Emotion order is fixed:
-- Top row, left to right: neutral, happy
-- Bottom row, left to right: angry, sleepy"#
+Your output will be sliced mechanically into a 2x2 grid (4 equal quadrants), so layout accuracy is mandatory.
+Draw the exact same character in every quadrant — same pose, scale, and framing — changing only the facial expression.
+Pure white background (#FFFFFF). No text anywhere in the image.
+Quadrant layout (fixed):
+- Top-left: Neutral expression.
+- Top-right: Happy expression.
+- Bottom-left: Angry expression.
+- Bottom-right: Sleepy expression."#
 }
 
 fn build_sprite_sheet_user_prompt(description: &str) -> String {
     format!(
-        r#"Draw a 2D pixel art cute baby dragon with these traits: {description}
-
-Render the same dragon across 4 emotion tiles with clearly distinct facial expression and body language.
-Return exactly one image."#
+        r#"Generate a 2x2 sprite sheet of EXACTLY ONE cute 2D pixel art character. Style: retro game sprite, crisp pixels, flat colors, pure white background (#FFFFFF). Subject: A cute 2D pixel art dragon. Description: {description}. CRITICAL INSTRUCTION: You MUST draw the exact same character in all 4 quadrants, changing ONLY the facial expression. Top-left: Neutral. Top-right: Happy. Bottom-left: Angry. Bottom-right: Sleepy. The character must be perfectly centered in each quadrant with plenty of white space around it."#
     )
 }
 
@@ -1708,16 +1727,58 @@ mod tests {
     }
 
     #[test]
+    fn extract_gemini_text_uses_first_non_empty_text_part() {
+        let body: GeminiResponse = serde_json::from_str(
+            r#"{
+                "candidates": [{
+                    "finishReason": "STOP",
+                    "content": {
+                        "parts": [
+                            {"text": "   "},
+                            {"text": "{\"summary\":\"ok\",\"dragonEvaluations\":[]}"}
+                        ]
+                    }
+                }]
+            }"#,
+        )
+        .expect("parse gemini response");
+
+        let text = extract_gemini_text(&body).expect("extract text");
+        assert_eq!(text, r#"{"summary":"ok","dragonEvaluations":[]}"#);
+    }
+
+    #[test]
+    fn extract_gemini_text_reports_finish_reason_when_candidate_is_empty() {
+        let body: GeminiResponse = serde_json::from_str(
+            r#"{
+                "candidates": [{
+                    "finishReason": "MAX_TOKENS",
+                    "content": {"parts": []}
+                }]
+            }"#,
+        )
+        .expect("parse gemini response");
+
+        let error = extract_gemini_text(&body).expect_err("must fail");
+        assert!(error.to_string().contains("finish reasons: MAX_TOKENS"));
+    }
+
+    #[test]
     fn sprite_sheet_prompts_encode_hard_layout_rules() {
         let system = build_sprite_sheet_system_instruction();
         let user = build_sprite_sheet_user_prompt("violet crystal dragon");
 
-        assert!(system.contains("2 columns × 2 rows sprite sheet"));
-        assert!(system.contains("No gutters, no spacing, no borders"));
-        assert!(system.contains("Top row, left to right: neutral, happy"));
-        assert!(system.contains("Bottom row, left to right: angry, sleepy"));
-        assert!(user.contains("Dragon description: violet crystal dragon"));
-        assert!(user.contains("Render the same dragon across 4 emotion tiles"));
+        assert!(system.contains("2x2 grid"));
+        assert!(system.contains("Pure white background (#FFFFFF)"));
+        assert!(system.contains("No text anywhere in the image"));
+        assert!(system.contains("Top-left: Neutral"));
+        assert!(system.contains("Top-right: Happy"));
+        assert!(system.contains("Bottom-left: Angry"));
+        assert!(system.contains("Bottom-right: Sleepy"));
+        assert!(user.contains("Subject: A cute 2D pixel art dragon"));
+        assert!(user.contains("Description: violet crystal dragon"));
+        assert!(user.contains("Top-left: Neutral"));
+        assert!(user.contains("Bottom-right: Sleepy"));
     }
 
     #[test]

@@ -635,7 +635,7 @@ fn session_player(id: &str, name: &str, joined_at_seconds: i64) -> SessionPlayer
     SessionPlayer {
         id: id.to_string(),
         name: name.to_string(),
-        pet_description: Some(default_player_pet_description(name)),
+        pet_description: None,
         custom_sprites: None,
         is_host: false,
         is_connected: true,
@@ -645,12 +645,6 @@ fn session_player(id: &str, name: &str, joined_at_seconds: i64) -> SessionPlayer
         achievements: Vec::new(),
         joined_at: chrono::DateTime::from_timestamp(joined_at_seconds, 0).expect("valid timestamp"),
     }
-}
-
-fn default_player_pet_description(name: &str) -> String {
-    format!(
-        "A plain training-manikin dragon for {name}: neutral gray scales, simple proportions, and no distinctive personality yet."
-    )
 }
 
 fn create_workshop_body(name: &str) -> String {
@@ -2704,10 +2698,9 @@ async fn create_workshop_endpoint_returns_join_success() {
                 .players
                 .get(&success.player_id)
                 .expect("host player in state");
-            let expected_description = default_player_pet_description("Alice");
             assert_eq!(
                 host.pet_description.as_deref(),
-                Some(expected_description.as_str())
+                None
             );
         }
         WorkshopJoinResult::Error(error) => panic!("expected success, got error: {}", error.error),
@@ -3357,10 +3350,9 @@ async fn join_workshop_endpoint_returns_join_success_for_lobby_session() {
                 .players
                 .get(&success.player_id)
                 .expect("joined player in state");
-            let expected_description = default_player_pet_description("Bob");
             assert_eq!(
                 joined.pet_description.as_deref(),
-                Some(expected_description.as_str())
+                None
             );
         }
         WorkshopJoinResult::Error(error) => panic!("expected success, got error: {}", error.error),
@@ -6158,6 +6150,24 @@ async fn workshop_command_enters_judge_when_host_ends_multiplayer_phase2() {
     let session = sessions.get(&session_code).expect("session exists");
     assert_eq!(session.phase, protocol::Phase::Judge);
     assert!(session.voting.is_none());
+    let session_id = session.id.to_string();
+    drop(sessions);
+
+    let artifacts = state
+        .store
+        .list_session_artifacts(&session_id)
+        .await
+        .expect("list session artifacts after endGame");
+    let judge_artifact = artifacts
+        .iter()
+        .find(|artifact| artifact.kind == SessionArtifactKind::JudgeBundleGenerated)
+        .expect("judge artifact generated");
+    let summary = judge_artifact
+        .payload
+        .get("llmSummary")
+        .and_then(|value| value.as_str())
+        .expect("judge artifact summary");
+    assert!(!summary.trim().is_empty());
 }
 
 #[tokio::test]
