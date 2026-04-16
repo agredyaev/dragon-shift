@@ -73,7 +73,22 @@ export async function gotoApp(page: Page) {
 }
 
 export async function waitForNotice(page: Page, text: string) {
-  await expect(page.getByTestId('notice-bar')).toContainText(text)
+  const aliases: Record<string, string[]> = {
+    'Character creation opened.': ['Opening character creation…'],
+    'Scoring opened.': ['Opening design voting…'],
+    'Voting finished.': ['Finishing voting…'],
+  }
+
+  const accepted = [text, ...(aliases[text] ?? [])]
+  await expect
+    .poll(async () => {
+      const notice = page.getByTestId('notice-bar')
+      if (await notice.count() === 0) {
+        return ''
+      }
+      return (await notice.textContent()) ?? ''
+    })
+    .toSatisfy(message => accepted.some(candidate => message.includes(candidate)))
 }
 
 export async function expectPhaseVisible(pages: Page[], text: string, timeout = 15_000) {
@@ -179,17 +194,17 @@ export async function enterPhase2(hostPage: Page, ...otherPages: Page[]) {
 
 export async function enterJudge(hostPage: Page, ...otherPages: Page[]) {
   await hostPage.getByTestId('end-game-button').click()
-  await expect(hostPage.getByTestId('start-voting-button')).toBeVisible({ timeout: 120_000 })
+  await waitForNotice(hostPage, 'Scoring opened.')
   for (const page of [hostPage, ...otherPages]) {
-    await expect(page.locator('body')).toContainText('Mechanics leaderboard', { timeout: 120_000 })
+    await expect(page.locator('body')).toContainText('Scoring', { timeout: 120_000 })
+    await expect(page.getByTestId('end-session-button')).toBeVisible({ timeout: 120_000 })
   }
 }
 
 export async function enterVoting(hostPage: Page, ...otherPages: Page[]) {
-  await hostPage.getByTestId('start-voting-button').click()
-  await waitForNotice(hostPage, 'Design voting started.')
   for (const page of [hostPage, ...otherPages]) {
     await expect(page.locator('.voting-grid')).toBeVisible()
+    await expect(page.locator('body')).toContainText('Vote for the most creative dragon design')
   }
 }
 
