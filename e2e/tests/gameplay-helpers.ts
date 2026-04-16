@@ -80,15 +80,20 @@ export async function waitForNotice(page: Page, text: string) {
   }
 
   const accepted = [text, ...(aliases[text] ?? [])]
-  await expect
-    .poll(async () => {
-      const notice = page.getByTestId('notice-bar')
-      if (await notice.count() === 0) {
-        return ''
+  const notice = page.getByTestId('notice-bar')
+  const deadline = Date.now() + 15_000
+
+  while (Date.now() < deadline) {
+    if (await notice.count()) {
+      const message = (await notice.textContent()) ?? ''
+      if (accepted.some(candidate => message.includes(candidate))) {
+        return
       }
-      return (await notice.textContent()) ?? ''
-    })
-    .toSatisfy(message => accepted.some(candidate => message.includes(candidate)))
+    }
+    await page.waitForTimeout(200)
+  }
+
+  throw new Error(`notice did not match any expected text: ${accepted.join(' | ')}`)
 }
 
 export async function expectPhaseVisible(pages: Page[], text: string, timeout = 15_000) {
