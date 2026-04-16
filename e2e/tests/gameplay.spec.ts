@@ -3,12 +3,21 @@ import { expect, test, type WebSocketRoute } from '@playwright/test'
 import {
   advanceWorkshopToVoting,
   createWorkshop,
+  dismissGameOverOverlay,
+  enterHandover,
+  enterJudge,
+  enterPhase1,
+  enterPhase2,
+  enterVoting,
   expectToStayOnHome,
+  generateDragonSprites,
   gotoApp,
   joinWorkshop,
   newPlayerContext,
+  openCharacterCreation,
   readReconnectToken,
   readSessionSnapshot,
+  saveHandoverTags,
   voteForVisibleDragon,
   waitForNotice,
 } from './gameplay-helpers'
@@ -18,6 +27,30 @@ async function safeClose(...contexts: Array<{ close: () => Promise<void> }>) {
 }
 
 const lobbyTitlePattern = /Workshop lobby|Waiting lobby/
+
+async function expectPhaseDragonSprite(page: Parameters<typeof gotoApp>[0]) {
+  const stageSprite = page.locator('.dragon-stage__sprite')
+  await expect(stageSprite).toBeVisible()
+  const spriteSource = await stageSprite.getAttribute('src')
+  expect(spriteSource).toMatch(/^data:image\/png;base64,/
+  )
+  await expect(page.locator('.dragon-stage .meta').filter({ hasText: 'Mood:' })).toHaveCount(0)
+}
+
+async function expectVotingSpriteImages(page: Parameters<typeof gotoApp>[0], expectedCount: number) {
+  const spriteImages = page.locator('.voting-card__sprite-img')
+  await expect(spriteImages).toHaveCount(expectedCount)
+
+  for (let index = 0; index < expectedCount; index++) {
+    const spriteImage = spriteImages.nth(index)
+    await expect(spriteImage).toBeVisible()
+    const spriteSource = await spriteImage.getAttribute('src')
+    expect(spriteSource).toMatch(/^data:image\/png;base64,/
+    )
+  }
+
+  await expect(page.locator('.voting-card__sprite .sprite-body')).toHaveCount(0)
+}
 
 test.describe('dragon shift deployed gameplay', () => {
   test('host and guest can advance through the visible workshop flow', async ({ browser }) => {
@@ -43,11 +76,12 @@ test.describe('dragon shift deployed gameplay', () => {
 
       await host.page.getByTestId('reveal-results-button').click()
       await waitForNotice(host.page, 'Voting results revealed.')
+      await dismissGameOverOverlay(host.page, guest.page)
       await expect(host.page.getByTestId('session-panel')).toContainText('Workshop results')
-      await expect(host.page.getByTestId('session-panel')).toContainText('Creativity Leaderboard')
+      await expect(host.page.getByTestId('session-panel')).toContainText('Creativity leaderboard')
       await expect(host.page.getByTestId('session-panel')).toContainText('Mechanics leaderboard')
       await expect(guest.page.getByTestId('session-panel')).toContainText('Workshop results')
-      await expect(guest.page.getByTestId('session-panel')).toContainText('Creativity Leaderboard')
+      await expect(guest.page.getByTestId('session-panel')).toContainText('Creativity leaderboard')
 
       await expect(host.page.getByTestId('archive-panel')).toContainText('Build the workshop archive')
       await host.page.getByTestId('build-archive-button').click()
@@ -62,6 +96,53 @@ test.describe('dragon shift deployed gameplay', () => {
       await waitForNotice(host.page, 'Workshop reset.')
       await expect(host.page.getByTestId('session-panel')).toContainText(lobbyTitlePattern)
       await expect(guest.page.getByTestId('session-panel')).toContainText(lobbyTitlePattern)
+    } finally {
+      await safeClose(host.context, guest.context)
+    }
+  })
+
+  test('phase 0 sprite drafts remain visible through later phases without explicit save', async ({ browser }) => {
+    const host = await newPlayerContext(browser)
+    const guest = await newPlayerContext(browser)
+
+    try {
+      const workshopCode = await createWorkshop(host.page, 'Alice')
+      await joinWorkshop(guest.page, workshopCode, 'Bob')
+
+      await openCharacterCreation(host.page, guest.page)
+
+      await host.page
+        .getByTestId('dragon-description-input')
+        .fill('A confident coral dragon with striped wings and lantern eyes.')
+      await guest.page
+        .getByTestId('dragon-description-input')
+        .fill('A moss-green dragon with wide fins and a comet tail.')
+
+      await generateDragonSprites(host.page)
+      await generateDragonSprites(guest.page)
+
+      await expect(host.page.getByTestId('save-dragon-button')).toBeVisible()
+      await expect(guest.page.getByTestId('save-dragon-button')).toBeVisible()
+
+      await enterPhase1(host.page, guest.page)
+
+      await expectPhaseDragonSprite(host.page)
+      await expectPhaseDragonSprite(guest.page)
+
+      await enterHandover(host.page, guest.page)
+      await saveHandoverTags(host.page, 'calm,dusk,berries')
+      await saveHandoverTags(guest.page, 'music,night,playful')
+
+      await enterPhase2(host.page, guest.page)
+
+      await expectPhaseDragonSprite(host.page)
+      await expectPhaseDragonSprite(guest.page)
+
+      await enterJudge(host.page, guest.page)
+      await enterVoting(host.page, guest.page)
+
+      await expectVotingSpriteImages(host.page, 2)
+      await expectVotingSpriteImages(guest.page, 2)
     } finally {
       await safeClose(host.context, guest.context)
     }
@@ -253,6 +334,7 @@ test.describe('dragon shift deployed gameplay', () => {
       await voteForVisibleDragon(guest.page)
       await host.page.getByTestId('reveal-results-button').click()
       await waitForNotice(host.page, 'Voting results revealed.')
+      await dismissGameOverOverlay(host.page, guest.page)
 
       await host.page.route('**/api/workshops/judge-bundle', async route => {
         await route.abort('failed')

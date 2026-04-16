@@ -1,0 +1,72 @@
+image:
+  repository: dragon-shift-rust
+  tag: kind-local
+  pullPolicy: IfNotPresent
+
+service:
+  type: NodePort
+  port: 3000
+  targetPort: 3000
+  nodePort: 32000
+
+ingress:
+  enabled: false
+
+app:
+  port: 3000
+  allowedOrigins: "http://localhost:4100,http://127.0.0.1:4100"
+  viteAppUrl: http://127.0.0.1:4100
+  staticDir: /app/static
+  rustLog: "info,tower_http=debug,app_server=debug"
+  rustSessionCodePrefix: "9"
+  databasePoolSize: 5
+  createRateLimitMax: 20
+  joinRateLimitMax: 40
+  commandRateLimitMax: 120
+  socketRateLimitMax: 300
+  googleCloudProject: "rna-workshop"
+  googleCloudLocation: "global"
+  judgeProviders:
+    - type: vertex_ai
+      model: gemini-2.5-flash
+  imageProviders:
+    - type: vertex_ai
+      model: gemini-2.5-flash-image
+  extraEnv:
+    - name: GOOGLE_IMPERSONATE_SERVICE_ACCOUNT
+      value: dragon-shift-local-kube@rna-workshop.iam.gserviceaccount.com
+
+postgresql:
+  enabled: true
+  auth:
+    username: dragon_shift
+    password: dragon-shift-local
+    database: dragon_shift
+  primary:
+    persistence:
+      enabled: false
+
+resources:
+  requests:
+    cpu: 150m
+    memory: 256Mi
+  limits:
+    cpu: 750m
+    memory: 768Mi
+
+podDisruptionBudget:
+  enabled: false
+
+replicaCount: 1
+
+serviceAccount:
+  create: true
+  name: dragon-shift-local
+  automountServiceAccountToken: false
+  annotations: {}
+
+gcpCredentials:
+  enabled: true
+  secretName: dragon-shift-gcp-adc
+  secretKey: credentials.json
+  mountPath: /var/secrets/google/credentials.json

@@ -95,6 +95,10 @@ spec:
             - name: GOOGLE_CLOUD_LOCATION
               value: {{ . | quote }}
             {{- end }}
+            {{- if .Values.gcpCredentials.enabled }}
+            - name: GOOGLE_APPLICATION_CREDENTIALS
+              value: {{ .Values.gcpCredentials.mountPath | quote }}
+            {{- end }}
             {{- if .Values.app.judgeProviders }}
             - name: LLM_JUDGE_PROVIDERS
               value: {{ include "dragon-shift.llmProviderEntries" (dict "providers" .Values.app.judgeProviders "role" "JUDGE") | quote }}
@@ -160,11 +164,22 @@ spec:
           volumeMounts:
             - name: tmp
               mountPath: /tmp
+            {{- if .Values.gcpCredentials.enabled }}
+            - name: gcp-credentials
+              mountPath: {{ .Values.gcpCredentials.mountPath | quote }}
+              subPath: {{ .Values.gcpCredentials.secretKey | quote }}
+              readOnly: true
+            {{- end }}
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
       volumes:
         - name: tmp
           emptyDir: {}
+        {{- if .Values.gcpCredentials.enabled }}
+        - name: gcp-credentials
+          secret:
+            secretName: {{ .Values.gcpCredentials.secretName | quote }}
+        {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

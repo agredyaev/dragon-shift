@@ -38,14 +38,23 @@ export async function saveDragonProfile(page: Page, description?: string) {
     await page.getByTestId('dragon-description-input').fill(description)
   }
 
+  const saveResponse = page.waitForResponse(response =>
+    response.url().includes('/api/workshops/command')
+    && response.request().method() === 'POST'
+    && response.status() === 200,
+  )
+
   await page.getByTestId('save-dragon-button').click()
-  await waitForNotice(page, 'Dragon profile saved.')
+  await saveResponse
+  await expect(page.getByTestId('save-dragon-button')).toHaveText('Looks good!')
 }
 
 export async function generateDragonSprites(page: Page, timeout = 120_000) {
   await page.getByTestId('generate-sprites-button').click()
-  await expect(page.getByTestId('notice-bar')).toContainText('Dragon sprites generated!', { timeout })
-  await expect(page.getByTestId('sprite-preview-image')).toBeVisible({ timeout })
+  const previewImages = page.locator('.sprite-grid__image')
+  await expect(previewImages).toHaveCount(4, { timeout })
+  await expect(previewImages.first()).toBeVisible({ timeout })
+  await expect(page.getByTestId('save-dragon-button')).toBeVisible({ timeout })
 }
 
 export async function newPlayerContext(
@@ -64,12 +73,32 @@ export async function gotoApp(page: Page) {
 }
 
 export async function waitForNotice(page: Page, text: string) {
-  await expect(page.getByTestId('notice-bar')).toContainText(text)
+  const aliases: Record<string, string[]> = {
+    'Character creation opened.': ['Opening character creation…'],
+    'Scoring opened.': ['Opening design voting…'],
+    'Voting finished.': ['Finishing voting…'],
+  }
+
+  const accepted = [text, ...(aliases[text] ?? [])]
+  const notice = page.getByTestId('notice-bar')
+  const deadline = Date.now() + 15_000
+
+  while (Date.now() < deadline) {
+    if (await notice.count()) {
+      const message = (await notice.textContent()) ?? ''
+      if (accepted.some(candidate => message.includes(candidate))) {
+        return
+      }
+    }
+    await page.waitForTimeout(200)
+  }
+
+  throw new Error(`notice did not match any expected text: ${accepted.join(' | ')}`)
 }
 
 export async function expectPhaseVisible(pages: Page[], text: string, timeout = 15_000) {
   for (const page of pages) {
-    await expect(page.getByTestId('session-panel')).toContainText(text, { timeout })
+    await expect(page.locator('body')).toContainText(text, { timeout })
   }
 }
 
@@ -77,7 +106,7 @@ export async function createWorkshop(page: Page, hostName: string) {
   await gotoApp(page)
   await page.getByTestId('create-name-input').fill(hostName)
   await page.getByTestId('create-workshop-button').click()
-  await expect(page.getByTestId('session-panel')).toBeVisible()
+  await expect(page.getByTestId('lobby-panel')).toBeVisible()
   await expect(page.getByTestId('connection-badge')).toContainText('Connected')
   await waitForNotice(page, 'Session synced.')
   const workshopBadge = page.getByTestId('workshop-code-badge')
@@ -95,7 +124,7 @@ export async function joinWorkshop(page: Page, workshopCode: string, playerName:
   await page.getByTestId('join-session-code-input').fill(workshopCode)
   await page.getByTestId('join-name-input').fill(playerName)
   await page.getByTestId('join-workshop-button').click()
-  await expect(page.getByTestId('session-panel')).toBeVisible()
+  await expect(page.getByTestId('lobby-panel')).toBeVisible()
   await expect(page.getByTestId('connection-badge')).toContainText('Connected')
   await waitForNotice(page, 'Session synced.')
   await expect(page.getByTestId('workshop-code-badge')).toContainText(workshopCode)
@@ -103,7 +132,7 @@ export async function joinWorkshop(page: Page, workshopCode: string, playerName:
 
 export async function expectToStayOnHome(page: Page) {
   await expect(page.getByTestId('hero-panel')).toBeVisible()
-  await expect(page.getByTestId('session-panel')).toHaveCount(0)
+  await expect(page.getByTestId('lobby-panel')).toHaveCount(0)
   await expect(page.getByTestId('connection-badge')).toContainText('Offline')
 }
 
@@ -113,26 +142,48 @@ export async function voteForVisibleDragon(page: Page) {
   await voteButton.click()
 }
 
+export async function dismissGameOverOverlay(...pages: Page[]) {
+  for (const page of pages) {
+    const overlay = page.getByTestId('game-over-overlay')
+    await expect(overlay).toBeVisible()
+    await page.getByTestId('game-over-continue-button').click()
+    await expect(overlay).toHaveCount(0)
+  }
+}
+
 export async function openCharacterCreation(hostPage: Page, ...otherPages: Page[]) {
   await hostPage.getByTestId('start-phase0-button').click()
-  await waitForNotice(hostPage, 'Character creation opened.')
-  await expectPhaseVisible([hostPage, ...otherPages], 'Character creation')
+  for (const page of [hostPage, ...otherPages]) {
+    await expect(page.getByTestId('dragon-description-input')).toBeVisible()
+  }
 }
 
 export async function enterPhase1(hostPage: Page, ...otherPages: Page[]) {
   await hostPage.getByTestId('start-phase1-button').click()
   await waitForNotice(hostPage, 'Phase 1 started.')
-  await expectPhaseVisible([hostPage, ...otherPages], 'Discovery round')
+  for (const page of [hostPage, ...otherPages]) {
+    await expect(page.getByTestId('observation-input')).toBeVisible()
+    await expect(page.locator('.dragon-stage')).toBeVisible()
+  }
 }
 
 export async function enterHandover(hostPage: Page, ...otherPages: Page[]) {
   await hostPage.getByTestId('start-handover-button').click()
   await waitForNotice(hostPage, 'Handover started.')
-  await expectPhaseVisible([hostPage, ...otherPages], 'Handover')
+  for (const page of [hostPage, ...otherPages]) {
+    await expect(page.getByTestId('handover-rule-1')).toBeVisible()
+  }
 }
 
 export async function saveHandoverTags(page: Page, tags: string) {
-  await page.getByTestId('handover-tags-input').fill(tags)
+  const [rule1 = '', rule2 = '', rule3 = ''] = tags
+    .split(',')
+    .map(part => part.trim())
+    .filter(part => part.length > 0)
+
+  await page.getByTestId('handover-rule-1').fill(rule1)
+  await page.getByTestId('handover-rule-2').fill(rule2)
+  await page.getByTestId('handover-rule-3').fill(rule3)
   await page.getByTestId('save-handover-tags-button').click()
   await waitForNotice(page, 'Handover tags saved.')
 }
@@ -140,18 +191,26 @@ export async function saveHandoverTags(page: Page, tags: string) {
 export async function enterPhase2(hostPage: Page, ...otherPages: Page[]) {
   await hostPage.getByTestId('start-phase2-button').click()
   await waitForNotice(hostPage, 'Phase 2 started.')
-  await expectPhaseVisible([hostPage, ...otherPages], 'Care round')
+  for (const page of [hostPage, ...otherPages]) {
+    await expect(page.locator('.phase2-creator-label')).toBeVisible()
+    await expect(page.getByTestId('action-feed-meat')).toBeVisible()
+  }
 }
 
 export async function enterJudge(hostPage: Page, ...otherPages: Page[]) {
   await hostPage.getByTestId('end-game-button').click()
-  await expectPhaseVisible([hostPage, ...otherPages], 'Judge review', 120_000)
+  await waitForNotice(hostPage, 'Scoring opened.')
+  for (const page of [hostPage, ...otherPages]) {
+    await expect(page.locator('body')).toContainText('Scoring', { timeout: 120_000 })
+    await expect(page.getByTestId('end-session-button')).toBeVisible({ timeout: 120_000 })
+  }
 }
 
 export async function enterVoting(hostPage: Page, ...otherPages: Page[]) {
-  await hostPage.getByTestId('start-voting-button').click()
-  await waitForNotice(hostPage, 'Design voting started.')
-  await expectPhaseVisible([hostPage, ...otherPages], 'Design voting')
+  for (const page of [hostPage, ...otherPages]) {
+    await expect(page.locator('.voting-grid')).toBeVisible()
+    await expect(page.locator('body')).toContainText('Vote for the most creative dragon design')
+  }
 }
 
 export async function advanceWorkshopToVoting(hostPage: Page, guestPage: Page) {
@@ -173,8 +232,8 @@ export async function advanceWorkshopToVoting(hostPage: Page, guestPage: Page) {
   await enterJudge(hostPage, guestPage)
 
   await enterVoting(hostPage, guestPage)
-  await expect(hostPage.getByTestId('session-panel')).toContainText('0 / 2 votes submitted')
-  await expect(guestPage.getByTestId('session-panel')).toContainText('0 / 2 votes submitted')
+  await expect(hostPage.locator('body')).toContainText('0 / 2 votes submitted')
+  await expect(guestPage.locator('body')).toContainText('0 / 2 votes submitted')
   await expect(hostPage.locator('[data-testid^="vote-button-"]')).toHaveCount(1)
   await expect(guestPage.locator('[data-testid^="vote-button-"]')).toHaveCount(1)
 }

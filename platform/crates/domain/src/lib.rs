@@ -16,6 +16,8 @@ pub struct SessionCode(pub String);
 pub struct VotingState {
     pub eligible_player_ids: Vec<String>,
     pub votes_by_player_id: BTreeMap<String, String>,
+    #[serde(default)]
+    pub results_revealed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -225,6 +227,21 @@ impl WorkshopSession {
         player.pet_description = Some(description);
         player.custom_sprites = sprites;
         player.is_ready = true;
+        self.touch();
+        Ok(())
+    }
+
+    pub fn update_player_sprite_draft(
+        &mut self,
+        player_id: &str,
+        description: String,
+        sprites: SpriteSet,
+    ) -> Result<(), DomainError> {
+        let Some(player) = self.players.get_mut(player_id) else {
+            return Err(DomainError::ActionNotAllowed);
+        };
+        player.pet_description = Some(description);
+        player.custom_sprites = Some(sprites);
         self.touch();
         Ok(())
     }
@@ -939,6 +956,7 @@ impl WorkshopSession {
         self.voting = Some(VotingState {
             eligible_player_ids: normalized_eligible,
             votes_by_player_id: BTreeMap::new(),
+            results_revealed: false,
         });
 
         self.touch();
@@ -979,6 +997,13 @@ impl WorkshopSession {
     pub fn finalize_voting(&mut self) -> Result<(), DomainError> {
         self.transition_to(Phase::End)?;
 
+        self.touch();
+        Ok(())
+    }
+
+    pub fn reveal_voting_results(&mut self) -> Result<(), DomainError> {
+        let voting = self.voting.as_mut().ok_or(DomainError::VotingNotActive)?;
+        voting.results_revealed = true;
         self.touch();
         Ok(())
     }
@@ -1401,7 +1426,38 @@ mod tests {
     }
 
     #[test]
-    fn enter_voting_with_single_assigned_player_immediately_finalizes() {
+    fn update_player_sprite_draft_keeps_player_not_ready() {
+        let mut session = WorkshopSession::new(
+            Uuid::new_v4(),
+            SessionCode("123456".into()),
+            ts(1),
+            config(),
+        );
+        session.add_player(player("p1", true, 10));
+        enter_phase0(&mut session);
+
+        let sprites = SpriteSet {
+            neutral: "neutral_b64".into(),
+            happy: "happy_b64".into(),
+            angry: "angry_b64".into(),
+            sleepy: "sleepy_b64".into(),
+        };
+
+        session
+            .update_player_sprite_draft("p1", "Crystal dragon".into(), sprites.clone())
+            .expect("save sprite draft");
+
+        let player = session.players.get("p1").expect("player p1");
+        assert_eq!(player.pet_description.as_deref(), Some("Crystal dragon"));
+        assert_eq!(player.custom_sprites.as_ref(), Some(&sprites));
+        assert!(
+            !player.is_ready,
+            "phase0 sprite draft persistence must not auto-mark the player ready"
+        );
+    }
+
+    #[test]
+    fn enter_voting_with_single_assigned_player_opens_scoring_without_voters() {
         let mut session = WorkshopSession::new(
             Uuid::new_v4(),
             SessionCode("123456".into()),
@@ -1419,9 +1475,8 @@ mod tests {
         session.transition_to(Phase::Handover).expect("to handover");
         session.transition_to(Phase::Phase2).expect("to phase2");
 
-        let immediate_finalize = session.enter_voting().expect("enter voting");
+        session.enter_voting().expect("enter voting");
 
-        assert!(immediate_finalize);
         assert_eq!(session.phase, Phase::Voting);
         assert_eq!(
             session.voting.as_ref().map(|v| v.eligible_player_ids.len()),
@@ -3542,8 +3597,7 @@ mod tests {
         }
         s.transition_to(Phase::Handover).unwrap();
         s.enter_phase2().unwrap();
-        let immediate = s.enter_voting().unwrap();
-        assert!(!immediate); // 2 players → not immediate
+        s.enter_voting().unwrap();
 
         // p1 votes for d2 (not their own dragon after shuffle)
         let p1_dragon = s
@@ -3623,8 +3677,7 @@ mod tests {
         s.transition_to(Phase::Handover).unwrap();
         s.enter_phase2().unwrap();
 
-        let immediate = s.enter_voting().unwrap();
-        assert!(!immediate);
+        s.enter_voting().unwrap();
         let eligible = &s.voting.as_ref().unwrap().eligible_player_ids;
         assert_eq!(eligible.len(), 2);
     }

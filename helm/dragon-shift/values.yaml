@@ -104,6 +104,12 @@ serviceAccount:
   name: ""
   automountServiceAccountToken: false
 
+gcpCredentials:
+  enabled: false
+  secretName: ""
+  secretKey: credentials.json
+  mountPath: /var/secrets/google/credentials.json
+
 podAnnotations: {}
 
 podSecurityContext:

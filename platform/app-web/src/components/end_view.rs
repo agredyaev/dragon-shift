@@ -1,32 +1,138 @@
 use dioxus::prelude::*;
-use protocol::{ClientGameState, Phase};
+use protocol::{ClientGameState, JudgeBundle, SessionCommand};
 
+use crate::flows::submit_workshop_command;
 use crate::helpers::*;
+use crate::state::{clear_session_identity, IdentityState, OperationState};
+
+use super::archive_panel::ArchivePanel;
 
 #[component]
-pub fn EndView(game_state: Signal<Option<ClientGameState>>) -> Element {
+pub fn EndView(
+    identity: Signal<IdentityState>,
+    game_state: Signal<Option<ClientGameState>>,
+    ops: Signal<OperationState>,
+    handover_tags_input: Signal<String>,
+    judge_bundle: Signal<Option<JudgeBundle>>,
+) -> Element {
     let gs = game_state.read();
     let Some(state) = gs.as_ref() else {
         return rsx! {};
     };
 
     let results_status = end_results_status_copy(state);
+    let scoring_status = scoring_status_copy(state);
     let vote_rows = end_vote_result_rows(state);
     let score_rows = end_player_score_rows(state);
-    let judge_rows = judge_feedback_rows(state);
+    let voting_rows = voting_option_rows(state);
+    let game_over_rows = game_over_player_rows(state);
     let is_host = current_player(state).map(|p| p.is_host).unwrap_or(false);
-    let is_judge_screen = state.phase == Phase::Judge;
-    let header_title = if is_judge_screen {
-        "Judge review"
+    let is_end_screen = matches!(state.phase, protocol::Phase::End);
+    let is_voting_screen = matches!(
+        state.phase,
+        protocol::Phase::Voting | protocol::Phase::Judge
+    );
+    let reveal_enabled = voting_reveal_ready(state);
+    let results_revealed = voting_results_revealed(state);
+    let voting_progress = voting_progress_label(state);
+    let header_title = if is_end_screen {
+        "Game over"
     } else {
-        "Workshop results"
+        "Scoring"
     };
-    let header_meta = if is_judge_screen {
-        "Mechanics scoring is ready before the anonymous design vote.".to_string()
+    let header_meta = scoring_status.clone();
+    let header_status = if is_end_screen { "Final" } else { "Scoring" };
+
+    let commands_disabled = {
+        let o = ops.read();
+        o.pending_flow.is_some() || o.pending_command.is_some()
+    };
+
+    drop(gs);
+
+    let mut show_game_over = use_signal(|| true);
+    let mut active_tab = use_signal(|| {
+        if is_end_screen || results_revealed {
+            "design".to_string()
+        } else {
+            "vote".to_string()
+        }
+    });
+    let active_tab_value = active_tab.read().clone();
+    let active_tab_key = if is_end_screen {
+        "design"
+    } else if results_revealed && active_tab_value == "vote" {
+        "design"
     } else {
-        results_status
+        active_tab_value.as_str()
     };
-    let header_status = if is_judge_screen { "Judge" } else { "Final" };
+
+    // Game Over overlay — shown on End phase until dismissed
+    if is_end_screen && !game_over_rows.is_empty() && *show_game_over.read() {
+        return rsx! {
+            div { class: "game-over", "data-testid": "game-over-overlay",
+                h1 { class: "game-over__title", "Game Over!" }
+                p { class: "game-over__subtitle", "High Scores" }
+                div { class: "game-over__list",
+                    for row in game_over_rows {
+                        div {
+                            class: format!(
+                                "game-over__player{}",
+                                if row.is_winner { " game-over__player--winner" } else { "" },
+                            ),
+                            div { class: "game-over__player-header",
+                                span {
+                                    class: format!(
+                                        "game-over__name{}",
+                                        if row.is_winner { " game-over__name--winner" } else { "" },
+                                    ),
+                                    if row.is_winner {
+                                        img {
+                                            class: "game-over__crown game-over__crown-icon",
+                                            src: poke_icon_url("crown"),
+                                            alt: "Winner crown",
+                                        }
+                                    }
+                                    "{row.placement_label}. {row.player_name}"
+                                }
+                                span {
+                                    class: format!(
+                                        "game-over__score{}",
+                                        if row.is_winner { " game-over__score--winner" } else { "" },
+                                    ),
+                                    {row.score_label.clone()}
+                                }
+                            }
+                            if !row.achievement_badges.is_empty() {
+                                div { class: "game-over__achievements",
+                                    for (name, icon) in row.achievement_badges {
+                                        span { class: "game-over__badge",
+                                            img {
+                                                class: "game-over__badge-icon",
+                                                src: poke_icon_url(icon),
+                                                alt: "{name}",
+                                            }
+                                            "{name}"
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                div { class: "button-row",
+                    button {
+                        class: "button button--primary",
+                        "data-testid": "game-over-continue-button",
+                        onclick: move |_| {
+                            show_game_over.set(false);
+                        },
+                        "Continue"
+                    }
+                }
+            }
+        };
+    }
 
     rsx! {
         article { class: "roster__item roster__item--phase",
@@ -36,109 +142,241 @@ pub fn EndView(game_state: Signal<Option<ClientGameState>>) -> Element {
             }
             span { class: "roster__status roster__status--phase status-connected", {header_status} }
         }
-        if !score_rows.is_empty() {
-            p { class: "meta", if is_judge_screen { "Mechanics leaderboard" } else { "Mechanics leaderboard" } }
-            div { class: "roster",
-                for row in score_rows {
-                    article { class: "roster__item roster__item--feedback",
+        if is_voting_screen {
+            div { class: "button-row",
+                if !results_revealed {
+                    button {
+                        class: if active_tab_key == "vote" { "button button--primary" } else { "button button--secondary" },
+                        disabled: commands_disabled,
+                        onclick: move |_| active_tab.set("vote".to_string()),
+                        "Vote for design"
+                    }
+                }
+                button {
+                    class: if active_tab_key == "score" { "button button--primary" } else { "button button--secondary" },
+                    disabled: commands_disabled,
+                    onclick: move |_| active_tab.set("score".to_string()),
+                    "View score"
+                }
+                if results_revealed {
+                    button {
+                        class: if active_tab_key == "design" { "button button--primary" } else { "button button--secondary" },
+                        disabled: commands_disabled,
+                        onclick: move |_| active_tab.set("design".to_string()),
+                        "Design results"
+                    }
+                }
+            }
+        }
+
+        if !is_end_screen && !results_revealed && active_tab_key == "vote" {
+            article { class: "roster__item roster__item--phase",
+                div {
+                    p { class: "roster__name", "Vote for the most creative dragon design" }
+                    p { class: "roster__meta", {voting_progress} }
+                }
+                span { class: "roster__status roster__status--phase status-connected", "Design vote" }
+            }
+            div { class: "voting-grid",
+                for row in voting_rows {
+                    article {
+                        class: format!(
+                            "voting-card{}{}",
+                            if row.is_selected { " voting-card--selected" } else { "" },
+                            if row.is_current_players_dragon { " voting-card--blocked" } else { "" },
+                        ),
+                        div { class: "voting-card__sprite-stack",
+                            if let Some(ref sprites) = row.custom_sprites {
+                                div { class: "voting-card__emotion-row",
+                                    img { class: "voting-card__sprite-img", src: "data:image/png;base64,{sprites.neutral}", alt: "Neutral sprite" }
+                                    img { class: "voting-card__sprite-img", src: "data:image/png;base64,{sprites.happy}", alt: "Happy sprite" }
+                                }
+                                div { class: "voting-card__emotion-row",
+                                    img { class: "voting-card__sprite-img", src: "data:image/png;base64,{sprites.angry}", alt: "Angry sprite" }
+                                    img { class: "voting-card__sprite-img", src: "data:image/png;base64,{sprites.sleepy}", alt: "Sleepy sprite" }
+                                }
+                            } else {
+                                div { class: "voting-card__sprite voting-card__sprite--fallback",
+                                    div { class: "sprite-pixel sprite-body", style: format!("background: {};", row.color_primary) }
+                                    div { class: "sprite-pixel sprite-head", style: format!("background: {};", row.color_secondary) }
+                                    div { class: "sprite-pixel sprite-eye", style: format!("background: {};", row.color_accent) }
+                                    div { class: "sprite-pixel sprite-wing", style: format!("background: {};", row.color_secondary) }
+                                    div { class: "sprite-pixel sprite-tail", style: format!("background: {};", row.color_primary) }
+                                    div { class: "sprite-pixel sprite-horn", style: format!("background: {};", row.color_accent) }
+                                    div { class: "sprite-pixel sprite-legs", style: format!("background: {};", row.color_secondary) }
+                                }
+                            }
+                        }
+                        div { class: "voting-card__summary",
+                            p { class: "voting-card__name", {row.dragon_name.clone()} }
+                            if row.is_current_players_dragon {
+                                span { class: "voting-card__badge status-offline", "Your dragon" }
+                            } else if row.is_selected {
+                                span { class: "voting-card__badge status-connected", "Voted" }
+                            } else {
+                                button {
+                                    class: "button button--secondary voting-card__button",
+                                    "data-testid": format!("vote-button-{}", row.dragon_id),
+                                    disabled: commands_disabled,
+                                    onclick: {
+                                        let vote_target = row.dragon_id.clone();
+                                        move |_| {
+                                            spawn(submit_workshop_command(
+                                                identity,
+                                                ops,
+                                                handover_tags_input,
+                                                judge_bundle,
+                                                SessionCommand::SubmitVote,
+                                                Some(serde_json::json!({ "dragonId": vote_target.clone() })),
+                                            ));
+                                        }
+                                    },
+                                    "Vote"
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if active_tab_key == "score" {
+            if !score_rows.is_empty() {
+                p { class: "meta", "Score leaderboard" }
+                div { class: "leaderboard",
+                    div { class: "leaderboard__header",
+                        span { class: "leaderboard__col leaderboard__col--rank", "#" }
+                        span { class: "leaderboard__col leaderboard__col--name", "Player" }
+                        span { class: "leaderboard__col leaderboard__col--score", "Phase 1" }
+                        span { class: "leaderboard__col leaderboard__col--score", "Phase 2" }
+                        span { class: "leaderboard__col leaderboard__col--total", "Total" }
+                        span { class: "leaderboard__col leaderboard__col--status", "Judge" }
+                    }
+                    for row in score_rows {
                         div {
-                            p { class: "roster__name", {row.player_name.clone()} }
-                            p { class: "roster__meta", {row.placement_label.clone()} " - " {row.achievements_label.clone()} }
-                            p { class: "roster__meta roster__meta--feedback", {row.judge_feedback_label.clone()} }
+                            class: format!("leaderboard__row{}", if row.is_winner { " leaderboard__row--winner" } else { "" }),
+                            span { class: "leaderboard__col leaderboard__col--rank", {row.placement_label.clone()} }
+                            span { class: "leaderboard__col leaderboard__col--name", {row.player_name.clone()} }
+                            span { class: "leaderboard__col leaderboard__col--score", {row.phase1_score_label.clone()} }
+                            span { class: "leaderboard__col leaderboard__col--score", {row.phase2_score_label.clone()} }
+                            span { class: "leaderboard__col leaderboard__col--total", {row.total_score_label.clone()} }
+                            span {
+                                class: format!(
+                                    "leaderboard__col leaderboard__col--status leaderboard__tooltip-anchor {}",
+                                    if row.judge_status == "Good" {
+                                        "leaderboard__status--good"
+                                    } else {
+                                        "leaderboard__status--bad"
+                                    },
+                                ),
+                                {row.judge_status}
+                                if !row.judge_status_tooltip.is_empty() {
+                                    span { class: "leaderboard__tooltip", {row.judge_status_tooltip.clone()} }
+                                }
+                            }
                         }
-                        span {
-                            class: format!("roster__status {}", if row.is_winner { "status-connected" } else { "status-connecting" }),
-                            {row.score_label.clone()}
+                    }
+                }
+            } else {
+                p { class: "meta", "Judge scores are still syncing." }
+            }
+        }
+
+        if active_tab_key == "design" || is_end_screen {
+            if !vote_rows.is_empty() {
+                p { class: "meta", {results_status.clone()} }
+                p { class: "meta", "Creativity leaderboard" }
+                div { class: "leaderboard leaderboard--creativity",
+                    div { class: "leaderboard__header",
+                        span { class: "leaderboard__col leaderboard__col--rank", "#" }
+                        span { class: "leaderboard__col leaderboard__col--name", "Dragon" }
+                        span { class: "leaderboard__col leaderboard__col--name", "Creator" }
+                        span { class: "leaderboard__col leaderboard__col--total", "Votes" }
+                    }
+                    for row in vote_rows {
+                        div { class: "leaderboard__row",
+                            span { class: "leaderboard__col leaderboard__col--rank", {row.placement_label.clone()} }
+                            span { class: "leaderboard__col leaderboard__col--name", {row.dragon_name.clone()} }
+                            span { class: "leaderboard__col leaderboard__col--name", {row.creator_name.clone()} }
+                            span { class: "leaderboard__col leaderboard__col--total", {row.votes_label.clone()} }
                         }
                     }
                 }
             }
         }
-        if !judge_rows.is_empty() {
-            p { class: "meta", "Judge feedback by dragon" }
-            div { class: "roster" }
-            div { class: "judge-feedback-grid",
-                for row in judge_rows {
-                    article { class: "judge-feedback-card",
-                        p { class: "roster__name", {row.dragon_name.clone()} }
-                        p { class: "roster__meta", {row.observation_score_label.clone()} " - " {row.care_score_label.clone()} }
-                        p { class: "judge-feedback-card__body", {row.feedback.clone()} }
+        // ---- Host controls ----
+        if is_host {
+            div { class: "button-row",
+                if is_voting_screen && !results_revealed {
+                    button {
+                        class: "button button--primary",
+                        "data-testid": "reveal-results-button",
+                        disabled: commands_disabled || !reveal_enabled,
+                        onclick: move |_| {
+                            spawn(submit_workshop_command(identity, ops, handover_tags_input, judge_bundle, SessionCommand::RevealVotingResults, None));
+                            active_tab.set("design".to_string());
+                        },
+                        "Finish voting"
+                    }
+                }
+                if is_voting_screen {
+                    button {
+                        class: "button button--danger",
+                        "data-testid": "end-session-button",
+                        disabled: commands_disabled || !results_revealed,
+                        onclick: move |_| {
+                            spawn(submit_workshop_command(identity, ops, handover_tags_input, judge_bundle, SessionCommand::EndSession, None));
+                        },
+                        "End game"
+                    }
+                }
+                button {
+                    class: "button button--secondary",
+                    "data-testid": "reset-game-button",
+                    disabled: commands_disabled,
+                    onclick: move |_| {
+                        spawn(submit_workshop_command(identity, ops, handover_tags_input, judge_bundle, SessionCommand::ResetGame, None));
+                    },
+                    "Reset workshop"
+                }
+                if is_end_screen {
+                    button {
+                        class: "button button--secondary",
+                        "data-testid": "leave-workshop-button",
+                        onclick: move |_| {
+                            clear_session_identity(&mut identity.write());
+                        },
+                        "Leave workshop"
                     }
                 }
             }
-        }
-        if !is_judge_screen && !vote_rows.is_empty() {
-            p { class: "meta", "Creativity Leaderboard" }
-            div { class: "roster",
-                for row in vote_rows {
-                    article { class: "roster__item",
-                        div {
-                            p { class: "roster__name", {row.dragon_name.clone()} }
-                            p { class: "roster__meta", {row.placement_label.clone()} " - Created by " {row.creator_name.clone()} }
-                        }
-                        span { class: "roster__status status-connected", {row.votes_label.clone()} }
-                    }
-                }
-            }
-        }
-        if is_judge_screen {
+        } else {
             p {
                 class: "meta",
-                if is_host {
-                    "The host can now open anonymous design voting."
+                if is_end_screen {
+                    "Waiting for the host to reset or archive this workshop."
+                } else if results_revealed {
+                    "Waiting for the host to open the final game over screen."
                 } else {
-                    "Waiting for the host to open anonymous design voting."
+                    "Waiting for the host to finish voting."
+                }
+            }
+            if is_end_screen {
+                div { class: "button-row",
+                    button {
+                        class: "button button--secondary",
+                        "data-testid": "leave-workshop-button",
+                        onclick: move |_| {
+                            clear_session_identity(&mut identity.write());
+                        },
+                        "Leave workshop"
+                    }
                 }
             }
         }
-        // ---- Scoring methodology ----
-        article { class: "scoring-method",
-            p { class: "scoring-method__title", "How scores work" }
-            div { class: "scoring-method__body",
-                p { class: "scoring-method__section", "The judge evaluates each dragon on two axes (0-100 each):" }
-                ul { class: "panel__list",
-                    li { strong { "Observation score" } " — awarded to the Phase 1 creator. Measures quality of discovery notes and handover tags: did they identify the dragon's real food, play, and sleep preferences?" }
-                    li { strong { "Care score" } " — awarded to the Phase 2 caretaker. Measures how well they followed handover instructions, chose correct actions, and kept stats healthy." }
-                }
-                p { class: "scoring-method__section", "Final score = observation score + care score (max 200)." }
-                p { class: "scoring-method__section", "The judge also considers:" }
-                ul { class: "panel__list",
-                    li { "Correct action ratio — feeding the right food, playing the right game for the time of day." }
-                    li { "Wrong action count — wrong food/play choices escalate happiness penalties (20/25/30/35)." }
-                    li { "Cooldown discipline — spamming actions during cooldown counts against the care score." }
-                    li { "Stat health at finish — hunger, energy, and happiness levels at the end of Phase 2." }
-                    li { "Lowest happiness reached — recovering from a crash shows adaptability." }
-                }
-                p { class: "scoring-method__section", "Phase 2 decay is 3x stronger than Phase 1. Penalty stacks from wrong actions increase happiness drain." }
-            }
-        }
-        // ---- Achievement reference ----
-        article { class: "scoring-method",
-            p { class: "scoring-method__title", "Achievements" }
-            div { class: "scoring-method__body",
-                ul { class: "panel__list",
-                    li { strong { "master_chef" } " — first food attempt was correct." }
-                    li { strong { "playful_spirit" } " — first play attempt was correct." }
-                    li { strong { "speed_learner" } " — found both correct food and play within the first 3 actions." }
-                    li { strong { "no_mistakes" } " — zero wrong food or play choices (5+ actions required)." }
-                    li { strong { "zen_master" } " — ended Phase 2 with zero penalty stacks (8+ actions)." }
-                    li { strong { "perfectionist" } " — 80%+ correct action ratio (10+ actions)." }
-                    li { strong { "steady_hand" } " — held happiness above 60 for 20+ consecutive ticks in Phase 2." }
-                    li { strong { "comeback_kid" } " — recovered from happiness at or below 15 to finish at or above 70." }
-                    li { strong { "helicopter_parent" } " — performed 20+ total actions." }
-                    li { strong { "button_masher" } " — triggered 5+ cooldown violations." }
-                    li { strong { "chaos_gremlin" } " — reached 4+ penalty stacks at some point." }
-                    li { strong { "rock_bottom" } " — happiness dropped to zero." }
-                }
-            }
-        }
-        p {
-            class: "meta",
-            if is_host {
-                "Host can reset the workshop when the group is ready for another round."
-            } else {
-                "Waiting for the host to reset or archive this workshop."
-            }
+        // ---- Workshop archive (End phase only) ----
+        if is_end_screen {
+            ArchivePanel { game_state, judge_bundle }
         }
     }
 }

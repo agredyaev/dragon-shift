@@ -1,9 +1,15 @@
+use chrono::{DateTime, Utc};
+use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use protocol::{
     JudgeBundle, LlmDragonEvaluation, LlmJudgeEvaluation, LlmProviderEntry, LlmProviderKind,
     SpriteSet,
 };
 use serde::{Deserialize, Serialize};
-use std::{env, sync::Arc, time::Duration};
+use std::{
+    env, fs,
+    sync::Arc,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
@@ -131,7 +137,7 @@ pub(crate) fn load_llm_pool_config() -> Result<LlmPoolConfig, String> {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Deserialize)]
-struct MetadataTokenResponse {
+struct AccessTokenResponse {
     access_token: String,
     #[allow(dead_code)]
     expires_in: u64,
@@ -145,10 +151,114 @@ pub(crate) struct GceTokenCache {
     client: reqwest::Client,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct ServiceAccountCredentials {
+    client_email: String,
+    private_key: String,
+    #[serde(default = "default_google_token_uri")]
+    token_uri: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct AuthorizedUserCredentials {
+    client_id: String,
+    client_secret: String,
+    refresh_token: String,
+    #[serde(default = "default_google_token_uri")]
+    token_uri: String,
+    #[serde(default)]
+    service_account_impersonation_url: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+enum GoogleApplicationCredentials {
+    ServiceAccount(ServiceAccountCredentials),
+    AuthorizedUser(AuthorizedUserCredentials),
+}
+
+#[derive(Serialize)]
+struct ServiceAccountJwtClaims<'a> {
+    iss: &'a str,
+    scope: &'a str,
+    aud: &'a str,
+    exp: usize,
+    iat: usize,
+}
+
+#[derive(Serialize)]
+struct ServiceAccountTokenRequest<'a> {
+    grant_type: &'a str,
+    assertion: &'a str,
+}
+
+#[derive(Serialize)]
+struct AuthorizedUserTokenRequest<'a> {
+    client_id: &'a str,
+    client_secret: &'a str,
+    refresh_token: &'a str,
+    grant_type: &'a str,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ImpersonatedTokenRequest<'a> {
+    scope: &'a [&'a str],
+    lifetime: &'a str,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ImpersonatedTokenResponse {
+    access_token: String,
+    expire_time: String,
+}
+
 #[derive(Clone)]
 struct CachedToken {
     access_token: String,
     expires_at: std::time::Instant,
+}
+
+fn default_google_token_uri() -> String {
+    "https://oauth2.googleapis.com/token".to_string()
+}
+
+fn build_cached_token(access_token: String, expires_in: u64) -> CachedToken {
+    CachedToken {
+        access_token,
+        expires_at: std::time::Instant::now() + Duration::from_secs(expires_in),
+    }
+}
+
+fn build_cached_token_from_expire_time(
+    access_token: String,
+    expire_time: &str,
+) -> Result<CachedToken, LlmError> {
+    let expires_at = DateTime::parse_from_rfc3339(expire_time).map_err(|e| {
+        LlmError::ProviderUnavailable(format!("parse impersonated token expiry: {e}"))
+    })?;
+    let remaining_seconds = (expires_at.with_timezone(&Utc) - Utc::now())
+        .num_seconds()
+        .max(0) as u64;
+    Ok(build_cached_token(access_token, remaining_seconds))
+}
+
+fn configured_impersonation_url(adc_url: Option<&str>) -> Option<String> {
+    env::var("GOOGLE_IMPERSONATE_SERVICE_ACCOUNT")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .map(|service_account| {
+            format!(
+                "https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/{service_account}:generateAccessToken"
+            )
+        })
+        .or_else(|| {
+            adc_url
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        })
 }
 
 impl GceTokenCache {
@@ -169,6 +279,32 @@ impl GceTokenCache {
             }
         }
 
+        if let Some(token) = env::var("GOOGLE_OAUTH_ACCESS_TOKEN")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+        {
+            let expires_in = env::var("GOOGLE_OAUTH_ACCESS_TOKEN_EXPIRES_IN")
+                .ok()
+                .and_then(|value| value.trim().parse::<u64>().ok())
+                .filter(|value| *value > 60)
+                .unwrap_or(3000);
+            let cached = build_cached_token(token.clone(), expires_in);
+            *self.token.lock().await = Some(cached);
+            return Ok(token);
+        }
+
+        if let Some(path) = env::var("GOOGLE_APPLICATION_CREDENTIALS")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+        {
+            let cached = fetch_google_application_credentials_token(&self.client, &path).await?;
+            let access_token = cached.access_token.clone();
+            *self.token.lock().await = Some(cached);
+            return Ok(access_token);
+        }
+
         let response = self
             .client
             .get("http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token")
@@ -185,18 +321,189 @@ impl GceTokenCache {
             )));
         }
 
-        let body: MetadataTokenResponse = response
+        let body: AccessTokenResponse = response
             .json()
             .await
             .map_err(|e| LlmError::ProviderUnavailable(format!("metadata token parse: {e}")))?;
 
-        let cached = CachedToken {
-            access_token: body.access_token.clone(),
-            expires_at: std::time::Instant::now() + Duration::from_secs(body.expires_in),
-        };
+        let cached = build_cached_token(body.access_token.clone(), body.expires_in);
         *self.token.lock().await = Some(cached);
 
         Ok(body.access_token)
+    }
+}
+
+fn load_google_application_credentials(
+    path: &str,
+) -> Result<GoogleApplicationCredentials, LlmError> {
+    let raw = fs::read_to_string(path).map_err(|e| {
+        LlmError::ProviderUnavailable(format!(
+            "read GOOGLE_APPLICATION_CREDENTIALS file {path}: {e}"
+        ))
+    })?;
+    let value: serde_json::Value = serde_json::from_str(&raw).map_err(|e| {
+        LlmError::ProviderUnavailable(format!(
+            "parse GOOGLE_APPLICATION_CREDENTIALS file {path}: {e}"
+        ))
+    })?;
+    let credential_type = value
+        .get("type")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default();
+    match credential_type {
+        "service_account" => serde_json::from_value(value)
+            .map(GoogleApplicationCredentials::ServiceAccount)
+            .map_err(|e| {
+                LlmError::ProviderUnavailable(format!(
+                    "parse service_account GOOGLE_APPLICATION_CREDENTIALS file {path}: {e}"
+                ))
+            }),
+        "authorized_user" => serde_json::from_value(value)
+            .map(GoogleApplicationCredentials::AuthorizedUser)
+            .map_err(|e| {
+                LlmError::ProviderUnavailable(format!(
+                    "parse authorized_user GOOGLE_APPLICATION_CREDENTIALS file {path}: {e}"
+                ))
+            }),
+        other => Err(LlmError::ProviderUnavailable(format!(
+            "unsupported GOOGLE_APPLICATION_CREDENTIALS type '{other}' in {path}"
+        ))),
+    }
+}
+
+async fn fetch_service_account_token(
+    client: &reqwest::Client,
+    credentials: &ServiceAccountCredentials,
+) -> Result<AccessTokenResponse, LlmError> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| LlmError::ProviderUnavailable(format!("system clock before epoch: {e}")))?
+        .as_secs() as usize;
+    let claims = ServiceAccountJwtClaims {
+        iss: &credentials.client_email,
+        scope: "https://www.googleapis.com/auth/cloud-platform",
+        aud: &credentials.token_uri,
+        iat: now,
+        exp: now + 3600,
+    };
+    let key = EncodingKey::from_rsa_pem(credentials.private_key.as_bytes()).map_err(|e| {
+        LlmError::ProviderUnavailable(format!("decode service account private key: {e}"))
+    })?;
+    let assertion = encode(&Header::new(Algorithm::RS256), &claims, &key)
+        .map_err(|e| LlmError::ProviderUnavailable(format!("sign service account jwt: {e}")))?;
+
+    let response = client
+        .post(&credentials.token_uri)
+        .form(&ServiceAccountTokenRequest {
+            grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer",
+            assertion: &assertion,
+        })
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await
+        .map_err(|e| LlmError::ProviderUnavailable(format!("service account token HTTP: {e}")))?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        return Err(LlmError::ProviderUnavailable(format!(
+            "service account token endpoint {}: {body}",
+            status.as_u16()
+        )));
+    }
+
+    response
+        .json()
+        .await
+        .map_err(|e| LlmError::ProviderUnavailable(format!("service account token parse: {e}")))
+}
+
+async fn fetch_authorized_user_token(
+    client: &reqwest::Client,
+    credentials: &AuthorizedUserCredentials,
+) -> Result<AccessTokenResponse, LlmError> {
+    let response = client
+        .post(&credentials.token_uri)
+        .form(&AuthorizedUserTokenRequest {
+            client_id: &credentials.client_id,
+            client_secret: &credentials.client_secret,
+            refresh_token: &credentials.refresh_token,
+            grant_type: "refresh_token",
+        })
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await
+        .map_err(|e| LlmError::ProviderUnavailable(format!("authorized user token HTTP: {e}")))?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        return Err(LlmError::ProviderUnavailable(format!(
+            "authorized user token endpoint {}: {body}",
+            status.as_u16()
+        )));
+    }
+
+    response
+        .json()
+        .await
+        .map_err(|e| LlmError::ProviderUnavailable(format!("authorized user token parse: {e}")))
+}
+
+async fn fetch_impersonated_service_account_token(
+    client: &reqwest::Client,
+    source_access_token: &str,
+    url: &str,
+) -> Result<CachedToken, LlmError> {
+    let scopes = ["https://www.googleapis.com/auth/cloud-platform"];
+    let response = client
+        .post(url)
+        .bearer_auth(source_access_token)
+        .json(&ImpersonatedTokenRequest {
+            scope: &scopes,
+            lifetime: "3600s",
+        })
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await
+        .map_err(|e| {
+            LlmError::ProviderUnavailable(format!("service account impersonation HTTP: {e}"))
+        })?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        return Err(LlmError::ProviderUnavailable(format!(
+            "service account impersonation endpoint {}: {body}",
+            status.as_u16()
+        )));
+    }
+
+    let body: ImpersonatedTokenResponse = response.json().await.map_err(|e| {
+        LlmError::ProviderUnavailable(format!("service account impersonation parse: {e}"))
+    })?;
+    build_cached_token_from_expire_time(body.access_token, &body.expire_time)
+}
+
+async fn fetch_google_application_credentials_token(
+    client: &reqwest::Client,
+    path: &str,
+) -> Result<CachedToken, LlmError> {
+    match load_google_application_credentials(path)? {
+        GoogleApplicationCredentials::ServiceAccount(credentials) => {
+            let body = fetch_service_account_token(client, &credentials).await?;
+            Ok(build_cached_token(body.access_token, body.expires_in))
+        }
+        GoogleApplicationCredentials::AuthorizedUser(credentials) => {
+            let body = fetch_authorized_user_token(client, &credentials).await?;
+            if let Some(url) = configured_impersonation_url(
+                credentials.service_account_impersonation_url.as_deref(),
+            ) {
+                fetch_impersonated_service_account_token(client, &body.access_token, &url).await
+            } else {
+                Ok(build_cached_token(body.access_token, body.expires_in))
+            }
+        }
     }
 }
 
@@ -274,11 +581,15 @@ struct GeminiGenerationConfig {
 #[derive(Deserialize)]
 struct GeminiResponse {
     candidates: Option<Vec<GeminiCandidate>>,
+    #[serde(rename = "promptFeedback")]
+    prompt_feedback: Option<GeminiPromptFeedback>,
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct GeminiCandidate {
     content: Option<GeminiResponseContent>,
+    finish_reason: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -300,6 +611,12 @@ struct GeminiInlineData {
     data: Option<String>,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GeminiPromptFeedback {
+    block_reason: Option<String>,
+}
+
 fn gemini_text_content(role: Option<&str>, text: &str) -> GeminiContent {
     GeminiContent {
         role: role.map(str::to_string),
@@ -307,6 +624,49 @@ fn gemini_text_content(role: Option<&str>, text: &str) -> GeminiContent {
             text: text.to_string(),
         }],
     }
+}
+
+fn extract_gemini_text(body: &GeminiResponse) -> Result<String, LlmError> {
+    let Some(candidates) = body.candidates.as_ref() else {
+        return Err(LlmError::ProviderUnavailable(
+            body.prompt_feedback
+                .as_ref()
+                .and_then(|feedback| feedback.block_reason.as_deref())
+                .map(|reason| format!("model returned no candidates (block reason: {reason})"))
+                .unwrap_or_else(|| "model returned no candidates".to_string()),
+        ));
+    };
+
+    for candidate in candidates {
+        if let Some(parts) = candidate
+            .content
+            .as_ref()
+            .and_then(|content| content.parts.as_ref())
+        {
+            let text = parts
+                .iter()
+                .filter_map(|part| part.text.as_deref())
+                .map(str::trim)
+                .find(|text| !text.is_empty());
+            if let Some(text) = text {
+                return Ok(text.to_string());
+            }
+        }
+    }
+
+    let finish_reasons = candidates
+        .iter()
+        .filter_map(|candidate| candidate.finish_reason.as_deref())
+        .collect::<Vec<_>>();
+    let detail = if finish_reasons.is_empty() {
+        "empty response from model".to_string()
+    } else {
+        format!(
+            "empty response from model (finish reasons: {})",
+            finish_reasons.join(", ")
+        )
+    };
+    Err(LlmError::ProviderUnavailable(detail))
 }
 
 fn vertex_ai_generate_content_url(project: &str, location: &str, model: &str) -> String {
@@ -467,7 +827,7 @@ impl LlmClient {
     }
 
     // -----------------------------------------------------------------------
-    // Sprite sheet generation: prompt → 4x2 grid → 8 base64 frames
+    // Sprite sheet generation: prompt → 2x2 grid → 4 base64 frames
     // -----------------------------------------------------------------------
 
     pub(crate) async fn generate_sprite_sheet(
@@ -584,19 +944,7 @@ impl LlmClient {
                         LlmError::ProviderUnavailable(format!("response parse: {e}"))
                     })?;
 
-                    let text = body
-                        .candidates
-                        .as_ref()
-                        .and_then(|c| c.first())
-                        .and_then(|c| c.content.as_ref())
-                        .and_then(|c| c.parts.as_ref())
-                        .and_then(|p| p.first())
-                        .and_then(|p| p.text.as_ref())
-                        .ok_or_else(|| {
-                            LlmError::ProviderUnavailable("empty response from model".to_string())
-                        })?;
-
-                    return Ok(text.clone());
+                    return extract_gemini_text(&body);
                 }
 
                 return Err(LlmError::RateLimited("429 from vertex_ai provider".into()));
@@ -650,19 +998,7 @@ impl LlmClient {
             .await
             .map_err(|e| LlmError::ProviderUnavailable(format!("response parse: {e}")))?;
 
-        let text = body
-            .candidates
-            .as_ref()
-            .and_then(|c| c.first())
-            .and_then(|c| c.content.as_ref())
-            .and_then(|c| c.parts.as_ref())
-            .and_then(|p| p.first())
-            .and_then(|p| p.text.as_ref())
-            .ok_or_else(|| {
-                LlmError::ProviderUnavailable("empty response from model".to_string())
-            })?;
-
-        Ok(text.clone())
+        extract_gemini_text(&body)
     }
 
     // -----------------------------------------------------------------------
@@ -881,16 +1217,98 @@ fn extract_gemini_image(body: &GeminiResponse) -> Result<(String, String), LlmEr
     ))
 }
 
+pub(crate) fn normalize_sprite_base64(image_base64: &str) -> Result<String, LlmError> {
+    use base64::Engine as _;
+    use image::{DynamicImage, ImageFormat, ImageReader};
+    use std::collections::VecDeque;
+    use std::io::Cursor;
+
+    let raw = base64::engine::general_purpose::STANDARD
+        .decode(image_base64)
+        .map_err(|e| LlmError::BadRequest(format!("failed to decode sprite base64: {e}")))?;
+
+    let mut rgba = ImageReader::with_format(Cursor::new(&raw), ImageFormat::Png)
+        .decode()
+        .or_else(|_| {
+            ImageReader::new(Cursor::new(&raw))
+                .with_guessed_format()
+                .map_err(|e| LlmError::BadRequest(format!("failed to guess image format: {e}")))?
+                .decode()
+                .map_err(|e| LlmError::BadRequest(format!("failed to decode sprite image: {e}")))
+        })?
+        .to_rgba8();
+
+    let (width, height) = rgba.dimensions();
+    if width == 0 || height == 0 {
+        return Err(LlmError::BadRequest("sprite image cannot be empty".into()));
+    }
+
+    let mut queue = VecDeque::new();
+    let mut visited = vec![false; (width as usize) * (height as usize)];
+
+    let idx = |x: u32, y: u32| (y as usize) * (width as usize) + (x as usize);
+    let is_near_white =
+        |pixel: &image::Rgba<u8>| pixel[0] > 220 && pixel[1] > 220 && pixel[2] > 220;
+
+    let enqueue = |x: u32,
+                   y: u32,
+                   rgba: &image::RgbaImage,
+                   queue: &mut VecDeque<(u32, u32)>,
+                   visited: &mut [bool]| {
+        let index = idx(x, y);
+        if !visited[index] && is_near_white(rgba.get_pixel(x, y)) {
+            visited[index] = true;
+            queue.push_back((x, y));
+        }
+    };
+
+    for x in 0..width {
+        enqueue(x, 0, &rgba, &mut queue, &mut visited);
+        enqueue(x, height - 1, &rgba, &mut queue, &mut visited);
+    }
+    for y in 0..height {
+        enqueue(0, y, &rgba, &mut queue, &mut visited);
+        enqueue(width - 1, y, &rgba, &mut queue, &mut visited);
+    }
+
+    while let Some((x, y)) = queue.pop_front() {
+        rgba.get_pixel_mut(x, y)[3] = 0;
+
+        if x > 0 {
+            enqueue(x - 1, y, &rgba, &mut queue, &mut visited);
+        }
+        if x + 1 < width {
+            enqueue(x + 1, y, &rgba, &mut queue, &mut visited);
+        }
+        if y > 0 {
+            enqueue(x, y - 1, &rgba, &mut queue, &mut visited);
+        }
+        if y + 1 < height {
+            enqueue(x, y + 1, &rgba, &mut queue, &mut visited);
+        }
+    }
+
+    let mut buf = Vec::new();
+    DynamicImage::ImageRgba8(rgba)
+        .write_to(&mut Cursor::new(&mut buf), ImageFormat::Png)
+        .map_err(|e| LlmError::BadRequest(format!("failed to encode normalized sprite: {e}")))?;
+
+    Ok(base64::engine::general_purpose::STANDARD.encode(buf))
+}
+
 // ---------------------------------------------------------------------------
-// Sprite sheet slicing: base64 → 8 emotion frames → SpriteSet
+// Sprite sheet slicing: base64 → 4 emotion frames → SpriteSet
 // ---------------------------------------------------------------------------
 
-/// Layout: 4 columns × 2 rows.
-/// Row 0 (top):    happy, content, angry, tired
-/// Row 1 (bottom): excited, hungry, sleepy, neutral
+/// Layout: 2 columns × 2 rows.
+/// Top-left: neutral, Top-right: happy
+/// Bottom-left: angry, Bottom-right: sleepy
+///
+/// Crops 5% margins from each quadrant edge to remove any grid lines
+/// the AI might draw, matching the initial-version slicing approach.
 fn slice_sprite_sheet(image_base64: &str) -> Result<SpriteSet, LlmError> {
     use base64::Engine as _;
-    use image::{GenericImageView, ImageFormat, ImageReader};
+    use image::{DynamicImage, GenericImageView, ImageFormat, ImageReader};
     use std::io::Cursor;
 
     let raw = base64::engine::general_purpose::STANDARD
@@ -911,70 +1329,55 @@ fn slice_sprite_sheet(image_base64: &str) -> Result<SpriteSet, LlmError> {
         })?;
 
     let (w, h) = img.dimensions();
-    let tile_w = w / 4;
+    let tile_w = w / 2;
     let tile_h = h / 2;
 
     if tile_w == 0 || tile_h == 0 {
         return Err(LlmError::BadRequest(format!(
-            "sprite sheet too small to slice into 4×2 grid: {w}×{h}"
+            "sprite sheet too small to slice into 2×2 grid: {w}×{h}"
         )));
     }
 
+    // Crop 5% from each edge of every quadrant to remove any grid lines
+    // the AI might draw (matches initial-version extractQuadrant logic).
+    let margin_x = (tile_w as f64 * 0.05) as u32;
+    let margin_y = (tile_h as f64 * 0.05) as u32;
+    let cropped_w = tile_w - margin_x * 2;
+    let cropped_h = tile_h - margin_y * 2;
+
     let encode_tile = |col: u32, row: u32| -> Result<String, LlmError> {
-        let tile = img.crop_imm(col * tile_w, row * tile_h, tile_w, tile_h);
+        let sx = col * tile_w + margin_x;
+        let sy = row * tile_h + margin_y;
         let mut buf = Vec::new();
-        tile.write_to(&mut Cursor::new(&mut buf), ImageFormat::Png)
+        DynamicImage::ImageRgba8(img.crop_imm(sx, sy, cropped_w, cropped_h).to_rgba8())
+            .write_to(&mut Cursor::new(&mut buf), ImageFormat::Png)
             .map_err(|e| LlmError::BadRequest(format!("failed to encode tile: {e}")))?;
-        Ok(base64::engine::general_purpose::STANDARD.encode(&buf))
+        normalize_sprite_base64(&base64::engine::general_purpose::STANDARD.encode(&buf))
     };
 
     Ok(SpriteSet {
-        happy: encode_tile(0, 0)?,
-        content: encode_tile(1, 0)?,
-        angry: encode_tile(2, 0)?,
-        tired: encode_tile(3, 0)?,
-        excited: encode_tile(0, 1)?,
-        hungry: encode_tile(1, 1)?,
-        sleepy: encode_tile(2, 1)?,
-        neutral: encode_tile(3, 1)?,
+        neutral: encode_tile(0, 0)?,
+        happy: encode_tile(1, 0)?,
+        angry: encode_tile(0, 1)?,
+        sleepy: encode_tile(1, 1)?,
     })
 }
 
 fn build_sprite_sheet_system_instruction() -> &'static str {
-    r#"You are a production sprite-sheet generator for an automated game pipeline.
-
-Your output will be sliced mechanically into 8 equal tiles, so layout accuracy is mandatory.
-
-Hard requirements:
-- Return exactly one image.
-- The full canvas must be a 4 columns × 2 rows sprite sheet.
-- Use equal-sized tiles with perfect alignment.
-- No gutters, no spacing, no borders, no frames, no labels, no captions, no text.
-- Show the same dragon in all 8 tiles.
-- Keep the same camera angle, scale, framing, and silhouette in every tile.
-- Center the dragon in each tile and let it fill most of the tile.
-- Retro pixel-art only: crisp edges, no anti-aliasing, no painterly shading, no blur.
-- Background must be transparent or a uniform dark flat background.
-- No props, scenery, UI, speech bubbles, or extra characters.
-
-Emotion order is fixed:
-- Top row, left to right: happy, content, angry, tired
-- Bottom row, left to right: excited, hungry, sleepy, neutral
-
-Positive example of the required layout:
-- [happy][content][angry][tired]
-- [excited][hungry][sleepy][neutral]"#
+    r#"You are a sprite-sheet generator for a pixel-art dragon game.
+Your output will be sliced mechanically into a 2x2 grid (4 equal quadrants), so layout accuracy is mandatory.
+Draw the exact same character in every quadrant — same pose, scale, and framing — changing only the facial expression.
+Pure white background (#FFFFFF). No text anywhere in the image.
+Quadrant layout (fixed):
+- Top-left: Neutral expression.
+- Top-right: Happy expression.
+- Bottom-left: Angry expression.
+- Bottom-right: Sleepy expression."#
 }
 
 fn build_sprite_sheet_user_prompt(description: &str) -> String {
     format!(
-        r#"Create a single sprite sheet image that follows the system instructions.
-
-Dragon description: {description}
-
-Render the same dragon across 8 emotion tiles with clearly distinct facial expression and body language.
-Do not add any text or decorative frame elements.
-Return exactly one image."#
+        r#"Generate a 2x2 sprite sheet of EXACTLY ONE cute 2D pixel art character. Style: retro game sprite, crisp pixels, flat colors, pure white background (#FFFFFF). Subject: A cute 2D pixel art dragon. Description: {description}. CRITICAL INSTRUCTION: You MUST draw the exact same character in all 4 quadrants, changing ONLY the facial expression. Top-left: Neutral. Top-right: Happy. Bottom-left: Angry. Bottom-right: Sleepy. The character must be perfectly centered in each quadrant with plenty of white space around it."#
     )
 }
 
@@ -1164,6 +1567,44 @@ fn validate_judge_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{LazyLock, Mutex as StdMutex, MutexGuard};
+
+    struct ScopedEnvVar {
+        key: &'static str,
+        original: Option<String>,
+        _guard: MutexGuard<'static, ()>,
+    }
+
+    static ENV_TEST_MUTEX: LazyLock<StdMutex<()>> = LazyLock::new(|| StdMutex::new(()));
+
+    impl ScopedEnvVar {
+        fn set(key: &'static str, value: &str) -> Self {
+            let guard = ENV_TEST_MUTEX.lock().expect("lock llm env test mutex");
+            let original = std::env::var(key).ok();
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self {
+                key,
+                original,
+                _guard: guard,
+            }
+        }
+    }
+
+    impl Drop for ScopedEnvVar {
+        fn drop(&mut self) {
+            if let Some(original) = &self.original {
+                unsafe {
+                    std::env::set_var(self.key, original);
+                }
+            } else {
+                unsafe {
+                    std::env::remove_var(self.key);
+                }
+            }
+        }
+    }
 
     fn mock_judge_bundle() -> JudgeBundle {
         JudgeBundle {
@@ -1378,14 +1819,140 @@ mod tests {
     }
 
     #[test]
+    fn extract_gemini_text_uses_first_non_empty_text_part() {
+        let body: GeminiResponse = serde_json::from_str(
+            r#"{
+                "candidates": [{
+                    "finishReason": "STOP",
+                    "content": {
+                        "parts": [
+                            {"text": "   "},
+                            {"text": "{\"summary\":\"ok\",\"dragonEvaluations\":[]}"}
+                        ]
+                    }
+                }]
+            }"#,
+        )
+        .expect("parse gemini response");
+
+        let text = extract_gemini_text(&body).expect("extract text");
+        assert_eq!(text, r#"{"summary":"ok","dragonEvaluations":[]}"#);
+    }
+
+    #[test]
+    fn extract_gemini_text_reports_finish_reason_when_candidate_is_empty() {
+        let body: GeminiResponse = serde_json::from_str(
+            r#"{
+                "candidates": [{
+                    "finishReason": "MAX_TOKENS",
+                    "content": {"parts": []}
+                }]
+            }"#,
+        )
+        .expect("parse gemini response");
+
+        let error = extract_gemini_text(&body).expect_err("must fail");
+        assert!(error.to_string().contains("finish reasons: MAX_TOKENS"));
+    }
+
+    #[test]
     fn sprite_sheet_prompts_encode_hard_layout_rules() {
         let system = build_sprite_sheet_system_instruction();
         let user = build_sprite_sheet_user_prompt("violet crystal dragon");
 
-        assert!(system.contains("4 columns × 2 rows sprite sheet"));
-        assert!(system.contains("No gutters, no spacing, no borders"));
-        assert!(system.contains("Top row, left to right: happy, content, angry, tired"));
-        assert!(user.contains("Dragon description: violet crystal dragon"));
+        assert!(system.contains("2x2 grid"));
+        assert!(system.contains("Pure white background (#FFFFFF)"));
+        assert!(system.contains("No text anywhere in the image"));
+        assert!(system.contains("Top-left: Neutral"));
+        assert!(system.contains("Top-right: Happy"));
+        assert!(system.contains("Bottom-left: Angry"));
+        assert!(system.contains("Bottom-right: Sleepy"));
+        assert!(user.contains("Subject: A cute 2D pixel art dragon"));
+        assert!(user.contains("Description: violet crystal dragon"));
+        assert!(user.contains("Top-left: Neutral"));
+        assert!(user.contains("Bottom-right: Sleepy"));
+    }
+
+    #[test]
+    fn slice_sprite_sheet_converts_edge_connected_background_to_transparent() {
+        use base64::Engine as _;
+        use image::{DynamicImage, ImageBuffer, ImageFormat, Rgba};
+        use std::io::Cursor;
+
+        let mut sheet = ImageBuffer::from_pixel(20, 20, Rgba([255, 255, 255, 255]));
+
+        for y in 4..6 {
+            for x in 4..6 {
+                sheet.put_pixel(x, y, Rgba([32, 64, 96, 255]));
+            }
+        }
+
+        let mut png = Vec::new();
+        DynamicImage::ImageRgba8(sheet)
+            .write_to(&mut Cursor::new(&mut png), ImageFormat::Png)
+            .expect("encode sprite sheet");
+
+        let sprites = slice_sprite_sheet(&base64::engine::general_purpose::STANDARD.encode(png))
+            .expect("slice sprite sheet");
+
+        let neutral = base64::engine::general_purpose::STANDARD
+            .decode(sprites.neutral)
+            .expect("decode neutral sprite");
+        let neutral = image::load_from_memory_with_format(&neutral, ImageFormat::Png)
+            .expect("decode neutral png")
+            .to_rgba8();
+
+        assert_eq!(
+            neutral.get_pixel(0, 0)[3],
+            0,
+            "white background should be transparent"
+        );
+        assert!(
+            neutral.pixels().any(|pixel| pixel.0 == [32, 64, 96, 255]),
+            "colored sprite pixels must remain opaque"
+        );
+    }
+
+    #[test]
+    fn normalize_sprite_base64_keeps_internal_white_details_opaque() {
+        use base64::Engine as _;
+        use image::{DynamicImage, ImageBuffer, ImageFormat, Rgba};
+        use std::io::Cursor;
+
+        let mut sprite = ImageBuffer::from_pixel(6, 6, Rgba([255, 255, 255, 255]));
+        for y in 1..5 {
+            for x in 1..5 {
+                sprite.put_pixel(x, y, Rgba([32, 64, 96, 255]));
+            }
+        }
+        sprite.put_pixel(3, 3, Rgba([255, 255, 255, 255]));
+
+        let mut png = Vec::new();
+        DynamicImage::ImageRgba8(sprite)
+            .write_to(&mut Cursor::new(&mut png), ImageFormat::Png)
+            .expect("encode sprite png");
+
+        let normalized =
+            normalize_sprite_base64(&base64::engine::general_purpose::STANDARD.encode(png))
+                .expect("normalize sprite");
+
+        let normalized = base64::engine::general_purpose::STANDARD
+            .decode(normalized)
+            .expect("decode normalized sprite");
+        let normalized = image::load_from_memory_with_format(&normalized, ImageFormat::Png)
+            .expect("decode normalized png")
+            .to_rgba8();
+
+        assert_eq!(
+            normalized.get_pixel(0, 0)[3],
+            0,
+            "outer background should be transparent"
+        );
+        assert_eq!(
+            normalized.get_pixel(3, 3).0,
+            [255, 255, 255, 255],
+            "internal white sprite details must remain opaque"
+        );
     }
 
     #[test]
@@ -1444,5 +2011,40 @@ mod tests {
         let resolved = resolve_providers(&entries, "test");
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].model, "gemini-1.5-pro");
+    }
+
+    #[test]
+    fn configured_impersonation_url_prefers_explicit_env() {
+        let _impersonate = ScopedEnvVar::set(
+            "GOOGLE_IMPERSONATE_SERVICE_ACCOUNT",
+            "dragon-shift-local-kube@rna-workshop.iam.gserviceaccount.com",
+        );
+
+        let url = configured_impersonation_url(Some(
+            "https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/ignored:generateAccessToken",
+        ));
+
+        assert_eq!(
+            url.as_deref(),
+            Some(
+                "https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/dragon-shift-local-kube@rna-workshop.iam.gserviceaccount.com:generateAccessToken"
+            )
+        );
+    }
+
+    #[test]
+    fn configured_impersonation_url_uses_adc_value_when_env_missing() {
+        let _impersonate = ScopedEnvVar::set("GOOGLE_IMPERSONATE_SERVICE_ACCOUNT", "");
+
+        let url = configured_impersonation_url(Some(
+            "https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/from-adc:generateAccessToken",
+        ));
+
+        assert_eq!(
+            url.as_deref(),
+            Some(
+                "https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/from-adc:generateAccessToken"
+            )
+        );
     }
 }

@@ -944,14 +944,6 @@ pub(crate) async fn advance_game_ticks(state: &AppState) {
             }
         }
 
-        // Persist asynchronously (best-effort; don't block the ticker)
-        {
-            let sessions = state.sessions.lock().await;
-            if let Some(session) = sessions.get(&session_code) {
-                let _ = state.store.save_session(session).await;
-            }
-        }
-
         // Broadcast updated state to all connected players
         broadcast_session_state(state, &session_code, None).await;
     }

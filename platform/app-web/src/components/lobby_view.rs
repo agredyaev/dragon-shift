@@ -18,6 +18,7 @@ pub fn LobbyView(
         return rsx! {};
     };
 
+    let session_code = state.session.code.clone();
     let rows = lobby_player_rows(state);
     let ready_label = lobby_ready_summary(state);
     let status_label = lobby_status_copy(state);
@@ -30,49 +31,63 @@ pub fn LobbyView(
     drop(gs);
 
     rsx! {
-        article { class: "roster__item roster__item--phase",
-            div {
-                p { class: "roster__name", "Workshop waiting room" }
-                p { class: "roster__meta", {ready_label} }
+        article { class: "panel", "data-testid": "lobby-panel",
+            h2 { class: "panel__title", "Workshop Lobby" }
+            p { class: "panel__body",
+                "Code: "
+                strong { {session_code} }
             }
-            span { class: "roster__status roster__status--phase status-connecting", "Lobby" }
-        }
-        p { class: "panel__body", {status_label} }
-        div { class: "roster",
-            for row in rows {
-                article { class: "roster__item",
-                    div {
-                        p { class: "roster__name", {row.name} }
-                        p { class: "roster__meta", {row.role_label} " - " {row.readiness_label} }
-                    }
-                    span {
-                        class: format!("roster__status {}", if row.connectivity_label == "Online" { "status-connected" } else { "status-offline" }),
-                        {row.connectivity_label}
+            p { class: "panel__body", {status_label} }
+
+            div { class: "panel__stack",
+                // Ready counter
+                div { style: "background:#0f172a;padding:16px;border:4px solid #0f172a;text-align:center;box-shadow:inset 4px 4px 0 rgba(0,0,0,0.5);",
+                    p { style: "font-family:var(--font-display);font-size:20px;font-weight:900;letter-spacing:0.12em;color:#34d399;",
+                        {ready_label}
                     }
                 }
-            }
-        }
-        if is_host {
-            div { class: "button-row",
-                button {
-                    class: "button button--primary",
-                    "data-testid": "start-phase0-button",
-                    disabled: commands_disabled,
-                    onclick: move |_| {
-                        spawn(submit_workshop_command(
-                            identity,
-                            ops,
-                            handover_tags_input,
-                            judge_bundle,
-                            SessionCommand::StartPhase0,
-                            None,
-                        ));
-                    },
-                    "Open character creation"
+
+                // Player roster
+                div { class: "roster",
+                    for row in rows {
+                        article { class: "roster__item",
+                            div {
+                                p { class: "roster__name", {row.name} }
+                                p { class: "roster__meta", {row.role_label} " \u{2014} " {row.readiness_label} }
+                            }
+                            span {
+                                class: format!("roster__status {}", if row.connectivity_label == "Online" { "status-connected" } else { "status-offline" }),
+                                {row.connectivity_label}
+                            }
+                        }
+                    }
+                }
+
+                // Host controls
+                if is_host {
+                    div { class: "button-row",
+                        button {
+                            class: "button button--primary",
+                            style: "width:100%;",
+                            "data-testid": "start-phase0-button",
+                            disabled: commands_disabled,
+                            onclick: move |_| {
+                                spawn(submit_workshop_command(
+                                    identity,
+                                    ops,
+                                    handover_tags_input,
+                                    judge_bundle,
+                                    SessionCommand::StartPhase0,
+                                    None,
+                                ));
+                            },
+                            "Open Character Creation"
+                        }
+                    }
+                } else {
+                    p { class: "meta", style: "text-align:center;", "Waiting for the host to open character creation." }
                 }
             }
-        } else {
-            p { class: "meta", "Only the host can move the group into character creation." }
         }
     }
 }

@@ -34,12 +34,6 @@ use crate::helpers::{
 };
 use crate::ws::broadcast_session_state;
 
-fn default_player_pet_description(player_name: &str) -> String {
-    format!(
-        "A plain training-manikin dragon for {player_name}: neutral gray scales, simple proportions, and no distinctive personality yet."
-    )
-}
-
 fn clamp_score(score: i32) -> i32 {
     score.clamp(0, 100)
 }
@@ -274,11 +268,17 @@ async fn run_judge_for_session(
 
     let bundle = build_judge_bundle(&session, &artifacts);
     let evaluation = if state.config.llm_pool.is_judge_configured() {
-        state
-            .llm_client
-            .judge(&bundle)
-            .await
-            .map_err(|error| format!("LLM judge failed: {error}"))?
+        match state.llm_client.judge(&bundle).await {
+            Ok(evaluation) => evaluation,
+            Err(error) => {
+                tracing::warn!(
+                    %session_code,
+                    %error,
+                    "LLM judge failed, using deterministic local fallback"
+                );
+                deterministic_local_judge_evaluation(&bundle)
+            }
+        }
     } else {
         tracing::info!(%session_code, "using deterministic local judge fallback");
         deterministic_local_judge_evaluation(&bundle)
@@ -470,7 +470,7 @@ pub(crate) async fn create_workshop(
     let host_player = SessionPlayer {
         id: player_id.clone(),
         name: normalized_name.to_string(),
-        pet_description: Some(default_player_pet_description(normalized_name)),
+        pet_description: None,
         custom_sprites: None,
         is_host: true,
         is_connected: true,
@@ -718,7 +718,7 @@ pub(crate) async fn join_workshop(
         let player = SessionPlayer {
             id: player_id.clone(),
             name: normalized_name.clone(),
-            pet_description: Some(default_player_pet_description(&normalized_name)),
+            pet_description: None,
             custom_sprites: None,
             is_host: false,
             is_connected: true,
@@ -1186,11 +1186,13 @@ pub(crate) async fn workshop_command(
                 if session.host_player_id.as_deref() != Some(identity.player_id.as_str()) {
                     return bad_command_request("Only the host can end the workshop.");
                 }
-                if session.phase != protocol::Phase::Phase2 {
-                    return bad_command_request("Judge review can only begin from Phase 2.");
+                if !matches!(session.phase, protocol::Phase::Phase2 | protocol::Phase::Judge) {
+                    return bad_command_request("Design voting can only begin from Phase 2.");
                 }
-                // Award phase-end achievements before transitioning
                 session.award_phase_end_achievements();
+                if let Err(error) = session.enter_voting() {
+                    return bad_command_request(&error.to_string());
+                }
                 session_to_persist = Some(session.clone());
                 artifact_to_append = Some(SessionArtifactRecord {
                     id: random_prefixed_id("artifact"),
@@ -1200,7 +1202,11 @@ pub(crate) async fn workshop_command(
                     kind: SessionArtifactKind::ActionProcessed,
                     player_id: Some(identity.player_id.clone()),
                     created_at: Utc::now().to_rfc3339(),
-                    payload: json!({ "command": "endGame", "judgeQueued": true }),
+                    payload: json!({
+                        "command": "endGame",
+                        "judgeQueued": true,
+                        "toPhase": "voting"
+                    }),
                 });
 
                 successful_workshop_command(&mut should_broadcast)
@@ -1209,14 +1215,10 @@ pub(crate) async fn workshop_command(
                 if session.host_player_id.as_deref() != Some(identity.player_id.as_str()) {
                     return bad_command_request("Only the host can open the design vote.");
                 }
-                if session.phase != protocol::Phase::Judge {
-                    return bad_command_request("Design voting can only begin after judge review.");
+                if session.phase != protocol::Phase::Phase2 {
+                    return bad_command_request("Design voting can only begin from Phase 2.");
                 }
-                let immediate_finalize = match session.enter_voting() {
-                    Ok(immediate_finalize) => immediate_finalize,
-                    Err(error) => return bad_command_request(&error.to_string()),
-                };
-                if immediate_finalize && let Err(error) = session.finalize_voting() {
+                if let Err(error) = session.enter_voting() {
                     return bad_command_request(&error.to_string());
                 }
                 session_to_persist = Some(session.clone());
@@ -1228,7 +1230,7 @@ pub(crate) async fn workshop_command(
                     kind: SessionArtifactKind::PhaseChanged,
                     player_id: Some(identity.player_id.clone()),
                     created_at: Utc::now().to_rfc3339(),
-                    payload: json!({ "toPhase": if immediate_finalize { "end" } else { "voting" } }),
+                    payload: json!({ "toPhase": "voting" }),
                 });
 
                 successful_workshop_command(&mut should_broadcast)
@@ -1283,10 +1285,36 @@ pub(crate) async fn workshop_command(
                 if session.phase != protocol::Phase::Voting {
                     return bad_command_request("Results can only be revealed during voting.");
                 }
-                if let Some(voting) = session.voting.as_ref()
-                    && voting.votes_by_player_id.len() < voting.eligible_player_ids.len()
-                {
-                    return bad_command_request("Wait until every eligible player has voted.");
+                if let Err(error) = session.reveal_voting_results() {
+                    return bad_command_request(&error.to_string());
+                }
+                session_to_persist = Some(session.clone());
+                artifact_to_append = Some(SessionArtifactRecord {
+                    id: random_prefixed_id("artifact"),
+                    session_id: session.id.to_string(),
+                    phase: session.phase,
+                    step: phase_step(session.phase),
+                    kind: SessionArtifactKind::VotingFinalized,
+                    player_id: Some(identity.player_id.clone()),
+                    created_at: Utc::now().to_rfc3339(),
+                    payload: json!({
+                        "resultsRevealed": true,
+                        "playerScores": session
+                            .players
+                            .iter()
+                            .map(|(player_id, player)| (player_id.clone(), player.score))
+                            .collect::<BTreeMap<_, _>>()
+                    }),
+                });
+
+                successful_workshop_command(&mut should_broadcast)
+            }
+            SessionCommand::EndSession => {
+                if session.host_player_id.as_deref() != Some(identity.player_id.as_str()) {
+                    return bad_command_request("Only the host can end the session.");
+                }
+                if session.phase != protocol::Phase::Voting {
+                    return bad_command_request("Session can only be ended during voting.");
                 }
                 if let Err(error) = session.finalize_voting() {
                     return bad_command_request(&error.to_string());
@@ -1302,6 +1330,7 @@ pub(crate) async fn workshop_command(
                     created_at: Utc::now().to_rfc3339(),
                     payload: json!({
                         "toPhase": "end",
+                        "endedEarly": true,
                         "playerScores": session
                             .players
                             .iter()
@@ -1428,14 +1457,30 @@ pub(crate) async fn workshop_command(
     drop(_write_guard);
     drop(write_lease);
 
-    if should_broadcast && !should_run_judge {
+    if should_broadcast {
         broadcast_session_state(&state, session_code, None).await;
     }
 
     if should_run_judge {
-        if let Err(error) = run_judge_for_session(&state, session_code, &identity.player_id).await {
-            return internal_command_error(error);
-        }
+        let background_state = state.clone();
+        let background_session_code = session_code.to_string();
+        let background_player_id = identity.player_id.clone();
+        tokio::spawn(async move {
+            if let Err(error) = run_judge_for_session(
+                &background_state,
+                &background_session_code,
+                &background_player_id,
+            )
+            .await
+            {
+                tracing::error!(
+                    session_code = %background_session_code,
+                    player_id = %background_player_id,
+                    %error,
+                    "background judge run failed"
+                );
+            }
+        });
     }
 
     tracing::info!(
@@ -1929,14 +1974,36 @@ pub(crate) async fn generate_sprite_sheet(
         return internal_sprite_sheet_error(format!("failed to touch player identity: {error}"));
     }
 
-    let phase = {
-        match ensure_session_cached(&state, session_code).await {
-            Ok(true) => {}
-            Ok(false) => return bad_sprite_sheet_request("Workshop not found."),
+    let (_, _write_guard, write_lease) =
+        match SessionWriteLease::acquire(&state, session_code).await {
+            Ok(guard) => guard,
             Err(error) => {
-                return internal_sprite_sheet_error(format!("failed to load session: {error}"));
+                return internal_sprite_sheet_error(format!(
+                    "failed to acquire session lease: {error}"
+                ));
             }
+        };
+    if let Err(error) = write_lease.ensure_active() {
+        return internal_sprite_sheet_error(format!(
+            "lost session lease before sprite generation load: {error}"
+        ));
+    }
+
+    match reload_cached_session(&state, session_code).await {
+        Ok(true) => {}
+        Ok(false) => return bad_sprite_sheet_request("Workshop not found."),
+        Err(error) => {
+            return internal_sprite_sheet_error(format!("failed to load session: {error}"));
         }
+    }
+
+    if let Err(error) = write_lease.ensure_active() {
+        return internal_sprite_sheet_error(format!(
+            "lost session lease before sprite generation validation: {error}"
+        ));
+    }
+
+    {
         let sessions = state.sessions.lock().await;
         let Some(session) = sessions.get(session_code) else {
             return bad_sprite_sheet_request("Workshop not found.");
@@ -1944,13 +2011,11 @@ pub(crate) async fn generate_sprite_sheet(
         if session.players.get(&identity.player_id).is_none() {
             return bad_sprite_sheet_request("Session identity is invalid or expired.");
         }
-        session.phase
-    };
-
-    if phase != protocol::Phase::Phase0 {
-        return bad_sprite_sheet_request(
-            "Dragon sprites can only be generated during character creation.",
-        );
+        if session.phase != protocol::Phase::Phase0 {
+            return bad_sprite_sheet_request(
+                "Dragon sprites can only be generated during character creation.",
+            );
+        }
     }
 
     let description = request.description.trim();
@@ -1964,6 +2029,65 @@ pub(crate) async fn generate_sprite_sheet(
             return internal_sprite_sheet_error(format!("sprite sheet generation failed: {error}"));
         }
     };
+
+    let (session_before, session_to_persist, artifact_to_append) = {
+        let mut sessions = state.sessions.lock().await;
+        let Some(session) = sessions.get_mut(session_code) else {
+            return bad_sprite_sheet_request("Workshop not found.");
+        };
+        let session_before = session.clone();
+        if session.players.get(&identity.player_id).is_none() {
+            return bad_sprite_sheet_request("Session identity is invalid or expired.");
+        }
+        if session.phase != protocol::Phase::Phase0 {
+            return bad_sprite_sheet_request(
+                "Dragon sprites can only be generated during character creation.",
+            );
+        }
+        if let Err(error) = session.update_player_sprite_draft(
+            &identity.player_id,
+            description.to_string(),
+            sprites.clone(),
+        ) {
+            return bad_sprite_sheet_request(&error.to_string());
+        }
+        let artifact = SessionArtifactRecord {
+            id: random_prefixed_id("artifact"),
+            session_id: session.id.to_string(),
+            phase: session.phase,
+            step: phase_step(session.phase),
+            kind: SessionArtifactKind::PetProfileUpdated,
+            player_id: Some(identity.player_id.clone()),
+            created_at: Utc::now().to_rfc3339(),
+            payload: json!({
+                "hasSprites": true,
+                "draftOnly": true,
+            }),
+        };
+        (session_before, session.clone(), artifact)
+    };
+
+    if let Err(error) = write_lease.ensure_active() {
+        let mut sessions = state.sessions.lock().await;
+        sessions.insert(session_code.to_string(), session_before);
+        return internal_sprite_sheet_error(format!(
+            "lost session lease before sprite draft persist: {error}"
+        ));
+    }
+
+    if let Err(error) = state
+        .store
+        .save_session_with_artifact(&session_to_persist, &artifact_to_append)
+        .await
+    {
+        let mut sessions = state.sessions.lock().await;
+        sessions.insert(session_code.to_string(), session_before);
+        return internal_sprite_sheet_error(format!("failed to persist sprite draft: {error}"));
+    }
+
+    drop(_write_guard);
+    drop(write_lease);
+    broadcast_session_state(&state, session_code, None).await;
 
     (
         StatusCode::OK,

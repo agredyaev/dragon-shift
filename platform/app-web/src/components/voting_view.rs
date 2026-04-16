@@ -131,22 +131,39 @@ pub fn VotingView(
         if is_host {
             p {
                 class: "meta",
-                if reveal_enabled {
-                    "All votes are in. Reveal is unlocked for the host."
-                } else {
-                    "Reveal unlocks after all eligible votes are submitted."
-                }
+                "The host can finish voting whenever the workshop is ready, even if some players skip voting."
             }
             div { class: "button-row",
                 button {
-                    class: "button button--secondary",
+                    class: "button button--primary",
+                    "data-testid": "reveal-results-button",
                     disabled: commands_disabled || !reveal_enabled,
                     onclick: move |_| {
                         spawn(submit_workshop_command(identity, ops, handover_tags_input, judge_bundle, SessionCommand::RevealVotingResults, None));
                     },
-                    "Reveal results"
+                    "Finish voting"
+                }
+                button {
+                    class: "button button--danger",
+                    "data-testid": "end-session-button",
+                    disabled: commands_disabled,
+                    onclick: move |_| {
+                        spawn(submit_workshop_command(identity, ops, handover_tags_input, judge_bundle, SessionCommand::EndSession, None));
+                    },
+                    "End game"
+                }
+                button {
+                    class: "button button--secondary",
+                    "data-testid": "reset-game-button",
+                    disabled: commands_disabled,
+                    onclick: move |_| {
+                        spawn(submit_workshop_command(identity, ops, handover_tags_input, judge_bundle, SessionCommand::ResetGame, None));
+                    },
+                    "Reset workshop"
                 }
             }
+        } else {
+            p { class: "meta", "Waiting for the host to finish voting and reveal the final standings." }
         }
     }
 }

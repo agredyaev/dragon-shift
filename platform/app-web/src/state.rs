@@ -498,10 +498,11 @@ pub fn command_success_message(command: SessionCommand) -> &'static str {
         SessionCommand::StartHandover => "Handover started.",
         SessionCommand::SubmitTags => "Handover tags saved.",
         SessionCommand::StartPhase2 => "Phase 2 started.",
-        SessionCommand::EndGame => "Judge review started.",
+        SessionCommand::EndGame => "Scoring opened.",
         SessionCommand::StartVoting => "Design voting started.",
-        SessionCommand::RevealVotingResults => "Voting results revealed.",
+        SessionCommand::RevealVotingResults => "Voting finished.",
         SessionCommand::ResetGame => "Workshop reset.",
+        SessionCommand::EndSession => "Game over ready.",
         _ => "Command sent.",
     }
 }
@@ -513,9 +514,10 @@ fn command_completed_by_phase_update(command: SessionCommand, phase: Phase) -> b
             | (SessionCommand::StartPhase1, Phase::Phase1)
             | (SessionCommand::StartHandover, Phase::Handover)
             | (SessionCommand::StartPhase2, Phase::Phase2)
-            | (SessionCommand::EndGame, Phase::Judge)
+            | (SessionCommand::EndGame, Phase::Voting)
             | (SessionCommand::StartVoting, Phase::Voting)
-            | (SessionCommand::RevealVotingResults, Phase::End)
+            | (SessionCommand::RevealVotingResults, Phase::Voting)
+            | (SessionCommand::EndSession, Phase::End)
             | (SessionCommand::ResetGame, Phase::Lobby)
     )
 }
@@ -598,7 +600,7 @@ fn should_clear_session_snapshot(error: &str) -> bool {
     )
 }
 
-fn clear_session_identity(identity: &mut IdentityState) {
+pub fn clear_session_identity(identity: &mut IdentityState) {
     identity.screen = ShellScreen::Home;
     identity.connection_status = ConnectionStatus::Offline;
     identity.identity = None;

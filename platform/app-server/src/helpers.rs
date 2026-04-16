@@ -1,10 +1,11 @@
+use crate::llm::normalize_sprite_base64;
 use chrono::Utc;
 use domain::{PlayerAction, SessionDragon, WorkshopSession};
 use protocol::{
-    ActionPayload, ActiveTime, ClientDragon, ClientGameState, ClientVotingState, DragonStats,
-    DragonVisuals, FoodType, JudgeActionTrace, JudgeBundle, JudgeDragonBundle, JudgeHandoverChain,
-    JudgePlayerSummary, PlayType, Player, SessionArtifactKind, SessionArtifactRecord, SessionMeta,
-    VoteResult, create_session_settings,
+    create_session_settings, ActionPayload, ActiveTime, ClientDragon, ClientGameState,
+    ClientVotingState, DragonStats, DragonVisuals, FoodType, JudgeActionTrace, JudgeBundle,
+    JudgeDragonBundle, JudgeHandoverChain, JudgePlayerSummary, PlayType, Player,
+    SessionArtifactKind, SessionArtifactRecord, SessionMeta, VoteResult,
 };
 use std::collections::BTreeMap;
 use uuid::Uuid;
@@ -24,6 +25,16 @@ pub(crate) fn phase_label(phase: protocol::Phase) -> &'static str {
 
 pub(crate) fn random_prefixed_id(prefix: &str) -> String {
     format!("{prefix}_{}", Uuid::new_v4().simple())
+}
+
+fn normalized_sprite_set(sprites: &protocol::SpriteSet) -> protocol::SpriteSet {
+    protocol::SpriteSet {
+        neutral: normalize_sprite_base64(&sprites.neutral)
+            .unwrap_or_else(|_| sprites.neutral.clone()),
+        happy: normalize_sprite_base64(&sprites.happy).unwrap_or_else(|_| sprites.happy.clone()),
+        angry: normalize_sprite_base64(&sprites.angry).unwrap_or_else(|_| sprites.angry.clone()),
+        sleepy: normalize_sprite_base64(&sprites.sleepy).unwrap_or_else(|_| sprites.sleepy.clone()),
+    }
 }
 
 fn client_dragon_visuals(dragon: &SessionDragon) -> DragonVisuals {
@@ -106,8 +117,7 @@ fn client_voting_state(
             counts
         },
     );
-    let results = if session.phase == protocol::Phase::End && !voting.eligible_player_ids.is_empty()
-    {
+    let results = if voting.results_revealed && !voting.eligible_player_ids.is_empty() {
         Some(
             session
                 .dragons
@@ -126,6 +136,7 @@ fn client_voting_state(
         eligible_count: voting.eligible_player_ids.len() as i32,
         submitted_count: voting.votes_by_player_id.len() as i32,
         current_player_vote_dragon_id: voting.votes_by_player_id.get(current_player_id).cloned(),
+        results_revealed: voting.results_revealed,
         results,
     })
 }
@@ -134,6 +145,17 @@ pub(crate) fn to_client_game_state(
     session: &WorkshopSession,
     current_player_id: &str,
 ) -> ClientGameState {
+    let normalized_player_sprites: BTreeMap<String, Option<protocol::SpriteSet>> = session
+        .players
+        .iter()
+        .map(|(player_id, player)| {
+            (
+                player_id.clone(),
+                player.custom_sprites.as_ref().map(normalized_sprite_set),
+            )
+        })
+        .collect();
+
     let players = session
         .players
         .iter()
@@ -150,7 +172,7 @@ pub(crate) fn to_client_game_state(
                     is_ready: player.is_ready,
                     is_connected: player.is_connected,
                     pet_description: player.pet_description.clone(),
-                    custom_sprites: player.custom_sprites.clone(),
+                    custom_sprites: normalized_player_sprites.get(player_id).cloned().flatten(),
                 },
             )
         })
@@ -160,7 +182,10 @@ pub(crate) fn to_client_game_state(
         .dragons
         .iter()
         .map(|(dragon_id, dragon)| {
-            let hide_owner_identity = session.phase == protocol::Phase::Voting;
+            let hide_owner_identity = matches!(
+                session.phase,
+                protocol::Phase::Voting if !session.voting.as_ref().is_some_and(|v| v.results_revealed)
+            );
             (
                 dragon_id.clone(),
                 ClientDragon {
@@ -190,10 +215,10 @@ pub(crate) fn to_client_game_state(
                     speech: dragon.speech.clone(),
                     speech_timer: dragon.speech_timer,
                     action_cooldown: dragon.action_cooldown,
-                    custom_sprites: session
-                        .players
+                    custom_sprites: normalized_player_sprites
                         .get(&dragon.original_owner_id)
-                        .and_then(|player| player.custom_sprites.clone()),
+                        .cloned()
+                        .flatten(),
                     judge_observation_score: dragon.judge_observation_score,
                     judge_care_score: dragon.judge_care_score,
                     judge_feedback: dragon.judge_feedback.clone(),

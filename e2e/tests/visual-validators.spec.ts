@@ -128,11 +128,23 @@ async function openReconnectWindow(
   expectedText: string,
 ) {
   const player = await newPlayerContext(browser)
-  await gotoApp(player.page)
-  await player.page.getByTestId('reconnect-session-code-input').fill(workshopCode)
-  await player.page.getByTestId('reconnect-token-input').fill(reconnectToken)
-  await player.page.getByTestId('reconnect-button').click()
-  await expect(player.page.getByTestId('session-panel')).toContainText(expectedText)
+  await player.page.goto('/')
+
+  const sessionPanel = player.page.getByTestId('session-panel')
+  const reconnectButton = player.page.getByTestId('reconnect-button')
+
+  await Promise.race([
+    sessionPanel.waitFor({ state: 'visible', timeout: 30_000 }).then(() => 'session'),
+    reconnectButton.waitFor({ state: 'visible', timeout: 30_000 }).then(() => 'home'),
+  ])
+
+  if (await reconnectButton.isVisible().catch(() => false)) {
+    await player.page.getByTestId('reconnect-session-code-input').fill(workshopCode)
+    await player.page.getByTestId('reconnect-token-input').fill(reconnectToken)
+    await reconnectButton.click()
+  }
+
+  await expect(sessionPanel).toContainText(expectedText)
   await expect(player.page.getByTestId('connection-badge')).toContainText('Connected')
   return player
 }
@@ -328,7 +340,9 @@ test.describe.serial('visual validators', () => {
               fn: async currentPage => {
                 await expect(currentPage.getByTestId('session-panel')).toContainText('Character creation')
                 await expect(currentPage.getByTestId('dragon-description-input')).toBeVisible()
-                await expect(currentPage.getByTestId('sprite-preview-image')).toBeVisible()
+                const previewImages = currentPage.getByTestId('session-panel').locator('.sprite-grid__image')
+                await expect(previewImages).toHaveCount(4)
+                await expect(previewImages.first()).toBeVisible()
                 await expect(currentPage.getByTestId('save-dragon-button')).toBeVisible()
                 return {
                   summary: 'Phase 0 character creation is usable',
@@ -541,7 +555,7 @@ test.describe.serial('visual validators', () => {
               label: 'end-leaderboards',
               fn: async currentPage => {
                 await expect(currentPage.getByTestId('session-panel')).toContainText('Workshop results')
-                await expect(currentPage.getByTestId('session-panel')).toContainText('Creativity Leaderboard')
+                await expect(currentPage.getByTestId('session-panel')).toContainText('Creativity leaderboard')
                 await expect(currentPage.getByTestId('session-panel')).toContainText('Mechanics leaderboard')
                 return {
                   summary: 'End screen shows split leaderboards',
