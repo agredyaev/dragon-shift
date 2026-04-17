@@ -6,6 +6,25 @@ pub type SessionStage = u8;
 pub type SpriteCatalog = BTreeMap<String, SpriteSet>;
 pub type SessionPhaseConfig = BTreeMap<Phase, SessionPhaseSettings>;
 
+pub const SPRITE_ATELIER_NOTICE_TITLE: &str = "Sprite Atelier";
+pub const SPRITE_ATELIER_ACCEPTED_NOTICE_MESSAGE: &str =
+    "The atelier accepted your dragon brief and is preparing a sketch slot.";
+pub const SPRITE_ATELIER_QUEUED_NOTICE_MESSAGE: &str =
+    "All easels are busy. Your dragon is waiting in the atelier queue.";
+pub const SPRITE_ATELIER_DRAWING_NOTICE_MESSAGE: &str =
+    "An easel is free. The atelier has started sketching your dragon.";
+pub const SPRITE_ATELIER_FALLBACK_NOTICE_MESSAGE: &str =
+    "The atelier prepared a reserve companion sprite sheet so you can keep playing.";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionNoticeCode {
+    SpriteAtelierAccepted,
+    SpriteAtelierQueued,
+    SpriteAtelierDrawing,
+    SpriteAtelierFallback,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Phase {
@@ -31,7 +50,7 @@ pub enum CoordinatorType {
 pub enum SessionCommand {
     Join,
     StartPhase0,
-    UpdatePlayerPet,
+    SelectCharacter,
     SubmitObservation,
     StartPhase1,
     StartHandover,
@@ -108,6 +127,16 @@ pub struct SpriteSet {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct CharacterProfile {
+    pub id: String,
+    pub description: String,
+    pub sprites: SpriteSet,
+    #[serde(default)]
+    pub remaining_sprite_regenerations: u8,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Player {
     pub id: String,
     pub name: String,
@@ -118,9 +147,13 @@ pub struct Player {
     pub is_ready: bool,
     pub is_connected: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub character_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pet_description: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_sprites: Option<SpriteSet>,
+    #[serde(default)]
+    pub remaining_sprite_regenerations: u8,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -135,9 +168,13 @@ pub struct ServerPlayer {
     pub is_ready: bool,
     pub is_connected: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub character_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pet_description: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_sprites: Option<SpriteSet>,
+    #[serde(default)]
+    pub remaining_sprite_regenerations: u8,
     pub joined_at: String,
     pub last_seen_at: String,
 }
@@ -163,10 +200,8 @@ pub struct DragonVisuals {
 #[serde(rename_all = "camelCase")]
 pub struct DragonTraits {
     pub active_time: ActiveTime,
-    pub day_food: FoodType,
-    pub night_food: FoodType,
-    pub day_play: PlayType,
-    pub night_play: PlayType,
+    pub favorite_food: FoodType,
+    pub favorite_play: PlayType,
     pub sleep_rate: i32,
 }
 
@@ -350,6 +385,8 @@ pub struct SessionNotice {
     pub level: NoticeLevel,
     pub title: String,
     pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<SessionNoticeCode>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -384,6 +421,8 @@ impl Default for WorkshopCreateConfig {
 pub struct CreateWorkshopRequest {
     pub name: String,
     pub config: WorkshopCreateConfig,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub character_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -393,15 +432,15 @@ pub struct JoinWorkshopRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub character_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reconnect_token: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct UpdatePlayerPetRequest {
-    pub description: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sprites: Option<SpriteSet>,
+pub struct SelectCharacterRequest {
+    pub character_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -495,10 +534,8 @@ pub struct JudgeDragonBundle {
     pub creative_vote_count: i32,
     pub final_stats: DragonStats,
     pub actual_active_time: ActiveTime,
-    pub actual_day_food: FoodType,
-    pub actual_night_food: FoodType,
-    pub actual_day_play: PlayType,
-    pub actual_night_play: PlayType,
+    pub actual_favorite_food: FoodType,
+    pub actual_favorite_play: PlayType,
     pub actual_sleep_rate: i32,
     pub handover_chain: JudgeHandoverChain,
     pub phase2_actions: Vec<JudgeActionTrace>,
@@ -621,16 +658,63 @@ pub struct SpriteSheetRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CharacterSpriteSheetRequest {
+    pub session_code: String,
+    pub reconnect_token: String,
+    pub description: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub character_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct CharacterCatalogRequest {}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SpriteSheetSuccess {
     pub ok: bool,
     pub sprites: SpriteSet,
+    #[serde(default)]
+    pub fallback_used: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CharacterSpriteSheetSuccess {
+    pub ok: bool,
+    pub character_id: String,
+    pub sprites: SpriteSet,
+    #[serde(default)]
+    pub remaining_sprite_regenerations: u8,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum SpriteSheetResult {
     Success(SpriteSheetSuccess),
+    Error(WorkshopError),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum CharacterSpriteSheetResult {
+    Success(CharacterSpriteSheetSuccess),
+    Error(WorkshopError),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CharacterCatalogSuccess {
+    pub ok: bool,
+    pub characters: Vec<CharacterProfile>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum CharacterCatalogResult {
+    Success(CharacterCatalogSuccess),
     Error(WorkshopError),
 }
 
@@ -734,12 +818,13 @@ pub fn create_session_settings(config: &WorkshopCreateConfig) -> SessionSettings
             step: 0,
             label: "Lobby - Waiting Room".to_string(),
             description:
-                "Join the workshop, confirm the roster, and wait for the host to open character creation."
+                "Join the workshop, pick or create your character from the lobby, and wait for the host to begin discovery."
                     .to_string(),
             duration_seconds: 0,
             allowed_commands: vec![
                 SessionCommand::Join,
-                SessionCommand::StartPhase0,
+                SessionCommand::SelectCharacter,
+                SessionCommand::StartPhase1,
                 SessionCommand::ResetGame,
                 SessionCommand::LeaveWorkshop,
             ],
@@ -749,13 +834,13 @@ pub fn create_session_settings(config: &WorkshopCreateConfig) -> SessionSettings
         Phase::Phase0,
         SessionPhaseSettings {
             step: 1,
-            label: "Phase 0 - Create Pet".to_string(),
+            label: "Phase 0 - Character Atelier".to_string(),
             description:
-                "Describe your dragon, generate sprites, and save your character profile before discovery begins."
+                "Create or redraw a global character from the lobby before discovery begins."
                     .to_string(),
             duration_seconds: (config.phase0_minutes as i32) * 60,
             allowed_commands: vec![
-                SessionCommand::UpdatePlayerPet,
+                SessionCommand::SelectCharacter,
                 SessionCommand::StartPhase1,
                 SessionCommand::ResetGame,
                 SessionCommand::LeaveWorkshop,
@@ -876,6 +961,7 @@ mod tests {
 
         assert_eq!(request.session_code, "123456");
         assert_eq!(request.name, None);
+        assert_eq!(request.character_id, None);
         assert_eq!(request.reconnect_token, None);
     }
 
@@ -960,10 +1046,10 @@ mod tests {
             .contains(&SessionCommand::Join));
         assert!(settings
             .phases
-            .get(&Phase::Phase0)
-            .expect("phase0 phase")
+            .get(&Phase::Lobby)
+            .expect("lobby phase")
             .allowed_commands
-            .contains(&SessionCommand::UpdatePlayerPet));
+            .contains(&SessionCommand::SelectCharacter));
         assert!(settings
             .phases
             .get(&Phase::Judge)
@@ -976,5 +1062,24 @@ mod tests {
             .expect("voting phase")
             .allowed_commands
             .contains(&SessionCommand::SubmitVote));
+    }
+
+    #[test]
+    fn character_sprite_sheet_request_skips_missing_character_id() {
+        let request = CharacterSpriteSheetRequest {
+            session_code: "123456".to_string(),
+            reconnect_token: "reconnect-1".to_string(),
+            description: "A moonlit dragon".to_string(),
+            character_id: None,
+        };
+
+        let value = serde_json::to_value(&request).expect("serialize character sprite request");
+        let object = value.as_object().expect("character sprite request object");
+
+        assert_eq!(
+            object.get("description").and_then(|value| value.as_str()),
+            Some("A moonlit dragon")
+        );
+        assert!(!object.contains_key("characterId"));
     }
 }

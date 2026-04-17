@@ -1,6 +1,6 @@
 use chrono::{DateTime, Utc};
 use domain::WorkshopSession;
-use protocol::SessionArtifactRecord;
+use protocol::{CharacterProfile, SessionArtifactRecord, SpriteSet};
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
@@ -79,6 +79,94 @@ pub struct RealtimeConnectionClaim {
 pub struct RealtimeConnectionRestore {
     pub restored: bool,
     pub replaced: Option<RealtimeConnectionRegistration>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppSpriteDefaults {
+    pub key: String,
+    pub sprites: SpriteSet,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CharacterRecord {
+    pub id: String,
+    pub description: String,
+    pub sprites: SpriteSet,
+    pub remaining_sprite_regenerations: u8,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+impl CharacterRecord {
+    pub fn profile(&self) -> CharacterProfile {
+        CharacterProfile {
+            id: self.id.clone(),
+            description: self.description.clone(),
+            sprites: self.sprites.clone(),
+            remaining_sprite_regenerations: self.remaining_sprite_regenerations,
+        }
+    }
+}
+
+pub const TIMEOUT_COMPANION_SPRITE_KEY: &str = "timeout_companion";
+
+const TIMEOUT_COMPANION_NEUTRAL_SPRITE: &str =
+    "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAApElEQVR42mNgGAWjYBQMFfD/asJ/WqrHaxA6Rpavjvn/nxT1VHEAyFJcmKoOwGYYPkfgUz80Q2BQOADZYHwWY3MIjE2WxWum/v+PjEmxHIbRzaDYAXJycmCMy0J0eZo4AATwOQBZnuoOGNAoePd4Hcl4eDvg/6S1ePk0dYCNbgBOPHyiAB2Q4wCqtAfQsxYxFqPrGV4OwCZPqh6qOoBaekbByAUAnY5G6OllDUkAAAAASUVORK5CYII=";
+const TIMEOUT_COMPANION_HAPPY_SPRITE: &str =
+    "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAAvElEQVR42mNgGAWjYBQMFfD/asJ/WqrHaxA6Rpavjvn/nxT1VHEAyFJcmKoOwGYYPkfgUz80Q2BQOADZYHwWY3MIjE2WxWum/v+PjEmxHIbRzaDYAXJycmCMy0J0eZo4AATwOQBZnuoOsNENIBjsyGqo6oB3j9eBMcgCGBsdo8vRxAGkYJo54P+ktVgtRBcfviGAKy1QNQ2gA1yJDhmjy1OlPYCezYgJenQ9w8sB2ORJ1UNVB1BLzygYuQAAmLxC6PcDH7YAAAAASUVORK5CYII=";
+const TIMEOUT_COMPANION_ANGRY_SPRITE: &str =
+    "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAArklEQVR42mNgGAWjYBQMFfD/asJ/WqrHaxA6Rpavjvn/nxT1VHEAyFJcmKoOwGYYPkfgUz80Q2BQOADZYHwWY3MIjE2WxWum/v+PjG10A8CYkMXI6tDNoMgBMAvk5ORwWo4uRxMHgIP3P5YgxyJGMwcQi6nqgHeP15GMRx1Acwf8T3ZHoenmAJCFuDDVHIAOyIkCqrQH0LMWMRaj6xleDsAmT6oeqjqAWnpGwcgFAAfTTcoNBh/0AAAAAElFTkSuQmCC";
+const TIMEOUT_COMPANION_SLEEPY_SPRITE: &str =
+    "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAApElEQVR42mNgGAWjYBQMFfD/asJ/WqrHaxA6Rpavjvn/nxT1VHEAyFJcmKoOwGYYPkfgUz80Q2BQOADZYHwWY3MIjE2WxWum/v+PjEmxHIbRzaDYATU7CFuKrIaqDgAZjIyxWYwuT/UQGNAoePd4Hcl41AHD1wE2ugFYMVUdgA7QDUe2EJvlIEyV9gB61iIm6NH1DC8HYJMnVQ9VHUAtPaNg5AIAXXpP4NPsjugAAAAASUVORK5CYII=";
+
+pub fn timeout_companion_defaults() -> AppSpriteDefaults {
+    AppSpriteDefaults {
+        key: TIMEOUT_COMPANION_SPRITE_KEY.to_string(),
+        sprites: SpriteSet {
+            neutral: TIMEOUT_COMPANION_NEUTRAL_SPRITE.to_string(),
+            happy: TIMEOUT_COMPANION_HAPPY_SPRITE.to_string(),
+            angry: TIMEOUT_COMPANION_ANGRY_SPRITE.to_string(),
+            sleepy: TIMEOUT_COMPANION_SLEEPY_SPRITE.to_string(),
+        },
+    }
+}
+
+pub fn starter_character_defaults() -> Vec<CharacterRecord> {
+    let defaults = timeout_companion_defaults().sprites;
+    vec![
+        CharacterRecord {
+            id: "starter_violet_crystal".to_string(),
+            description: "A violet crystal dragon with lantern eyes and a careful, observant posture.".to_string(),
+            sprites: defaults.clone(),
+            remaining_sprite_regenerations: 1,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+        },
+        CharacterRecord {
+            id: "starter_moss_forest".to_string(),
+            description: "A mossy forest dragon with fern-like frills and a warm trail-guide demeanor.".to_string(),
+            sprites: defaults.clone(),
+            remaining_sprite_regenerations: 1,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+        },
+        CharacterRecord {
+            id: "starter_sunset_coral".to_string(),
+            description: "A coral sunset dragon with tide-polished scales and a bright show-off streak.".to_string(),
+            sprites: defaults.clone(),
+            remaining_sprite_regenerations: 1,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+        },
+        CharacterRecord {
+            id: "starter_midnight_moon".to_string(),
+            description: "A midnight moon dragon with silver horns, soft wings, and a nocturnal calm.".to_string(),
+            sprites: defaults,
+            remaining_sprite_regenerations: 1,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+        },
+    ]
 }
 
 pub const REALTIME_CONNECTION_TTL_SECONDS: i64 = 15;
@@ -307,6 +395,21 @@ pub trait SessionStore: Send + Sync {
                 + '_,
         >,
     >;
+    fn load_app_sprite_defaults(
+        &self,
+        key: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<AppSpriteDefaults>, PersistenceError>> + Send + '_>>;
+    fn load_character(
+        &self,
+        character_id: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<CharacterRecord>, PersistenceError>> + Send + '_>>;
+    fn list_characters(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<CharacterRecord>, PersistenceError>> + Send + '_>>;
+    fn save_character(
+        &self,
+        character: &CharacterRecord,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + '_>>;
     fn publish_session_notification(
         &self,
         notification: &SessionUpdateNotification,
@@ -319,6 +422,8 @@ pub struct InMemorySessionStore {
     sessions_by_id: RwLock<HashMap<String, WorkshopSession>>,
     artifacts_by_session_id: RwLock<HashMap<String, Vec<SessionArtifactRecord>>>,
     identities_by_token: RwLock<HashMap<String, PlayerIdentity>>,
+    app_sprite_defaults_by_key: RwLock<HashMap<String, AppSpriteDefaults>>,
+    characters_by_id: RwLock<HashMap<String, CharacterRecord>>,
     session_leases: RwLock<HashMap<String, (String, String)>>,
     realtime_connections_by_id:
         RwLock<HashMap<String, (RealtimeConnectionRegistration, DateTime<Utc>)>>,
@@ -328,7 +433,26 @@ pub struct InMemorySessionStore {
 
 impl InMemorySessionStore {
     pub fn new() -> Self {
-        Self::default()
+        let store = Self::default();
+        store
+            .seed_app_sprite_defaults(timeout_companion_defaults())
+            .expect("seed in-memory timeout companion sprites");
+        for character in starter_character_defaults() {
+            store
+                .characters_by_id
+                .write()
+                .expect("seed in-memory characters")
+                .insert(character.id.clone(), character);
+        }
+        store
+    }
+
+    pub fn seed_app_sprite_defaults(&self, defaults: AppSpriteDefaults) -> Result<(), PersistenceError> {
+        self.app_sprite_defaults_by_key
+            .write()
+            .map_err(|_| PersistenceError::LockPoisoned)?
+            .insert(defaults.key.clone(), defaults);
+        Ok(())
     }
 }
 
@@ -393,6 +517,78 @@ impl PostgresSessionStore {
                 .execute(&mut **tx)
                 .await?;
         }
+        Ok(())
+    }
+
+    async fn save_character_in_tx(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        character: &CharacterRecord,
+    ) -> Result<(), PersistenceError> {
+        sqlx::query(
+            "
+                INSERT INTO characters (
+                    character_id,
+                    description,
+                    neutral_sprite,
+                    happy_sprite,
+                    angry_sprite,
+                    sleepy_sprite,
+                    remaining_sprite_regenerations,
+                    created_at,
+                    updated_at
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                ON CONFLICT (character_id) DO UPDATE SET
+                    description = EXCLUDED.description,
+                    neutral_sprite = EXCLUDED.neutral_sprite,
+                    happy_sprite = EXCLUDED.happy_sprite,
+                    angry_sprite = EXCLUDED.angry_sprite,
+                    sleepy_sprite = EXCLUDED.sleepy_sprite,
+                    remaining_sprite_regenerations = EXCLUDED.remaining_sprite_regenerations,
+                    created_at = EXCLUDED.created_at,
+                    updated_at = EXCLUDED.updated_at
+            ",
+        )
+        .bind(&character.id)
+        .bind(&character.description)
+        .bind(&character.sprites.neutral)
+        .bind(&character.sprites.happy)
+        .bind(&character.sprites.angry)
+        .bind(&character.sprites.sleepy)
+        .bind(i16::from(character.remaining_sprite_regenerations))
+        .bind(&character.created_at)
+        .bind(&character.updated_at)
+        .execute(&mut **tx)
+        .await?;
+        Ok(())
+    }
+
+    fn character_from_row(row: &sqlx::postgres::PgRow) -> CharacterRecord {
+        use sqlx::Row;
+
+        CharacterRecord {
+            id: row.get("character_id"),
+            description: row.get("description"),
+            sprites: SpriteSet {
+                neutral: row.get("neutral_sprite"),
+                happy: row.get("happy_sprite"),
+                angry: row.get("angry_sprite"),
+                sleepy: row.get("sleepy_sprite"),
+            },
+            remaining_sprite_regenerations: row
+                .get::<i16, _>("remaining_sprite_regenerations")
+                .clamp(0, u8::MAX as i16) as u8,
+            created_at: row.get("created_at"),
+            updated_at: row.get("updated_at"),
+        }
+    }
+
+    async fn seed_default_characters(&self) -> Result<(), PersistenceError> {
+        let mut tx = self.pool.begin().await?;
+        for character in starter_character_defaults() {
+            Self::save_character_in_tx(&mut tx, &character).await?;
+        }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -668,6 +864,7 @@ impl SessionStore for PostgresSessionStore {
     fn init(&self) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + '_>> {
         Box::pin(async move {
             MIGRATOR.run(&self.pool).await?;
+            self.seed_default_characters().await?;
             Ok(())
         })
     }
@@ -1150,6 +1347,106 @@ impl SessionStore for PostgresSessionStore {
                     .execute(&self.pool)
                     .await?;
             }
+            Ok(())
+        })
+    }
+
+    fn load_app_sprite_defaults(
+        &self,
+        key: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<AppSpriteDefaults>, PersistenceError>> + Send + '_>> {
+        let key = key.to_string();
+        Box::pin(async move {
+            use sqlx::Row;
+
+            let row = sqlx::query(
+                "SELECT neutral_sprite, happy_sprite, angry_sprite, sleepy_sprite FROM app_sprite_defaults WHERE sprite_key = $1",
+            )
+            .bind(&key)
+            .fetch_optional(&self.pool)
+            .await?;
+
+            Ok(row.map(|row| AppSpriteDefaults {
+                key,
+                sprites: SpriteSet {
+                    neutral: row.get("neutral_sprite"),
+                    happy: row.get("happy_sprite"),
+                    angry: row.get("angry_sprite"),
+                    sleepy: row.get("sleepy_sprite"),
+                },
+            }))
+        })
+    }
+
+    fn load_character(
+        &self,
+        character_id: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<CharacterRecord>, PersistenceError>> + Send + '_>> {
+        let character_id = character_id.to_string();
+        Box::pin(async move {
+            let row = sqlx::query(
+                "
+                    SELECT
+                        character_id,
+                        description,
+                        neutral_sprite,
+                        happy_sprite,
+                        angry_sprite,
+                        sleepy_sprite,
+                        remaining_sprite_regenerations,
+                        created_at,
+                        updated_at
+                    FROM characters
+                    WHERE character_id = $1
+                ",
+            )
+            .bind(&character_id)
+            .fetch_optional(&self.pool)
+            .await?;
+
+            Ok(row.map(|row| Self::character_from_row(&row)))
+        })
+    }
+
+    fn list_characters(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<CharacterRecord>, PersistenceError>> + Send + '_>> {
+        Box::pin(async move {
+            let rows = sqlx::query(
+                "
+                    SELECT
+                        character_id,
+                        description,
+                        neutral_sprite,
+                        happy_sprite,
+                        angry_sprite,
+                        sleepy_sprite,
+                        remaining_sprite_regenerations,
+                        created_at,
+                        updated_at
+                    FROM characters
+                    ORDER BY created_at ASC, character_id ASC
+                ",
+            )
+            .fetch_all(&self.pool)
+            .await?;
+
+            Ok(rows
+                .into_iter()
+                .map(|row| Self::character_from_row(&row))
+                .collect())
+        })
+    }
+
+    fn save_character(
+        &self,
+        character: &CharacterRecord,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + '_>> {
+        let character = character.clone();
+        Box::pin(async move {
+            let mut tx = self.pool.begin().await?;
+            Self::save_character_in_tx(&mut tx, &character).await?;
+            tx.commit().await?;
             Ok(())
         })
     }
@@ -1867,6 +2164,72 @@ impl SessionStore for InMemorySessionStore {
     ) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + '_>> {
         Box::pin(async move { Ok(()) })
     }
+
+    fn load_app_sprite_defaults(
+        &self,
+        key: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<AppSpriteDefaults>, PersistenceError>> + Send + '_>> {
+        let key = key.to_string();
+        Box::pin(async move {
+            let defaults = self
+                .app_sprite_defaults_by_key
+                .read()
+                .map_err(|_| PersistenceError::LockPoisoned)?
+                .get(&key)
+                .cloned();
+            Ok(defaults)
+        })
+    }
+
+    fn load_character(
+        &self,
+        character_id: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<CharacterRecord>, PersistenceError>> + Send + '_>> {
+        let character_id = character_id.to_string();
+        Box::pin(async move {
+            let character = self
+                .characters_by_id
+                .read()
+                .map_err(|_| PersistenceError::LockPoisoned)?
+                .get(&character_id)
+                .cloned();
+            Ok(character)
+        })
+    }
+
+    fn list_characters(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<CharacterRecord>, PersistenceError>> + Send + '_>> {
+        Box::pin(async move {
+            let mut characters = self
+                .characters_by_id
+                .read()
+                .map_err(|_| PersistenceError::LockPoisoned)?
+                .values()
+                .cloned()
+                .collect::<Vec<_>>();
+            characters.sort_by(|left, right| {
+                left.created_at
+                    .cmp(&right.created_at)
+                    .then_with(|| left.id.cmp(&right.id))
+            });
+            Ok(characters)
+        })
+    }
+
+    fn save_character(
+        &self,
+        character: &CharacterRecord,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + '_>> {
+        let character = character.clone();
+        Box::pin(async move {
+            self.characters_by_id
+                .write()
+                .map_err(|_| PersistenceError::LockPoisoned)?
+                .insert(character.id.clone(), character);
+            Ok(())
+        })
+    }
 }
 
 async fn rollback_in_memory_session(
@@ -2005,15 +2368,25 @@ mod tests {
         session.add_player(SessionPlayer {
             id: "player-1".to_string(),
             name: "Alice".to_string(),
-            pet_description: Some("Alice's workshop dragon".to_string()),
+            character_id: Some("character-1".to_string()),
+            selected_character: Some(protocol::CharacterProfile {
+                id: "character-1".to_string(),
+                description: "Alice's workshop dragon".to_string(),
+                sprites: SpriteSet {
+                    neutral: "neutral".to_string(),
+                    happy: "happy".to_string(),
+                    angry: "angry".to_string(),
+                    sleepy: "sleepy".to_string(),
+                },
+                remaining_sprite_regenerations: 1,
+            }),
             is_host: true,
             is_connected: true,
-            is_ready: false,
+            is_ready: true,
             score: 0,
             current_dragon_id: None,
             achievements: Vec::new(),
             joined_at: ts(updated_at_seconds),
-            custom_sprites: None,
         });
         session
     }
@@ -2043,6 +2416,38 @@ mod tests {
             .expect("session exists");
 
         assert_eq!(loaded, saved);
+    }
+
+    #[tokio::test]
+    async fn save_and_load_character_roundtrip() {
+        let store = InMemorySessionStore::new();
+        let character = CharacterRecord {
+            id: "character-1".to_string(),
+            description: "A violet crystal dragon".to_string(),
+            sprites: SpriteSet {
+                neutral: "neutral".to_string(),
+                happy: "happy".to_string(),
+                angry: "angry".to_string(),
+                sleepy: "sleepy".to_string(),
+            },
+            remaining_sprite_regenerations: 1,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+        };
+
+        store
+            .save_character(&character)
+            .await
+            .expect("save character");
+
+        let loaded = store
+            .load_character("character-1")
+            .await
+            .expect("load character")
+            .expect("character exists");
+
+        assert_eq!(loaded, character);
+        assert_eq!(loaded.profile().id, "character-1");
     }
 
     #[tokio::test]

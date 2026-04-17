@@ -8,7 +8,7 @@ use chrono::Utc;
 use persistence::{RealtimeConnectionRegistration, SessionUpdateNotification};
 use protocol::{
     ClientWsMessage, NoticeLevel, ServerWsMessage, SessionArtifactKind, SessionArtifactRecord,
-    SessionEnvelope,
+    SessionEnvelope, SessionNoticeCode,
 };
 use serde_json::json;
 #[cfg(test)]
@@ -93,6 +93,7 @@ async fn broadcast_notice(
         level,
         title: title.to_string(),
         message: message.to_string(),
+        code: None,
     });
 
     let failed_connection_ids = {
@@ -100,6 +101,56 @@ async fn broadcast_notice(
         registrations
             .into_iter()
             .filter(|registration| registration.replica_id == state.replica_id)
+            .filter_map(|registration| {
+                senders.get(&registration.connection_id).and_then(|sender| {
+                    sender
+                        .send(WsOutbound::Message(notice.clone()))
+                        .err()
+                        .map(|_| registration.connection_id)
+                })
+            })
+            .collect::<Vec<_>>()
+    };
+
+    if !failed_connection_ids.is_empty() {
+        let mut senders = state.realtime_senders.lock().await;
+        for connection_id in failed_connection_ids {
+            senders.remove(&connection_id);
+        }
+    }
+}
+
+pub(crate) async fn send_player_notice_with_code(
+    state: &AppState,
+    session_code: &str,
+    player_id: &str,
+    level: protocol::NoticeLevel,
+    title: &str,
+    message: &str,
+    code: Option<SessionNoticeCode>,
+) {
+    let registrations = match state.store.list_realtime_connections(session_code).await {
+        Ok(registrations) => registrations,
+        Err(_) => return,
+    };
+    if registrations.is_empty() {
+        return;
+    }
+
+    let notice = ServerWsMessage::Notice(protocol::SessionNotice {
+        level,
+        title: title.to_string(),
+        message: message.to_string(),
+        code,
+    });
+
+    let failed_connection_ids = {
+        let senders = state.realtime_senders.lock().await;
+        registrations
+            .into_iter()
+            .filter(|registration| {
+                registration.replica_id == state.replica_id && registration.player_id == player_id
+            })
             .filter_map(|registration| {
                 senders.get(&registration.connection_id).and_then(|sender| {
                     sender
@@ -937,10 +988,24 @@ pub(crate) async fn advance_game_ticks(state: &AppState) {
     };
 
     for session_code in session_codes {
-        {
+        let session_snapshot = {
             let mut sessions = state.sessions.lock().await;
             if let Some(session) = sessions.get_mut(&session_code) {
                 session.advance_tick();
+                Some(session.clone())
+            } else {
+                None
+            }
+        };
+
+        // Persist tick-decayed state periodically so that command-handler reloads
+        // (reload_cached_session) pick up recent stats. Throttled to every 5 ticks
+        // to reduce write pressure on Postgres (was OOM-killed at 1 write/sec).
+        if let Some(snapshot) = &session_snapshot {
+            if snapshot.time % 5 == 0 {
+                if let Err(error) = state.store.save_session(snapshot).await {
+                    info!(session_code = %session_code, error = %error, "failed to persist tick state");
+                }
             }
         }
 

@@ -16,6 +16,9 @@ use std::{
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
+pub(crate) struct ImageGenerationLease {
+}
+
 // ---------------------------------------------------------------------------
 // Provider pool
 // ---------------------------------------------------------------------------
@@ -541,6 +544,10 @@ impl LlmError {
     fn is_failover_eligible(&self) -> bool {
         matches!(self, Self::RateLimited(_) | Self::ProviderUnavailable(_))
     }
+
+    fn is_rate_limited(&self) -> bool {
+        matches!(self, Self::RateLimited(_) | Self::AllProvidersExhausted(_))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -698,6 +705,19 @@ fn provider_attempt_indices(provider_count: usize, start_index: usize) -> Vec<us
         .collect()
 }
 
+/// Returns a pseudo-random jitter in `0..max_ms` using the current timestamp
+/// nanoseconds — good enough for backoff jitter without pulling in a PRNG crate.
+fn rand_jitter_ms(max_ms: u64) -> u64 {
+    if max_ms == 0 {
+        return 0;
+    }
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_nanos() as u64
+        % max_ms
+}
+
 // ---------------------------------------------------------------------------
 // Provider pool executor
 // ---------------------------------------------------------------------------
@@ -725,6 +745,10 @@ impl LlmClient {
             judge_provider_cursor: Arc::new(AtomicUsize::new(0)),
             image_provider_cursor: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    pub(crate) fn acquire_image_generation_lease(&self) -> ImageGenerationLease {
+        ImageGenerationLease {}
     }
 
     // -----------------------------------------------------------------------
@@ -794,13 +818,18 @@ impl LlmClient {
     // Image generation
     // -----------------------------------------------------------------------
 
-    pub(crate) async fn generate_image(&self, prompt: &str) -> Result<(String, String), LlmError> {
-        self.generate_image_with_system_instruction(None, prompt)
+    pub(crate) async fn generate_image_with_lease(
+        &self,
+        lease: &ImageGenerationLease,
+        prompt: &str,
+    ) -> Result<(String, String), LlmError> {
+        self.generate_image_with_system_instruction(lease, None, prompt)
             .await
     }
 
     async fn generate_image_with_system_instruction(
         &self,
+        _lease: &ImageGenerationLease,
         system_instruction: Option<&str>,
         prompt: &str,
     ) -> Result<(String, String), LlmError> {
@@ -810,6 +839,48 @@ impl LlmClient {
             ));
         }
 
+        // Retry the full provider loop up to 4 times with jittered exponential
+        // backoff when every provider is rate-limited.
+        const MAX_RETRIES: u32 = 4;
+        const BASE_DELAY_MS: u64 = 2_000;
+
+        let mut last_error = LlmError::AllProvidersExhausted("no attempts made".into());
+
+        for attempt in 0..=MAX_RETRIES {
+            if attempt > 0 {
+                let backoff_ms =
+                    BASE_DELAY_MS * 2u64.pow(attempt - 1) + rand_jitter_ms(500);
+                warn!(
+                    attempt,
+                    backoff_ms,
+                    "image generation rate-limited, retrying after backoff"
+                );
+                tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+            }
+
+            match self
+                .try_image_generation(system_instruction, prompt)
+                .await
+            {
+                Ok(result) => return Ok(result),
+                Err(e) if e.is_rate_limited() && attempt < MAX_RETRIES => {
+                    last_error = e;
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        Err(last_error)
+    }
+
+    /// Single pass through all image providers — returns the first success or
+    /// an aggregate error.
+    async fn try_image_generation(
+        &self,
+        system_instruction: Option<&str>,
+        prompt: &str,
+    ) -> Result<(String, String), LlmError> {
         let mut last_error = String::new();
         let start_index = self
             .image_provider_cursor
@@ -853,14 +924,15 @@ impl LlmClient {
     // Sprite sheet generation: prompt → 2x2 grid → 4 base64 frames
     // -----------------------------------------------------------------------
 
-    pub(crate) async fn generate_sprite_sheet(
+    pub(crate) async fn generate_sprite_sheet_with_lease(
         &self,
+        lease: &ImageGenerationLease,
         description: &str,
     ) -> Result<SpriteSet, LlmError> {
         let system_instruction = build_sprite_sheet_system_instruction();
         let prompt = build_sprite_sheet_user_prompt(description);
         let (image_base64, _mime) = self
-            .generate_image_with_system_instruction(Some(system_instruction), &prompt)
+            .generate_image_with_system_instruction(lease, Some(system_instruction), &prompt)
             .await?;
         slice_sprite_sheet(&image_base64)
     }
@@ -1652,10 +1724,8 @@ mod tests {
                         happiness: 80,
                     },
                     actual_active_time: protocol::ActiveTime::Day,
-                    actual_day_food: protocol::FoodType::Meat,
-                    actual_night_food: protocol::FoodType::Fruit,
-                    actual_day_play: protocol::PlayType::Fetch,
-                    actual_night_play: protocol::PlayType::Puzzle,
+                    actual_favorite_food: protocol::FoodType::Meat,
+                    actual_favorite_play: protocol::PlayType::Fetch,
                     actual_sleep_rate: 2,
                     handover_chain: protocol::JudgeHandoverChain {
                         creator_instructions: "Feed at dusk".to_string(),
@@ -1685,10 +1755,8 @@ mod tests {
                         happiness: 74,
                     },
                     actual_active_time: protocol::ActiveTime::Night,
-                    actual_day_food: protocol::FoodType::Fish,
-                    actual_night_food: protocol::FoodType::Meat,
-                    actual_day_play: protocol::PlayType::Music,
-                    actual_night_play: protocol::PlayType::Fetch,
+                    actual_favorite_food: protocol::FoodType::Fish,
+                    actual_favorite_play: protocol::PlayType::Music,
                     actual_sleep_rate: 1,
                     handover_chain: protocol::JudgeHandoverChain {
                         creator_instructions: "Play music during the day".to_string(),
@@ -2040,7 +2108,7 @@ mod tests {
     fn configured_impersonation_url_prefers_explicit_env() {
         let _impersonate = ScopedEnvVar::set(
             "GOOGLE_IMPERSONATE_SERVICE_ACCOUNT",
-            "dragon-shift-local-kube@rna-workshop.iam.gserviceaccount.com",
+            "dragon-shift-local-kube@rna-workshop2.iam.gserviceaccount.com",
         );
 
         let url = configured_impersonation_url(Some(
@@ -2050,7 +2118,7 @@ mod tests {
         assert_eq!(
             url.as_deref(),
             Some(
-                "https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/dragon-shift-local-kube@rna-workshop.iam.gserviceaccount.com:generateAccessToken"
+                "https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/dragon-shift-local-kube@rna-workshop2.iam.gserviceaccount.com:generateAccessToken"
             )
         );
     }

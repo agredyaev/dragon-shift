@@ -1,9 +1,9 @@
 use futures_util::{SinkExt, StreamExt};
 use protocol::{
     ClientWsMessage, CreateWorkshopRequest, JoinWorkshopRequest, JudgeBundle, Phase,
-    ServerWsMessage, SessionCommand, SessionEnvelope, WorkshopCommandRequest,
-    WorkshopCommandResult, WorkshopJoinResult, WorkshopJoinSuccess, WorkshopJudgeBundleRequest,
-    WorkshopJudgeBundleResult,
+    ServerWsMessage, SessionCommand, SessionEnvelope, SpriteSheetRequest, SpriteSheetResult,
+    WorkshopCommandRequest, WorkshopCommandResult, WorkshopJoinResult, WorkshopJoinSuccess,
+    WorkshopJudgeBundleRequest, WorkshopJudgeBundleResult,
 };
 use serde_json::json;
 use sqlx::PgPool;
@@ -42,6 +42,12 @@ struct WebBuildConfig {
 struct JoinLoadConfig {
     base_url: String,
     clients: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SpriteLoadConfig {
+    base_url: String,
+    workers: usize,
 }
 
 fn main() {
@@ -86,6 +92,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
         }
         "smoke-phase1" => run_async(smoke_phase1(smoke_base_url(&forwarded)?)),
         "smoke-join-load" => run_async(smoke_join_load(join_load_config(&forwarded)?)),
+        "smoke-sprite-load" => run_async(smoke_sprite_load(sprite_load_config(&forwarded)?)),
         "smoke-judge-bundle" => run_async(smoke_judge_bundle(smoke_base_url(&forwarded)?)),
         "smoke-offline-failover" => run_async(smoke_offline_failover(smoke_base_url(&forwarded)?)),
         "smoke-persistence" => run_async(smoke_persistence(persistence_smoke_config(&forwarded)?)),
@@ -279,6 +286,42 @@ fn join_load_config(forwarded: &[String]) -> Result<JoinLoadConfig, String> {
     Ok(JoinLoadConfig {
         base_url: normalize_base_url(&base_url),
         clients,
+    })
+}
+
+fn sprite_load_config(forwarded: &[String]) -> Result<SpriteLoadConfig, String> {
+    let mut base_url = env::var("XTASK_SMOKE_BASE_URL")
+        .or_else(|_| env::var("SMOKE_TEST_BASE_URL"))
+        .unwrap_or_else(|_| "http://127.0.0.1:4100".to_string());
+    let mut workers = 40usize;
+    let mut args = forwarded.iter();
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--base-url" => {
+                base_url = args
+                    .next()
+                    .ok_or_else(|| "missing value for --base-url".to_string())?
+                    .clone();
+            }
+            "--workers" => {
+                workers = args
+                    .next()
+                    .ok_or_else(|| "missing value for --workers".to_string())?
+                    .parse::<usize>()
+                    .map_err(|error| format!("invalid value for --workers: {error}"))?;
+            }
+            unknown => return Err(format!("unknown sprite-load arg: {unknown}")),
+        }
+    }
+
+    if workers == 0 {
+        return Err("--workers must be greater than 0".to_string());
+    }
+
+    Ok(SpriteLoadConfig {
+        base_url: normalize_base_url(&base_url),
+        workers,
     })
 }
 
@@ -863,6 +906,162 @@ async fn smoke_join_load(config: JoinLoadConfig) -> Result<(), String> {
         "joinedClients": requested_clients,
         "totalPlayers": total_players,
         "connectedPlayers": connected_players,
+    }))
+}
+
+async fn smoke_sprite_load(config: SpriteLoadConfig) -> Result<(), String> {
+    let total_start = std::time::Instant::now();
+    let client = reqwest::Client::new();
+    let workers = config.workers;
+
+    // Phase 1: create workshops and advance each to Phase0 (paced to stay
+    // within the server's create rate-limit window).
+    let mut sessions: Vec<WorkshopJoinSuccess> = Vec::with_capacity(workers);
+    for index in 0..workers {
+        let name = format!("SpriteWorker{:03}", index + 1);
+        let host = create_workshop(&client, &config.base_url, &name).await?;
+        send_command(
+            &client,
+            &config.base_url,
+            command_request(&host, SessionCommand::StartPhase0, None),
+        )
+        .await?;
+        sessions.push(host);
+        // Pace creation to avoid hitting the per-IP rate limiter.
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    }
+    let setup_ms = total_start.elapsed().as_millis();
+
+    // Phase 2: fire all sprite-sheet requests concurrently.
+    let descriptions = [
+        "A tiny green dragon with sparkling scales and butterfly wings",
+        "A fierce red dragon breathing blue fire in a thunderstorm",
+        "A fluffy pink dragon sleeping on a cloud made of cotton candy",
+        "A cyberpunk dragon with neon circuits and glowing purple eyes",
+        "A crystal ice dragon whose body refracts rainbow light",
+        "A baby golden dragon hatching from a jewel-encrusted egg",
+        "A shadow dragon made of swirling dark smoke and amber embers",
+        "A coral reef dragon with flowing fins and bioluminescent spots",
+        "A steampunk dragon with brass gears and copper pipe wings",
+        "A galaxy dragon whose scales are tiny shimmering constellations",
+    ];
+
+    let gen_start = std::time::Instant::now();
+    let sprite_results = futures_util::future::join_all(sessions.iter().enumerate().map(
+        |(index, session)| {
+            let client = client.clone();
+            let base_url = config.base_url.clone();
+            let description = descriptions[index % descriptions.len()].to_string();
+            let session_code = session.session_code.clone();
+            let reconnect_token = session.reconnect_token.clone();
+
+            async move {
+                let t0 = std::time::Instant::now();
+                let result = client
+                    .post(format!("{base_url}/api/workshops/sprite-sheet"))
+                    .header("Origin", &base_url)
+                    .json(&SpriteSheetRequest {
+                        session_code,
+                        reconnect_token,
+                        description,
+                    })
+                    .send()
+                    .await;
+
+                let elapsed_ms = t0.elapsed().as_millis();
+                match result {
+                    Ok(response) => {
+                        let status = response.status().as_u16();
+                        let body = response.json::<SpriteSheetResult>().await;
+                        match body {
+                            Ok(SpriteSheetResult::Success(success)) => {
+                                let sprite_sizes: Vec<usize> = [
+                                    &success.sprites.neutral,
+                                    &success.sprites.happy,
+                                    &success.sprites.angry,
+                                    &success.sprites.sleepy,
+                                ]
+                                .iter()
+                                .map(|s| s.len())
+                                .collect();
+                                (index, elapsed_ms, status, Ok(sprite_sizes))
+                            }
+                            Ok(SpriteSheetResult::Error(err)) => {
+                                (index, elapsed_ms, status, Err(err.error))
+                            }
+                            Err(parse_err) => (
+                                index,
+                                elapsed_ms,
+                                status,
+                                Err(format!("response parse error: {parse_err}")),
+                            ),
+                        }
+                    }
+                    Err(req_err) => (index, elapsed_ms, 0, Err(format!("request error: {req_err}"))),
+                }
+            }
+        },
+    ))
+    .await;
+
+    let gen_ms = gen_start.elapsed().as_millis();
+
+    // Phase 3: summarize results.
+    let mut successes = 0u64;
+    let mut failures = 0u64;
+    let mut success_times: Vec<u128> = Vec::new();
+    let mut failure_details: Vec<serde_json::Value> = Vec::new();
+
+    for (index, elapsed_ms, status, result) in &sprite_results {
+        match result {
+            Ok(_sizes) => {
+                successes += 1;
+                success_times.push(*elapsed_ms);
+            }
+            Err(error) => {
+                failures += 1;
+                failure_details.push(json!({
+                    "worker": index,
+                    "status": status,
+                    "elapsedMs": elapsed_ms,
+                    "error": error,
+                }));
+            }
+        }
+    }
+
+    success_times.sort();
+    let p50 = success_times.get(success_times.len() / 2).copied().unwrap_or(0);
+    let p95 = success_times
+        .get((success_times.len() as f64 * 0.95) as usize)
+        .copied()
+        .unwrap_or(0);
+    let p99 = success_times
+        .get((success_times.len() as f64 * 0.99) as usize)
+        .copied()
+        .unwrap_or(0);
+    let max = success_times.last().copied().unwrap_or(0);
+    let min = success_times.first().copied().unwrap_or(0);
+
+    let total_ms = total_start.elapsed().as_millis();
+
+    print_json(json!({
+        "ok": failures == 0,
+        "baseUrl": config.base_url,
+        "workers": workers,
+        "setupMs": setup_ms,
+        "generationMs": gen_ms,
+        "totalMs": total_ms,
+        "successes": successes,
+        "failures": failures,
+        "latency": {
+            "minMs": min,
+            "p50Ms": p50,
+            "p95Ms": p95,
+            "p99Ms": p99,
+            "maxMs": max,
+        },
+        "failureDetails": failure_details,
     }))
 }
 
@@ -1628,6 +1827,7 @@ async fn create_workshop(
                 phase1_minutes: 10,
                 phase2_minutes: 10,
             },
+            character_id: None,
         })
         .send()
         .await
@@ -1696,6 +1896,7 @@ async fn join_workshop(
         .json(&JoinWorkshopRequest {
             session_code: session_code.to_string(),
             name: Some(name.to_string()),
+            character_id: None,
             reconnect_token: None,
         })
         .send()
@@ -1716,6 +1917,7 @@ async fn reconnect_workshop(
         .json(&JoinWorkshopRequest {
             session_code: identity.session_code.clone(),
             name: None,
+            character_id: None,
             reconnect_token: Some(identity.reconnect_token.clone()),
         })
         .send()
@@ -1802,6 +2004,7 @@ fn print_help() {
   cargo xtask server -- [app-server args]
   cargo xtask smoke-phase1 -- [--base-url http://127.0.0.1:4100]
   cargo xtask smoke-join-load -- [--base-url http://127.0.0.1:4100] [--clients 30]
+  cargo xtask smoke-sprite-load -- [--base-url http://127.0.0.1:4100] [--workers 40]
   cargo xtask smoke-judge-bundle -- [--base-url http://127.0.0.1:4100]
   cargo xtask smoke-offline-failover -- [--base-url http://127.0.0.1:4100]
   cargo xtask smoke-persistence -- [--base-url http://127.0.0.1:4100] [--database-url postgres://...]
@@ -1865,6 +2068,26 @@ mod tests {
         .expect("join load config with flags");
         assert_eq!(config.base_url, "http://localhost:4300");
         assert_eq!(config.clients, 12);
+    }
+
+    #[test]
+    fn sprite_load_config_defaults_to_forty_workers() {
+        let config = sprite_load_config(&[]).expect("sprite load config");
+        assert_eq!(config.base_url, "http://127.0.0.1:4100");
+        assert_eq!(config.workers, 40);
+    }
+
+    #[test]
+    fn sprite_load_config_uses_forwarded_flags() {
+        let config = sprite_load_config(&[
+            "--base-url".to_string(),
+            "http://localhost:4300/".to_string(),
+            "--workers".to_string(),
+            "10".to_string(),
+        ])
+        .expect("sprite load config with flags");
+        assert_eq!(config.base_url, "http://localhost:4300");
+        assert_eq!(config.workers, 10);
     }
 
     #[test]

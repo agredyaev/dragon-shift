@@ -6,7 +6,11 @@ use axum::{
     routing::{get, post},
 };
 use domain::WorkshopSession;
-use persistence::{InMemorySessionStore, PostgresSessionStore, SessionStore};
+use persistence::{
+    InMemorySessionStore, PostgresSessionStore, SessionStore,
+    TIMEOUT_COMPANION_SPRITE_KEY, timeout_companion_defaults,
+};
+use protocol::SpriteSet;
 use realtime::SessionRegistry;
 use security::{
     DEFAULT_RUST_SESSION_CODE_PREFIX, FixedWindowRateLimiter, OriginPolicy, OriginPolicyOptions,
@@ -19,7 +23,7 @@ use std::{
     time::Duration,
 };
 use tokio::{
-    sync::{Mutex, mpsc},
+    sync::{Mutex, Semaphore, mpsc},
     task::JoinHandle,
 };
 use tower_http::{
@@ -29,7 +33,8 @@ use tower_http::{
 };
 
 use crate::http::{
-    create_workshop, generate_sprite_sheet, join_workshop, live, ready, workshop_command,
+    create_workshop, generate_character_sprite_sheet, generate_sprite_sheet, join_workshop,
+    list_character_catalog, live, llm_generate_image, llm_judge, ready, workshop_command,
     workshop_judge_bundle,
 };
 use crate::llm::{LlmClient, LlmPoolConfig, load_llm_pool_config};
@@ -50,6 +55,8 @@ pub(crate) struct AppConfig {
     pub(crate) static_assets_dir: PathBuf,
     pub(crate) database_url: Option<String>,
     pub(crate) llm_pool: LlmPoolConfig,
+    pub(crate) sprite_queue_timeout: Duration,
+    pub(crate) image_job_max_concurrency: usize,
 }
 
 #[derive(Clone)]
@@ -58,6 +65,8 @@ pub(crate) struct AppState {
     pub(crate) replica_id: String,
     pub(crate) store: Arc<dyn SessionStore>,
     pub(crate) llm_client: Arc<LlmClient>,
+    pub(crate) fallback_companion_sprites: Arc<SpriteSet>,
+    pub(crate) image_job_queue: Arc<Semaphore>,
     pub(crate) sessions: Arc<Mutex<BTreeMap<String, WorkshopSession>>>,
     pub(crate) session_cache_load_locks: Arc<Mutex<BTreeMap<String, Arc<Mutex<()>>>>>,
     pub(crate) session_write_locks: Arc<Mutex<BTreeMap<String, Arc<Mutex<()>>>>>,
@@ -75,17 +84,24 @@ pub(crate) struct AppState {
 }
 
 impl AppState {
-    pub(crate) fn new(config: Arc<AppConfig>, store: Arc<dyn SessionStore>) -> Self {
+    pub(crate) fn new(
+        config: Arc<AppConfig>,
+        store: Arc<dyn SessionStore>,
+        fallback_companion_sprites: SpriteSet,
+    ) -> Self {
         let create_rate_limit = config.create_rate_limit;
         let join_rate_limit = config.join_rate_limit;
         let command_rate_limit = config.command_rate_limit;
         let websocket_rate_limit = config.websocket_rate_limit;
+        let image_job_max_concurrency = config.image_job_max_concurrency;
         let llm_client = Arc::new(LlmClient::new(config.llm_pool.clone()));
         Self {
             config,
             replica_id: uuid::Uuid::new_v4().to_string(),
             store,
             llm_client,
+            fallback_companion_sprites: Arc::new(fallback_companion_sprites),
+            image_job_queue: Arc::new(Semaphore::new(image_job_max_concurrency)),
             sessions: Arc::new(Mutex::new(BTreeMap::new())),
             session_cache_load_locks: Arc::new(Mutex::new(BTreeMap::new())),
             session_write_locks: Arc::new(Mutex::new(BTreeMap::new())),
@@ -116,6 +132,18 @@ impl AppState {
     }
 }
 
+pub(crate) async fn load_fallback_companion_sprites(
+    store: &Arc<dyn SessionStore>,
+) -> Result<SpriteSet, String> {
+    let defaults = store
+        .load_app_sprite_defaults(TIMEOUT_COMPANION_SPRITE_KEY)
+        .await
+        .map_err(|error| format!("load fallback companion sprites: {error}"))?
+        .unwrap_or_else(timeout_companion_defaults);
+
+    Ok(defaults.sprites)
+}
+
 pub(crate) fn build_app(state: AppState) -> Router {
     let static_assets_dir = state.config.static_assets_dir.clone();
     let index_file = static_assets_dir.join("index.html");
@@ -127,6 +155,10 @@ pub(crate) fn build_app(state: AppState) -> Router {
         .route("/workshops/ws", get(workshop_ws))
         .route("/workshops/judge-bundle", post(workshop_judge_bundle))
         .route("/workshops/sprite-sheet", post(generate_sprite_sheet))
+        .route("/characters/catalog", post(list_character_catalog))
+        .route("/characters/sprite-sheet", post(generate_character_sprite_sheet))
+        .route("/llm/judge", post(llm_judge))
+        .route("/llm/images", post(llm_generate_image))
         .route("/live", get(live))
         .route("/ready", get(ready))
         .fallback(api_not_found);
@@ -203,6 +235,11 @@ pub(crate) fn load_config() -> Result<AppConfig, String> {
         });
     let llm_pool = load_llm_pool_config()?;
     let database_url = load_database_url()?;
+    let sprite_queue_timeout = Duration::from_secs(load_duration_env(
+        "SPRITE_QUEUE_TIMEOUT_SECONDS",
+        20 * 60,
+    )?);
+    let image_job_max_concurrency = load_queue_concurrency_env("IMAGE_JOB_MAX_CONCURRENCY", 2)?;
     if is_production && database_url.is_none() {
         return Err("DATABASE_URL is required when NODE_ENV=production".to_string());
     }
@@ -220,6 +257,8 @@ pub(crate) fn load_config() -> Result<AppConfig, String> {
         static_assets_dir,
         database_url,
         llm_pool,
+        sprite_queue_timeout,
+        image_job_max_concurrency,
     })
 }
 
@@ -266,5 +305,22 @@ fn load_duration_env(key: &str, default_seconds: u64) -> Result<u64, String> {
             }
         }
         Err(_) => Ok(default_seconds),
+    }
+}
+
+fn load_queue_concurrency_env(key: &str, default: usize) -> Result<usize, String> {
+    match env::var(key) {
+        Ok(value) => {
+            let parsed = value
+                .trim()
+                .parse::<usize>()
+                .map_err(|error| format!("invalid {key}: {error}"))?;
+            if parsed == 0 {
+                Err(format!("{key} must be greater than zero"))
+            } else {
+                Ok(parsed)
+            }
+        }
+        Err(_) => Ok(default),
     }
 }

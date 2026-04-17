@@ -6,7 +6,7 @@ use crate::{
     handle_session_update_notification,
     helpers::{build_judge_action_traces, to_client_game_state},
     http::allocate_session_code,
-    llm::LlmPoolConfig,
+    llm::{LlmClient, LlmPoolConfig, ResolvedProvider},
     parse_session_update_notification,
     ws::{advance_game_ticks, emit_phase_warning_notices},
 };
@@ -19,14 +19,16 @@ use chrono::{Duration as ChronoDuration, Utc};
 use domain::{SessionCode, SessionPlayer, WorkshopSession};
 use futures_util::{SinkExt, StreamExt};
 use persistence::{
-    InMemorySessionStore, PersistenceError, PlayerIdentityMatch, PostgresSessionStore,
+    AppSpriteDefaults, InMemorySessionStore, PersistenceError, PlayerIdentityMatch,
+    PostgresSessionStore,
     RealtimeConnectionClaim, RealtimeConnectionRegistration, RealtimeConnectionRestore,
-    SessionStore, SessionUpdateNotification,
+    SessionStore, SessionUpdateNotification, timeout_companion_defaults,
 };
 use protocol::{
     ClientWsMessage, CoordinatorType, DragonStats, JoinWorkshopRequest, NoticeLevel,
-    ServerWsMessage, SessionArtifactKind, SessionArtifactRecord, SessionCommand, SessionEnvelope,
-        WorkshopCommandRequest, WorkshopCommandResult, WorkshopJoinResult, WorkshopJudgeBundleResult,
+    LlmImageResult, LlmProviderKind, ServerWsMessage, SessionArtifactKind, SessionArtifactRecord, SessionCommand,
+    SessionEnvelope, SpriteSheetResult, WorkshopCommandRequest, WorkshopCommandResult,
+    WorkshopJoinResult, WorkshopJudgeBundleResult,
     };
 use security::{DEFAULT_RUST_SESSION_CODE_PREFIX, OriginPolicyOptions, create_origin_policy};
 use sqlx::PgPool;
@@ -323,7 +325,10 @@ struct FaultyStore {
 
 impl FaultyStore {
     fn new() -> Self {
-        Self::default()
+        Self {
+            inner: InMemorySessionStore::new(),
+            ..Self::default()
+        }
     }
 
     fn fail_loads(&self) {
@@ -629,6 +634,41 @@ impl SessionStore for FaultyStore {
         self.inner.list_realtime_connections(session_code)
     }
 
+    fn load_app_sprite_defaults(
+        &self,
+        key: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<AppSpriteDefaults>, PersistenceError>> + Send + '_>> {
+        self.inner.load_app_sprite_defaults(key)
+    }
+
+    fn load_character(
+        &self,
+        character_id: &str,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Option<persistence::CharacterRecord>, PersistenceError>>
+                + Send
+                + '_,
+        >,
+    > {
+        self.inner.load_character(character_id)
+    }
+
+    fn list_characters(
+        &self,
+    ) -> Pin<
+        Box<dyn Future<Output = Result<Vec<persistence::CharacterRecord>, PersistenceError>> + Send + '_>,
+    > {
+        self.inner.list_characters()
+    }
+
+    fn save_character(
+        &self,
+        character: &persistence::CharacterRecord,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + '_>> {
+        self.inner.save_character(character)
+    }
+
     fn publish_session_notification(
         &self,
         notification: &SessionUpdateNotification,
@@ -637,19 +677,49 @@ impl SessionStore for FaultyStore {
     }
 }
 
-fn session_player(id: &str, name: &str, joined_at_seconds: i64) -> SessionPlayer {
+fn session_player_with_state(
+    id: &str,
+    name: &str,
+    joined_at: chrono::DateTime<Utc>,
+    is_host: bool,
+    is_connected: bool,
+) -> SessionPlayer {
     SessionPlayer {
         id: id.to_string(),
         name: name.to_string(),
-        pet_description: None,
-        custom_sprites: None,
-        is_host: false,
-        is_connected: true,
+        character_id: None,
+        selected_character: None,
+        is_host,
+        is_connected,
         is_ready: false,
         score: 0,
         current_dragon_id: None,
         achievements: Vec::new(),
-        joined_at: chrono::DateTime::from_timestamp(joined_at_seconds, 0).expect("valid timestamp"),
+        joined_at,
+    }
+}
+
+fn session_player(id: &str, name: &str, joined_at_seconds: i64) -> SessionPlayer {
+    session_player_with_state(
+        id,
+        name,
+        chrono::DateTime::from_timestamp(joined_at_seconds, 0).expect("valid timestamp"),
+        false,
+        true,
+    )
+}
+
+fn test_character_profile(
+    id: &str,
+    description: &str,
+    sprites: protocol::SpriteSet,
+    remaining_sprite_regenerations: u8,
+) -> protocol::CharacterProfile {
+    protocol::CharacterProfile {
+        id: id.to_string(),
+        description: description.to_string(),
+        sprites,
+        remaining_sprite_regenerations,
     }
 }
 
@@ -708,9 +778,15 @@ fn test_state_with_limits(create_limit: u32, join_limit: u32) -> AppState {
             judge_providers: Vec::new(),
             image_providers: Vec::new(),
         },
+        sprite_queue_timeout: std::time::Duration::from_secs(20 * 60),
+        image_job_max_concurrency: 2,
     });
 
-    AppState::new(config, Arc::new(InMemorySessionStore::new()))
+    AppState::new(
+        config,
+        Arc::new(InMemorySessionStore::new()),
+        timeout_companion_defaults().sprites,
+    )
 }
 
 async fn spawn_test_server(app: Router) -> (SocketAddr, tokio::task::JoinHandle<()>) {
@@ -1092,19 +1168,7 @@ async fn workshop_command_does_not_leave_mutated_cache_when_persisted_command_wr
         timestamp,
         protocol::WorkshopCreateConfig::default(),
     );
-    let host_player = SessionPlayer {
-        id: player_id.clone(),
-        name: "Alice".to_string(),
-        pet_description: Some("Alice's workshop dragon".to_string()),
-        custom_sprites: None,
-        is_host: true,
-        is_connected: true,
-        is_ready: false,
-        score: 0,
-        current_dragon_id: None,
-        achievements: Vec::new(),
-        joined_at: timestamp,
-    };
+    let host_player = session_player_with_state(&player_id, "Alice", timestamp, true, true);
     session.add_player(host_player);
     store
         .inner
@@ -1322,19 +1386,13 @@ async fn ensure_session_cached_clears_restored_transient_connectivity() {
         timestamp,
         protocol::WorkshopCreateConfig::default(),
     );
-    session.add_player(SessionPlayer {
-        id: "player-1".to_string(),
-        name: "Alice".to_string(),
-        pet_description: Some("Alice's workshop dragon".to_string()),
-        custom_sprites: None,
-        is_host: true,
-        is_connected: true,
-        is_ready: false,
-        score: 0,
-        current_dragon_id: None,
-        achievements: Vec::new(),
-        joined_at: timestamp,
-    });
+    session.add_player(session_player_with_state(
+        "player-1",
+        "Alice",
+        timestamp,
+        true,
+        true,
+    ));
     session.host_player_id = Some("player-1".to_string());
     state
         .store
@@ -1497,19 +1555,13 @@ async fn session_update_notification_skip_does_not_evict_cache_or_broadcast() {
         timestamp,
         protocol::WorkshopCreateConfig::default(),
     );
-    session.add_player(SessionPlayer {
-        id: "player-1".to_string(),
-        name: "Alice".to_string(),
-        pet_description: Some("Alice's workshop dragon".to_string()),
-        custom_sprites: None,
-        is_host: true,
-        is_connected: true,
-        is_ready: false,
-        score: 0,
-        current_dragon_id: None,
-        achievements: Vec::new(),
-        joined_at: timestamp,
-    });
+    session.add_player(session_player_with_state(
+        "player-1",
+        "Alice",
+        timestamp,
+        true,
+        true,
+    ));
 
     state
         .sessions
@@ -1679,19 +1731,13 @@ async fn typed_notification_followed_by_legacy_notification_does_not_rebroadcast
         timestamp,
         protocol::WorkshopCreateConfig::default(),
     );
-    session.add_player(SessionPlayer {
-        id: "player-1".to_string(),
-        name: "Alice".to_string(),
-        pet_description: Some("Alice's workshop dragon".to_string()),
-        custom_sprites: None,
-        is_host: true,
-        is_connected: true,
-        is_ready: false,
-        score: 0,
-        current_dragon_id: None,
-        achievements: Vec::new(),
-        joined_at: timestamp,
-    });
+    session.add_player(session_player_with_state(
+        "player-1",
+        "Alice",
+        timestamp,
+        true,
+        true,
+    ));
 
     state
         .store
@@ -1794,19 +1840,13 @@ async fn realtime_replaced_notification_clears_local_registration_without_persis
         timestamp,
         protocol::WorkshopCreateConfig::default(),
     );
-    session.add_player(SessionPlayer {
-        id: "player-1".to_string(),
-        name: "Alice".to_string(),
-        pet_description: Some("Alice's workshop dragon".to_string()),
-        custom_sprites: None,
-        is_host: true,
-        is_connected: true,
-        is_ready: false,
-        score: 0,
-        current_dragon_id: None,
-        achievements: Vec::new(),
-        joined_at: timestamp,
-    });
+    session.add_player(session_player_with_state(
+        "player-1",
+        "Alice",
+        timestamp,
+        true,
+        true,
+    ));
     state
         .store
         .save_session(&session)
@@ -1919,19 +1959,13 @@ async fn clearing_local_realtime_before_close_prevents_false_disconnect_fallback
         timestamp,
         protocol::WorkshopCreateConfig::default(),
     );
-    session.add_player(SessionPlayer {
-        id: "player-1".to_string(),
-        name: "Alice".to_string(),
-        pet_description: Some("Alice's workshop dragon".to_string()),
-        custom_sprites: None,
-        is_host: true,
-        is_connected: true,
-        is_ready: false,
-        score: 0,
-        current_dragon_id: None,
-        achievements: Vec::new(),
-        joined_at: timestamp,
-    });
+    session.add_player(session_player_with_state(
+        "player-1",
+        "Alice",
+        timestamp,
+        true,
+        true,
+    ));
     state
         .store
         .save_session(&session)
@@ -2201,6 +2235,7 @@ async fn same_socket_cannot_attach_to_different_player_after_already_attached() 
                     serde_json::to_vec(&JoinWorkshopRequest {
                         session_code: create_success.session_code.clone(),
                         name: Some("Bob".to_string()),
+                        character_id: None,
                         reconnect_token: None,
                     })
                     .expect("encode join request"),
@@ -2425,6 +2460,15 @@ fn test_state_with_reconnect_ttl(ttl: std::time::Duration) -> AppState {
     state
 }
 
+fn test_state_with_sprite_queue_timeout(timeout: std::time::Duration) -> AppState {
+    let mut state = test_state();
+    state.config = Arc::new(AppConfig {
+        sprite_queue_timeout: timeout,
+        ..state.config.as_ref().clone()
+    });
+    state
+}
+
 async fn overwrite_identity_last_seen_at(
     store: &dyn SessionStore,
     session_id: &str,
@@ -2542,27 +2586,27 @@ async fn workshop_judge_bundle_returns_bundle_for_completed_session() {
 
     let sessions = state.sessions.lock().await;
     let session = sessions.get(&session_code).expect("session exists");
-    let alice_dragon_id = session
+    let alice_current_dragon_id = session
         .players
         .get(&create_success.player_id)
         .and_then(|player| player.current_dragon_id.clone())
-        .expect("alice dragon id");
-    let bob_dragon_id = session
+        .expect("alice current dragon id");
+    let bob_current_dragon_id = session
         .players
         .get(&join_success.player_id)
         .and_then(|player| player.current_dragon_id.clone())
-        .expect("bob dragon id");
+        .expect("bob current dragon id");
     let session_id = session.id.to_string();
     drop(sessions);
 
     for request_body in [
         format!(
             r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"submitVote","payload":{{"dragonId":"{}"}}}}"#,
-            session_code, create_success.reconnect_token, bob_dragon_id
+            session_code, create_success.reconnect_token, alice_current_dragon_id
         ),
         format!(
             r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"submitVote","payload":{{"dragonId":"{}"}}}}"#,
-            session_code, join_success.reconnect_token, alice_dragon_id
+            session_code, join_success.reconnect_token, bob_current_dragon_id
         ),
     ] {
         let response = app
@@ -2622,7 +2666,7 @@ async fn workshop_judge_bundle_returns_bundle_for_completed_session() {
             player_id: Some(join_success.player_id.clone()),
             created_at: "2026-01-01T00:00:00Z".into(),
             payload: serde_json::json!({
-                "dragonId": alice_dragon_id,
+                "dragonId": bob_current_dragon_id,
                 "actionType": "feed",
                 "actionValue": "meat",
                 "hunger": 88,
@@ -2670,7 +2714,7 @@ async fn workshop_judge_bundle_returns_bundle_for_completed_session() {
         .bundle
         .dragons
         .iter()
-        .find(|dragon| dragon.dragon_id == alice_dragon_id)
+        .find(|dragon| dragon.dragon_id == bob_current_dragon_id)
         .expect("judged dragon bundle");
     assert_eq!(judged_dragon.creative_vote_count, 1);
     assert_eq!(
@@ -2717,7 +2761,9 @@ async fn create_workshop_endpoint_returns_join_success() {
                 .players
                 .get(&success.player_id)
                 .expect("host player in state");
-            assert_eq!(host.pet_description.as_deref(), None);
+            assert!(host.character_id.is_some());
+            assert!(host.pet_description.is_some());
+            assert!(host.is_ready);
         }
         WorkshopJoinResult::Error(error) => panic!("expected success, got error: {}", error.error),
     }
@@ -2854,6 +2900,506 @@ async fn workshop_judge_bundle_rejects_expired_reconnect_token() {
         .await
         .expect("find expired reconnect token after judge bundle check");
     assert_eq!(found, None);
+}
+
+#[tokio::test]
+async fn workshop_judge_bundle_rejects_non_host_requests() {
+    let state = test_state();
+    let app = build_app(state.clone());
+
+    let create_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops")
+                .header("content-type", "application/json")
+                .body(Body::from(create_workshop_body("Alice")))
+                .expect("build create request"),
+        )
+        .await
+        .expect("call create workshop");
+    let create_body = to_bytes(create_response.into_body(), usize::MAX)
+        .await
+        .expect("read create body");
+    let create_result: WorkshopJoinResult =
+        serde_json::from_slice(&create_body).expect("parse create result");
+    let create_success = match create_result {
+        WorkshopJoinResult::Success(success) => success,
+        WorkshopJoinResult::Error(error) => panic!("expected create success, got error: {}", error.error),
+    };
+
+    let join_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops/join")
+                .header("content-type", "application/json")
+                .body(Body::from(format!(
+                    r#"{{"sessionCode":"{}","name":"Bob"}}"#,
+                    create_success.session_code
+                )))
+                .expect("build join request"),
+        )
+        .await
+        .expect("call join workshop");
+    let join_body = to_bytes(join_response.into_body(), usize::MAX)
+        .await
+        .expect("read join body");
+    let join_result: WorkshopJoinResult =
+        serde_json::from_slice(&join_body).expect("parse join result");
+    let join_success = match join_result {
+        WorkshopJoinResult::Success(success) => success,
+        WorkshopJoinResult::Error(error) => panic!("expected join success, got error: {}", error.error),
+    };
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops/judge-bundle")
+                .header("content-type", "application/json")
+                .body(Body::from(format!(
+                    r#"{{"sessionCode":"{}","reconnectToken":"{}"}}"#,
+                    create_success.session_code, join_success.reconnect_token
+                )))
+                .expect("build judge bundle request"),
+        )
+        .await
+        .expect("call judge bundle endpoint");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read judge bundle body");
+    let result: WorkshopJudgeBundleResult =
+        serde_json::from_slice(&body).expect("parse judge bundle result");
+    match result {
+        WorkshopJudgeBundleResult::Error(error) => {
+            assert_eq!(error.error, "Only the host can build the workshop archive.");
+        }
+        WorkshopJudgeBundleResult::Success(_) => panic!("expected error response"),
+    }
+}
+
+#[tokio::test]
+async fn workshop_judge_bundle_rejects_requests_before_end_phase() {
+    let state = test_state();
+    let app = build_app(state.clone());
+
+    let create_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops")
+                .header("content-type", "application/json")
+                .body(Body::from(create_workshop_body("Alice")))
+                .expect("build create request"),
+        )
+        .await
+        .expect("call create workshop");
+    let create_body = to_bytes(create_response.into_body(), usize::MAX)
+        .await
+        .expect("read create body");
+    let create_result: WorkshopJoinResult =
+        serde_json::from_slice(&create_body).expect("parse create result");
+    let create_success = match create_result {
+        WorkshopJoinResult::Success(success) => success,
+        WorkshopJoinResult::Error(error) => {
+            panic!("expected create success, got error: {}", error.error)
+        }
+    };
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops/judge-bundle")
+                .header("content-type", "application/json")
+                .body(Body::from(format!(
+                    r#"{{"sessionCode":"{}","reconnectToken":"{}"}}"#,
+                    create_success.session_code, create_success.reconnect_token
+                )))
+                .expect("build judge bundle request"),
+        )
+        .await
+        .expect("call judge bundle endpoint");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read judge bundle body");
+    let result: WorkshopJudgeBundleResult =
+        serde_json::from_slice(&body).expect("parse judge bundle result");
+    match result {
+        WorkshopJudgeBundleResult::Error(error) => {
+            assert_eq!(error.error, "Workshop archive can only be built after the game ends.");
+        }
+        WorkshopJudgeBundleResult::Success(_) => panic!("expected error response"),
+    }
+}
+
+#[tokio::test]
+async fn generate_sprite_sheet_times_out_to_fallback_companion() {
+    let state = test_state_with_sprite_queue_timeout(std::time::Duration::from_millis(20));
+    let app = build_app(state.clone());
+
+    let create_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops")
+                .header("content-type", "application/json")
+                .body(Body::from(create_workshop_body("Alice")))
+                .expect("build create request"),
+        )
+        .await
+        .expect("call create workshop");
+    let create_body = to_bytes(create_response.into_body(), usize::MAX)
+        .await
+        .expect("read create body");
+    let create_result: WorkshopJoinResult =
+        serde_json::from_slice(&create_body).expect("parse create result");
+    let create_success = match create_result {
+        WorkshopJoinResult::Success(success) => success,
+        WorkshopJoinResult::Error(error) => panic!("expected create success, got error: {}", error.error),
+    };
+
+    let start_phase0_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops/command")
+                .header("content-type", "application/json")
+                .body(Body::from(setup_phase0_body(
+                    &create_success.session_code,
+                    &create_success.reconnect_token,
+                )))
+                .expect("build start phase0 request"),
+        )
+        .await
+        .expect("call start phase0 command");
+    assert_eq!(start_phase0_response.status(), StatusCode::OK);
+
+    let mut queue_permits = Vec::new();
+    for _ in 0..state.config.image_job_max_concurrency {
+        queue_permits.push(
+            state
+                .image_job_queue
+                .clone()
+                .try_acquire_owned()
+                .expect("reserve queue permit for timeout test"),
+        );
+    }
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops/sprite-sheet")
+                .header("content-type", "application/json")
+                .body(Body::from(format!(
+                    r#"{{"sessionCode":"{}","reconnectToken":"{}","description":"A bronze dragon with bright wings"}}"#,
+                    create_success.session_code, create_success.reconnect_token
+                )))
+                .expect("build sprite sheet request"),
+        )
+        .await
+        .expect("call sprite sheet endpoint");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read sprite sheet body");
+    let result: SpriteSheetResult = serde_json::from_slice(&body).expect("parse sprite sheet result");
+    let success = match result {
+        SpriteSheetResult::Success(success) => success,
+        SpriteSheetResult::Error(error) => panic!("expected success, got error: {}", error.error),
+    };
+    assert!(success.fallback_used);
+    assert_eq!(success.sprites, timeout_companion_defaults().sprites);
+
+    let sessions = state.sessions.lock().await;
+    let session = sessions
+        .get(&create_success.session_code)
+        .expect("cached session exists");
+    let player = session
+        .players
+        .get(&create_success.player_id)
+        .expect("player exists");
+    let selected_character = player
+        .selected_character
+        .as_ref()
+        .expect("selected character saved");
+    let character_id = player.character_id.clone().expect("character id present");
+    assert_eq!(Some(character_id.as_str()), Some(selected_character.id.as_str()));
+    assert_eq!(selected_character.description, "A bronze dragon with bright wings");
+    assert_eq!(selected_character.sprites, timeout_companion_defaults().sprites);
+    assert_eq!(selected_character.remaining_sprite_regenerations, 0);
+    drop(sessions);
+
+    let persisted_character = state
+        .store
+        .load_character(&character_id)
+        .await
+        .expect("load saved character")
+        .expect("saved character exists");
+    assert_eq!(persisted_character.description, "A bronze dragon with bright wings");
+    assert_eq!(persisted_character.sprites, timeout_companion_defaults().sprites);
+    assert_eq!(persisted_character.remaining_sprite_regenerations, 0);
+
+    let artifacts = state
+        .store
+        .list_session_artifacts(&create_success.state.session.id)
+        .await
+        .expect("list artifacts");
+    let artifact = artifacts
+        .iter()
+        .rev()
+        .find(|artifact| artifact.kind == SessionArtifactKind::PetProfileUpdated)
+        .expect("pet profile artifact exists");
+    assert!(artifact.payload.get("characterId").is_some());
+    assert_eq!(artifact.payload.get("fallbackUsed"), Some(&serde_json::json!(true)));
+    assert_eq!(
+        artifact.payload.get("remainingSpriteRegenerations"),
+        Some(&serde_json::json!(0))
+    );
+    drop(queue_permits);
+}
+
+#[tokio::test]
+async fn generate_sprite_sheet_provider_failure_uses_fallback_companion() {
+    let _env_lock = lock_env();
+    let _google_credentials = ScopedEnvVar::set(
+        "GOOGLE_APPLICATION_CREDENTIALS",
+        "/definitely/missing-test-credentials.json",
+    );
+    let _google_project = ScopedEnvVar::set("GOOGLE_CLOUD_PROJECT", "rna-workshop2");
+    let _google_location = ScopedEnvVar::set("GOOGLE_CLOUD_LOCATION", "us-central1");
+
+    let mut state = test_state();
+    state.config = Arc::new(AppConfig {
+        llm_pool: LlmPoolConfig {
+            google_cloud_project: Some("rna-workshop2".to_string()),
+            google_cloud_location: Some("us-central1".to_string()),
+            judge_providers: Vec::new(),
+            image_providers: vec![ResolvedProvider {
+                kind: LlmProviderKind::VertexAi,
+                model: "gemini-2.5-flash-image".to_string(),
+                api_key: None,
+            }],
+        },
+        ..state.config.as_ref().clone()
+    });
+    state.llm_client = Arc::new(LlmClient::new(state.config.llm_pool.clone()));
+
+    let app = build_app(state.clone());
+
+    let create_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops")
+                .header("content-type", "application/json")
+                .body(Body::from(create_workshop_body("Alice")))
+                .expect("build create request"),
+        )
+        .await
+        .expect("call create workshop");
+    let create_body = to_bytes(create_response.into_body(), usize::MAX)
+        .await
+        .expect("read create body");
+    let create_result: WorkshopJoinResult =
+        serde_json::from_slice(&create_body).expect("parse create result");
+    let create_success = match create_result {
+        WorkshopJoinResult::Success(success) => success,
+        WorkshopJoinResult::Error(error) => {
+            panic!("expected create success, got error: {}", error.error)
+        }
+    };
+
+    let start_phase0_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops/command")
+                .header("content-type", "application/json")
+                .body(Body::from(setup_phase0_body(
+                    &create_success.session_code,
+                    &create_success.reconnect_token,
+                )))
+                .expect("build start phase0 request"),
+        )
+        .await
+        .expect("call start phase0 command");
+    assert_eq!(start_phase0_response.status(), StatusCode::OK);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops/sprite-sheet")
+                .header("content-type", "application/json")
+                .body(Body::from(format!(
+                    r#"{{"sessionCode":"{}","reconnectToken":"{}","description":"A bronze dragon with bright wings"}}"#,
+                    create_success.session_code, create_success.reconnect_token
+                )))
+                .expect("build sprite sheet request"),
+        )
+        .await
+        .expect("call sprite sheet endpoint");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read sprite sheet body");
+    let result: SpriteSheetResult = serde_json::from_slice(&body).expect("parse sprite sheet result");
+    let success = match result {
+        SpriteSheetResult::Success(success) => success,
+        SpriteSheetResult::Error(error) => panic!("expected success, got error: {}", error.error),
+    };
+    assert!(success.fallback_used);
+    assert_eq!(success.sprites, timeout_companion_defaults().sprites);
+
+    let sessions = state.sessions.lock().await;
+    let session = sessions
+        .get(&create_success.session_code)
+        .expect("cached session exists");
+    let player = session
+        .players
+        .get(&create_success.player_id)
+        .expect("player exists");
+    let selected_character = player
+        .selected_character
+        .as_ref()
+        .expect("selected character saved");
+    let character_id = player.character_id.clone().expect("character id present");
+    assert_eq!(Some(character_id.as_str()), Some(selected_character.id.as_str()));
+    assert_eq!(selected_character.description, "A bronze dragon with bright wings");
+    assert_eq!(selected_character.sprites, timeout_companion_defaults().sprites);
+    assert_eq!(selected_character.remaining_sprite_regenerations, 0);
+    drop(sessions);
+
+    let persisted_character = state
+        .store
+        .load_character(&character_id)
+        .await
+        .expect("load saved character")
+        .expect("saved character exists");
+    assert_eq!(persisted_character.description, "A bronze dragon with bright wings");
+    assert_eq!(persisted_character.sprites, timeout_companion_defaults().sprites);
+    assert_eq!(persisted_character.remaining_sprite_regenerations, 0);
+
+    let artifacts = state
+        .store
+        .list_session_artifacts(&create_success.state.session.id)
+        .await
+        .expect("list artifacts");
+    let artifact = artifacts
+        .iter()
+        .rev()
+        .find(|artifact| artifact.kind == SessionArtifactKind::PetProfileUpdated)
+        .expect("pet profile artifact exists");
+    assert!(artifact.payload.get("characterId").is_some());
+    assert_eq!(artifact.payload.get("fallbackUsed"), Some(&serde_json::json!(true)));
+    assert_eq!(
+        artifact.payload.get("remainingSpriteRegenerations"),
+        Some(&serde_json::json!(0))
+    );
+}
+
+#[tokio::test]
+async fn llm_images_times_out_while_waiting_for_shared_queue_capacity() {
+    let state = test_state_with_sprite_queue_timeout(std::time::Duration::from_millis(20));
+    let app = build_app(state.clone());
+
+    let create_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops")
+                .header("content-type", "application/json")
+                .body(Body::from(create_workshop_body("Alice")))
+                .expect("build create request"),
+        )
+        .await
+        .expect("call create workshop");
+    let create_body = to_bytes(create_response.into_body(), usize::MAX)
+        .await
+        .expect("read create body");
+    let create_result: WorkshopJoinResult =
+        serde_json::from_slice(&create_body).expect("parse create result");
+    let create_success = match create_result {
+        WorkshopJoinResult::Success(success) => success,
+        WorkshopJoinResult::Error(error) => panic!("expected create success, got error: {}", error.error),
+    };
+
+    let start_phase0_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops/command")
+                .header("content-type", "application/json")
+                .body(Body::from(setup_phase0_body(
+                    &create_success.session_code,
+                    &create_success.reconnect_token,
+                )))
+                .expect("build start phase0 request"),
+        )
+        .await
+        .expect("call start phase0 command");
+    assert_eq!(start_phase0_response.status(), StatusCode::OK);
+
+    let mut queue_permits = Vec::new();
+    for _ in 0..state.config.image_job_max_concurrency {
+        queue_permits.push(
+            state
+                .image_job_queue
+                .clone()
+                .try_acquire_owned()
+                .expect("reserve queue permit for llm image timeout test"),
+        );
+    }
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/llm/images")
+                .header("content-type", "application/json")
+                .body(Body::from(format!(
+                    r#"{{"sessionCode":"{}","reconnectToken":"{}","dragonId":"dragon-1","prompt":"Sketch a dragon portrait"}}"#,
+                    create_success.session_code, create_success.reconnect_token
+                )))
+                .expect("build llm image request"),
+        )
+        .await
+        .expect("call llm image endpoint");
+
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read llm image body");
+    let result: LlmImageResult = serde_json::from_slice(&body).expect("parse llm image result");
+    match result {
+        LlmImageResult::Error(error) => {
+            assert_eq!(
+                error.error,
+                "image request timed out while waiting for generation capacity"
+            );
+        }
+        LlmImageResult::Success(_) => panic!("expected llm image error response"),
+    }
+
+    drop(queue_permits);
 }
 
 #[tokio::test]
@@ -3366,7 +3912,9 @@ async fn join_workshop_endpoint_returns_join_success_for_lobby_session() {
                 .players
                 .get(&success.player_id)
                 .expect("joined player in state");
-            assert_eq!(joined.pet_description.as_deref(), None);
+            assert!(joined.character_id.is_some());
+            assert!(joined.pet_description.is_some());
+            assert!(joined.is_ready);
         }
         WorkshopJoinResult::Error(error) => panic!("expected success, got error: {}", error.error),
     }
@@ -3558,6 +4106,7 @@ async fn http_reconnect_does_not_persist_connected_presence() {
                     serde_json::to_vec(&JoinWorkshopRequest {
                         session_code: create_success.session_code.clone(),
                         name: None,
+                        character_id: None,
                         reconnect_token: Some(create_success.reconnect_token.clone()),
                     })
                     .expect("encode reconnect request"),
@@ -3657,6 +4206,7 @@ async fn restart_reload_and_reconnect_keep_presence_runtime_only() {
                     serde_json::to_vec(&JoinWorkshopRequest {
                         session_code: create_success.session_code.clone(),
                         name: None,
+                        character_id: None,
                         reconnect_token: Some(create_success.reconnect_token.clone()),
                     })
                     .expect("encode reconnect request"),
@@ -3776,6 +4326,7 @@ async fn postgres_restart_reload_and_reconnect_keep_presence_runtime_only() {
                     serde_json::to_vec(&JoinWorkshopRequest {
                         session_code: create_success.session_code.clone(),
                         name: None,
+                        character_id: None,
                         reconnect_token: Some(create_success.reconnect_token.clone()),
                     })
                     .expect("encode reconnect request"),
@@ -3989,19 +4540,13 @@ async fn reload_cached_session_clears_stale_cached_presence_without_realtime_reg
         timestamp,
         protocol::WorkshopCreateConfig::default(),
     );
-    session.add_player(SessionPlayer {
-        id: player_id.clone(),
-        name: "Alice".to_string(),
-        pet_description: Some("Alice's workshop dragon".to_string()),
-        custom_sprites: None,
-        is_host: true,
-        is_connected: false,
-        is_ready: false,
-        score: 0,
-        current_dragon_id: None,
-        achievements: Vec::new(),
-        joined_at: timestamp,
-    });
+    session.add_player(session_player_with_state(
+        &player_id,
+        "Alice",
+        timestamp,
+        true,
+        false,
+    ));
     state
         .store
         .save_session(&session)
@@ -4053,19 +4598,13 @@ async fn postgres_reload_ignores_stale_distributed_realtime_presence() {
         timestamp,
         protocol::WorkshopCreateConfig::default(),
     );
-    session.add_player(SessionPlayer {
-        id: player_id.clone(),
-        name: "Alice".to_string(),
-        pet_description: Some("Alice's workshop dragon".to_string()),
-        custom_sprites: None,
-        is_host: true,
-        is_connected: false,
-        is_ready: false,
-        score: 0,
-        current_dragon_id: None,
-        achievements: Vec::new(),
-        joined_at: timestamp,
-    });
+    session.add_player(session_player_with_state(
+        &player_id,
+        "Alice",
+        timestamp,
+        true,
+        false,
+    ));
     pg.store
         .save_session(&session)
         .await
@@ -4760,7 +5299,7 @@ async fn workshop_command_rejects_non_host_start_phase1() {
 }
 
 #[tokio::test]
-async fn workshop_command_rejects_start_phase1_from_lobby() {
+async fn workshop_command_starts_phase1_from_lobby() {
     let state = test_state();
     let app = build_app(state.clone());
     let create_response = app
@@ -4802,21 +5341,27 @@ async fn workshop_command_rejects_start_phase1_from_lobby() {
         .await
         .expect("call command endpoint");
 
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(response.status(), StatusCode::OK);
     let body = to_bytes(response.into_body(), usize::MAX)
         .await
         .expect("read command body");
     let result: WorkshopCommandResult =
         serde_json::from_slice(&body).expect("parse command result");
     match result {
-        WorkshopCommandResult::Error(error) => {
-            assert_eq!(
-                error.error,
-                "Phase 1 can only start after character creation."
-            );
+        WorkshopCommandResult::Success(success) => {
+            assert!(success.ok);
         }
-        WorkshopCommandResult::Success(_) => panic!("expected error response"),
+        WorkshopCommandResult::Error(error) => {
+            panic!("expected success, got error response: {}", error.error)
+        }
     }
+
+    let sessions = state.sessions.lock().await;
+    let session = sessions
+        .get(&create_success.session_code)
+        .expect("session cached after phase1 start");
+    assert_eq!(session.phase, protocol::Phase::Phase1);
+    assert!(session.players.values().all(|player| player.current_dragon_id.is_some()));
 }
 
 #[tokio::test]
@@ -6388,11 +6933,11 @@ async fn workshop_command_rejects_self_vote_in_voting() {
 
     let sessions = state.sessions.lock().await;
     let session = sessions.get(&session_code).expect("session exists");
-    let bob_dragon_id = session
+    let alice_current_dragon_id = session
         .players
-        .get(&join_success.player_id)
+        .get(&create_success.player_id)
         .and_then(|player| player.current_dragon_id.clone())
-        .expect("bob dragon id");
+        .expect("alice current dragon id");
     drop(sessions);
 
     let response = app
@@ -6401,9 +6946,9 @@ async fn workshop_command_rejects_self_vote_in_voting() {
                      .method("POST")
                      .uri("/api/workshops/command")
                      .header("content-type", "application/json")
-                     .body(Body::from(format!(r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"submitVote","payload":{{"dragonId":"{}"}}}}"#, session_code, join_success.reconnect_token, bob_dragon_id)))
-                     .expect("build command request"),
-             )
+                      .body(Body::from(format!(r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"submitVote","payload":{{"dragonId":"{}"}}}}"#, session_code, join_success.reconnect_token, alice_current_dragon_id)))
+                      .expect("build command request"),
+              )
              .await
              .expect("call submitVote command");
 
@@ -6518,11 +7063,11 @@ async fn workshop_command_accepts_valid_vote_in_voting() {
 
     let sessions = state.sessions.lock().await;
     let session = sessions.get(&session_code).expect("session exists");
-    let bob_dragon_id = session
+    let alice_current_dragon_id = session
         .players
-        .get(&join_success.player_id)
+        .get(&create_success.player_id)
         .and_then(|player| player.current_dragon_id.clone())
-        .expect("bob dragon id");
+        .expect("alice current dragon id");
     drop(sessions);
 
     let response = app
@@ -6531,9 +7076,9 @@ async fn workshop_command_accepts_valid_vote_in_voting() {
                      .method("POST")
                      .uri("/api/workshops/command")
                      .header("content-type", "application/json")
-                     .body(Body::from(format!(r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"submitVote","payload":{{"dragonId":"{}"}}}}"#, session_code, create_success.reconnect_token, bob_dragon_id)))
-                     .expect("build command request"),
-             )
+                      .body(Body::from(format!(r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"submitVote","payload":{{"dragonId":"{}"}}}}"#, session_code, create_success.reconnect_token, alice_current_dragon_id)))
+                      .expect("build command request"),
+              )
              .await
              .expect("call submitVote command");
 
@@ -6725,7 +7270,7 @@ async fn workshop_command_rejects_non_host_reveal_results() {
 }
 
 #[tokio::test]
-async fn workshop_command_allows_reveal_results_while_votes_are_pending() {
+async fn workshop_command_rejects_reveal_results_while_votes_are_pending() {
     let app = build_app(test_state());
     let create_response = app
         .clone()
@@ -6830,17 +7375,142 @@ async fn workshop_command_allows_reveal_results_while_votes_are_pending() {
              .await
              .expect("call command endpoint");
 
-    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     let body = to_bytes(response.into_body(), usize::MAX)
         .await
         .expect("read command body");
     let result: WorkshopCommandResult =
         serde_json::from_slice(&body).expect("parse command result");
     match result {
-        WorkshopCommandResult::Success(success) => assert!(success.ok),
-        WorkshopCommandResult::Error(error) => {
-            panic!("expected success, got error: {}", error.error)
+        WorkshopCommandResult::Error(error) => assert_eq!(
+            error.error,
+            "Voting can only be finished after at least one eligible vote is submitted."
+        ),
+        WorkshopCommandResult::Success(_) => panic!("expected error response"),
+    }
+}
+
+#[tokio::test]
+async fn workshop_command_rejects_end_session_before_results_are_revealed() {
+    let app = build_app(test_state());
+    let create_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops")
+                .header("content-type", "application/json")
+                .body(Body::from(create_workshop_body("Alice")))
+                .expect("build create request"),
+        )
+        .await
+        .expect("call create workshop");
+    let create_body = to_bytes(create_response.into_body(), usize::MAX)
+        .await
+        .expect("read create body");
+    let create_result: WorkshopJoinResult =
+        serde_json::from_slice(&create_body).expect("parse create result");
+    let create_success = match create_result {
+        WorkshopJoinResult::Success(success) => success,
+        WorkshopJoinResult::Error(error) => {
+            panic!("expected create success, got error: {}", error.error)
         }
+    };
+    let session_code = create_success.session_code.clone();
+
+    let join_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops/join")
+                .header("content-type", "application/json")
+                .body(Body::from(format!(
+                    r#"{{"sessionCode":"{}","name":"Bob"}}"#,
+                    session_code
+                )))
+                .expect("build join request"),
+        )
+        .await
+        .expect("call join workshop");
+    let join_body = to_bytes(join_response.into_body(), usize::MAX)
+        .await
+        .expect("read join body");
+    let join_result: WorkshopJoinResult =
+        serde_json::from_slice(&join_body).expect("parse join result");
+    let join_success = match join_result {
+        WorkshopJoinResult::Success(success) => success,
+        WorkshopJoinResult::Error(error) => {
+            panic!("expected join success, got error: {}", error.error)
+        }
+    };
+
+    for request_body in [
+        setup_phase0_body(&session_code, &create_success.reconnect_token),
+        setup_phase1_body(&session_code, &create_success.reconnect_token),
+        format!(
+            r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"startHandover"}}"#,
+            session_code, create_success.reconnect_token
+        ),
+        format!(
+            r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"submitTags","payload":["one","two","three"]}}"#,
+            session_code, create_success.reconnect_token
+        ),
+        format!(
+            r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"submitTags","payload":["four","five","six"]}}"#,
+            session_code, join_success.reconnect_token
+        ),
+        format!(
+            r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"startPhase2"}}"#,
+            session_code, create_success.reconnect_token
+        ),
+        format!(
+            r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"endGame"}}"#,
+            session_code, create_success.reconnect_token
+        ),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/workshops/command")
+                    .header("content-type", "application/json")
+                    .body(Body::from(request_body))
+                    .expect("build setup request"),
+            )
+            .await
+            .expect("call setup command");
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops/command")
+                .header("content-type", "application/json")
+                .body(Body::from(format!(
+                    r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"endSession"}}"#,
+                    session_code, create_success.reconnect_token
+                )))
+                .expect("build end session request"),
+        )
+        .await
+        .expect("call endSession command");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read command body");
+    let result: WorkshopCommandResult =
+        serde_json::from_slice(&body).expect("parse command result");
+    match result {
+        WorkshopCommandResult::Error(error) => assert_eq!(
+            error.error,
+            "Session can only be ended after voting results are revealed."
+        ),
+        WorkshopCommandResult::Success(_) => panic!("expected error response"),
     }
 }
 
@@ -6941,26 +7611,26 @@ async fn workshop_command_reveals_voting_results_after_all_votes() {
 
     let sessions = state.sessions.lock().await;
     let session = sessions.get(&session_code).expect("session exists");
-    let alice_dragon_id = session
+    let alice_current_dragon_id = session
         .players
         .get(&create_success.player_id)
         .and_then(|player| player.current_dragon_id.clone())
-        .expect("alice dragon id");
-    let bob_dragon_id = session
+        .expect("alice current dragon id");
+    let bob_current_dragon_id = session
         .players
         .get(&join_success.player_id)
         .and_then(|player| player.current_dragon_id.clone())
-        .expect("bob dragon id");
+        .expect("bob current dragon id");
     drop(sessions);
 
     for request_body in [
         format!(
             r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"submitVote","payload":{{"dragonId":"{}"}}}}"#,
-            session_code, create_success.reconnect_token, bob_dragon_id
+            session_code, create_success.reconnect_token, alice_current_dragon_id
         ),
         format!(
             r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"submitVote","payload":{{"dragonId":"{}"}}}}"#,
-            session_code, join_success.reconnect_token, alice_dragon_id
+            session_code, join_success.reconnect_token, bob_current_dragon_id
         ),
     ] {
         let response = app
@@ -7027,26 +7697,32 @@ async fn advance_game_ticks_updates_cached_session_without_persisting_each_tick(
 
     let mut host = session_player("player-1", "Alice", 1);
     host.is_host = true;
-    let guest = session_player("player-2", "Bob", 2);
+    host.character_id = Some("character-1".into());
+    host.selected_character = Some(test_character_profile(
+        "character-1",
+        "Coral dragon",
+        protocol::SpriteSet {
+            neutral: "neutral_b64".into(),
+            happy: "happy_b64".into(),
+            angry: "angry_b64".into(),
+            sleepy: "sleepy_b64".into(),
+        },
+        1,
+    ));
+    host.is_ready = true;
+    let mut guest = session_player("player-2", "Bob", 2);
+    guest.character_id = Some("character-2".into());
+    guest.selected_character = Some(test_character_profile(
+        "character-2",
+        "Moss dragon",
+        timeout_companion_defaults().sprites,
+        1,
+    ));
+    guest.is_ready = true;
     session.add_player(host);
     session.add_player(guest);
 
     session.transition_to(protocol::Phase::Phase0).unwrap();
-    session
-        .update_player_pet(
-            "player-1",
-            "Coral dragon".to_string(),
-            Some(protocol::SpriteSet {
-                neutral: "neutral_b64".into(),
-                happy: "happy_b64".into(),
-                angry: "angry_b64".into(),
-                sleepy: "sleepy_b64".into(),
-            }),
-        )
-        .unwrap();
-    session
-        .update_player_pet("player-2", "Moss dragon".to_string(), None)
-        .unwrap();
     session
         .begin_phase1(&[
             domain::Phase1Assignment {
@@ -7074,16 +7750,34 @@ async fn advance_game_ticks_updates_cached_session_without_persisting_each_tick(
 
     let baseline_save_calls = store.save_session_calls();
 
+    // Tick 1: time 16 → 17; 17 % 5 != 0 → no persist (throttled)
     advance_game_ticks(&state).await;
 
     let cached = state.sessions.lock().await;
     let updated = cached.get("955555").expect("cached session after tick");
     assert_eq!(updated.phase, protocol::Phase::Phase1);
-    assert_eq!(updated.time, (original_time + 1) % 24);
+    assert_eq!(updated.time, (original_time + 1) % 48);
     assert_eq!(
         store.save_session_calls(),
         baseline_save_calls,
-        "phase ticks should no longer persist the full session on every second"
+        "non-multiple-of-5 ticks should NOT persist (throttled to reduce DB writes)"
+    );
+    drop(cached);
+
+    // Advance until time is a multiple of 5 (tick 20) to verify persistence kicks in
+    // time is 17 now, need 3 more ticks to reach 20
+    advance_game_ticks(&state).await; // → 18
+    advance_game_ticks(&state).await; // → 19
+    let before_persist = store.save_session_calls();
+    advance_game_ticks(&state).await; // → 20, 20 % 5 == 0 → persist
+
+    let cached = state.sessions.lock().await;
+    let updated = cached.get("955555").expect("cached session after persist tick");
+    assert_eq!(updated.time, 20);
+    assert_eq!(
+        store.save_session_calls(),
+        before_persist + 1,
+        "multiple-of-5 ticks must persist so command-handler reloads pick up decayed stats"
     );
 }
 
@@ -7588,19 +8282,13 @@ async fn workshop_ws_attach_restores_cache_state_when_grouped_reconnect_persist_
         timestamp,
         protocol::WorkshopCreateConfig::default(),
     );
-    session.add_player(SessionPlayer {
-        id: player_id.clone(),
-        name: "Alice".to_string(),
-        pet_description: Some("Alice's workshop dragon".to_string()),
-        custom_sprites: None,
-        is_host: true,
-        is_connected: false,
-        is_ready: false,
-        score: 0,
-        current_dragon_id: None,
-        achievements: Vec::new(),
-        joined_at: timestamp,
-    });
+    session.add_player(session_player_with_state(
+        &player_id,
+        "Alice",
+        timestamp,
+        true,
+        false,
+    ));
     store
         .inner
         .save_session(&session)
@@ -8201,19 +8889,13 @@ async fn reconnect_join_restores_cache_state_when_grouped_reconnect_persist_fail
         timestamp,
         protocol::WorkshopCreateConfig::default(),
     );
-    session.add_player(SessionPlayer {
-        id: player_id.clone(),
-        name: "Alice".to_string(),
-        pet_description: Some("Alice's workshop dragon".to_string()),
-        custom_sprites: None,
-        is_host: true,
-        is_connected: false,
-        is_ready: false,
-        score: 0,
-        current_dragon_id: None,
-        achievements: Vec::new(),
-        joined_at: timestamp,
-    });
+    session.add_player(session_player_with_state(
+        &player_id,
+        "Alice",
+        timestamp,
+        true,
+        false,
+    ));
     store
         .inner
         .save_session(&session)
@@ -8277,19 +8959,13 @@ async fn websocket_reconnect_persistence_does_not_store_connected_presence() {
         timestamp,
         protocol::WorkshopCreateConfig::default(),
     );
-    session.add_player(SessionPlayer {
-        id: player_id.clone(),
-        name: "Alice".to_string(),
-        pet_description: Some("Alice's workshop dragon".to_string()),
-        custom_sprites: None,
-        is_host: true,
-        is_connected: false,
-        is_ready: false,
-        score: 0,
-        current_dragon_id: None,
-        achievements: Vec::new(),
-        joined_at: timestamp,
-    });
+    session.add_player(session_player_with_state(
+        &player_id,
+        "Alice",
+        timestamp,
+        true,
+        false,
+    ));
     state
         .store
         .save_session(&session)
@@ -8370,19 +9046,13 @@ async fn websocket_disconnect_restores_cache_state_when_grouped_disconnect_persi
         timestamp,
         protocol::WorkshopCreateConfig::default(),
     );
-    session.add_player(SessionPlayer {
-        id: player_id.clone(),
-        name: "Alice".to_string(),
-        pet_description: Some("Alice's workshop dragon".to_string()),
-        custom_sprites: None,
-        is_host: true,
-        is_connected: true,
-        is_ready: false,
-        score: 0,
-        current_dragon_id: None,
-        achievements: Vec::new(),
-        joined_at: timestamp,
-    });
+    session.add_player(session_player_with_state(
+        &player_id,
+        "Alice",
+        timestamp,
+        true,
+        true,
+    ));
     store
         .inner
         .save_session(&session)
@@ -8460,19 +9130,13 @@ async fn replaced_connection_close_before_notification_does_not_persist_false_di
         timestamp,
         protocol::WorkshopCreateConfig::default(),
     );
-    session.add_player(SessionPlayer {
-        id: player_id.clone(),
-        name: "Alice".to_string(),
-        pet_description: Some("Alice's workshop dragon".to_string()),
-        custom_sprites: None,
-        is_host: true,
-        is_connected: true,
-        is_ready: false,
-        score: 0,
-        current_dragon_id: None,
-        achievements: Vec::new(),
-        joined_at: timestamp,
-    });
+    session.add_player(session_player_with_state(
+        &player_id,
+        "Alice",
+        timestamp,
+        true,
+        true,
+    ));
     pg.store
         .save_session(&session)
         .await
@@ -8629,19 +9293,13 @@ async fn fresh_join_restores_cache_state_when_grouped_join_persist_fails() {
         timestamp,
         protocol::WorkshopCreateConfig::default(),
     );
-    session.add_player(SessionPlayer {
-        id: "host-1".to_string(),
-        name: "Alice".to_string(),
-        pet_description: Some("Alice's workshop dragon".to_string()),
-        custom_sprites: None,
-        is_host: true,
-        is_connected: true,
-        is_ready: false,
-        score: 0,
-        current_dragon_id: None,
-        achievements: Vec::new(),
-        joined_at: timestamp,
-    });
+    session.add_player(session_player_with_state(
+        "host-1",
+        "Alice",
+        timestamp,
+        true,
+        true,
+    ));
     store
         .inner
         .save_session(&session)
@@ -9192,20 +9850,21 @@ fn to_client_game_state_includes_dragons_and_voting_details() {
         .apply_action("p1", domain::PlayerAction::Sleep)
         .expect("apply action");
     session.enter_voting().expect("enter voting");
-    let bob_dragon_id = session
-        .players
-        .get("p2")
-        .and_then(|player| player.current_dragon_id.clone())
-        .expect("bob dragon");
+    let voted_dragon_id = session
+        .dragons
+        .values()
+        .find(|dragon| dragon.original_owner_id != "p1")
+        .map(|dragon| dragon.id.clone())
+        .expect("vote dragon");
     session
-        .submit_vote("p1", &bob_dragon_id)
+        .submit_vote("p1", &voted_dragon_id)
         .expect("submit vote");
 
     let client_state = to_client_game_state(&session, "p1");
 
     assert_eq!(client_state.phase, protocol::Phase::Voting);
     assert_eq!(client_state.dragons.len(), 2);
-    let alice_current_dragon_id = client_state
+    let alice_rendered_current_dragon_id = client_state
         .players
         .get("p1")
         .and_then(|player| player.current_dragon_id.as_deref())
@@ -9213,7 +9872,7 @@ fn to_client_game_state_includes_dragons_and_voting_details() {
         .to_string();
     let alice_current_dragon = client_state
         .dragons
-        .get(&alice_current_dragon_id)
+        .get(&alice_rendered_current_dragon_id)
         .expect("alice current dragon details");
     assert!(
         !alice_current_dragon
@@ -9253,7 +9912,7 @@ fn to_client_game_state_includes_dragons_and_voting_details() {
             .voting
             .as_ref()
             .is_some_and(|voting| voting.current_player_vote_dragon_id.as_deref()
-                == Some(bob_dragon_id.as_str()))
+                == Some(voted_dragon_id.as_str()))
     );
 }
 
@@ -9274,8 +9933,13 @@ fn to_client_game_state_propagates_custom_sprites_to_dragon() {
         angry: "angry_b64".to_string(),
         sleepy: "sleepy_b64".to_string(),
     };
-    alice.custom_sprites = Some(sprites.clone());
-    alice.pet_description = Some("A fiery red dragon".to_string());
+    alice.character_id = Some("character-p1".to_string());
+    alice.selected_character = Some(test_character_profile(
+        "character-p1",
+        "A fiery red dragon",
+        sprites.clone(),
+        1,
+    ));
     let bob = session_player("p2", "Bob", 2);
     session.add_player(alice);
     session.add_player(bob);
@@ -9363,13 +10027,18 @@ fn to_client_game_state_normalizes_white_sprite_backgrounds() {
         .expect("encode sprite png");
     let base64_sprite = base64::engine::general_purpose::STANDARD.encode(png);
 
-    alice.custom_sprites = Some(protocol::SpriteSet {
-        neutral: base64_sprite.clone(),
-        happy: base64_sprite.clone(),
-        angry: base64_sprite.clone(),
-        sleepy: base64_sprite.clone(),
-    });
-    alice.pet_description = Some("A fiery red dragon".to_string());
+    alice.character_id = Some("character-p1".to_string());
+    alice.selected_character = Some(test_character_profile(
+        "character-p1",
+        "A fiery red dragon",
+        protocol::SpriteSet {
+            neutral: base64_sprite.clone(),
+            happy: base64_sprite.clone(),
+            angry: base64_sprite.clone(),
+            sleepy: base64_sprite.clone(),
+        },
+        1,
+    ));
     let bob = session_player("p2", "Bob", 2);
     session.add_player(alice);
     session.add_player(bob);
@@ -9419,7 +10088,7 @@ fn to_client_game_state_normalizes_white_sprite_backgrounds() {
 }
 
 #[test]
-fn phase0_sprite_draft_persists_without_marking_player_ready() {
+fn assign_player_character_marks_player_ready_and_persists_selected_character() {
     let timestamp = chrono::DateTime::from_timestamp(1, 0).expect("valid timestamp");
     let mut session = WorkshopSession::new(
         Uuid::new_v4(),
@@ -9442,17 +10111,30 @@ fn phase0_sprite_draft_persists_without_marking_player_ready() {
     };
 
     session
-        .update_player_sprite_draft("p1", "A fiery red dragon".into(), sprites.clone())
-        .expect("save sprite draft");
+        .assign_player_character(
+            "p1",
+            test_character_profile("character-p1", "A fiery red dragon", sprites.clone(), 1),
+        )
+        .expect("assign selected character");
 
     let player = session.players.get("p1").expect("player exists");
+    assert_eq!(player.character_id.as_deref(), Some("character-p1"));
     assert_eq!(
-        player.pet_description.as_deref(),
+        player
+            .selected_character
+            .as_ref()
+            .map(|character| character.description.as_str()),
         Some("A fiery red dragon")
     );
-    assert_eq!(player.custom_sprites.as_ref(), Some(&sprites));
+    assert_eq!(
+        player
+            .selected_character
+            .as_ref()
+            .map(|character| &character.sprites),
+        Some(&sprites)
+    );
     assert!(
-        !player.is_ready,
-        "sprite generation draft save must not auto-mark player ready"
+        player.is_ready,
+        "character assignment should mark the player ready"
     );
 }

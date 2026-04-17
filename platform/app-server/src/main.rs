@@ -9,7 +9,9 @@ mod ws;
 
 use std::sync::Arc;
 
-use app::{AppState, build_app, build_session_store, load_config};
+use app::{
+    AppState, build_app, build_session_store, load_config, load_fallback_companion_sprites,
+};
 use persistence::SessionUpdateNotification;
 use tracing::info;
 use ws::{
@@ -193,8 +195,11 @@ async fn main() {
         .await
         .expect("build session store");
     store.init().await.expect("init session store");
+    let fallback_companion_sprites = load_fallback_companion_sprites(&store)
+        .await
+        .expect("load fallback companion sprites");
 
-    let state = AppState::new(config.clone(), store);
+    let state = AppState::new(config.clone(), store, fallback_companion_sprites);
 
     if let Some(database_url) = state.config.database_url.as_deref() {
         let listener_state = state.clone();

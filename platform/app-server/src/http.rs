@@ -5,12 +5,20 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use domain::{DomainError, Phase1Assignment, SessionCode, SessionPlayer, WorkshopSession};
+use persistence::CharacterRecord;
 use protocol::{
-    ActionPayload, CoordinatorType, CreateWorkshopRequest, DiscoveryObservationRequest,
+    ActionPayload, CharacterCatalogRequest, CharacterCatalogResult, CharacterCatalogSuccess,
+    CharacterProfile, CharacterSpriteSheetRequest, CharacterSpriteSheetResult,
+    CharacterSpriteSheetSuccess, CoordinatorType, CreateWorkshopRequest,
+    DiscoveryObservationRequest,
     JoinWorkshopRequest, JudgeBundle, JudgeDragonBundle, LlmDragonEvaluation, LlmImageRequest,
     LlmImageResult, LlmImageSuccess, LlmJudgeEvaluation, LlmJudgeRequest, LlmJudgeResult,
     LlmJudgeSuccess, SessionArtifactKind, SessionArtifactRecord, SessionCommand,
-    SpriteSheetRequest, SpriteSheetResult, SpriteSheetSuccess, UpdatePlayerPetRequest, VotePayload,
+    SPRITE_ATELIER_ACCEPTED_NOTICE_MESSAGE, SPRITE_ATELIER_DRAWING_NOTICE_MESSAGE,
+    SPRITE_ATELIER_NOTICE_TITLE,
+    SPRITE_ATELIER_FALLBACK_NOTICE_MESSAGE, SPRITE_ATELIER_QUEUED_NOTICE_MESSAGE,
+    SelectCharacterRequest, SessionNoticeCode, SpriteSheetRequest, SpriteSheetResult,
+    SpriteSheetSuccess, VotePayload,
     WorkshopCommandRequest, WorkshopCommandResult, WorkshopCommandSuccess, WorkshopError,
     WorkshopJoinResult, WorkshopJoinSuccess, WorkshopJudgeBundleRequest, WorkshopJudgeBundleResult,
     WorkshopJudgeBundleSuccess,
@@ -23,7 +31,7 @@ use std::{
     net::SocketAddr,
     sync::Arc,
 };
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OwnedSemaphorePermit, TryAcquireError};
 use uuid::Uuid;
 
 use crate::app::AppState;
@@ -32,10 +40,182 @@ use crate::helpers::{
     build_judge_bundle, parse_player_action, phase_step, random_prefixed_id,
     session_config_from_request, to_client_game_state,
 };
-use crate::ws::broadcast_session_state;
+use crate::ws::{broadcast_session_state, send_player_notice_with_code};
+
+enum ImageJobAdmissionError {
+    TimedOut,
+    QueueUnavailable,
+}
+
+async fn wait_for_image_job_turn(
+    state: &AppState,
+) -> Result<OwnedSemaphorePermit, ImageJobAdmissionError> {
+    match tokio::time::timeout(
+        state.config.sprite_queue_timeout,
+        state.image_job_queue.clone().acquire_owned(),
+    )
+    .await
+    {
+        Ok(Ok(permit)) => Ok(permit),
+        Ok(Err(_)) => Err(ImageJobAdmissionError::QueueUnavailable),
+        Err(_) => Err(ImageJobAdmissionError::TimedOut),
+    }
+}
+
+async fn sprite_sheet_fallback_with_notice(
+    state: &AppState,
+    session_code: &str,
+    player_id: &str,
+    level: protocol::NoticeLevel,
+) -> Result<(protocol::SpriteSet, bool), String> {
+    send_player_notice_with_code(
+        state,
+        session_code,
+        player_id,
+        level,
+        SPRITE_ATELIER_NOTICE_TITLE,
+        SPRITE_ATELIER_FALLBACK_NOTICE_MESSAGE,
+        Some(SessionNoticeCode::SpriteAtelierFallback),
+    )
+    .await;
+
+    Ok(((*state.fallback_companion_sprites).clone(), true))
+}
+
+async fn generate_sprite_sheet_with_queue(
+    state: AppState,
+    session_code: &str,
+    player_id: &str,
+    description: &str,
+) -> Result<(protocol::SpriteSet, bool), String> {
+    send_player_notice_with_code(
+        &state,
+        session_code,
+        player_id,
+        protocol::NoticeLevel::Info,
+        SPRITE_ATELIER_NOTICE_TITLE,
+        SPRITE_ATELIER_ACCEPTED_NOTICE_MESSAGE,
+        Some(SessionNoticeCode::SpriteAtelierAccepted),
+    )
+    .await;
+
+    let _queue_lease = match state.image_job_queue.clone().try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(TryAcquireError::NoPermits) => {
+            send_player_notice_with_code(
+                &state,
+                session_code,
+                player_id,
+                protocol::NoticeLevel::Info,
+                SPRITE_ATELIER_NOTICE_TITLE,
+                SPRITE_ATELIER_QUEUED_NOTICE_MESSAGE,
+                Some(SessionNoticeCode::SpriteAtelierQueued),
+            )
+            .await;
+            match wait_for_image_job_turn(&state).await {
+                Ok(permit) => permit,
+                Err(ImageJobAdmissionError::TimedOut) => {
+                    return sprite_sheet_fallback_with_notice(
+                        &state,
+                        session_code,
+                        player_id,
+                        protocol::NoticeLevel::Warning,
+                    )
+                    .await;
+                }
+                Err(ImageJobAdmissionError::QueueUnavailable) => {
+                    return Err("image generation queue is unavailable".to_string());
+                }
+            }
+        }
+        Err(TryAcquireError::Closed) => {
+            return Err("image generation queue is unavailable".to_string());
+        }
+    };
+
+    send_player_notice_with_code(
+        &state,
+        session_code,
+        player_id,
+        protocol::NoticeLevel::Info,
+        SPRITE_ATELIER_NOTICE_TITLE,
+        SPRITE_ATELIER_DRAWING_NOTICE_MESSAGE,
+        Some(SessionNoticeCode::SpriteAtelierDrawing),
+    )
+    .await;
+
+    let lease = state.llm_client.acquire_image_generation_lease();
+
+    match state
+        .llm_client
+        .generate_sprite_sheet_with_lease(&lease, description)
+        .await
+    {
+        Ok(sprites) => Ok((sprites, false)),
+        Err(error) => {
+            tracing::warn!(
+                session_code = %session_code,
+                player_id = %player_id,
+                %error,
+                "sprite sheet generation failed, using fallback companion"
+            );
+            sprite_sheet_fallback_with_notice(
+                &state,
+                session_code,
+                player_id,
+                protocol::NoticeLevel::Warning,
+            )
+            .await
+        }
+    }
+}
 
 fn clamp_score(score: i32) -> i32 {
     score.clamp(0, 100)
+}
+
+fn character_profile_from_record(record: &CharacterRecord) -> CharacterProfile {
+    record.profile()
+}
+
+async fn load_character_profile(
+    state: &AppState,
+    character_id: &str,
+) -> Result<Option<CharacterProfile>, String> {
+    state
+        .store
+        .load_character(character_id)
+        .await
+        .map_err(|error| format!("failed to load character: {error}"))
+        .map(|record| record.as_ref().map(character_profile_from_record))
+}
+
+async fn pick_random_character_profile(state: &AppState) -> Result<Option<CharacterProfile>, String> {
+    let mut characters = state
+        .store
+        .list_characters()
+        .await
+        .map_err(|error| format!("failed to list characters: {error}"))?;
+    if characters.is_empty() {
+        return Ok(None);
+    }
+    characters.sort_by(|left, right| left.id.cmp(&right.id));
+    let index = rand::random_range(0..characters.len());
+    Ok(characters.get(index).map(character_profile_from_record))
+}
+
+async fn load_or_pick_character_profile(
+    state: &AppState,
+    requested_character_id: Option<&str>,
+) -> Result<Option<CharacterProfile>, String> {
+    if let Some(character_id) = requested_character_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return load_character_profile(state, character_id).await;
+    }
+
+    pick_random_character_profile(state).await
 }
 
 fn active_time_keyword(active_time: protocol::ActiveTime) -> &'static str {
@@ -61,6 +241,7 @@ fn play_keyword(play: protocol::PlayType) -> &'static str {
     }
 }
 
+#[allow(dead_code)]
 fn unique_keyword_hits(text: &str, keywords: &[&str]) -> i32 {
     let mut seen = BTreeSet::new();
     let mut hits = 0;
@@ -109,20 +290,8 @@ fn deterministic_local_judge_dragon_evaluation(dragon: &JudgeDragonBundle) -> Ll
 
     let mechanic_clue_hits =
         (combined_notes.contains(active_time_keyword(dragon.actual_active_time)) as i32)
-            + unique_keyword_hits(
-                &combined_notes,
-                &[
-                    food_keyword(dragon.actual_day_food),
-                    food_keyword(dragon.actual_night_food),
-                ],
-            )
-            + unique_keyword_hits(
-                &combined_notes,
-                &[
-                    play_keyword(dragon.actual_day_play),
-                    play_keyword(dragon.actual_night_play),
-                ],
-            );
+            + (combined_notes.contains(food_keyword(dragon.actual_favorite_food)) as i32)
+            + (combined_notes.contains(play_keyword(dragon.actual_favorite_play)) as i32);
 
     let completeness_score = match observation_count + tags_count {
         0 => 0,
@@ -458,6 +627,10 @@ pub(crate) async fn create_workshop(
         );
     }
     let timestamp = Utc::now();
+    let selected_character = match load_or_pick_character_profile(&state, payload.character_id.as_deref()).await {
+        Ok(character) => character,
+        Err(error) => return internal_join_error(error),
+    };
     let session_code = allocate_session_code(&state).await;
     let player_id = random_prefixed_id("player");
     let reconnect_token = random_prefixed_id("reconnect");
@@ -470,11 +643,11 @@ pub(crate) async fn create_workshop(
     let host_player = SessionPlayer {
         id: player_id.clone(),
         name: normalized_name.to_string(),
-        pet_description: None,
-        custom_sprites: None,
+        character_id: selected_character.as_ref().map(|character| character.id.clone()),
+        selected_character: selected_character.clone(),
         is_host: true,
         is_connected: true,
-        is_ready: false,
+        is_ready: selected_character.is_some(),
         score: 0,
         current_dragon_id: None,
         achievements: Vec::new(),
@@ -500,6 +673,7 @@ pub(crate) async fn create_workshop(
         payload: json!({
             "sessionCode": session_code,
             "hostName": normalized_name,
+            "characterId": selected_character.as_ref().map(|character| character.id.clone()),
             "phase0Minutes": session.config.phase0_minutes,
             "phase1Minutes": session.config.phase1_minutes,
             "phase2Minutes": session.config.phase2_minutes,
@@ -672,6 +846,10 @@ pub(crate) async fn join_workshop(
     if normalized_name.is_empty() {
         return bad_join_request("Please enter a player name.");
     }
+    let selected_character = match load_or_pick_character_profile(&state, payload.character_id.as_deref()).await {
+        Ok(character) => character,
+        Err(error) => return internal_join_error(error),
+    };
 
     let (_, _write_guard, write_lease) =
         match SessionWriteLease::acquire(&state, session_code).await {
@@ -718,11 +896,11 @@ pub(crate) async fn join_workshop(
         let player = SessionPlayer {
             id: player_id.clone(),
             name: normalized_name.clone(),
-            pet_description: None,
-            custom_sprites: None,
+            character_id: selected_character.as_ref().map(|character| character.id.clone()),
+            selected_character: selected_character.clone(),
             is_host: false,
             is_connected: true,
-            is_ready: false,
+            is_ready: selected_character.is_some(),
             score: 0,
             current_dragon_id: None,
             achievements: Vec::new(),
@@ -748,7 +926,11 @@ pub(crate) async fn join_workshop(
         kind: SessionArtifactKind::PlayerJoined,
         player_id: Some(player_id.clone()),
         created_at: timestamp.to_rfc3339(),
-        payload: json!({ "sessionCode": session_code, "playerName": normalized_name }),
+        payload: json!({
+            "sessionCode": session_code,
+            "playerName": normalized_name,
+            "characterId": selected_character.as_ref().map(|character| character.id.clone()),
+        }),
     };
     if let Err(error) = write_lease.ensure_active() {
         let mut sessions = state.sessions.lock().await;
@@ -916,8 +1098,34 @@ pub(crate) async fn workshop_command(
                 if session.host_player_id.as_deref() != Some(identity.player_id.as_str()) {
                     return bad_command_request("Only the host can start the workshop.");
                 }
-                if session.phase != protocol::Phase::Phase0 {
-                    return bad_command_request("Phase 1 can only start after character creation.");
+                if session.phase != protocol::Phase::Lobby && session.phase != protocol::Phase::Phase0 {
+                    return bad_command_request("Phase 1 can only start from the lobby.");
+                }
+
+                let missing_player_ids = session
+                    .players
+                    .iter()
+                    .filter_map(|(player_id, player)| {
+                        if player.selected_character.is_none() {
+                            Some(player_id.clone())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect::<Vec<_>>();
+
+                for player_id in missing_player_ids {
+                    let Some(character) = (match pick_random_character_profile(&state).await {
+                        Ok(character) => character,
+                        Err(error) => return internal_command_error(error),
+                    }) else {
+                        return bad_command_request(
+                            "No characters are available to auto-assign for this workshop.",
+                        );
+                    };
+                    if let Err(error) = session.assign_player_character(&player_id, character) {
+                        return bad_command_request(&error.to_string());
+                    }
                 }
 
                 let assignments = session
@@ -942,6 +1150,42 @@ pub(crate) async fn workshop_command(
                     player_id: Some(identity.player_id.clone()),
                     created_at: Utc::now().to_rfc3339(),
                     payload: json!({ "toPhase": "phase1" }),
+                });
+
+                successful_workshop_command(&mut should_broadcast)
+            }
+            SessionCommand::SelectCharacter => {
+                let payload = match request.payload.clone() {
+                    Some(value) => serde_json::from_value::<SelectCharacterRequest>(value).ok(),
+                    None => None,
+                };
+                let Some(payload) = payload else {
+                    return bad_command_request("Character selection payload is invalid.");
+                };
+
+                let Some(character) = (match load_character_profile(&state, payload.character_id.trim()).await {
+                    Ok(character) => character,
+                    Err(error) => return internal_command_error(error),
+                }) else {
+                    return bad_command_request("Selected character was not found.");
+                };
+
+                if let Err(error) = session.assign_player_character(&identity.player_id, character.clone()) {
+                    return bad_command_request(&error.to_string());
+                }
+                session_to_persist = Some(session.clone());
+                artifact_to_append = Some(SessionArtifactRecord {
+                    id: random_prefixed_id("artifact"),
+                    session_id: session.id.to_string(),
+                    phase: session.phase,
+                    step: phase_step(session.phase),
+                    kind: SessionArtifactKind::PetProfileUpdated,
+                    player_id: Some(identity.player_id.clone()),
+                    created_at: Utc::now().to_rfc3339(),
+                    payload: json!({
+                        "characterId": character.id,
+                        "remainingSpriteRegenerations": character.remaining_sprite_regenerations,
+                    }),
                 });
 
                 successful_workshop_command(&mut should_broadcast)
@@ -1286,7 +1530,14 @@ pub(crate) async fn workshop_command(
                     return bad_command_request("Results can only be revealed during voting.");
                 }
                 if let Err(error) = session.reveal_voting_results() {
-                    return bad_command_request(&error.to_string());
+                    let message = match error {
+                        DomainError::VotingRevealNotReady => {
+                            "Voting can only be finished after at least one eligible vote is submitted."
+                                .to_string()
+                        }
+                        _ => error.to_string(),
+                    };
+                    return bad_command_request(&message);
                 }
                 session_to_persist = Some(session.clone());
                 artifact_to_append = Some(SessionArtifactRecord {
@@ -1317,7 +1568,14 @@ pub(crate) async fn workshop_command(
                     return bad_command_request("Session can only be ended during voting.");
                 }
                 if let Err(error) = session.finalize_voting() {
-                    return bad_command_request(&error.to_string());
+                    let message = match error {
+                        DomainError::VotingResultsNotRevealed => {
+                            "Session can only be ended after voting results are revealed."
+                                .to_string()
+                        }
+                        _ => error.to_string(),
+                    };
+                    return bad_command_request(&message);
                 }
                 session_to_persist = Some(session.clone());
                 artifact_to_append = Some(SessionArtifactRecord {
@@ -1345,7 +1603,7 @@ pub(crate) async fn workshop_command(
                 if session.host_player_id.as_deref() != Some(identity.player_id.as_str()) {
                     return bad_command_request("Only the host can reset the workshop.");
                 }
-                if let Err(error) = session.reset_to_lobby() {
+                if let Err(error) = session.reset_to_lobby(&identity.player_id) {
                     return bad_command_request(&error.to_string());
                 }
                 session_to_persist = Some(session.clone());
@@ -1358,43 +1616,6 @@ pub(crate) async fn workshop_command(
                     player_id: Some(identity.player_id.clone()),
                     created_at: Utc::now().to_rfc3339(),
                     payload: json!({ "toPhase": "lobby" }),
-                });
-
-                successful_workshop_command(&mut should_broadcast)
-            }
-            SessionCommand::UpdatePlayerPet => {
-                if session.phase != protocol::Phase::Phase0 {
-                    return bad_command_request(
-                        "Pet profile can only be updated during character creation.",
-                    );
-                }
-                let payload = match request.payload.clone() {
-                    Some(value) => serde_json::from_value::<UpdatePlayerPetRequest>(value).ok(),
-                    None => None,
-                };
-                let Some(payload) = payload else {
-                    return bad_command_request("Pet profile payload is invalid.");
-                };
-                let description = payload.description.trim().to_string();
-                if description.is_empty() {
-                    return bad_command_request("Pet description is required.");
-                }
-                let has_sprites = payload.sprites.is_some();
-                if let Err(error) =
-                    session.update_player_pet(&identity.player_id, description, payload.sprites)
-                {
-                    return bad_command_request(&error.to_string());
-                }
-                session_to_persist = Some(session.clone());
-                artifact_to_append = Some(SessionArtifactRecord {
-                    id: random_prefixed_id("artifact"),
-                    session_id: session.id.to_string(),
-                    phase: session.phase,
-                    step: phase_step(session.phase),
-                    kind: SessionArtifactKind::PetProfileUpdated,
-                    player_id: Some(identity.player_id.clone()),
-                    created_at: Utc::now().to_rfc3339(),
-                    payload: json!({ "hasSprites": has_sprites }),
                 });
 
                 successful_workshop_command(&mut should_broadcast)
@@ -1514,21 +1735,6 @@ pub(crate) async fn workshop_judge_bundle(
         return bad_judge_bundle_request("Missing workshop credentials.");
     }
 
-    let session = {
-        match ensure_session_cached(&state, session_code).await {
-            Ok(true) => {}
-            Ok(false) => return bad_judge_bundle_request("Workshop not found."),
-            Err(error) => {
-                return internal_judge_bundle_error(format!("failed to load session: {error}"));
-            }
-        }
-        let sessions = state.sessions.lock().await;
-        let Some(session) = sessions.get(session_code) else {
-            return bad_judge_bundle_request("Workshop not found.");
-        };
-        session.clone()
-    };
-
     let identity = match authorize_reconnect_identity(&state, session_code, reconnect_token).await {
         Ok(Some(identity)) => identity,
         Ok(None) => return bad_judge_bundle_request("Session identity is invalid or expired."),
@@ -1539,6 +1745,45 @@ pub(crate) async fn workshop_judge_bundle(
 
     if let Err(error) = refresh_reconnect_identity(&state, reconnect_token, Utc::now()).await {
         return internal_judge_bundle_error(format!("failed to touch player identity: {error}"));
+    }
+
+    let (_, _write_guard, write_lease) = match SessionWriteLease::acquire(&state, session_code).await {
+        Ok(guard) => guard,
+        Err(error) => {
+            return internal_judge_bundle_error(format!("failed to acquire session lease: {error}"));
+        }
+    };
+    if let Err(error) = write_lease.ensure_active() {
+        return internal_judge_bundle_error(format!(
+            "lost session lease before workshop archive load: {error}"
+        ));
+    }
+    match reload_cached_session(&state, session_code).await {
+        Ok(true) => {}
+        Ok(false) => return bad_judge_bundle_request("Workshop not found."),
+        Err(error) => {
+            return internal_judge_bundle_error(format!("failed to reload session: {error}"));
+        }
+    }
+    if let Err(error) = write_lease.ensure_active() {
+        return internal_judge_bundle_error(format!(
+            "lost session lease before workshop archive validation: {error}"
+        ));
+    }
+
+    let session = {
+        let sessions = state.sessions.lock().await;
+        let Some(session) = sessions.get(session_code) else {
+            return bad_judge_bundle_request("Workshop not found.");
+        };
+        session.clone()
+    };
+
+    if session.host_player_id.as_deref() != Some(identity.player_id.as_str()) {
+        return bad_judge_bundle_request("Only the host can build the workshop archive.");
+    }
+    if session.phase != protocol::Phase::End {
+        return bad_judge_bundle_request("Workshop archive can only be built after the game ends.");
     }
 
     let artifacts = match state
@@ -1562,7 +1807,7 @@ pub(crate) async fn workshop_judge_bundle(
             id: random_prefixed_id("artifact"),
             session_id: session.id.to_string(),
             phase: session.phase,
-            step: 4,
+            step: phase_step(session.phase),
             kind: SessionArtifactKind::JudgeBundleGenerated,
             player_id: Some(identity.player_id.clone()),
             created_at: Utc::now().to_rfc3339(),
@@ -1920,7 +2165,68 @@ pub(crate) async fn llm_generate_image(
         return bad_llm_image_request("Image prompt is required.");
     }
 
-    let (image_base64, mime_type) = match state.llm_client.generate_image(prompt).await {
+    let session = match ensure_session_cached(&state, session_code).await {
+        Ok(true) => {
+            let sessions = state.sessions.lock().await;
+            sessions.get(session_code).cloned()
+        }
+        Ok(false) => None,
+        Err(error) => {
+            return internal_llm_image_error(format!("failed to load session: {error}"));
+        }
+    };
+    let Some(session) = session else {
+        return bad_llm_image_request("Workshop not found.");
+    };
+    if session.phase != protocol::Phase::Phase0 {
+        return bad_llm_image_request(
+            "Image generation is only available during character creation.",
+        );
+    }
+
+    let _queue_lease = match state.image_job_queue.clone().try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(TryAcquireError::NoPermits) => match wait_for_image_job_turn(&state).await {
+            Ok(permit) => permit,
+            Err(ImageJobAdmissionError::TimedOut) => {
+                return internal_llm_image_error(
+                    "image request timed out while waiting for generation capacity".to_string(),
+                );
+            }
+            Err(ImageJobAdmissionError::QueueUnavailable) => {
+                return internal_llm_image_error("image generation queue is unavailable".to_string());
+            }
+        },
+        Err(TryAcquireError::Closed) => {
+            return internal_llm_image_error("image generation queue is unavailable".to_string());
+        }
+    };
+
+    let session_after_wait = match ensure_session_cached(&state, session_code).await {
+        Ok(true) => {
+            let sessions = state.sessions.lock().await;
+            sessions.get(session_code).cloned()
+        }
+        Ok(false) => None,
+        Err(error) => {
+            return internal_llm_image_error(format!("failed to reload session: {error}"));
+        }
+    };
+    let Some(session_after_wait) = session_after_wait else {
+        return bad_llm_image_request("Workshop not found.");
+    };
+    if session_after_wait.phase != protocol::Phase::Phase0 {
+        return bad_llm_image_request(
+            "Image generation is only available during character creation.",
+        );
+    };
+    let image_lease = state.llm_client.acquire_image_generation_lease();
+
+    let (image_base64, mime_type) = match state
+        .llm_client
+        .generate_image_with_lease(&image_lease, prompt)
+        .await
+    {
         Ok(result) => result,
         Err(error) => {
             return internal_llm_image_error(format!("image generation failed: {error}"));
@@ -1943,14 +2249,96 @@ pub(crate) async fn generate_sprite_sheet(
     headers: HeaderMap,
     Json(request): Json<SpriteSheetRequest>,
 ) -> (StatusCode, Json<SpriteSheetResult>) {
-    if let Some(response) =
-        reject_disallowed_sprite_sheet_origin(&headers, &state.config.origin_policy)
+    let fallback_companion_sprites = (*state.fallback_companion_sprites).clone();
+    match generate_or_update_character_sprite_sheet(
+        state,
+        connect_info,
+        headers,
+        CharacterSpriteSheetRequest {
+            session_code: request.session_code,
+            reconnect_token: request.reconnect_token,
+            description: request.description,
+            character_id: None,
+        },
+    )
+    .await
+    {
+        (status, Json(CharacterSpriteSheetResult::Success(success))) => {
+            let fallback_used = success.sprites == fallback_companion_sprites;
+            (
+                status,
+                Json(SpriteSheetResult::Success(SpriteSheetSuccess {
+                    ok: success.ok,
+                    sprites: success.sprites,
+                    fallback_used,
+                })),
+            )
+        }
+        (status, Json(CharacterSpriteSheetResult::Error(error))) => {
+            (status, Json(SpriteSheetResult::Error(error)))
+        }
+    }
+}
+
+pub(crate) async fn list_character_catalog(
+    State(state): State<AppState>,
+    connect_info: MaybeConnectInfo,
+    headers: HeaderMap,
+    Json(_request): Json<CharacterCatalogRequest>,
+) -> (StatusCode, Json<CharacterCatalogResult>) {
+    if let Some(response) = reject_disallowed_character_catalog_origin(&headers, &state.config.origin_policy)
     {
         return response;
     }
     let client_key = client_key(&state, connect_info, &headers);
     if is_rate_limited(&state.command_limiter, &client_key).await {
-        return too_many_sprite_sheet_requests();
+        return too_many_character_catalog_requests();
+    }
+
+    let mut characters = match state.store.list_characters().await {
+        Ok(characters) => characters,
+        Err(error) => {
+            return internal_character_catalog_error(format!("failed to list characters: {error}"));
+        }
+    };
+    characters.sort_by(|left, right| left.id.cmp(&right.id));
+    let profiles = characters
+        .iter()
+        .map(character_profile_from_record)
+        .collect::<Vec<_>>();
+
+    (
+        StatusCode::OK,
+        Json(CharacterCatalogResult::Success(CharacterCatalogSuccess {
+            ok: true,
+            characters: profiles,
+        })),
+    )
+}
+
+pub(crate) async fn generate_character_sprite_sheet(
+    State(state): State<AppState>,
+    connect_info: MaybeConnectInfo,
+    headers: HeaderMap,
+    Json(request): Json<CharacterSpriteSheetRequest>,
+) -> (StatusCode, Json<CharacterSpriteSheetResult>) {
+    generate_or_update_character_sprite_sheet(state, connect_info, headers, request).await
+}
+
+async fn generate_or_update_character_sprite_sheet(
+    state: AppState,
+    connect_info: MaybeConnectInfo,
+    headers: HeaderMap,
+    request: CharacterSpriteSheetRequest,
+) -> (StatusCode, Json<CharacterSpriteSheetResult>) {
+    if let Some(response) =
+        reject_disallowed_character_sprite_sheet_origin(&headers, &state.config.origin_policy)
+    {
+        return response;
+    }
+    let client_key = client_key(&state, connect_info, &headers);
+    if is_rate_limited(&state.command_limiter, &client_key).await {
+        return too_many_character_sprite_sheet_requests();
     }
 
     let session_code = request.session_code.trim();
@@ -1959,128 +2347,134 @@ pub(crate) async fn generate_sprite_sheet(
         || reconnect_token.is_empty()
         || security::validate_session_code(session_code).is_err()
     {
-        return bad_sprite_sheet_request("Missing workshop credentials.");
+        return bad_character_sprite_sheet_request("Missing workshop credentials.");
     }
 
     let identity = match authorize_reconnect_identity(&state, session_code, reconnect_token).await {
         Ok(Some(identity)) => identity,
-        Ok(None) => return bad_sprite_sheet_request("Session identity is invalid or expired."),
+        Ok(None) => {
+            return bad_character_sprite_sheet_request("Session identity is invalid or expired.");
+        }
         Err(error) => {
-            return internal_sprite_sheet_error(format!("failed to lookup identity: {error}"));
+            return internal_character_sprite_sheet_error(format!(
+                "failed to lookup identity: {error}"
+            ));
         }
     };
 
     if let Err(error) = refresh_reconnect_identity(&state, reconnect_token, Utc::now()).await {
-        return internal_sprite_sheet_error(format!("failed to touch player identity: {error}"));
-    }
-
-    {
-        let (_, _write_guard, write_lease) =
-            match SessionWriteLease::acquire(&state, session_code).await {
-                Ok(guard) => guard,
-                Err(error) => {
-                    return internal_sprite_sheet_error(format!(
-                        "failed to acquire session lease: {error}"
-                    ));
-                }
-            };
-        if let Err(error) = write_lease.ensure_active() {
-            return internal_sprite_sheet_error(format!(
-                "lost session lease before sprite generation load: {error}"
-            ));
-        }
-
-        match reload_cached_session(&state, session_code).await {
-            Ok(true) => {}
-            Ok(false) => return bad_sprite_sheet_request("Workshop not found."),
-            Err(error) => {
-                return internal_sprite_sheet_error(format!("failed to load session: {error}"));
-            }
-        }
-
-        if let Err(error) = write_lease.ensure_active() {
-            return internal_sprite_sheet_error(format!(
-                "lost session lease before sprite generation validation: {error}"
-            ));
-        }
-
-        let sessions = state.sessions.lock().await;
-        let Some(session) = sessions.get(session_code) else {
-            return bad_sprite_sheet_request("Workshop not found.");
-        };
-        if session.players.get(&identity.player_id).is_none() {
-            return bad_sprite_sheet_request("Session identity is invalid or expired.");
-        }
-        if session.phase != protocol::Phase::Phase0 {
-            return bad_sprite_sheet_request(
-                "Dragon sprites can only be generated during character creation.",
-            );
-        }
-    }
-
-    let description = request.description.trim();
-    if description.is_empty() {
-        return bad_sprite_sheet_request("Dragon description is required.");
-    }
-
-    let sprites = match state.llm_client.generate_sprite_sheet(description).await {
-        Ok(result) => result,
-        Err(error) => {
-            return internal_sprite_sheet_error(format!("sprite sheet generation failed: {error}"));
-        }
-    };
-
-    let (_, _write_guard, write_lease) = match SessionWriteLease::acquire(&state, session_code).await
-    {
-        Ok(guard) => guard,
-        Err(error) => {
-            return internal_sprite_sheet_error(format!(
-                "failed to acquire session lease before sprite draft save: {error}"
-            ));
-        }
-    };
-    if let Err(error) = write_lease.ensure_active() {
-        return internal_sprite_sheet_error(format!(
-            "lost session lease before sprite draft reload: {error}"
+        return internal_character_sprite_sheet_error(format!(
+            "failed to touch player identity: {error}"
         ));
     }
 
     match reload_cached_session(&state, session_code).await {
         Ok(true) => {}
-        Ok(false) => return bad_sprite_sheet_request("Workshop not found."),
+        Ok(false) => return bad_character_sprite_sheet_request("Workshop not found."),
         Err(error) => {
-            return internal_sprite_sheet_error(format!(
-                "failed to reload session before sprite draft save: {error}"
+            return internal_character_sprite_sheet_error(format!(
+                "failed to load session: {error}"
             ));
         }
     }
 
-    if let Err(error) = write_lease.ensure_active() {
-        return internal_sprite_sheet_error(format!(
-            "lost session lease before sprite draft validation: {error}"
-        ));
-    }
-
-    let (session_before, session_to_persist, artifact_to_append) = {
-        let mut sessions = state.sessions.lock().await;
-        let Some(session) = sessions.get_mut(session_code) else {
-            return bad_sprite_sheet_request("Workshop not found.");
+    let current_character = {
+        let sessions = state.sessions.lock().await;
+        let Some(session) = sessions.get(session_code) else {
+            return bad_character_sprite_sheet_request("Workshop not found.");
         };
-        let session_before = session.clone();
-        if session.players.get(&identity.player_id).is_none() {
-            return bad_sprite_sheet_request("Session identity is invalid or expired.");
-        }
-        if session.phase != protocol::Phase::Phase0 {
-            return bad_sprite_sheet_request(
-                "Dragon sprites can only be generated during character creation.",
+        let Some(player) = session.players.get(&identity.player_id) else {
+            return bad_character_sprite_sheet_request("Session identity is invalid or expired.");
+        };
+        player.selected_character.clone()
+    };
+
+    if let Some(requested_character_id) = request
+        .character_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        let Some(selected_character) = current_character.as_ref() else {
+            return bad_character_sprite_sheet_request("Select a character before redrawing it.");
+        };
+        if selected_character.id != requested_character_id {
+            return bad_character_sprite_sheet_request(
+                "You can only redraw the character currently selected for this player.",
             );
         }
-        if let Err(error) = session.update_player_sprite_draft(
-            &identity.player_id,
-            description.to_string(),
-            sprites.clone(),
-        ) {
-            return bad_sprite_sheet_request(&error.to_string());
+    }
+
+    if current_character
+        .as_ref()
+        .is_some_and(|character| character.remaining_sprite_regenerations == 0)
+    {
+        return bad_character_sprite_sheet_request("Your dragon has already used its one redraw.");
+    }
+
+    let existing_character_created_at = match current_character.as_ref() {
+        Some(character) => match state.store.load_character(&character.id).await {
+            Ok(Some(record)) => Some(record.created_at),
+            Ok(None) => None,
+            Err(error) => {
+                return internal_character_sprite_sheet_error(format!(
+                    "failed to load character: {error}"
+                ));
+            }
+        },
+        None => None,
+    };
+
+    let description = request.description.trim();
+    if description.is_empty() {
+        return bad_character_sprite_sheet_request("Dragon description is required.");
+    }
+
+    let (sprites, fallback_used) = match generate_sprite_sheet_with_queue(
+        state.clone(),
+        session_code,
+        &identity.player_id,
+        description,
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(error) => return internal_character_sprite_sheet_error(error),
+    };
+
+    let fallback_used = fallback_used;
+
+    let (session_before, session_to_persist, artifact_to_append, next_character_record) = {
+        let mut sessions = state.sessions.lock().await;
+        let Some(session) = sessions.get_mut(session_code) else {
+            return bad_character_sprite_sheet_request("Workshop not found.");
+        };
+        let session_before = session.clone();
+        let Some(player) = session.players.get(&identity.player_id) else {
+            return bad_character_sprite_sheet_request("Session identity is invalid or expired.");
+        };
+        let existing_character = player.selected_character.clone();
+        let next_remaining_sprite_regenerations = existing_character
+            .as_ref()
+            .map(|character| character.remaining_sprite_regenerations.saturating_sub(1))
+            .unwrap_or(1);
+        let character_id = existing_character
+            .as_ref()
+            .map(|character| character.id.clone())
+            .unwrap_or_else(|| random_prefixed_id("character"));
+        let timestamp = Utc::now().to_rfc3339();
+        let character_record = CharacterRecord {
+            id: character_id.clone(),
+            description: description.to_string(),
+            sprites: sprites.clone(),
+            remaining_sprite_regenerations: next_remaining_sprite_regenerations,
+            created_at: existing_character_created_at
+                .clone()
+                .unwrap_or_else(|| timestamp.clone()),
+            updated_at: timestamp,
+        };
+        if let Err(error) = session.assign_player_character(&identity.player_id, character_record.profile()) {
+            return bad_character_sprite_sheet_request(&error.to_string());
         }
         let artifact = SessionArtifactRecord {
             id: random_prefixed_id("artifact"),
@@ -2092,17 +2486,19 @@ pub(crate) async fn generate_sprite_sheet(
             created_at: Utc::now().to_rfc3339(),
             payload: json!({
                 "hasSprites": true,
-                "draftOnly": true,
+                "characterId": character_record.id,
+                "fallbackUsed": fallback_used,
+                "remainingSpriteRegenerations": character_record.remaining_sprite_regenerations,
             }),
         };
-        (session_before, session.clone(), artifact)
+        (session_before, session.clone(), artifact, character_record)
     };
 
-    if let Err(error) = write_lease.ensure_active() {
+    if let Err(error) = state.store.save_character(&next_character_record).await {
         let mut sessions = state.sessions.lock().await;
-        sessions.insert(session_code.to_string(), session_before);
-        return internal_sprite_sheet_error(format!(
-            "lost session lease before sprite draft persist: {error}"
+        sessions.insert(session_code.to_string(), session_before.clone());
+        return internal_character_sprite_sheet_error(format!(
+            "failed to persist character: {error}"
         ));
     }
 
@@ -2113,18 +2509,19 @@ pub(crate) async fn generate_sprite_sheet(
     {
         let mut sessions = state.sessions.lock().await;
         sessions.insert(session_code.to_string(), session_before);
-        return internal_sprite_sheet_error(format!("failed to persist sprite draft: {error}"));
+        return internal_character_sprite_sheet_error(format!(
+            "failed to persist character selection: {error}"
+        ));
     }
-
-    drop(_write_guard);
-    drop(write_lease);
     broadcast_session_state(&state, session_code, None).await;
 
     (
         StatusCode::OK,
-        Json(SpriteSheetResult::Success(SpriteSheetSuccess {
+        Json(CharacterSpriteSheetResult::Success(CharacterSpriteSheetSuccess {
             ok: true,
+            character_id: next_character_record.id,
             sprites,
+            remaining_sprite_regenerations: next_character_record.remaining_sprite_regenerations,
         })),
     )
 }
@@ -2225,6 +2622,36 @@ fn too_many_llm_image_requests() -> (StatusCode, Json<LlmImageResult>) {
     )
 }
 
+fn too_many_sprite_sheet_requests() -> (StatusCode, Json<SpriteSheetResult>) {
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        Json(SpriteSheetResult::Error(WorkshopError {
+            ok: false,
+            error: "Too many requests. Please slow down and try again.".to_string(),
+        })),
+    )
+}
+
+fn too_many_character_catalog_requests() -> (StatusCode, Json<CharacterCatalogResult>) {
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        Json(CharacterCatalogResult::Error(WorkshopError {
+            ok: false,
+            error: "Too many requests. Please slow down and try again.".to_string(),
+        })),
+    )
+}
+
+fn too_many_character_sprite_sheet_requests() -> (StatusCode, Json<CharacterSpriteSheetResult>) {
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        Json(CharacterSpriteSheetResult::Error(WorkshopError {
+            ok: false,
+            error: "Too many requests. Please slow down and try again.".to_string(),
+        })),
+    )
+}
+
 fn reject_disallowed_sprite_sheet_origin(
     headers: &HeaderMap,
     policy: &OriginPolicy,
@@ -2243,6 +2670,42 @@ fn reject_disallowed_sprite_sheet_origin(
     }
 }
 
+fn reject_disallowed_character_catalog_origin(
+    headers: &HeaderMap,
+    policy: &OriginPolicy,
+) -> Option<(StatusCode, Json<CharacterCatalogResult>)> {
+    let origin = headers.get("origin").and_then(|value| value.to_str().ok());
+    if security::is_origin_allowed(origin, policy) {
+        None
+    } else {
+        Some((
+            StatusCode::FORBIDDEN,
+            Json(CharacterCatalogResult::Error(WorkshopError {
+                ok: false,
+                error: "Origin is not allowed.".to_string(),
+            })),
+        ))
+    }
+}
+
+fn reject_disallowed_character_sprite_sheet_origin(
+    headers: &HeaderMap,
+    policy: &OriginPolicy,
+) -> Option<(StatusCode, Json<CharacterSpriteSheetResult>)> {
+    let origin = headers.get("origin").and_then(|value| value.to_str().ok());
+    if security::is_origin_allowed(origin, policy) {
+        None
+    } else {
+        Some((
+            StatusCode::FORBIDDEN,
+            Json(CharacterSpriteSheetResult::Error(WorkshopError {
+                ok: false,
+                error: "Origin is not allowed.".to_string(),
+            })),
+        ))
+    }
+}
+
 fn bad_sprite_sheet_request(message: &str) -> (StatusCode, Json<SpriteSheetResult>) {
     (
         StatusCode::BAD_REQUEST,
@@ -2253,22 +2716,56 @@ fn bad_sprite_sheet_request(message: &str) -> (StatusCode, Json<SpriteSheetResul
     )
 }
 
-fn internal_sprite_sheet_error(message: String) -> (StatusCode, Json<SpriteSheetResult>) {
+fn bad_character_catalog_request(message: &str) -> (StatusCode, Json<CharacterCatalogResult>) {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(CharacterCatalogResult::Error(WorkshopError {
+            ok: false,
+            error: message.to_string(),
+        })),
+    )
+}
+
+fn internal_character_catalog_error(message: String) -> (StatusCode, Json<CharacterCatalogResult>) {
     (
         StatusCode::INTERNAL_SERVER_ERROR,
-        Json(SpriteSheetResult::Error(WorkshopError {
+        Json(CharacterCatalogResult::Error(WorkshopError {
             ok: false,
             error: message,
         })),
     )
 }
 
-fn too_many_sprite_sheet_requests() -> (StatusCode, Json<SpriteSheetResult>) {
+fn bad_character_sprite_sheet_request(
+    message: &str,
+) -> (StatusCode, Json<CharacterSpriteSheetResult>) {
     (
-        StatusCode::TOO_MANY_REQUESTS,
+        StatusCode::BAD_REQUEST,
+        Json(CharacterSpriteSheetResult::Error(WorkshopError {
+            ok: false,
+            error: message.to_string(),
+        })),
+    )
+}
+
+fn internal_character_sprite_sheet_error(
+    message: String,
+) -> (StatusCode, Json<CharacterSpriteSheetResult>) {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(CharacterSpriteSheetResult::Error(WorkshopError {
+            ok: false,
+            error: message,
+        })),
+    )
+}
+
+fn internal_sprite_sheet_error(message: String) -> (StatusCode, Json<SpriteSheetResult>) {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
         Json(SpriteSheetResult::Error(WorkshopError {
             ok: false,
-            error: "Too many requests. Please slow down and try again.".to_string(),
+            error: message,
         })),
     )
 }

@@ -1,7 +1,10 @@
 #[cfg(test)]
 #[allow(clippy::module_inception)]
 mod postgres_tests {
-    use crate::{PlayerIdentity, PostgresSessionStore, SessionStore};
+    use crate::{
+        CharacterRecord, PlayerIdentity, PostgresSessionStore, SessionStore,
+        TIMEOUT_COMPANION_SPRITE_KEY, timeout_companion_defaults,
+    };
     use chrono::Utc;
     use domain::{SessionCode, SessionPlayer, WorkshopSession};
     use protocol::{Phase, SessionArtifactKind, SessionArtifactRecord};
@@ -291,7 +294,60 @@ mod postgres_tests {
                 .await
                 .expect("read applied migrations");
 
-        assert_eq!(versions, vec![(1,), (2,), (3,)]);
+        assert_eq!(versions, vec![(1,), (2,), (3,), (4,), (5,), (6,)]);
+        store.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn init_seeds_timeout_companion_defaults() {
+        let store = setup_store("init_seeds_timeout_companion_defaults").await;
+
+        let defaults = store
+            .load_app_sprite_defaults(TIMEOUT_COMPANION_SPRITE_KEY)
+            .await
+            .expect("load timeout companion defaults")
+            .expect("seeded timeout companion defaults");
+
+        assert_eq!(defaults.key, TIMEOUT_COMPANION_SPRITE_KEY);
+        assert_eq!(defaults.sprites, timeout_companion_defaults().sprites);
+        store.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn save_and_load_character_round_trip() {
+        let store = setup_store("save_and_load_character_round_trip").await;
+
+        let character = CharacterRecord {
+            id: "character_1".to_string(),
+            description: "A mossy lantern dragon".to_string(),
+            sprites: protocol::SpriteSet {
+                neutral: "neutral_b64".to_string(),
+                happy: "happy_b64".to_string(),
+                angry: "angry_b64".to_string(),
+                sleepy: "sleepy_b64".to_string(),
+            },
+            remaining_sprite_regenerations: 1,
+            created_at: Utc::now().to_rfc3339(),
+            updated_at: Utc::now().to_rfc3339(),
+        };
+
+        store
+            .save_character(&character)
+            .await
+            .expect("save character");
+
+        let loaded = store
+            .load_character("character_1")
+            .await
+            .expect("load character")
+            .expect("character must exist");
+
+        assert_eq!(loaded.id, character.id);
+        assert_eq!(loaded.description, character.description);
+        assert_eq!(loaded.sprites, character.sprites);
+        assert_eq!(loaded.remaining_sprite_regenerations, 1);
         store.cleanup().await;
     }
 
@@ -463,28 +519,48 @@ mod postgres_tests {
         session.add_player(SessionPlayer {
             id: "player_1".to_string(),
             name: "Alice".to_string(),
-            pet_description: Some("Alice's workshop dragon".to_string()),
+            character_id: Some("character-1".to_string()),
+            selected_character: Some(protocol::CharacterProfile {
+                id: "character-1".to_string(),
+                description: "Alice's workshop dragon".to_string(),
+                sprites: protocol::SpriteSet {
+                    neutral: "neutral".to_string(),
+                    happy: "happy".to_string(),
+                    angry: "angry".to_string(),
+                    sleepy: "sleepy".to_string(),
+                },
+                remaining_sprite_regenerations: 1,
+            }),
             is_host: true,
             is_connected: false,
-            is_ready: false,
+            is_ready: true,
             score: 0,
             current_dragon_id: None,
             achievements: Vec::new(),
             joined_at: Utc::now(),
-            custom_sprites: None,
         });
         session.add_player(SessionPlayer {
             id: "player_2".to_string(),
             name: "Bob".to_string(),
-            pet_description: Some("Bob's workshop dragon".to_string()),
+            character_id: Some("character-2".to_string()),
+            selected_character: Some(protocol::CharacterProfile {
+                id: "character-2".to_string(),
+                description: "Bob's workshop dragon".to_string(),
+                sprites: protocol::SpriteSet {
+                    neutral: "neutral".to_string(),
+                    happy: "happy".to_string(),
+                    angry: "angry".to_string(),
+                    sleepy: "sleepy".to_string(),
+                },
+                remaining_sprite_regenerations: 1,
+            }),
             is_host: false,
             is_connected: false,
-            is_ready: false,
+            is_ready: true,
             score: 0,
             current_dragon_id: None,
             achievements: Vec::new(),
             joined_at: Utc::now(),
-            custom_sprites: None,
         });
         session
             .players
