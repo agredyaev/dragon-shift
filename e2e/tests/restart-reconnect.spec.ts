@@ -133,7 +133,7 @@ test.describe('browser restart reconnect proof', () => {
       await expect(reconnect.page.locator('body')).toContainText('berries')
 
       await expect(guest.page.getByTestId('connection-badge')).toContainText('Offline')
-      await guest.page.getByTestId('sync-session-button').click()
+      await guest.page.reload()
       await waitForNotice(guest.page, 'Session synced.')
       await expect(guest.page.getByTestId('connection-badge')).toContainText('Connected')
       await expect(guest.page.locator('body')).toContainText('Handover')

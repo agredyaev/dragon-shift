@@ -26,7 +26,7 @@ async function safeClose(...contexts: Array<{ close: () => Promise<void> }>) {
   await Promise.allSettled(contexts.map(context => context.close()))
 }
 
-const lobbyTitlePattern = /Workshop lobby|Waiting lobby/
+const lobbyTitlePattern = /Workshop Lobby|Waiting lobby/
 
 async function expectPhaseDragonSprite(page: Parameters<typeof gotoApp>[0]) {
   const stageSprite = page.locator('.dragon-stage__sprite')
@@ -54,6 +54,7 @@ async function expectVotingSpriteImages(page: Parameters<typeof gotoApp>[0], exp
 
 test.describe('dragon shift deployed gameplay', () => {
   test('host and guest can advance through the visible workshop flow', async ({ browser }) => {
+    test.setTimeout(180_000) // sprite generation + LLM judge scoring need extra time
     const host = await newPlayerContext(browser)
     const guest = await newPlayerContext(browser)
 
@@ -75,12 +76,14 @@ test.describe('dragon shift deployed gameplay', () => {
       await expect(guest.page.getByTestId('session-panel')).toContainText('2 / 2 votes submitted')
 
       await host.page.getByTestId('reveal-results-button').click()
-      await waitForNotice(host.page, 'Voting results revealed.')
+      await waitForNotice(host.page, 'Voting finished.')
+
+      await host.page.getByTestId('end-session-button').click()
+      await waitForNotice(host.page, 'Game over ready.')
       await dismissGameOverOverlay(host.page, guest.page)
-      await expect(host.page.getByTestId('session-panel')).toContainText('Workshop results')
+      await expect(host.page.getByTestId('session-panel')).toContainText('Game over')
       await expect(host.page.getByTestId('session-panel')).toContainText('Creativity leaderboard')
-      await expect(host.page.getByTestId('session-panel')).toContainText('Mechanics leaderboard')
-      await expect(guest.page.getByTestId('session-panel')).toContainText('Workshop results')
+      await expect(guest.page.getByTestId('session-panel')).toContainText('Game over')
       await expect(guest.page.getByTestId('session-panel')).toContainText('Creativity leaderboard')
 
       await expect(host.page.getByTestId('archive-panel')).toContainText('Build the workshop archive')
@@ -92,7 +95,7 @@ test.describe('dragon shift deployed gameplay', () => {
       await expect(guest.page.getByTestId('archive-panel')).toContainText('Build the workshop archive')
       await expect(guest.page.getByTestId('build-archive-button')).toHaveCount(0)
 
-      await host.page.getByTestId('reset-workshop-button').click()
+      await host.page.getByTestId('reset-game-button').click()
       await waitForNotice(host.page, 'Workshop reset.')
       await expect(host.page.getByTestId('session-panel')).toContainText(lobbyTitlePattern)
       await expect(guest.page.getByTestId('session-panel')).toContainText(lobbyTitlePattern)
@@ -102,6 +105,7 @@ test.describe('dragon shift deployed gameplay', () => {
   })
 
   test('phase 0 sprite drafts remain visible through later phases without explicit save', async ({ browser }) => {
+    test.setTimeout(180_000) // sprite generation + LLM judge scoring need extra time
     const host = await newPlayerContext(browser)
     const guest = await newPlayerContext(browser)
 
@@ -141,8 +145,8 @@ test.describe('dragon shift deployed gameplay', () => {
       await enterJudge(host.page, guest.page)
       await enterVoting(host.page, guest.page)
 
-      await expectVotingSpriteImages(host.page, 2)
-      await expectVotingSpriteImages(guest.page, 2)
+      await expectVotingSpriteImages(host.page, 8)
+      await expectVotingSpriteImages(guest.page, 8)
     } finally {
       await safeClose(host.context, guest.context)
     }
@@ -286,7 +290,7 @@ test.describe('dragon shift deployed gameplay', () => {
     }
   })
 
-  test('disconnected session can resync after using the session sync control', async ({ browser }) => {
+  test('disconnected session can resync after page reload', async ({ browser }) => {
     const host = await newPlayerContext(browser)
     const guest = await newPlayerContext(browser)
     const lateJoiner = await newPlayerContext(browser)
@@ -312,7 +316,7 @@ test.describe('dragon shift deployed gameplay', () => {
       await joinWorkshop(lateJoiner.page, workshopCode, 'Carol')
       await expect(host.page.getByTestId('session-panel')).toContainText('Players in view: 2')
 
-      await host.page.getByTestId('sync-session-button').click()
+      await host.page.reload()
       await waitForNotice(host.page, 'Session synced.')
 
       await expect(host.page.getByTestId('session-panel')).toContainText('Players in view: 3')
@@ -322,6 +326,7 @@ test.describe('dragon shift deployed gameplay', () => {
   })
 
   test('archive build failure shows degraded-path feedback', async ({ browser }) => {
+    test.setTimeout(180_000) // sprite generation + LLM judge scoring need extra time
     const host = await newPlayerContext(browser)
     const guest = await newPlayerContext(browser)
 
@@ -333,7 +338,10 @@ test.describe('dragon shift deployed gameplay', () => {
       await voteForVisibleDragon(host.page)
       await voteForVisibleDragon(guest.page)
       await host.page.getByTestId('reveal-results-button').click()
-      await waitForNotice(host.page, 'Voting results revealed.')
+      await waitForNotice(host.page, 'Voting finished.')
+
+      await host.page.getByTestId('end-session-button').click()
+      await waitForNotice(host.page, 'Game over ready.')
       await dismissGameOverOverlay(host.page, guest.page)
 
       await host.page.route('**/api/workshops/judge-bundle', async route => {

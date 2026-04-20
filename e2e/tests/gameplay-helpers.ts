@@ -137,15 +137,34 @@ export async function expectToStayOnHome(page: Page) {
 }
 
 export async function voteForVisibleDragon(page: Page) {
-  const voteButton = page.locator('[data-testid^="vote-button-"]').first()
-  await expect(voteButton).toBeVisible()
-  await voteButton.click()
+  const voteButtons = page.locator('[data-testid^="vote-button-"]')
+  await expect(voteButtons.first()).toBeVisible()
+  const count = await voteButtons.count()
+
+  for (let i = 0; i < count; i++) {
+    const button = voteButtons.nth(i)
+    await button.click()
+
+    // Wait briefly then check if a self-vote rejection appeared
+    await page.waitForTimeout(500)
+    const notice = page.getByTestId('notice-bar')
+    const noticeText = (await notice.count()) ? (await notice.textContent()) ?? '' : ''
+    if (noticeText.toLowerCase().includes('cannot vote for your own')) {
+      continue // self-vote rejected, try the next dragon
+    }
+
+    return // vote accepted
+  }
+
+  throw new Error('no valid vote button found (all rejected as self-vote)')
 }
 
 export async function dismissGameOverOverlay(...pages: Page[]) {
   for (const page of pages) {
     const overlay = page.getByTestId('game-over-overlay')
-    await expect(overlay).toBeVisible()
+    // Judge scoring runs asynchronously via LLM (Vertex AI); the overlay
+    // only appears once scores arrive, so allow extra wait time.
+    await expect(overlay).toBeVisible({ timeout: 45_000 })
     await page.getByTestId('game-over-continue-button').click()
     await expect(overlay).toHaveCount(0)
   }
@@ -202,8 +221,9 @@ export async function enterJudge(hostPage: Page, ...otherPages: Page[]) {
   await waitForNotice(hostPage, 'Scoring opened.')
   for (const page of [hostPage, ...otherPages]) {
     await expect(page.locator('body')).toContainText('Scoring', { timeout: 120_000 })
-    await expect(page.getByTestId('end-session-button')).toBeVisible({ timeout: 120_000 })
   }
+  // end-session-button is host-only; only check it on the host page
+  await expect(hostPage.getByTestId('end-session-button')).toBeVisible({ timeout: 120_000 })
 }
 
 export async function enterVoting(hostPage: Page, ...otherPages: Page[]) {
@@ -216,8 +236,14 @@ export async function enterVoting(hostPage: Page, ...otherPages: Page[]) {
 export async function advanceWorkshopToVoting(hostPage: Page, guestPage: Page) {
   await openCharacterCreation(hostPage, guestPage)
 
-  await saveDragonProfile(hostPage, 'A confident coral dragon with striped wings and lantern eyes.')
-  await saveDragonProfile(guestPage, 'A moss-green dragon with wide fins and a comet tail.')
+  await hostPage.getByTestId('dragon-description-input').fill('A confident coral dragon with striped wings and lantern eyes.')
+  await guestPage.getByTestId('dragon-description-input').fill('A moss-green dragon with wide fins and a comet tail.')
+
+  await generateDragonSprites(hostPage)
+  await generateDragonSprites(guestPage)
+
+  await saveDragonProfile(hostPage)
+  await saveDragonProfile(guestPage)
 
   await enterPhase1(hostPage, guestPage)
 
@@ -234,6 +260,6 @@ export async function advanceWorkshopToVoting(hostPage: Page, guestPage: Page) {
   await enterVoting(hostPage, guestPage)
   await expect(hostPage.locator('body')).toContainText('0 / 2 votes submitted')
   await expect(guestPage.locator('body')).toContainText('0 / 2 votes submitted')
-  await expect(hostPage.locator('[data-testid^="vote-button-"]')).toHaveCount(1)
-  await expect(guestPage.locator('[data-testid^="vote-button-"]')).toHaveCount(1)
+  await expect(hostPage.locator('[data-testid^="vote-button-"]')).toHaveCount(2)
+  await expect(guestPage.locator('[data-testid^="vote-button-"]')).toHaveCount(2)
 }
