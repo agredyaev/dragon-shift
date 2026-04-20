@@ -6,6 +6,9 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
+argon2 = { version = "0.5", features = ["std"] }
 base64 = "0.22"
+password-hash = { version = "0.5", features = ["rand_core"] }
+rand_core = { version = "0.6", features = ["std"] }
 thiserror.workspace = true
 url = "2"

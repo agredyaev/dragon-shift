@@ -331,6 +331,7 @@ mod postgres_tests {
             remaining_sprite_regenerations: 1,
             created_at: Utc::now().to_rfc3339(),
             updated_at: Utc::now().to_rfc3339(),
+            owner_account_id: None,
         };
 
         store
@@ -519,6 +520,7 @@ mod postgres_tests {
         session.add_player(SessionPlayer {
             id: "player_1".to_string(),
             name: "Alice".to_string(),
+            account_id: None,
             character_id: Some("character-1".to_string()),
             selected_character: Some(protocol::CharacterProfile {
                 id: "character-1".to_string(),
@@ -542,6 +544,7 @@ mod postgres_tests {
         session.add_player(SessionPlayer {
             id: "player_2".to_string(),
             name: "Bob".to_string(),
+            account_id: None,
             character_id: Some("character-2".to_string()),
             selected_character: Some(protocol::CharacterProfile {
                 id: "character-2".to_string(),

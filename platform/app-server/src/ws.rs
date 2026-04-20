@@ -18,6 +18,7 @@ use tokio::task::JoinHandle;
 use tracing::info;
 
 use crate::app::AppState;
+use crate::auth::SESSION_COOKIE_NAME;
 use crate::cache::{SessionWriteLease, ensure_session_cached, reload_cached_session};
 use crate::helpers::{phase_label, phase_step, random_prefixed_id, to_client_game_state};
 use crate::http::{
@@ -189,6 +190,27 @@ pub(crate) async fn workshop_ws(
             "Too many requests. Please slow down and try again.",
         )
             .into_response();
+    }
+
+    // Soft cookie check: if a session cookie is present in the upgrade
+    // request, verify it is not tampered. Reject tampered cookies but allow
+    // upgrade when no cookie is present (the client will auth via
+    // reconnect_token after the WebSocket is established).
+    {
+        use axum_extra::extract::cookie::SignedCookieJar;
+        let jar = SignedCookieJar::<axum_extra::extract::cookie::Key>::from_headers(
+            &headers,
+            state.config.cookie_key.clone(),
+        );
+        // Only check if the raw Cookie header actually contains our cookie
+        // name — avoids rejecting requests that carry no cookie at all.
+        let raw_cookies = headers
+            .get(axum::http::header::COOKIE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        if raw_cookies.contains(SESSION_COOKIE_NAME) && jar.get(SESSION_COOKIE_NAME).is_none() {
+            return (StatusCode::UNAUTHORIZED, "Invalid session cookie.").into_response();
+        }
     }
 
     ws.on_upgrade(move |socket| handle_workshop_ws(state, socket, client_key))

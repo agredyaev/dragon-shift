@@ -34,6 +34,8 @@ pub enum PersistenceError {
     SessionLeaseTimeout { session_code: String },
     #[error("realtime connection {connection_id} has been retired")]
     RetiredRealtimeConnection { connection_id: String },
+    #[error("account name already in use")]
+    DuplicateAccountName,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -95,6 +97,10 @@ pub struct CharacterRecord {
     pub remaining_sprite_regenerations: u8,
     pub created_at: String,
     pub updated_at: String,
+    /// `None` = starter pool (leasable), `Some(account_id)` = owned by that account.
+    /// Added in migration 0007; pre-0007 rows read back as `None`.
+    #[doc(hidden)]
+    pub owner_account_id: Option<String>,
 }
 
 impl CharacterRecord {
@@ -106,6 +112,31 @@ impl CharacterRecord {
             remaining_sprite_regenerations: self.remaining_sprite_regenerations,
         }
     }
+}
+
+/// Summary row returned by `SessionStore::list_open_workshops`. Captures
+/// only what AccountHome needs to render the lobby list. Intentionally a
+/// plain persistence DTO so the service layer can map it to the protocol's
+/// `OpenWorkshopSummary` without leaking `WorkshopSession` internals.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenWorkshopRecord {
+    pub session_code: String,
+    pub host_name: String,
+    pub player_count: u32,
+    pub created_at: String,
+}
+
+/// Row in the `accounts` table (migration 0007). Never carries plaintext
+/// password; only the argon2id PHC hash produced by `security::hash_password`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountRecord {
+    pub id: String,
+    pub hero: String,
+    pub name: String,
+    pub password_hash: String,
+    pub created_at: String,
+    pub updated_at: String,
+    pub last_login_at: Option<String>,
 }
 
 pub const TIMEOUT_COMPANION_SPRITE_KEY: &str = "timeout_companion";
@@ -141,6 +172,7 @@ pub fn starter_character_defaults() -> Vec<CharacterRecord> {
             remaining_sprite_regenerations: 1,
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
+            owner_account_id: None,
         },
         CharacterRecord {
             id: "starter_moss_forest".to_string(),
@@ -149,6 +181,7 @@ pub fn starter_character_defaults() -> Vec<CharacterRecord> {
             remaining_sprite_regenerations: 1,
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
+            owner_account_id: None,
         },
         CharacterRecord {
             id: "starter_sunset_coral".to_string(),
@@ -157,6 +190,7 @@ pub fn starter_character_defaults() -> Vec<CharacterRecord> {
             remaining_sprite_regenerations: 1,
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
+            owner_account_id: None,
         },
         CharacterRecord {
             id: "starter_midnight_moon".to_string(),
@@ -165,6 +199,7 @@ pub fn starter_character_defaults() -> Vec<CharacterRecord> {
             remaining_sprite_regenerations: 1,
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
+            owner_account_id: None,
         },
     ]
 }
@@ -268,6 +303,24 @@ fn parse_lease_deadline(value: &str) -> Option<DateTime<Utc>> {
 
 fn active_realtime_connection_cutoff() -> DateTime<Utc> {
     Utc::now() - chrono::Duration::seconds(REALTIME_CONNECTION_TTL_SECONDS)
+}
+
+/// Map a `WorkshopSession` to the summary record returned by
+/// `list_open_workshops`. Returns `None` when the session has no resolvable
+/// host (missing `host_player_id` or the host isn't in the player map) —
+/// such sessions are unrenderable on AccountHome and should be skipped.
+fn open_workshop_summary_from_session(session: &WorkshopSession) -> Option<OpenWorkshopRecord> {
+    let host_name = session
+        .host_player_id
+        .as_ref()
+        .and_then(|id| session.players.get(id))
+        .map(|player| player.name.clone())?;
+    Some(OpenWorkshopRecord {
+        session_code: session.code.0.clone(),
+        host_name,
+        player_count: session.players.len() as u32,
+        created_at: session.created_at.to_rfc3339(),
+    })
 }
 
 pub trait SessionStore: Send + Sync {
@@ -414,6 +467,72 @@ pub trait SessionStore: Send + Sync {
         &self,
         notification: &SessionUpdateNotification,
     ) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + '_>>;
+
+    // -----------------------------------------------------------------
+    // Accounts (added in migration 0007 / session 3)
+    // -----------------------------------------------------------------
+
+    /// Insert a new account row. Returns `DuplicateAccountName` if the
+    /// case-insensitive unique index on `accounts(LOWER(name))` is violated.
+    fn insert_account(
+        &self,
+        account: &AccountRecord,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + '_>>;
+
+    /// Look up an account by case-insensitive name. Returns `None` if no match.
+    fn find_account_by_name_lower(
+        &self,
+        name: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<AccountRecord>, PersistenceError>> + Send + '_>>;
+
+    /// Look up an account by id. Returns `None` if the id is unknown.
+    fn find_account_by_id(
+        &self,
+        account_id: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<AccountRecord>, PersistenceError>> + Send + '_>>;
+
+    /// Stamp the `last_login_at` column with the supplied RFC3339 timestamp.
+    /// No-op if the account does not exist (idempotent best-effort).
+    fn touch_last_login(
+        &self,
+        account_id: &str,
+        now: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + '_>>;
+
+    // -----------------------------------------------------------------
+    // Owner-aware character queries (added in migration 0007 / session 3)
+    // -----------------------------------------------------------------
+
+    /// List characters owned by the given account, oldest-first.
+    /// Does NOT return starter-pool rows (`owner_account_id IS NULL`).
+    fn list_characters_by_owner(
+        &self,
+        owner_account_id: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<CharacterRecord>, PersistenceError>> + Send + '_>>;
+
+    /// Count characters owned by the given account. Used by the service layer
+    /// to enforce `domain::MAX_CHARACTERS_PER_ACCOUNT`.
+    fn count_characters_by_owner(
+        &self,
+        owner_account_id: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<u32, PersistenceError>> + Send + '_>>;
+
+    /// Delete a character owned by the given account. Returns `true` if a row
+    /// was deleted, `false` if the id was not found or belonged to another
+    /// account (the service layer maps `false` → 404).
+    fn delete_character_by_owner(
+        &self,
+        character_id: &str,
+        owner_account_id: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, PersistenceError>> + Send + '_>>;
+
+    /// List sessions currently in `Phase::Lobby` for AccountHome's "open
+    /// workshops" list. Ordered newest-first by `created_at` so the UI
+    /// surfaces the freshest lobbies. Only returns summary fields; callers
+    /// needing full session state should still go through `load_session_by_code`.
+    fn list_open_workshops(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<OpenWorkshopRecord>, PersistenceError>> + Send + '_>>;
 }
 
 #[derive(Debug, Default)]
@@ -424,6 +543,7 @@ pub struct InMemorySessionStore {
     identities_by_token: RwLock<HashMap<String, PlayerIdentity>>,
     app_sprite_defaults_by_key: RwLock<HashMap<String, AppSpriteDefaults>>,
     characters_by_id: RwLock<HashMap<String, CharacterRecord>>,
+    accounts_by_id: RwLock<HashMap<String, AccountRecord>>,
     session_leases: RwLock<HashMap<String, (String, String)>>,
     realtime_connections_by_id:
         RwLock<HashMap<String, (RealtimeConnectionRegistration, DateTime<Utc>)>>,
@@ -535,9 +655,10 @@ impl PostgresSessionStore {
                     sleepy_sprite,
                     remaining_sprite_regenerations,
                     created_at,
-                    updated_at
+                    updated_at,
+                    owner_account_id
                 )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
                 ON CONFLICT (character_id) DO UPDATE SET
                     description = EXCLUDED.description,
                     neutral_sprite = EXCLUDED.neutral_sprite,
@@ -546,7 +667,8 @@ impl PostgresSessionStore {
                     sleepy_sprite = EXCLUDED.sleepy_sprite,
                     remaining_sprite_regenerations = EXCLUDED.remaining_sprite_regenerations,
                     created_at = EXCLUDED.created_at,
-                    updated_at = EXCLUDED.updated_at
+                    updated_at = EXCLUDED.updated_at,
+                    owner_account_id = EXCLUDED.owner_account_id
             ",
         )
         .bind(&character.id)
@@ -558,6 +680,7 @@ impl PostgresSessionStore {
         .bind(i16::from(character.remaining_sprite_regenerations))
         .bind(&character.created_at)
         .bind(&character.updated_at)
+        .bind(&character.owner_account_id)
         .execute(&mut **tx)
         .await?;
         Ok(())
@@ -580,6 +703,24 @@ impl PostgresSessionStore {
                 .clamp(0, u8::MAX as i16) as u8,
             created_at: row.get("created_at"),
             updated_at: row.get("updated_at"),
+            owner_account_id: row
+                .try_get::<Option<String>, _>("owner_account_id")
+                .ok()
+                .flatten(),
+        }
+    }
+
+    fn account_from_row(row: &sqlx::postgres::PgRow) -> AccountRecord {
+        use sqlx::Row;
+
+        AccountRecord {
+            id: row.get("account_id"),
+            hero: row.get("hero"),
+            name: row.get("name"),
+            password_hash: row.get("password_hash"),
+            created_at: row.get("created_at"),
+            updated_at: row.get("updated_at"),
+            last_login_at: row.get("last_login_at"),
         }
     }
 
@@ -1395,7 +1536,8 @@ impl SessionStore for PostgresSessionStore {
                         sleepy_sprite,
                         remaining_sprite_regenerations,
                         created_at,
-                        updated_at
+                        updated_at,
+                        owner_account_id
                     FROM characters
                     WHERE character_id = $1
                 ",
@@ -1423,7 +1565,8 @@ impl SessionStore for PostgresSessionStore {
                         sleepy_sprite,
                         remaining_sprite_regenerations,
                         created_at,
-                        updated_at
+                        updated_at,
+                        owner_account_id
                     FROM characters
                     ORDER BY created_at ASC, character_id ASC
                 ",
@@ -1448,6 +1591,229 @@ impl SessionStore for PostgresSessionStore {
             Self::save_character_in_tx(&mut tx, &character).await?;
             tx.commit().await?;
             Ok(())
+        })
+    }
+
+    fn insert_account(
+        &self,
+        account: &AccountRecord,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + '_>> {
+        let account = account.clone();
+        Box::pin(async move {
+            sqlx::query(
+                "
+                    INSERT INTO accounts (
+                        account_id,
+                        hero,
+                        name,
+                        password_hash,
+                        created_at,
+                        updated_at,
+                        last_login_at
+                    )
+                    VALUES ($1, $2, $3, $4, $5, $6, $7)
+                ",
+            )
+            .bind(&account.id)
+            .bind(&account.hero)
+            .bind(&account.name)
+            .bind(&account.password_hash)
+            .bind(&account.created_at)
+            .bind(&account.updated_at)
+            .bind(&account.last_login_at)
+            .execute(&self.pool)
+            .await
+            .map_err(|error| match error {
+                sqlx::Error::Database(db_error)
+                    if db_error.constraint() == Some("accounts_name_lower_idx") =>
+                {
+                    PersistenceError::DuplicateAccountName
+                }
+                other => PersistenceError::Sqlx(other),
+            })?;
+            Ok(())
+        })
+    }
+
+    fn find_account_by_name_lower(
+        &self,
+        name: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<AccountRecord>, PersistenceError>> + Send + '_>>
+    {
+        let name = name.to_string();
+        Box::pin(async move {
+            let row = sqlx::query(
+                "
+                    SELECT account_id, hero, name, password_hash,
+                           created_at, updated_at, last_login_at
+                    FROM accounts
+                    WHERE LOWER(name) = LOWER($1)
+                ",
+            )
+            .bind(&name)
+            .fetch_optional(&self.pool)
+            .await?;
+            Ok(row.map(|row| Self::account_from_row(&row)))
+        })
+    }
+
+    fn find_account_by_id(
+        &self,
+        account_id: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<AccountRecord>, PersistenceError>> + Send + '_>>
+    {
+        let account_id = account_id.to_string();
+        Box::pin(async move {
+            let row = sqlx::query(
+                "
+                    SELECT account_id, hero, name, password_hash,
+                           created_at, updated_at, last_login_at
+                    FROM accounts
+                    WHERE account_id = $1
+                ",
+            )
+            .bind(&account_id)
+            .fetch_optional(&self.pool)
+            .await?;
+            Ok(row.map(|row| Self::account_from_row(&row)))
+        })
+    }
+
+    fn touch_last_login(
+        &self,
+        account_id: &str,
+        now: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + '_>> {
+        let account_id = account_id.to_string();
+        let now = now.to_string();
+        Box::pin(async move {
+            sqlx::query(
+                "
+                    UPDATE accounts
+                    SET last_login_at = $2, updated_at = $2
+                    WHERE account_id = $1
+                ",
+            )
+            .bind(&account_id)
+            .bind(&now)
+            .execute(&self.pool)
+            .await?;
+            Ok(())
+        })
+    }
+
+    fn list_characters_by_owner(
+        &self,
+        owner_account_id: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<CharacterRecord>, PersistenceError>> + Send + '_>>
+    {
+        let owner = owner_account_id.to_string();
+        Box::pin(async move {
+            let rows = sqlx::query(
+                "
+                    SELECT
+                        character_id,
+                        description,
+                        neutral_sprite,
+                        happy_sprite,
+                        angry_sprite,
+                        sleepy_sprite,
+                        remaining_sprite_regenerations,
+                        created_at,
+                        updated_at,
+                        owner_account_id
+                    FROM characters
+                    WHERE owner_account_id = $1
+                    ORDER BY created_at ASC, character_id ASC
+                ",
+            )
+            .bind(&owner)
+            .fetch_all(&self.pool)
+            .await?;
+            Ok(rows
+                .into_iter()
+                .map(|row| Self::character_from_row(&row))
+                .collect())
+        })
+    }
+
+    fn count_characters_by_owner(
+        &self,
+        owner_account_id: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<u32, PersistenceError>> + Send + '_>> {
+        let owner = owner_account_id.to_string();
+        Box::pin(async move {
+            use sqlx::Row;
+            let row = sqlx::query(
+                "SELECT COUNT(*)::BIGINT AS cnt FROM characters WHERE owner_account_id = $1",
+            )
+            .bind(&owner)
+            .fetch_one(&self.pool)
+            .await?;
+            let count: i64 = row.get("cnt");
+            Ok(count.max(0) as u32)
+        })
+    }
+
+    fn delete_character_by_owner(
+        &self,
+        character_id: &str,
+        owner_account_id: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, PersistenceError>> + Send + '_>> {
+        let character_id = character_id.to_string();
+        let owner = owner_account_id.to_string();
+        Box::pin(async move {
+            let result = sqlx::query(
+                "DELETE FROM characters WHERE character_id = $1 AND owner_account_id = $2",
+            )
+            .bind(&character_id)
+            .bind(&owner)
+            .execute(&self.pool)
+            .await?;
+            Ok(result.rows_affected() > 0)
+        })
+    }
+
+    fn list_open_workshops(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<OpenWorkshopRecord>, PersistenceError>> + Send + '_>>
+    {
+        Box::pin(async move {
+            // `payload->>'phase'` reads the serde-lowercased Phase variant
+            // (see `protocol::Phase`). Ordering by the top-level `updated_at`
+            // TEXT column is safe because it's always RFC3339. We compute
+            // player_count and host_name from the JSON payload because
+            // sessions are stored as opaque blobs; the set of in-lobby
+            // sessions is expected to be small, so the per-row JSON parse
+            // cost is acceptable. Downstream callers should treat this as
+            // a lobby-listing read, not a hot path.
+            use sqlx::Row;
+            let rows = sqlx::query(
+                "
+                    SELECT payload
+                    FROM workshop_sessions
+                    WHERE payload->>'phase' = 'lobby'
+                    ORDER BY updated_at DESC
+                    LIMIT 100
+                ",
+            )
+            .fetch_all(&self.pool)
+            .await?;
+            let mut summaries = Vec::with_capacity(rows.len());
+            for row in rows {
+                let payload: sqlx::types::Json<serde_json::Value> = row.get("payload");
+                let session: WorkshopSession = match serde_json::from_value(payload.0) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        tracing::warn!(%error, "skipping malformed workshop_sessions.payload");
+                        continue;
+                    }
+                };
+                if let Some(summary) = open_workshop_summary_from_session(&session) {
+                    summaries.push(summary);
+                }
+            }
+            Ok(summaries)
         })
     }
 }
@@ -2230,6 +2596,173 @@ impl SessionStore for InMemorySessionStore {
             Ok(())
         })
     }
+
+    fn insert_account(
+        &self,
+        account: &AccountRecord,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + '_>> {
+        let account = account.clone();
+        Box::pin(async move {
+            let mut accounts = self
+                .accounts_by_id
+                .write()
+                .map_err(|_| PersistenceError::LockPoisoned)?;
+            let lower_name = account.name.to_lowercase();
+            if accounts
+                .values()
+                .any(|existing| existing.name.to_lowercase() == lower_name)
+            {
+                return Err(PersistenceError::DuplicateAccountName);
+            }
+            accounts.insert(account.id.clone(), account);
+            Ok(())
+        })
+    }
+
+    fn find_account_by_name_lower(
+        &self,
+        name: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<AccountRecord>, PersistenceError>> + Send + '_>>
+    {
+        let name_lower = name.to_lowercase();
+        Box::pin(async move {
+            let accounts = self
+                .accounts_by_id
+                .read()
+                .map_err(|_| PersistenceError::LockPoisoned)?;
+            Ok(accounts
+                .values()
+                .find(|account| account.name.to_lowercase() == name_lower)
+                .cloned())
+        })
+    }
+
+    fn find_account_by_id(
+        &self,
+        account_id: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<AccountRecord>, PersistenceError>> + Send + '_>>
+    {
+        let account_id = account_id.to_string();
+        Box::pin(async move {
+            Ok(self
+                .accounts_by_id
+                .read()
+                .map_err(|_| PersistenceError::LockPoisoned)?
+                .get(&account_id)
+                .cloned())
+        })
+    }
+
+    fn touch_last_login(
+        &self,
+        account_id: &str,
+        now: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + '_>> {
+        let account_id = account_id.to_string();
+        let now = now.to_string();
+        Box::pin(async move {
+            if let Some(account) = self
+                .accounts_by_id
+                .write()
+                .map_err(|_| PersistenceError::LockPoisoned)?
+                .get_mut(&account_id)
+            {
+                account.last_login_at = Some(now.clone());
+                account.updated_at = now;
+            }
+            Ok(())
+        })
+    }
+
+    fn list_characters_by_owner(
+        &self,
+        owner_account_id: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<CharacterRecord>, PersistenceError>> + Send + '_>>
+    {
+        let owner = owner_account_id.to_string();
+        Box::pin(async move {
+            let mut characters = self
+                .characters_by_id
+                .read()
+                .map_err(|_| PersistenceError::LockPoisoned)?
+                .values()
+                .filter(|record| record.owner_account_id.as_deref() == Some(owner.as_str()))
+                .cloned()
+                .collect::<Vec<_>>();
+            characters.sort_by(|left, right| {
+                left.created_at
+                    .cmp(&right.created_at)
+                    .then_with(|| left.id.cmp(&right.id))
+            });
+            Ok(characters)
+        })
+    }
+
+    fn count_characters_by_owner(
+        &self,
+        owner_account_id: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<u32, PersistenceError>> + Send + '_>> {
+        let owner = owner_account_id.to_string();
+        Box::pin(async move {
+            let count = self
+                .characters_by_id
+                .read()
+                .map_err(|_| PersistenceError::LockPoisoned)?
+                .values()
+                .filter(|record| record.owner_account_id.as_deref() == Some(owner.as_str()))
+                .count();
+            Ok(count as u32)
+        })
+    }
+
+    fn delete_character_by_owner(
+        &self,
+        character_id: &str,
+        owner_account_id: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, PersistenceError>> + Send + '_>> {
+        let character_id = character_id.to_string();
+        let owner = owner_account_id.to_string();
+        Box::pin(async move {
+            let mut characters = self
+                .characters_by_id
+                .write()
+                .map_err(|_| PersistenceError::LockPoisoned)?;
+            match characters.get(&character_id) {
+                Some(record) if record.owner_account_id.as_deref() == Some(owner.as_str()) => {
+                    characters.remove(&character_id);
+                    Ok(true)
+                }
+                _ => Ok(false),
+            }
+        })
+    }
+
+    fn list_open_workshops(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<OpenWorkshopRecord>, PersistenceError>> + Send + '_>>
+    {
+        Box::pin(async move {
+            let guard = self
+                .sessions_by_code
+                .read()
+                .map_err(|_| PersistenceError::LockPoisoned)?;
+            let mut summaries: Vec<OpenWorkshopRecord> = guard
+                .values()
+                .filter(|session| session.phase == protocol::Phase::Lobby)
+                .filter_map(open_workshop_summary_from_session)
+                .collect();
+            // Newest-first by created_at, breaking ties on session_code for
+            // determinism. Matches the Postgres impl's ordering goal.
+            summaries.sort_by(|left, right| {
+                right
+                    .created_at
+                    .cmp(&left.created_at)
+                    .then_with(|| left.session_code.cmp(&right.session_code))
+            });
+            summaries.truncate(100);
+            Ok(summaries)
+        })
+    }
 }
 
 async fn rollback_in_memory_session(
@@ -2368,6 +2901,7 @@ mod tests {
         session.add_player(SessionPlayer {
             id: "player-1".to_string(),
             name: "Alice".to_string(),
+            account_id: None,
             character_id: Some("character-1".to_string()),
             selected_character: Some(protocol::CharacterProfile {
                 id: "character-1".to_string(),
@@ -2433,6 +2967,7 @@ mod tests {
             remaining_sprite_regenerations: 1,
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
+            owner_account_id: None,
         };
 
         store

@@ -19,6 +19,7 @@ authors = ["dragon-switch migration workspace"]
 
 [workspace.dependencies]
 axum = "0.8.8"
+axum-extra = { version = "0.10", features = ["cookie", "cookie-signed"] }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

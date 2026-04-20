@@ -49,7 +49,9 @@ pub enum CoordinatorType {
 #[serde(rename_all = "camelCase")]
 pub enum SessionCommand {
     Join,
-    StartPhase0,
+    // Session 4 / refactor: `StartPhase0` removed. Character creation no longer
+    // happens inside a workshop; hosts transition `Lobby→Phase1` directly via
+    // `StartPhase1`.
     SelectCharacter,
     SubmitObservation,
     StartPhase1,
@@ -419,7 +421,10 @@ impl Default for WorkshopCreateConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CreateWorkshopRequest {
-    pub name: String,
+    /// Ignored by the server (name is derived from the authenticated account).
+    /// Kept as optional for backward compatibility with older clients.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     pub config: WorkshopCreateConfig,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub character_id: Option<String>,
@@ -936,6 +941,76 @@ pub fn create_session_settings(config: &WorkshopCreateConfig) -> SessionSettings
     );
 
     SessionSettings { phases }
+}
+
+// ---------------------------------------------------------------------------
+// Accounts & character ownership (refactor-plan.md §3)
+// ---------------------------------------------------------------------------
+
+/// Public-facing account profile. Never carries the password hash.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountProfile {
+    pub id: String,
+    pub hero: String,
+    pub name: String,
+}
+
+/// Combined sign-in / sign-up form submission. Server disambiguates:
+/// - name free → create account
+/// - name exists + password matches → login
+/// - name exists + password mismatch → 401
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuthRequest {
+    pub hero: String,
+    pub name: String,
+    pub password: String,
+}
+
+/// Outcome of a successful `/api/auth` call. Cookie is set separately by the
+/// HTTP layer; this body is the account snapshot for the client.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuthResponse {
+    pub account: AccountProfile,
+    pub created: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateCharacterRequest {
+    pub description: String,
+    pub sprites: SpriteSet,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MyCharactersResponse {
+    pub characters: Vec<CharacterProfile>,
+    pub limit: u8,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EligibleCharactersResponse {
+    pub characters: Vec<CharacterProfile>,
+}
+
+/// One row in the "open workshops" list shown on AccountHome.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenWorkshopSummary {
+    pub session_code: String,
+    pub host_name: String,
+    pub player_count: u32,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListOpenWorkshopsResponse {
+    pub workshops: Vec<OpenWorkshopSummary>,
 }
 
 #[cfg(test)]

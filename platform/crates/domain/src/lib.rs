@@ -114,6 +114,10 @@ pub enum ActionBlockReason {
 pub struct SessionPlayer {
     pub id: String,
     pub name: String,
+    /// Account id that owns this player slot (session 3 / refactor).
+    /// `None` = legacy anonymous player or starter-lease join; `Some` = signed-in account.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub character_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -125,6 +129,41 @@ pub struct SessionPlayer {
     pub current_dragon_id: Option<String>,
     pub achievements: Vec<String>,
     pub joined_at: DateTime<Utc>,
+}
+
+/// Maximum number of characters a single account may own.
+/// Enforced by the service layer via `count_characters_by_owner`.
+pub const MAX_CHARACTERS_PER_ACCOUNT: usize = 5;
+
+/// Account domain entity (session 3 / refactor).
+///
+/// Distinct from the persistence `AccountRecord`: this is the in-memory
+/// representation used by domain / service logic and does NOT expose the
+/// password hash. Mapping is performed at the service boundary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Account {
+    pub id: String,
+    /// Hero archetype / avatar identifier chosen at sign-up.
+    pub hero: String,
+    /// Display name. Uniqueness is enforced case-insensitively at the
+    /// persistence layer via `accounts_name_lower_idx`.
+    pub name: String,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Errors produced by account-centric domain operations.
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum AccountError {
+    #[error("an account with this name already exists")]
+    DuplicateName,
+    #[error("invalid credentials")]
+    InvalidCredentials,
+    #[error("account not found")]
+    NotFound,
+    #[error("character limit reached ({max} characters per account)")]
+    CharacterLimitReached { max: usize },
+    #[error("character does not belong to this account")]
+    CharacterNotOwned,
 }
 
 pub struct SessionSummary {
@@ -175,6 +214,11 @@ pub enum DomainError {
     ActionNotAllowed,
     #[error("player is not assigned to a dragon")]
     DragonNotAssigned,
+    /// Session 3: reserved for the strict `begin_phase1` rewrite landing in
+    /// session 4. No production path constructs this yet; adding the variant
+    /// early lets downstream pattern matches compile with an explicit arm.
+    #[error("phase1 transition blocked; players have not selected a character: {players:?}")]
+    MissingSelectedCharacter { players: Vec<String> },
 }
 
 impl WorkshopSession {
@@ -251,6 +295,20 @@ impl WorkshopSession {
     }
 
     pub fn begin_phase1(&mut self, assignments: &[Phase1Assignment]) -> Result<(), DomainError> {
+        // Strict: every player must have selected a character before Phase1 begins.
+        // The old fallback to `default_pet_description` is removed (session 4 / refactor):
+        // character creation is no longer part of the workshop lifecycle, so a missing
+        // selection is a programmer error surfaced to the host as a validation failure.
+        let missing: Vec<String> = self
+            .players
+            .values()
+            .filter(|player| player.selected_character.is_none())
+            .map(|player| player.id.clone())
+            .collect();
+        if !missing.is_empty() {
+            return Err(DomainError::MissingSelectedCharacter { players: missing });
+        }
+
         self.transition_to(Phase::Phase1)?;
         self.time = 16; // tick 16 = hour 8 (daytime start)
         self.voting = None;
@@ -268,7 +326,7 @@ impl WorkshopSession {
                     .selected_character
                     .as_ref()
                     .map(|character| character.description.clone())
-                    .unwrap_or_else(|| default_pet_description(&player.name));
+                    .expect("selected_character presence enforced by begin_phase1 guard above");
                 player.current_dragon_id = Some(assignment.dragon_id.clone());
                 self.dragons.insert(
                     assignment.dragon_id.clone(),
@@ -908,7 +966,7 @@ impl WorkshopSession {
     pub fn phase_duration_minutes(&self, phase: Phase) -> u32 {
         match phase {
             Phase::Lobby => 0,
-            Phase::Phase0 => self.config.phase0_minutes,
+            Phase::Phase0 => 0,
             Phase::Phase1 => self.config.phase1_minutes,
             Phase::Handover | Phase::Phase2 => self.config.phase2_minutes,
             Phase::Judge | Phase::Voting | Phase::End => 0,
@@ -1138,11 +1196,13 @@ impl WorkshopSession {
 }
 
 pub fn can_transition(current: Phase, next: Phase) -> bool {
+    // Session 4 / refactor: `Lobby→Phase0` and `Phase0→Phase1` edges are removed.
+    // `Phase::Phase0` is retained only for deserializing legacy persisted sessions;
+    // it is no longer reachable via the FSM. Hosts transition directly `Lobby→Phase1`
+    // via `begin_phase1`.
     matches!(
         (current, next),
-        (Phase::Lobby, Phase::Phase0)
-            | (Phase::Lobby, Phase::Phase1)
-            | (Phase::Phase0, Phase::Phase1)
+        (Phase::Lobby, Phase::Phase1)
             | (Phase::Phase1, Phase::Handover)
             | (Phase::Handover, Phase::Phase2)
             | (Phase::Phase2, Phase::Judge)
@@ -1182,12 +1242,6 @@ fn ambient_emotion(dragon: &SessionDragon) -> DragonEmotion {
     } else {
         DragonEmotion::Neutral
     }
-}
-
-fn default_pet_description(player_name: &str) -> String {
-    format!(
-        "A plain training-manikin dragon for {player_name}: neutral gray scales, simple proportions, and no distinctive personality yet."
-    )
 }
 
 fn random_dragon_name() -> String {
@@ -1233,6 +1287,7 @@ fn random_play_type() -> PlayType {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use protocol::SpriteSet;
 
     fn config() -> WorkshopCreateConfig {
         WorkshopCreateConfig {
@@ -1247,14 +1302,30 @@ mod tests {
     }
 
     fn player(id: &str, connected: bool, joined_at_seconds: i64) -> SessionPlayer {
+        // Session 4 / refactor: `begin_phase1` is now strict and requires every
+        // player to have `selected_character.is_some()`. The test helper now
+        // pre-populates a deterministic `CharacterProfile` so existing tests
+        // that call `begin_phase1` continue to work. Individual tests that need
+        // a missing-selection scenario can clear this field after construction.
         SessionPlayer {
             id: id.to_string(),
             name: format!("player-{id}"),
-            character_id: None,
-            selected_character: None,
+            account_id: None,
+            character_id: Some(format!("character-{id}")),
+            selected_character: Some(CharacterProfile {
+                id: format!("character-{id}"),
+                description: format!("test character for player-{id}"),
+                sprites: SpriteSet {
+                    neutral: "neutral".to_string(),
+                    happy: "happy".to_string(),
+                    angry: "angry".to_string(),
+                    sleepy: "sleepy".to_string(),
+                },
+                remaining_sprite_regenerations: 1,
+            }),
             is_host: false,
             is_connected: connected,
-            is_ready: false,
+            is_ready: true,
             score: 0,
             current_dragon_id: None,
             achievements: Vec::new(),
@@ -1262,12 +1333,10 @@ mod tests {
         }
     }
 
-    fn enter_phase0(session: &mut WorkshopSession) {
-        session.transition_to(Phase::Phase0).expect("enter phase0");
-    }
-
     #[test]
-    fn allows_valid_lobby_to_phase0_transition() {
+    fn rejects_lobby_to_phase0_transition_after_refactor() {
+        // Session 4 / refactor: `Lobby → Phase0` edge removed from the FSM.
+        // `Phase::Phase0` is retained only for legacy deserialization.
         let mut session = WorkshopSession::new(
             Uuid::new_v4(),
             SessionCode("123456".into()),
@@ -1277,8 +1346,14 @@ mod tests {
 
         let result = session.transition_to(Phase::Phase0);
 
-        assert!(result.is_ok());
-        assert_eq!(session.phase, Phase::Phase0);
+        assert!(matches!(
+            result,
+            Err(DomainError::InvalidSessionTransition {
+                from: Phase::Lobby,
+                to: Phase::Phase0,
+            })
+        ));
+        assert_eq!(session.phase, Phase::Lobby);
     }
 
     #[test]
@@ -1380,7 +1455,7 @@ mod tests {
         p2.achievements = vec!["playful_spirit".into()];
         session.add_player(p1);
         session.add_player(p2);
-        enter_phase0(&mut session);
+
 
         let result = session.begin_phase1(&[
             Phase1Assignment {
@@ -1428,9 +1503,11 @@ mod tests {
         assert_eq!(dragon_a.creator_instructions, "Curious cave dragon");
         assert!(dragon_a.discovery_observations.is_empty());
         let dragon_b = session.dragons.get("dragon-b").expect("dragon b");
+        // Session 4 / refactor: `default_pet_description` fallback removed.
+        // p2 now carries the default test character from the `player()` helper.
         assert_eq!(
             dragon_b.creator_instructions,
-            "A plain training-manikin dragon for player-p2: neutral gray scales, simple proportions, and no distinctive personality yet."
+            "test character for player-p2"
         );
     }
 
@@ -1443,7 +1520,7 @@ mod tests {
             config(),
         );
         session.add_player(player("p1", true, 10));
-        enter_phase0(&mut session);
+
         session
             .begin_phase1(&[Phase1Assignment {
                 player_id: "p1".into(),
@@ -1514,7 +1591,7 @@ mod tests {
             config(),
         );
         session.add_player(player("p1", true, 10));
-        enter_phase0(&mut session);
+
         session
             .begin_phase1(&[Phase1Assignment {
                 player_id: "p1".into(),
@@ -1545,7 +1622,7 @@ mod tests {
         p1.is_ready = true;
         session.add_player(p1);
         session.add_player(player("p2", true, 20));
-        enter_phase0(&mut session);
+
         session
             .begin_phase1(&[
                 Phase1Assignment {
@@ -1608,7 +1685,7 @@ mod tests {
             config(),
         );
         session.add_player(player("p1", false, 10));
-        enter_phase0(&mut session);
+
         session
             .begin_phase1(&[Phase1Assignment {
                 player_id: "p1".into(),
@@ -1634,7 +1711,7 @@ mod tests {
             config(),
         );
         session.add_player(player("p1", true, 10));
-        enter_phase0(&mut session);
+
         session
             .begin_phase1(&[Phase1Assignment {
                 player_id: "p1".into(),
@@ -1664,7 +1741,7 @@ mod tests {
         );
         session.add_player(player("p1", true, 10));
         session.add_player(player("p2", true, 20));
-        enter_phase0(&mut session);
+
         session
             .begin_phase1(&[
                 Phase1Assignment {
@@ -1723,7 +1800,7 @@ mod tests {
             config(),
         );
         session.add_player(player("p1", true, 10));
-        enter_phase0(&mut session);
+
         session
             .begin_phase1(&[Phase1Assignment {
                 player_id: "p1".into(),
@@ -1761,7 +1838,7 @@ mod tests {
         );
         session.add_player(player("p1", true, 10));
         session.add_player(player("p2", true, 20));
-        enter_phase0(&mut session);
+
         session
             .begin_phase1(&[
                 Phase1Assignment {
@@ -1795,7 +1872,7 @@ mod tests {
         );
         session.add_player(player("p1", true, 10));
         session.add_player(player("p2", true, 20));
-        enter_phase0(&mut session);
+
         session
             .begin_phase1(&[
                 Phase1Assignment {
@@ -1835,7 +1912,7 @@ mod tests {
         );
         session.add_player(player("p1", true, 10));
         session.add_player(player("p2", true, 20));
-        enter_phase0(&mut session);
+
         session
             .begin_phase1(&[
                 Phase1Assignment {
@@ -1880,7 +1957,7 @@ mod tests {
         );
         session.add_player(player("p1", true, 10));
         session.add_player(player("p2", true, 20));
-        enter_phase0(&mut session);
+
         session
             .begin_phase1(&[
                 Phase1Assignment {
@@ -1914,7 +1991,7 @@ mod tests {
         );
         session.add_player(player("p1", true, 10));
         session.add_player(player("p2", true, 20));
-        enter_phase0(&mut session);
+
         session
             .begin_phase1(&[
                 Phase1Assignment {
@@ -1957,7 +2034,7 @@ mod tests {
         );
         session.add_player(player("p1", true, 10));
         session.add_player(player("p2", true, 20));
-        enter_phase0(&mut session);
+
         session
             .begin_phase1(&[
                 Phase1Assignment {
@@ -2034,7 +2111,7 @@ mod tests {
             config(),
         );
         session.add_player(player("p1", true, 10));
-        enter_phase0(&mut session);
+
         session
             .begin_phase1(&[Phase1Assignment {
                 player_id: "p1".into(),
@@ -2066,7 +2143,7 @@ mod tests {
             config(),
         );
         session.add_player(player("p1", true, 10));
-        enter_phase0(&mut session);
+
         session
             .begin_phase1(&[Phase1Assignment {
                 player_id: "p1".into(),
@@ -2097,7 +2174,7 @@ mod tests {
             config(),
         );
         session.add_player(player("p1", true, 10));
-        enter_phase0(&mut session);
+
         session
             .begin_phase1(&[Phase1Assignment {
                 player_id: "p1".into(),
@@ -2129,7 +2206,7 @@ mod tests {
             config(),
         );
         session.add_player(player("p1", true, 10));
-        enter_phase0(&mut session);
+
         session
             .begin_phase1(&[Phase1Assignment {
                 player_id: "p1".into(),
@@ -2173,7 +2250,7 @@ mod tests {
             config(),
         );
         session.add_player(player("p1", true, 10));
-        enter_phase0(&mut session);
+
         session
             .begin_phase1(&[Phase1Assignment {
                 player_id: "p1".into(),
@@ -3528,7 +3605,7 @@ mod tests {
         let mut p1 = player("p1", false, 10); // disconnected
         p1.is_connected = false;
         s.add_player(p1);
-        enter_phase0(&mut s);
+
         s.begin_phase1(&[Phase1Assignment {
             player_id: "p1".into(),
             dragon_id: "d1".into(),
@@ -3720,7 +3797,7 @@ mod tests {
         );
         s.add_player(player("p1", true, 10));
         s.add_player(player("p2", true, 20));
-        enter_phase0(&mut s);
+
         s.begin_phase1(&[
             Phase1Assignment {
                 player_id: "p1".into(),
@@ -3873,7 +3950,7 @@ mod tests {
             config(),
         );
         session.add_player(player("p1", true, 10));
-        enter_phase0(&mut session);
+
         session
             .begin_phase1(&[Phase1Assignment {
                 player_id: "p1".into(),
@@ -3933,8 +4010,9 @@ mod tests {
 
     #[test]
     fn validator9_all_valid_transitions_accepted() {
-        assert!(can_transition(Phase::Lobby, Phase::Phase0));
-        assert!(can_transition(Phase::Phase0, Phase::Phase1));
+        // Session 4 / refactor: `Lobby → Phase0` and `Phase0 → Phase1` removed;
+        // `Lobby → Phase1` is now the only lobby exit.
+        assert!(can_transition(Phase::Lobby, Phase::Phase1));
         assert!(can_transition(Phase::Phase1, Phase::Handover));
         assert!(can_transition(Phase::Handover, Phase::Phase2));
         assert!(can_transition(Phase::Phase2, Phase::Voting));
@@ -3949,6 +4027,9 @@ mod tests {
         assert!(!can_transition(Phase::Phase1, Phase::Phase2));
         assert!(!can_transition(Phase::Phase2, Phase::End));
         assert!(!can_transition(Phase::Lobby, Phase::End));
+        // Session 4 / refactor: Phase0 edges no longer allowed.
+        assert!(!can_transition(Phase::Lobby, Phase::Phase0));
+        assert!(!can_transition(Phase::Phase0, Phase::Phase1));
         // Backwards
         assert!(!can_transition(Phase::Phase1, Phase::Lobby));
         assert!(!can_transition(Phase::End, Phase::Phase1));
@@ -3968,7 +4049,8 @@ mod tests {
         );
         s.warned_for_current_phase = true;
 
-        s.transition_to(Phase::Phase0).unwrap();
+        // Session 4 / refactor: was `Phase::Phase0`; now `Lobby→Phase1` directly.
+        s.transition_to(Phase::Phase1).unwrap();
         assert!(!s.warned_for_current_phase);
     }
 
@@ -3983,7 +4065,7 @@ mod tests {
         s.add_player(player("p1", true, 10));
         s.add_player(player("p2", true, 20));
         s.add_player(player("p3", true, 30));
-        enter_phase0(&mut s);
+
         s.begin_phase1(&[
             Phase1Assignment {
                 player_id: "p1".into(),
@@ -4047,7 +4129,7 @@ mod tests {
             config(),
         );
         s.add_player(player("p1", true, 10));
-        enter_phase0(&mut s);
+
         s.begin_phase1(&[Phase1Assignment {
             player_id: "p1".into(),
             dragon_id: "d1".into(),
@@ -4473,7 +4555,7 @@ mod tests {
             config(),
         );
         assert_eq!(s.phase_duration_minutes(Phase::Lobby), 0);
-        assert_eq!(s.phase_duration_minutes(Phase::Phase0), 5);
+        assert_eq!(s.phase_duration_minutes(Phase::Phase0), 0);
         assert_eq!(s.phase_duration_minutes(Phase::Phase1), 10);
         assert_eq!(s.phase_duration_minutes(Phase::Handover), 10);
         assert_eq!(s.phase_duration_minutes(Phase::Phase2), 10);
@@ -4502,8 +4584,9 @@ mod tests {
             ts(1),
             config(),
         );
-        s.phase = Phase::Phase0;
-        // Phase0 = 5 minutes = 300 seconds. 1000 seconds elapsed → should clamp to 0
+        s.phase = Phase::Phase1;
+        // Session 4 / refactor: was Phase0; now uses Phase1 (duration = 10 minutes).
+        // 10 minutes = 600 seconds. 1000 seconds elapsed → should clamp to 0.
         assert_eq!(s.remaining_phase_seconds(ts(1001)), Some(0));
     }
 
@@ -4520,7 +4603,7 @@ mod tests {
             let pid = format!("p{i}");
             s.add_player(player(&pid, true, i as i64));
         }
-        enter_phase0(&mut s);
+
         let assignments: Vec<Phase1Assignment> = (0..20)
             .map(|i| Phase1Assignment {
                 player_id: format!("p{i}"),

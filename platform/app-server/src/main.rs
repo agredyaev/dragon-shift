@@ -1,4 +1,5 @@
 mod app;
+mod auth;
 mod cache;
 mod helpers;
 mod http;
