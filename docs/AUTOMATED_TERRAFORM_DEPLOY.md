@@ -58,6 +58,8 @@ The default GitHub Actions Terraform roles now include `roles/iam.serviceAccount
 - `TF_LLM_JUDGE_MODEL`
 - `TF_LLM_IMAGE_MODEL`
 - `TF_RUST_LOG`
+- `TF_SPRITE_QUEUE_TIMEOUT_SECONDS`
+- `TF_IMAGE_JOB_MAX_CONCURRENCY`
 
 `TF_HOSTNAME_MODE=nip_io` is the zero-DNS default for a fresh project.
 `TF_STATE_BUCKET_NAME` is optional and defaults to `<project-id>-tfstate`.
@@ -103,7 +105,7 @@ This section documents configuration workarounds applied during the initial prod
 
 ### 1. Cloud Armor disabled — `TF_ENABLE_CLOUD_ARMOR=false`
 
-**Problem:** The GCP project `rna-workshop` has `SECURITY_POLICY_RULES` quota set to `0.0 globally`. Terraform fails with:
+**Problem:** The GCP project `rna-workshop2` has `SECURITY_POLICY_RULES` quota set to `0.0 globally`. Terraform fails with:
 ```
 Error waiting for Creating SecurityPolicy "dragon-shift-production":
 Quota 'SECURITY_POLICY_RULES' exceeded. Limit: 0.0 globally.

@@ -36,6 +36,8 @@
 - `TF_JOIN_RATE_LIMIT_MAX` - optional runtime join/reconnect rate limit override
 - `TF_COMMAND_RATE_LIMIT_MAX` - optional runtime workshop command rate limit override
 - `TF_WEBSOCKET_RATE_LIMIT_MAX` - optional runtime websocket rate limit override
+- `TF_SPRITE_QUEUE_TIMEOUT_SECONDS` - optional positive runtime override for backend queue wait timeout before timeout handling; sprite-sheet requests fall back, direct image requests return an error
+- `TF_IMAGE_JOB_MAX_CONCURRENCY` - optional positive runtime override for concurrent queued image job admission
 - `GCP_WORKLOAD_IDENTITY_PROVIDER` - repository secret for the Google Workload Identity Provider resource name
 - `GCP_SERVICE_ACCOUNT_EMAIL` - repository secret for the GitHub Actions Terraform service account email
 - `TF_PRODUCTION_DB_PASSWORD` - repository secret for the Cloud SQL application password
@@ -61,6 +63,8 @@
 - `app.allowedOrigins` - runtime origin allowlist
 - `app.viteAppUrl` - runtime base URL
 - `app.rustLog` - `RUST_LOG` filter string for request/runtime logging
+- `app.spriteQueueTimeoutSeconds` - backend queue wait timeout for sprite/image jobs before timeout handling
+- `app.imageJobMaxConcurrency` - concurrent queued image job admission limit for the backend runtime
 - `app.googleCloudProject` - required when any `vertex_ai` provider is configured
 - `app.googleCloudLocation` - required when any `vertex_ai` provider is configured
 - `app.judgeProviders` - ordered provider pool for the judge LLM; each entry has `type` (`vertex_ai` or `api_key`), `model`, and optional `apiKeySecretName`/`apiKeySecretKey`

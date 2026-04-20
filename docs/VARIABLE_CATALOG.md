@@ -11,6 +11,8 @@
 - `JOIN_RATE_LIMIT_MAX` - join and reconnect rate limit
 - `COMMAND_RATE_LIMIT_MAX` - workshop command rate limit
 - `WEBSOCKET_RATE_LIMIT_MAX` - websocket upgrade and message rate limit
+- `SPRITE_QUEUE_TIMEOUT_SECONDS` - how long sprite/image jobs may wait for backend image capacity before timing out
+- `IMAGE_JOB_MAX_CONCURRENCY` - how many queued image jobs the backend may admit concurrently
 - `RECONNECT_TOKEN_TTL_SECONDS` - reconnect token inactivity TTL
 - `DATABASE_POOL_SIZE` - Postgres connection pool size
 - `LLM_JUDGE_PROVIDERS` - JSON array of judge provider pool entries
@@ -24,6 +26,8 @@
 - `image.digest` - immutable image digest
 - `app.allowedOrigins` - runtime origin allowlist
 - `app.viteAppUrl` - runtime base URL
+- `app.spriteQueueTimeoutSeconds` - backend queue wait timeout for sprite/image jobs before timeout handling
+- `app.imageJobMaxConcurrency` - concurrent queued image job admission limit for the backend runtime
 - `app.googleCloudProject` - runtime GCP project for server-side Vertex AI calls; required when any `vertex_ai` provider is configured
 - `app.googleCloudLocation` - runtime GCP region/location for Vertex AI model routing; required when any `vertex_ai` provider is configured
 - `app.judgeProviders` - ordered provider pool for the judge LLM; each entry has `type` (`vertex_ai` or `api_key`), `model`, and optional `apiKeySecretName`/`apiKeySecretKey`
@@ -100,6 +104,8 @@
 - `TF_JOIN_RATE_LIMIT_MAX` - optional repository variable overriding the join/reconnect rate limit
 - `TF_COMMAND_RATE_LIMIT_MAX` - optional repository variable overriding the workshop command rate limit
 - `TF_WEBSOCKET_RATE_LIMIT_MAX` - optional repository variable overriding the websocket rate limit
+- `TF_SPRITE_QUEUE_TIMEOUT_SECONDS` - optional positive repository variable overriding how long sprite/image jobs may wait in the backend queue before timeout handling
+- `TF_IMAGE_JOB_MAX_CONCURRENCY` - optional positive repository variable overriding how many queued image jobs the backend admits concurrently
 - `GCP_WORKLOAD_IDENTITY_PROVIDER` - repository secret for the Google Workload Identity Provider resource name
 - `GCP_SERVICE_ACCOUNT_EMAIL` - repository secret for the GitHub Actions Terraform service account email
 - `TF_PRODUCTION_DB_PASSWORD` - repository secret for the Cloud SQL application password
