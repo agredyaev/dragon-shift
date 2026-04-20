@@ -157,6 +157,18 @@ variable "websocket_rate_limit_max" {
   default     = 500
 }
 
+variable "sprite_queue_timeout_seconds" {
+  description = "Seconds a sprite/image request may wait in the backend queue before timing out."
+  type        = number
+  default     = 1200
+}
+
+variable "image_job_max_concurrency" {
+  description = "Maximum number of queued image jobs admitted concurrently by the backend runtime."
+  type        = number
+  default     = 2
+}
+
 variable "cloud_armor_rate_limit_count" {
   description = "Cloud Armor rate limit count per interval."
   type        = number

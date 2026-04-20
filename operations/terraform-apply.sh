@@ -63,6 +63,8 @@ CREATE_RATE_LIMIT_MAX="${TF_CREATE_RATE_LIMIT_MAX:-}"
 JOIN_RATE_LIMIT_MAX="${TF_JOIN_RATE_LIMIT_MAX:-}"
 COMMAND_RATE_LIMIT_MAX="${TF_COMMAND_RATE_LIMIT_MAX:-}"
 WEBSOCKET_RATE_LIMIT_MAX="${TF_WEBSOCKET_RATE_LIMIT_MAX:-}"
+SPRITE_QUEUE_TIMEOUT_SECONDS="${TF_SPRITE_QUEUE_TIMEOUT_SECONDS:-}"
+IMAGE_JOB_MAX_CONCURRENCY="${TF_IMAGE_JOB_MAX_CONCURRENCY:-}"
 
 if [[ -z "${IMAGE_DIGEST}" && -z "${IMAGE_TAG}" ]]; then
   printf 'Either IMAGE_DIGEST or IMAGE_TAG must be set.\n' >&2
@@ -92,6 +94,17 @@ require_integer() {
       exit 1
       ;;
   esac
+}
+
+require_positive_integer() {
+  local name="$1"
+  local value="$2"
+
+  require_integer "${name}" "${value}"
+  if [[ "${value}" == "0" ]]; then
+    printf '%s must be greater than zero.\n' "${name}" >&2
+    exit 1
+  fi
 }
 
 json_escape() {
@@ -156,6 +169,12 @@ fi
 if [[ -n "${WEBSOCKET_RATE_LIMIT_MAX}" ]]; then
   require_integer "TF_WEBSOCKET_RATE_LIMIT_MAX" "${WEBSOCKET_RATE_LIMIT_MAX}"
 fi
+if [[ -n "${SPRITE_QUEUE_TIMEOUT_SECONDS}" ]]; then
+  require_positive_integer "TF_SPRITE_QUEUE_TIMEOUT_SECONDS" "${SPRITE_QUEUE_TIMEOUT_SECONDS}"
+fi
+if [[ -n "${IMAGE_JOB_MAX_CONCURRENCY}" ]]; then
+  require_positive_integer "TF_IMAGE_JOB_MAX_CONCURRENCY" "${IMAGE_JOB_MAX_CONCURRENCY}"
+fi
 
 FOUNDATION_VARS_FILE="${TMP_DIR}/foundation.auto.tfvars.json"
 PLATFORM_VARS_FILE="${TMP_DIR}/platform.auto.tfvars.json"
@@ -211,6 +230,16 @@ fi
 platform_websocket_rate_limit_json=""
 if [[ -n "${WEBSOCKET_RATE_LIMIT_MAX}" ]]; then
   platform_websocket_rate_limit_json=$',\n  "websocket_rate_limit_max": '"${WEBSOCKET_RATE_LIMIT_MAX}"
+fi
+
+platform_sprite_queue_timeout_json=""
+if [[ -n "${SPRITE_QUEUE_TIMEOUT_SECONDS}" ]]; then
+  platform_sprite_queue_timeout_json=$',\n  "sprite_queue_timeout_seconds": '"${SPRITE_QUEUE_TIMEOUT_SECONDS}"
+fi
+
+platform_image_job_max_concurrency_json=""
+if [[ -n "${IMAGE_JOB_MAX_CONCURRENCY}" ]]; then
+  platform_image_job_max_concurrency_json=$',\n  "image_job_max_concurrency": '"${IMAGE_JOB_MAX_CONCURRENCY}"
 fi
 
 authorized_network_entries=()
@@ -310,7 +339,7 @@ cat >"${PLATFORM_VARS_FILE}" <<EOF
   "kubeconfig_path": "$(json_escape "${KUBECONFIG_PATH}")",
   "labels": {
     "owner": "platform"
-  }${notification_channel_json}${gemini_api_key_json}${gemini_api_keys_json}${platform_database_pool_json}${platform_app_cpu_request_json}${platform_app_cpu_limit_json}${platform_app_memory_request_json}${platform_app_memory_limit_json}${platform_create_rate_limit_json}${platform_join_rate_limit_json}${platform_command_rate_limit_json}${platform_websocket_rate_limit_json}
+  }${notification_channel_json}${gemini_api_key_json}${gemini_api_keys_json}${platform_database_pool_json}${platform_app_cpu_request_json}${platform_app_cpu_limit_json}${platform_app_memory_request_json}${platform_app_memory_limit_json}${platform_create_rate_limit_json}${platform_join_rate_limit_json}${platform_command_rate_limit_json}${platform_websocket_rate_limit_json}${platform_sprite_queue_timeout_json}${platform_image_job_max_concurrency_json}
 }
 EOF
 

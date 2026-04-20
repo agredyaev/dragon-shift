@@ -1,7 +1,8 @@
 use futures_util::{SinkExt, StreamExt};
 use protocol::{
-    ClientWsMessage, CreateWorkshopRequest, JoinWorkshopRequest, JudgeBundle, Phase,
-    ServerWsMessage, SessionCommand, SessionEnvelope, SpriteSheetRequest, SpriteSheetResult,
+    AuthRequest, CharacterProfile, ClientWsMessage, CreateCharacterRequest,
+    CreateWorkshopRequest, JoinWorkshopRequest, JudgeBundle, Phase, ServerWsMessage,
+    SessionCommand, SessionEnvelope, SpriteSet, SpriteSheetRequest, SpriteSheetResult,
     WorkshopCommandRequest, WorkshopCommandResult, WorkshopJoinResult, WorkshopJoinSuccess,
     WorkshopJudgeBundleRequest, WorkshopJudgeBundleResult,
 };
@@ -914,18 +915,20 @@ async fn smoke_sprite_load(config: SpriteLoadConfig) -> Result<(), String> {
     let client = reqwest::Client::new();
     let workers = config.workers;
 
-    // Phase 1: create workshops and advance each to Phase0 (paced to stay
-    // within the server's create rate-limit window).
+    // Full account flow: sign in → create character → create workshop.
     let mut sessions: Vec<WorkshopJoinSuccess> = Vec::with_capacity(workers);
     for index in 0..workers {
         let name = format!("SpriteWorker{:03}", index + 1);
-        let host = create_workshop(&client, &config.base_url, &name).await?;
-        send_command(
-            &client,
-            &config.base_url,
-            command_request(&host, SessionCommand::StartPhase0, None),
-        )
-        .await?;
+
+        // 1. Sign in (create-or-login).
+        let cookie = signin_account(&client, &config.base_url, &name).await?;
+
+        // 2. Create a character.
+        let desc = format!("Smoke test dragon {}", index + 1);
+        let character = create_xtask_character(&client, &config.base_url, &cookie, &desc).await?;
+
+        // 3. Create workshop with the character.
+        let host = create_workshop_with_auth(&client, &config.base_url, &cookie, Some(character.id)).await?;
         sessions.push(host);
         // Pace creation to avoid hitting the per-IP rate limiter.
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
@@ -933,25 +936,13 @@ async fn smoke_sprite_load(config: SpriteLoadConfig) -> Result<(), String> {
     let setup_ms = total_start.elapsed().as_millis();
 
     // Phase 2: fire all sprite-sheet requests concurrently.
-    let descriptions = [
-        "A tiny green dragon with sparkling scales and butterfly wings",
-        "A fierce red dragon breathing blue fire in a thunderstorm",
-        "A fluffy pink dragon sleeping on a cloud made of cotton candy",
-        "A cyberpunk dragon with neon circuits and glowing purple eyes",
-        "A crystal ice dragon whose body refracts rainbow light",
-        "A baby golden dragon hatching from a jewel-encrusted egg",
-        "A shadow dragon made of swirling dark smoke and amber embers",
-        "A coral reef dragon with flowing fins and bioluminescent spots",
-        "A steampunk dragon with brass gears and copper pipe wings",
-        "A galaxy dragon whose scales are tiny shimmering constellations",
-    ];
 
     let gen_start = std::time::Instant::now();
     let sprite_results = futures_util::future::join_all(sessions.iter().enumerate().map(
         |(index, session)| {
             let client = client.clone();
             let base_url = config.base_url.clone();
-            let description = descriptions[index % descriptions.len()].to_string();
+            let description = format!("Smoke test dragon {}", index + 1);
             let session_code = session.session_code.clone();
             let reconnect_token = session.reconnect_token.clone();
 
@@ -1815,20 +1806,120 @@ async fn assert_health_endpoint(
 async fn create_workshop(
     client: &reqwest::Client,
     base_url: &str,
-    name: &str,
+    _name: &str,
 ) -> Result<WorkshopJoinSuccess, String> {
+    create_workshop_with_auth(client, base_url, "", None).await
+}
+
+/// Sign in (create-or-login) and return the raw `Set-Cookie` header value.
+async fn signin_account(
+    client: &reqwest::Client,
+    base_url: &str,
+    name: &str,
+) -> Result<String, String> {
     let response = client
+        .post(format!("{base_url}/api/auth/signin"))
+        .header("Origin", base_url)
+        .json(&AuthRequest {
+            hero: name.to_string(),
+            name: name.to_string(),
+            password: "smoketest-password-1234".to_string(),
+        })
+        .send()
+        .await
+        .map_err(|error| format!("signin failed: {error}"))?;
+
+    let status = response.status().as_u16();
+    if status != 200 && status != 201 {
+        let body = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "<unreadable>".to_string());
+        return Err(format!("signin returned {status}: {body}"));
+    }
+
+    // Extract the session cookie from the Set-Cookie header.
+    let cookie = response
+        .headers()
+        .get_all("set-cookie")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .find(|v| v.contains("ds_session="))
+        .ok_or_else(|| "signin response missing ds_session cookie".to_string())?
+        .to_string();
+
+    // Extract just the cookie key=value portion (before the first `;`).
+    let cookie_kv = cookie
+        .split(';')
+        .next()
+        .unwrap_or(&cookie)
+        .to_string();
+
+    Ok(cookie_kv)
+}
+
+/// Create a character and return its profile.
+async fn create_xtask_character(
+    client: &reqwest::Client,
+    base_url: &str,
+    cookie: &str,
+    description: &str,
+) -> Result<CharacterProfile, String> {
+    let response = client
+        .post(format!("{base_url}/api/characters"))
+        .header("Origin", base_url)
+        .header("Cookie", cookie)
+        .json(&CreateCharacterRequest {
+            description: description.to_string(),
+            sprites: SpriteSet {
+                neutral: String::new(),
+                happy: String::new(),
+                angry: String::new(),
+                sleepy: String::new(),
+            },
+        })
+        .send()
+        .await
+        .map_err(|error| format!("create character failed: {error}"))?;
+
+    let status = response.status().as_u16();
+    if status != 201 {
+        let body = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "<unreadable>".to_string());
+        return Err(format!("create character returned {status}: {body}"));
+    }
+
+    response
+        .json::<CharacterProfile>()
+        .await
+        .map_err(|error| format!("failed to parse character profile: {error}"))
+}
+
+async fn create_workshop_with_auth(
+    client: &reqwest::Client,
+    base_url: &str,
+    cookie: &str,
+    character_id: Option<String>,
+) -> Result<WorkshopJoinSuccess, String> {
+    let mut request = client
         .post(format!("{base_url}/api/workshops"))
         .header("Origin", base_url)
         .json(&CreateWorkshopRequest {
-            name: name.to_string(),
+            name: None,
             config: protocol::WorkshopCreateConfig {
                 phase0_minutes: 5,
                 phase1_minutes: 10,
                 phase2_minutes: 10,
             },
-            character_id: None,
-        })
+            character_id,
+        });
+    if !cookie.is_empty() {
+        request = request.header("Cookie", cookie);
+    }
+
+    let response = request
         .send()
         .await
         .map_err(|error| format!("failed to reach backend: {error}"))?;

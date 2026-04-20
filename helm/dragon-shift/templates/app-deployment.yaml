@@ -9,6 +9,12 @@ metadata:
     {{- toYaml . | nindent 4 }}
   {{- end }}
 spec:
+  {{- if ne (int .Values.replicaCount) 1 }}
+  {{- fail "replicaCount must remain 1 for the current singleton runtime" }}
+  {{- end }}
+  {{- if .Values.autoscaling.enabled }}
+  {{- fail "autoscaling.enabled must remain false for the current singleton runtime" }}
+  {{- end }}
   {{- if ne .Values.deploymentStrategy.type "Recreate" }}
   {{- fail "deploymentStrategy.type must remain Recreate for the current singleton runtime" }}
   {{- end }}
@@ -85,6 +91,10 @@ spec:
               value: {{ .Values.app.commandRateLimitMax | quote }}
             - name: WEBSOCKET_RATE_LIMIT_MAX
               value: {{ .Values.app.socketRateLimitMax | quote }}
+            - name: SPRITE_QUEUE_TIMEOUT_SECONDS
+              value: {{ .Values.app.spriteQueueTimeoutSeconds | quote }}
+            - name: IMAGE_JOB_MAX_CONCURRENCY
+              value: {{ .Values.app.imageJobMaxConcurrency | quote }}
             - name: DATABASE_POOL_SIZE
               value: {{ .Values.app.databasePoolSize | quote }}
             {{- with .Values.app.googleCloudProject }}

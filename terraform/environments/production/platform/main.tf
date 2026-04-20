@@ -423,18 +423,20 @@ resource "helm_release" "app" {
         }
       }
       app = {
-        allowedOrigins        = format("https://%s", local.app_hostname)
-        viteAppUrl            = format("https://%s", local.app_hostname)
-        rustLog               = var.rust_log
-        rustSessionCodePrefix = var.rust_session_code_prefix
-        trustForwardedFor     = var.trust_forwarded_for
-        databasePoolSize      = var.database_pool_size
-        createRateLimitMax    = var.create_rate_limit_max
-        joinRateLimitMax      = var.join_rate_limit_max
-        commandRateLimitMax   = var.command_rate_limit_max
-        socketRateLimitMax    = var.websocket_rate_limit_max
-        googleCloudProject    = var.llm_provider_type == "vertex_ai" ? (var.google_cloud_project != "" ? var.google_cloud_project : var.project_id) : ""
-        googleCloudLocation   = var.llm_provider_type == "vertex_ai" ? (var.google_cloud_location != "" ? var.google_cloud_location : var.region) : ""
+        allowedOrigins            = format("https://%s", local.app_hostname)
+        viteAppUrl                = format("https://%s", local.app_hostname)
+        rustLog                   = var.rust_log
+        rustSessionCodePrefix     = var.rust_session_code_prefix
+        trustForwardedFor         = var.trust_forwarded_for
+        databasePoolSize          = var.database_pool_size
+        createRateLimitMax        = var.create_rate_limit_max
+        joinRateLimitMax          = var.join_rate_limit_max
+        commandRateLimitMax       = var.command_rate_limit_max
+        socketRateLimitMax        = var.websocket_rate_limit_max
+        spriteQueueTimeoutSeconds = var.sprite_queue_timeout_seconds
+        imageJobMaxConcurrency    = var.image_job_max_concurrency
+        googleCloudProject        = var.llm_provider_type == "vertex_ai" ? (var.google_cloud_project != "" ? var.google_cloud_project : var.project_id) : ""
+        googleCloudLocation       = var.llm_provider_type == "vertex_ai" ? (var.google_cloud_location != "" ? var.google_cloud_location : var.region) : ""
         judgeProviders = var.llm_provider_type == "api_key" ? [
           for index, _key in local.gemini_api_keys : {
             type             = "api_key"

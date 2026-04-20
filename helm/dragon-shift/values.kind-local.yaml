@@ -20,12 +20,14 @@ app:
   rustLog: "info,tower_http=debug,app_server=debug"
   rustSessionCodePrefix: "9"
   databasePoolSize: 5
-  createRateLimitMax: 20
+  createRateLimitMax: 60
   joinRateLimitMax: 40
   commandRateLimitMax: 120
   socketRateLimitMax: 300
-  googleCloudProject: "rna-workshop"
-  googleCloudLocation: "global"
+  spriteQueueTimeoutSeconds: 1200
+  imageJobMaxConcurrency: 2
+  googleCloudProject: "rna-workshop2"
+  googleCloudLocation: "us-central1"
   judgeProviders:
     - type: vertex_ai
       model: gemini-2.5-flash
@@ -34,7 +36,7 @@ app:
       model: gemini-2.5-flash-image
   extraEnv:
     - name: GOOGLE_IMPERSONATE_SERVICE_ACCOUNT
-      value: dragon-shift-local-kube@rna-workshop.iam.gserviceaccount.com
+      value: dragon-shift-local-kube@rna-workshop2.iam.gserviceaccount.com
 
 postgresql:
   enabled: true
@@ -45,6 +47,13 @@ postgresql:
   primary:
     persistence:
       enabled: false
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        cpu: 250m
+        memory: 512Mi
 
 resources:
   requests:

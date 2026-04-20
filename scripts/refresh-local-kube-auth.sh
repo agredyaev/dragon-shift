@@ -57,6 +57,7 @@ kind load docker-image "$IMAGE_NAME" --name "$KIND_CLUSTER_NAME"
 
 printf 'Upgrading local Helm release...\n'
 helm upgrade --install "$RELEASE_NAME" "$ROOT_DIR/helm/dragon-shift" \
+  --kube-context "$KUBE_CONTEXT" \
   --namespace "$NAMESPACE" \
   --create-namespace \
   --reset-values \

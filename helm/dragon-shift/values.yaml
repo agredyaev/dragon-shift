@@ -44,6 +44,8 @@ app:
   joinRateLimitMax: 40
   commandRateLimitMax: 120
   socketRateLimitMax: 300
+  spriteQueueTimeoutSeconds: 1200
+  imageJobMaxConcurrency: 2
   googleCloudProject: ""
   googleCloudLocation: ""
   # Provider pool arrays — ordered by preference; failover happens left-to-right.
