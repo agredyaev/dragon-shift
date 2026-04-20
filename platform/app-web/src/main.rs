@@ -7,17 +7,16 @@ mod state;
 
 use dioxus::prelude::*;
 
-use components::create_panel::CreatePanel;
+use components::account_home::AccountHomeView;
+use components::create_character::CreateCharacterView;
 use components::end_view::EndView;
 use components::handover_view::HandoverView;
-use components::hero::Hero;
-use components::join_panel::JoinPanel;
 use components::lobby_view::LobbyView;
 use components::notice::NoticeBar;
-use components::phase0_view::Phase0View;
 use components::phase1_view::Phase1View;
 use components::phase2_view::Phase2View;
-use components::workshop_brief::WorkshopBrief;
+use components::pick_character::PickCharacterView;
+use components::sign_in::SignInView;
 
 use helpers::poke_icon_url;
 use protocol::Phase;
@@ -41,12 +40,6 @@ fn App() -> Element {
 
     let identity = use_signal(|| bootstrap.identity);
     let game_state = use_signal(|| bootstrap.game_state);
-    let create_name = use_signal(|| bootstrap.create_name);
-    let phase0_minutes = use_signal(|| "8".to_string());
-    let phase1_minutes = use_signal(|| "8".to_string());
-    let phase2_minutes = use_signal(|| "8".to_string());
-    let join_session_code = use_signal(|| bootstrap.join_session_code);
-    let join_name = use_signal(|| bootstrap.join_name);
     let reconnect_session_code = use_signal(|| bootstrap.reconnect_session_code);
     let reconnect_token = use_signal(|| bootstrap.reconnect_token);
     let handover_tags_input = use_signal(|| bootstrap.handover_tags_input);
@@ -62,6 +55,13 @@ fn App() -> Element {
         id.screen == ShellScreen::Session
     };
 
+    // Pre-session screen variant (only read when not in Session).
+    let pre_session_screen = if !render_session_panels_first {
+        Some(identity.read().screen.clone())
+    } else {
+        None
+    };
+
     // ---- Phase detection & day/night cycle (single read) ----
     let (current_phase, is_daytime, game_time, is_clock_phase) = {
         let gs = game_state.read();
@@ -70,7 +70,7 @@ fn App() -> Element {
                 let t = s.time.rem_euclid(24);
                 (
                     Some(s.phase),
-                    t >= 6 && t < 18,
+                    (6..18).contains(&t),
                     s.time,
                     matches!(s.phase, Phase::Phase1 | Phase::Phase2),
                 )
@@ -80,7 +80,6 @@ fn App() -> Element {
     };
 
     let is_lobby = render_session_panels_first && current_phase == Some(Phase::Lobby);
-    let is_phase0 = render_session_panels_first && current_phase == Some(Phase::Phase0);
     let is_phase1 = render_session_panels_first && current_phase == Some(Phase::Phase1);
     let is_phase2 = render_session_panels_first && current_phase == Some(Phase::Phase2);
     let is_handover = render_session_panels_first && current_phase == Some(Phase::Handover);
@@ -94,9 +93,7 @@ fn App() -> Element {
     let clock_icon_url = poke_icon_url(clock_icon);
 
     // ---- Container class ----
-    let container_class = if is_phase0 {
-        "shell__container shell__container--phase0"
-    } else if is_phase1 || is_phase2 {
+    let container_class = if is_phase1 || is_phase2 {
         "shell__container shell__container--phase1"
     } else if is_handover {
         "shell__container shell__container--handover"
@@ -150,8 +147,9 @@ fn App() -> Element {
                 }
             }
             section { class: container_class,
-                if is_phase0 {
-                    Phase0View {
+                if is_lobby {
+                    NoticeBar { ops }
+                    LobbyView {
                         identity,
                         game_state,
                         ops,
@@ -213,44 +211,36 @@ fn App() -> Element {
                         judge_bundle,
                     }
                 } else {
-                    // ---- Home screen ----
-                    Hero { identity, game_state }
+                    // ---- Pre-session screens (SignIn / AccountHome / etc.) ----
                     NoticeBar { ops }
-                    section { class: "grid",
-                        WorkshopBrief {}
-                        if is_lobby {
-                            LobbyView {
+                    match pre_session_screen.as_ref() {
+                        Some(ShellScreen::AccountHome) => rsx! {
+                            AccountHomeView {
                                 identity,
                                 game_state,
                                 ops,
-                                handover_tags_input,
-                                judge_bundle,
-                            }
-                        } else {
-                            CreatePanel {
-                                identity,
-                                game_state,
-                                ops,
-                                create_name,
-                                phase0_minutes,
-                                phase1_minutes,
-                                phase2_minutes,
-                                join_session_code,
                                 reconnect_session_code,
                                 reconnect_token,
                                 judge_bundle,
                             }
-                            JoinPanel {
+                        },
+                        Some(ShellScreen::CreateCharacter) => rsx! {
+                            CreateCharacterView { identity, ops }
+                        },
+                        Some(ShellScreen::PickCharacter { workshop_code }) => rsx! {
+                            PickCharacterView {
                                 identity,
                                 game_state,
                                 ops,
-                                join_session_code,
-                                join_name,
                                 reconnect_session_code,
                                 reconnect_token,
                                 judge_bundle,
+                                workshop_code: workshop_code.clone(),
                             }
-                        }
+                        },
+                        _ => rsx! {
+                            SignInView { identity, ops }
+                        },
                     }
                 }
             }

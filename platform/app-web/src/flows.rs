@@ -1,229 +1,30 @@
 #![allow(clippy::too_many_arguments)]
 
 use dioxus::prelude::*;
-use protocol::{ClientGameState, JoinWorkshopRequest, JudgeBundle, SessionCommand, SpriteSet};
+use protocol::{
+    AuthRequest, ClientGameState, JoinWorkshopRequest, JudgeBundle, SessionCommand, SpriteSet,
+    WorkshopCreateConfig,
+};
 
 use crate::api::{
-    AppWebApi, build_command_request, build_judge_bundle_request, build_sprite_sheet_request,
+    AppWebApi, build_command_request,
+    build_judge_bundle_request,
 };
 use crate::helpers::{parse_tags_input, pending_command_label};
 use crate::realtime::bootstrap_realtime;
 use crate::state::{
-    ConnectionStatus, IdentityState, OperationState, PendingFlow, apply_command_error,
-    apply_join_success, apply_judge_bundle_error, apply_judge_bundle_success,
-    apply_realtime_bootstrap_error, apply_request_error, apply_successful_command, error_notice,
-    info_notice, persist_browser_session_snapshot,
+    ConnectionStatus, IdentityState, OperationState, PendingFlow, ShellScreen,
+    apply_command_error, apply_join_success, apply_judge_bundle_error, apply_judge_bundle_success,
+    apply_realtime_bootstrap_error, apply_request_error, apply_successful_command,
+    clear_account_identity, clear_session_identity, error_notice, info_notice,
+    persist_browser_account_snapshot, persist_browser_session_snapshot, success_notice,
 };
-use protocol::WorkshopCreateConfig;
 
-pub enum SpriteSheetSubmitError {
-    Preflight(String),
-    Request(String),
-}
-
-pub async fn submit_create_flow(
-    mut identity: Signal<IdentityState>,
-    mut game_state: Signal<Option<ClientGameState>>,
-    mut ops: Signal<OperationState>,
-    create_name: Signal<String>,
-    phase0_minutes: Signal<String>,
-    phase1_minutes: Signal<String>,
-    phase2_minutes: Signal<String>,
-    mut join_session_code: Signal<String>,
-    mut reconnect_session_code: Signal<String>,
-    mut reconnect_token: Signal<String>,
-    mut judge_bundle: Signal<Option<JudgeBundle>>,
-) {
-    let (base_url, name) = {
-        let id = identity.read();
-        let name = create_name.read();
-        (id.api_base_url.clone(), name.trim().to_string())
-    };
-    let config = {
-        let phase0 = phase0_minutes.read().trim().parse::<u32>().unwrap_or(8);
-        let phase1 = phase1_minutes.read().trim().parse::<u32>().unwrap_or(8);
-        let phase2 = phase2_minutes.read().trim().parse::<u32>().unwrap_or(8);
-
-        WorkshopCreateConfig {
-            phase0_minutes: phase0,
-            phase1_minutes: phase1,
-            phase2_minutes: phase2,
-        }
-    };
-
-    if name.is_empty() {
-        ops.with_mut(|o| o.notice = Some(error_notice("Please enter a host name.")));
-        return;
-    }
-
-    identity.with_mut(|id| {
-        id.connection_status = ConnectionStatus::Connecting;
-    });
-    ops.with_mut(|o| {
-        o.pending_flow = Some(PendingFlow::Create);
-        o.notice = Some(info_notice("Creating workshop…"));
-    });
-
-    let api = AppWebApi::new(base_url);
-    match api.create_workshop(name, config).await {
-        Ok(success) => {
-            identity.with_mut(|id| {
-                game_state.with_mut(|gs| {
-                    ops.with_mut(|o| {
-                        join_session_code.with_mut(|join_code| {
-                            reconnect_session_code.with_mut(|reconnect_code| {
-                                reconnect_token.with_mut(|token| {
-                                    judge_bundle.with_mut(|jb| {
-                                        apply_join_success(
-                                            id,
-                                            gs,
-                                            o,
-                                            join_code,
-                                            reconnect_code,
-                                            token,
-                                            jb,
-                                            success,
-                                            PendingFlow::Create,
-                                        );
-                                    });
-                                });
-                            });
-                        });
-                    });
-                });
-            });
-            let persisted_snapshot = { identity.read().session_snapshot.clone() };
-            if let Some(snapshot) = persisted_snapshot
-                && let Err(error) = persist_browser_session_snapshot(&snapshot)
-            {
-                ops.with_mut(|o| {
-                    o.notice = Some(error_notice(&format!(
-                        "Workshop created, but session persistence failed: {error}"
-                    )))
-                });
-            }
-            if let Err(error) = bootstrap_realtime(identity, game_state, ops, judge_bundle) {
-                identity.with_mut(|id| {
-                    ops.with_mut(|o| {
-                        apply_realtime_bootstrap_error(id, o, error);
-                    });
-                });
-            }
-        }
-        Err(error) => {
-            identity.with_mut(|id| {
-                ops.with_mut(|o| {
-                    apply_request_error(id, o, error);
-                });
-            });
-        }
-    }
-}
-
-pub async fn submit_join_flow(
-    mut identity: Signal<IdentityState>,
-    mut game_state: Signal<Option<ClientGameState>>,
-    mut ops: Signal<OperationState>,
-    mut join_session_code_input: Signal<String>,
-    join_name_input: Signal<String>,
-    mut reconnect_session_code: Signal<String>,
-    mut reconnect_token: Signal<String>,
-    mut judge_bundle: Signal<Option<JudgeBundle>>,
-) {
-    let (base_url, session_code, name) = {
-        let id = identity.read();
-        let session_code = join_session_code_input.read();
-        let name = join_name_input.read();
-        (
-            id.api_base_url.clone(),
-            session_code.trim().to_string(),
-            name.trim().to_string(),
-        )
-    };
-
-    if session_code.is_empty() {
-        ops.with_mut(|o| o.notice = Some(error_notice("Enter a workshop code.")));
-        return;
-    }
-    if name.is_empty() {
-        ops.with_mut(|o| o.notice = Some(error_notice("Please enter a player name.")));
-        return;
-    }
-
-    identity.with_mut(|id| {
-        id.connection_status = ConnectionStatus::Connecting;
-    });
-    ops.with_mut(|o| {
-        o.pending_flow = Some(PendingFlow::Join);
-        o.notice = Some(info_notice("Joining workshop…"));
-    });
-
-    let api = AppWebApi::new(base_url);
-    let request = JoinWorkshopRequest {
-        session_code,
-        name: Some(name),
-        reconnect_token: None,
-    };
-    match api.join_workshop(request).await {
-        Ok(success) => {
-            identity.with_mut(|id| {
-                game_state.with_mut(|gs| {
-                    ops.with_mut(|o| {
-                        join_session_code_input.with_mut(|join_code| {
-                            reconnect_session_code.with_mut(|reconnect_code| {
-                                reconnect_token.with_mut(|token| {
-                                    judge_bundle.with_mut(|jb| {
-                                        apply_join_success(
-                                            id,
-                                            gs,
-                                            o,
-                                            join_code,
-                                            reconnect_code,
-                                            token,
-                                            jb,
-                                            success,
-                                            PendingFlow::Join,
-                                        );
-                                    });
-                                });
-                            });
-                        });
-                    });
-                });
-            });
-            let persisted_snapshot = { identity.read().session_snapshot.clone() };
-            if let Some(snapshot) = persisted_snapshot
-                && let Err(error) = persist_browser_session_snapshot(&snapshot)
-            {
-                ops.with_mut(|o| {
-                    o.notice = Some(error_notice(&format!(
-                        "Joined workshop, but session persistence failed: {error}"
-                    )))
-                });
-            }
-            if let Err(error) = bootstrap_realtime(identity, game_state, ops, judge_bundle) {
-                identity.with_mut(|id| {
-                    ops.with_mut(|o| {
-                        apply_realtime_bootstrap_error(id, o, error);
-                    });
-                });
-            }
-        }
-        Err(error) => {
-            identity.with_mut(|id| {
-                ops.with_mut(|o| {
-                    apply_request_error(id, o, error);
-                });
-            });
-        }
-    }
-}
-
+#[cfg_attr(not(test), allow(dead_code))]
 pub async fn submit_reconnect_flow(
     mut identity: Signal<IdentityState>,
     mut game_state: Signal<Option<ClientGameState>>,
     mut ops: Signal<OperationState>,
-    mut join_session_code: Signal<String>,
     mut reconnect_session_code_input: Signal<String>,
     mut reconnect_token_input: Signal<String>,
     mut judge_bundle: Signal<Option<JudgeBundle>>,
@@ -262,22 +63,19 @@ pub async fn submit_reconnect_flow(
             identity.with_mut(|id| {
                 game_state.with_mut(|gs| {
                     ops.with_mut(|o| {
-                        join_session_code.with_mut(|join_code| {
-                            reconnect_session_code_input.with_mut(|reconnect_code| {
-                                reconnect_token_input.with_mut(|token| {
-                                    judge_bundle.with_mut(|jb| {
-                                        apply_join_success(
-                                            id,
-                                            gs,
-                                            o,
-                                            join_code,
-                                            reconnect_code,
-                                            token,
-                                            jb,
-                                            success,
-                                            PendingFlow::Reconnect,
-                                        );
-                                    });
+                        reconnect_session_code_input.with_mut(|reconnect_code| {
+                            reconnect_token_input.with_mut(|token| {
+                                judge_bundle.with_mut(|jb| {
+                                    apply_join_success(
+                                        id,
+                                        gs,
+                                        o,
+                                        reconnect_code,
+                                        token,
+                                        jb,
+                                        success,
+                                        PendingFlow::Reconnect,
+                                    );
                                 });
                             });
                         });
@@ -376,8 +174,8 @@ pub async fn submit_handover_tags_command(
         parse_tags_input(&tags_input)
     };
 
-    if tags.is_empty() {
-        ops.with_mut(|o| o.notice = Some(error_notice("Enter at least one handover tag.")));
+    if tags.len() != 3 {
+        ops.with_mut(|o| o.notice = Some(error_notice("Enter exactly three handover rules before starting Phase 2.")));
         return;
     }
 
@@ -392,6 +190,7 @@ pub async fn submit_handover_tags_command(
     .await;
 }
 
+#[allow(dead_code)]
 pub async fn submit_judge_bundle_request(
     mut identity: Signal<IdentityState>,
     _game_state: Signal<Option<ClientGameState>>,
@@ -439,78 +238,392 @@ pub async fn submit_judge_bundle_request(
     }
 }
 
-pub async fn submit_sprite_sheet_request(
-    identity: Signal<IdentityState>,
+// ---------------------------------------------------------------------------
+// New cookie-auth flows
+// ---------------------------------------------------------------------------
+
+/// Sign in (or create account). On success, persists the account snapshot in
+/// localStorage and navigates to AccountHome.
+pub async fn submit_signin_flow(
+    mut identity: Signal<IdentityState>,
     mut ops: Signal<OperationState>,
-    mut sprite_result: Signal<Option<SpriteSet>>,
-    description: String,
-) -> Result<(), SpriteSheetSubmitError> {
-    let (base_url, snapshot) = {
-        let id = identity.read();
-        (id.api_base_url.clone(), id.session_snapshot.clone())
-    };
+    name: String,
+    password: String,
+    hero: String,
+) {
+    let base_url = { identity.read().api_base_url.clone() };
 
-    let Some(snapshot) = snapshot else {
-        let message = "Connect to a workshop before generating sprites.".to_string();
-        ops.with_mut(|o| {
-            o.notice = Some(error_notice(&message))
-        });
-        return Err(SpriteSheetSubmitError::Preflight(message));
-    };
-
-    if description.trim().is_empty() {
-        let message = "Enter a dragon description.".to_string();
-        ops.with_mut(|o| o.notice = Some(error_notice(&message)));
-        return Err(SpriteSheetSubmitError::Preflight(message));
+    if name.trim().is_empty() || password.is_empty() {
+        ops.with_mut(|o| o.notice = Some(error_notice("Name and password are required.")));
+        return;
     }
 
     ops.with_mut(|o| {
-        o.notice = Some(info_notice("Generating dragon sprites…"));
+        o.pending_flow = Some(PendingFlow::SignIn);
+        o.notice = Some(info_notice("Signing in…"));
     });
 
     let api = AppWebApi::new(base_url);
-    match api
-        .generate_sprite_sheet(build_sprite_sheet_request(&snapshot, &description))
-        .await
-    {
-        Ok(sprites) => {
-            sprite_result.set(Some(sprites));
-            ops.with_mut(|o| {
-                o.notice = Some(info_notice("Dragon sprites generated!"));
+    let request = AuthRequest {
+        hero: hero.clone(),
+        name: name.trim().to_string(),
+        password,
+    };
+    match api.signin(&request).await {
+        Ok(response) => {
+            if let Err(error) = persist_browser_account_snapshot(&response.account) {
+                ops.with_mut(|o| {
+                    o.notice = Some(error_notice(&format!(
+                        "Signed in, but local persistence failed: {error}"
+                    )));
+                });
+            }
+            identity.with_mut(|id| {
+                id.account = Some(response.account);
+                id.screen = ShellScreen::AccountHome;
             });
-            Ok(())
+            ops.with_mut(|o| {
+                o.pending_flow = None;
+                let msg = if response.created {
+                    "Account created."
+                } else {
+                    "Signed in."
+                };
+                o.notice = Some(success_notice(msg));
+            });
         }
         Err(error) => {
             ops.with_mut(|o| {
-                o.notice = Some(error_notice(&format!("Sprite generation failed: {error}")));
+                o.pending_flow = None;
+                o.notice = Some(error_notice(&error));
             });
-            Err(SpriteSheetSubmitError::Request(error))
         }
     }
 }
 
-pub async fn submit_update_player_pet(
-    identity: Signal<IdentityState>,
-    ops: Signal<OperationState>,
-    handover_tags_input: Signal<String>,
-    judge_bundle: Signal<Option<JudgeBundle>>,
-    description: String,
-    sprites: Option<SpriteSet>,
+/// Logout: clears cookie on server, clears localStorage, navigates to SignIn.
+pub async fn submit_logout_flow(
+    mut identity: Signal<IdentityState>,
+    mut ops: Signal<OperationState>,
 ) {
-    let payload = serde_json::json!({
-        "description": description,
-        "sprites": sprites,
+    let base_url = { identity.read().api_base_url.clone() };
+    let api = AppWebApi::new(base_url);
+
+    // Best-effort server logout; even if it fails we clear local state.
+    let _ = api.logout().await;
+
+    identity.with_mut(|id| {
+        clear_account_identity(id);
+    });
+    ops.with_mut(|o| {
+        o.pending_flow = None;
+        o.notice = None;
+    });
+}
+
+/// Create a workshop with default config. The server gets the host name from
+/// the signed cookie. On success, applies join + bootstraps realtime.
+pub async fn submit_create_workshop_flow(
+    mut identity: Signal<IdentityState>,
+    mut game_state: Signal<Option<ClientGameState>>,
+    mut ops: Signal<OperationState>,
+    mut reconnect_session_code: Signal<String>,
+    mut reconnect_token: Signal<String>,
+    mut judge_bundle: Signal<Option<JudgeBundle>>,
+) {
+    let base_url = { identity.read().api_base_url.clone() };
+
+    identity.with_mut(|id| {
+        id.connection_status = ConnectionStatus::Connecting;
+    });
+    ops.with_mut(|o| {
+        o.pending_flow = Some(PendingFlow::Create);
+        o.notice = Some(info_notice("Creating workshop…"));
     });
 
-    submit_workshop_command(
-        identity,
-        ops,
-        handover_tags_input,
-        judge_bundle,
-        SessionCommand::UpdatePlayerPet,
-        Some(payload),
-    )
-    .await;
+    let config = WorkshopCreateConfig {
+        phase0_minutes: 8,
+        phase1_minutes: 8,
+        phase2_minutes: 8,
+    };
+
+    let api = AppWebApi::new(base_url);
+    match api
+        .create_workshop(String::new(), config, None)
+        .await
+    {
+        Ok(success) => {
+            apply_join_and_bootstrap(
+                &mut identity,
+                &mut game_state,
+                &mut ops,
+                &mut reconnect_session_code,
+                &mut reconnect_token,
+                &mut judge_bundle,
+                success,
+                PendingFlow::Create,
+                "Workshop created, but session persistence failed",
+            );
+        }
+        Err(error) => {
+            identity.with_mut(|id| {
+                ops.with_mut(|o| {
+                    apply_request_error(id, o, error);
+                });
+            });
+        }
+    }
+}
+
+/// Join a workshop with an optional character. Called from PickCharacter screen.
+/// `character_id = None` means the server leases a random starter.
+pub async fn submit_join_with_character_flow(
+    mut identity: Signal<IdentityState>,
+    mut game_state: Signal<Option<ClientGameState>>,
+    mut ops: Signal<OperationState>,
+    mut reconnect_session_code: Signal<String>,
+    mut reconnect_token: Signal<String>,
+    mut judge_bundle: Signal<Option<JudgeBundle>>,
+    workshop_code: String,
+    character_id: Option<String>,
+) {
+    let base_url = { identity.read().api_base_url.clone() };
+
+    identity.with_mut(|id| {
+        id.connection_status = ConnectionStatus::Connecting;
+    });
+    ops.with_mut(|o| {
+        o.pending_flow = Some(PendingFlow::Join);
+        o.notice = Some(info_notice("Joining workshop…"));
+    });
+
+    let api = AppWebApi::new(base_url);
+    let request = JoinWorkshopRequest {
+        session_code: workshop_code,
+        name: None, // server gets name from cookie
+        character_id,
+        reconnect_token: None,
+    };
+    match api.join_workshop_with_character(&request).await {
+        Ok(success) => {
+            apply_join_and_bootstrap(
+                &mut identity,
+                &mut game_state,
+                &mut ops,
+                &mut reconnect_session_code,
+                &mut reconnect_token,
+                &mut judge_bundle,
+                success,
+                PendingFlow::Join,
+                "Joined workshop, but session persistence failed",
+            );
+        }
+        Err(error) => {
+            identity.with_mut(|id| {
+                ops.with_mut(|o| {
+                    apply_request_error(id, o, error);
+                });
+            });
+        }
+    }
+}
+
+/// Load the player's characters into `ops.my_characters`.
+pub async fn load_my_characters_flow(
+    identity: Signal<IdentityState>,
+    mut ops: Signal<OperationState>,
+) {
+    let base_url = { identity.read().api_base_url.clone() };
+    let api = AppWebApi::new(base_url);
+    match api.list_my_characters().await {
+        Ok(response) => {
+            ops.with_mut(|o| {
+                o.my_characters = response.characters;
+                o.my_characters_limit = response.limit;
+            });
+        }
+        Err(error) => {
+            ops.with_mut(|o| {
+                o.notice = Some(error_notice(&format!("Failed to load characters: {error}")));
+            });
+        }
+    }
+}
+
+/// Load open workshops into `ops.open_workshops`.
+pub async fn load_open_workshops_flow(
+    identity: Signal<IdentityState>,
+    mut ops: Signal<OperationState>,
+) {
+    let base_url = { identity.read().api_base_url.clone() };
+    let api = AppWebApi::new(base_url);
+    match api.list_open_workshops().await {
+        Ok(response) => {
+            ops.with_mut(|o| {
+                o.open_workshops = response.workshops;
+            });
+        }
+        Err(error) => {
+            ops.with_mut(|o| {
+                o.notice = Some(error_notice(&format!(
+                    "Failed to load workshops: {error}"
+                )));
+            });
+        }
+    }
+}
+
+/// Load eligible characters for a workshop into `ops.eligible_characters`.
+pub async fn load_eligible_characters_flow(
+    identity: Signal<IdentityState>,
+    mut ops: Signal<OperationState>,
+    workshop_code: String,
+) {
+    let base_url = { identity.read().api_base_url.clone() };
+    let api = AppWebApi::new(base_url);
+    match api.eligible_characters(&workshop_code).await {
+        Ok(response) => {
+            ops.with_mut(|o| {
+                o.eligible_characters = response.characters;
+            });
+        }
+        Err(error) => {
+            ops.with_mut(|o| {
+                o.notice = Some(error_notice(&format!(
+                    "Failed to load eligible characters: {error}"
+                )));
+            });
+        }
+    }
+}
+
+/// Create a character (standalone, account-scoped). On success, navigates back
+/// to AccountHome.
+pub async fn submit_create_character_flow(
+    mut identity: Signal<IdentityState>,
+    mut ops: Signal<OperationState>,
+    description: String,
+    sprites: SpriteSet,
+) {
+    let base_url = { identity.read().api_base_url.clone() };
+
+    if description.trim().is_empty() {
+        ops.with_mut(|o| o.notice = Some(error_notice("Enter a character description.")));
+        return;
+    }
+
+    ops.with_mut(|o| {
+        o.pending_flow = Some(PendingFlow::Create);
+        o.notice = Some(info_notice("Creating character…"));
+    });
+
+    let api = AppWebApi::new(base_url);
+    let request = protocol::CreateCharacterRequest {
+        description: description.trim().to_string(),
+        sprites,
+    };
+    match api.create_character(&request).await {
+        Ok(_profile) => {
+            identity.with_mut(|id| {
+                id.screen = ShellScreen::AccountHome;
+            });
+            ops.with_mut(|o| {
+                o.pending_flow = None;
+                o.notice = Some(success_notice("Character created."));
+            });
+        }
+        Err(error) => {
+            ops.with_mut(|o| {
+                o.pending_flow = None;
+                o.notice = Some(error_notice(&error));
+            });
+        }
+    }
+}
+
+/// Delete a character and refresh the character list.
+pub async fn submit_delete_character_flow(
+    identity: Signal<IdentityState>,
+    mut ops: Signal<OperationState>,
+    character_id: String,
+) {
+    let base_url = { identity.read().api_base_url.clone() };
+    let api = AppWebApi::new(base_url);
+    match api.delete_character(&character_id).await {
+        Ok(()) => {
+            ops.with_mut(|o| {
+                o.my_characters.retain(|c| c.id != character_id);
+                o.notice = Some(success_notice("Character deleted."));
+            });
+        }
+        Err(error) => {
+            ops.with_mut(|o| {
+                o.notice = Some(error_notice(&format!("Failed to delete character: {error}")));
+            });
+        }
+    }
+}
+
+/// Leave the current workshop session and return to AccountHome.
+pub fn leave_workshop(
+    mut identity: Signal<IdentityState>,
+    mut ops: Signal<OperationState>,
+) {
+    identity.with_mut(|id| {
+        clear_session_identity(id);
+    });
+    ops.with_mut(|o| {
+        o.pending_flow = None;
+        o.pending_command = None;
+        o.notice = None;
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Shared helper for join+bootstrap
+// ---------------------------------------------------------------------------
+
+fn apply_join_and_bootstrap(
+    identity: &mut Signal<IdentityState>,
+    game_state: &mut Signal<Option<ClientGameState>>,
+    ops: &mut Signal<OperationState>,
+    reconnect_session_code: &mut Signal<String>,
+    reconnect_token: &mut Signal<String>,
+    judge_bundle: &mut Signal<Option<JudgeBundle>>,
+    success: protocol::WorkshopJoinSuccess,
+    flow: PendingFlow,
+    persistence_error_prefix: &str,
+) {
+    identity.with_mut(|id| {
+        game_state.with_mut(|gs| {
+            ops.with_mut(|o| {
+                reconnect_session_code.with_mut(|reconnect_code| {
+                    reconnect_token.with_mut(|token| {
+                        judge_bundle.with_mut(|jb| {
+                            apply_join_success(id, gs, o, reconnect_code, token, jb, success, flow);
+                        });
+                    });
+                });
+            });
+        });
+    });
+    let persisted_snapshot = { identity.read().session_snapshot.clone() };
+    if let Some(snapshot) = persisted_snapshot
+        && let Err(error) = persist_browser_session_snapshot(&snapshot)
+    {
+        ops.with_mut(|o| {
+            o.notice = Some(error_notice(&format!(
+                "{persistence_error_prefix}: {error}"
+            )));
+        });
+    }
+    if let Err(error) = bootstrap_realtime(*identity, *game_state, *ops, *judge_bundle) {
+        identity.with_mut(|id| {
+            ops.with_mut(|o| {
+                apply_realtime_bootstrap_error(id, o, error);
+            });
+        });
+    }
 }
 
 #[cfg(test)]
@@ -541,8 +654,10 @@ mod tests {
                 achievements: Vec::new(),
                 is_ready: false,
                 is_connected: true,
+                character_id: None,
                 pet_description: Some("Alice's workshop dragon".to_string()),
                 custom_sprites: None,
+                remaining_sprite_regenerations: 1,
             },
         );
 
@@ -612,7 +727,6 @@ mod tests {
             let identity = Signal::new(initial_identity);
             let game_state = Signal::new(None);
             let ops = Signal::new(default_operation_state());
-            let join_session_code = Signal::new(String::new());
             let reconnect_session_code = Signal::new("123456".to_string());
             let reconnect_token = Signal::new("reconnect-1".to_string());
             let judge_bundle = Signal::new(None);
@@ -621,7 +735,6 @@ mod tests {
                 identity,
                 game_state,
                 ops,
-                join_session_code,
                 reconnect_session_code,
                 reconnect_token,
                 judge_bundle,

@@ -1,8 +1,10 @@
 use protocol::{
-    ClientSessionSnapshot, CreateWorkshopRequest, JoinWorkshopRequest, JudgeBundle, SessionCommand,
-    SessionEnvelope, SpriteSet, SpriteSheetRequest, SpriteSheetResult, WorkshopCommandRequest,
-    WorkshopCommandResult, WorkshopCreateConfig, WorkshopJoinResult, WorkshopJoinSuccess,
-    WorkshopJudgeBundleRequest, WorkshopJudgeBundleResult,
+    AccountProfile, AuthRequest, AuthResponse, CharacterProfile, ClientSessionSnapshot,
+    CreateCharacterRequest, CreateWorkshopRequest, EligibleCharactersResponse,
+    JoinWorkshopRequest, JudgeBundle, ListOpenWorkshopsResponse, MyCharactersResponse,
+    SessionCommand, SessionEnvelope, WorkshopCommandRequest, WorkshopCommandResult,
+    WorkshopCreateConfig, WorkshopJoinResult, WorkshopJoinSuccess, WorkshopJudgeBundleRequest,
+    WorkshopJudgeBundleResult,
 };
 
 use serde::de::DeserializeOwned;
@@ -38,9 +40,17 @@ impl AppWebApi {
         &self,
         name: String,
         config: WorkshopCreateConfig,
+        character_id: Option<String>,
     ) -> Result<WorkshopJoinSuccess, String> {
         Self::parse_join_response(
-            self.post_json("/api/workshops", &CreateWorkshopRequest { name, config })
+            self.post_json(
+                "/api/workshops",
+                &CreateWorkshopRequest {
+                    name: Some(name),
+                    config,
+                    character_id,
+                },
+            )
                 .await?,
         )
     }
@@ -85,18 +95,58 @@ impl AppWebApi {
         }
     }
 
-    pub async fn generate_sprite_sheet(
-        &self,
-        request: SpriteSheetRequest,
-    ) -> Result<SpriteSet, String> {
-        let payload: SpriteSheetResult = self
-            .post_json("/api/workshops/sprite-sheet", &request)
-            .await?;
+    // -----------------------------------------------------------------------
+    // New cookie-auth endpoints
+    // -----------------------------------------------------------------------
 
-        match payload {
-            SpriteSheetResult::Success(success) => Ok(success.sprites),
-            SpriteSheetResult::Error(error) => Err(error.error),
-        }
+    pub async fn signin(&self, request: &AuthRequest) -> Result<AuthResponse, String> {
+        self.post_json("/api/auth/signin", request).await
+    }
+
+    pub async fn logout(&self) -> Result<(), String> {
+        self.post_empty("/api/auth/logout", &()).await
+    }
+
+    #[allow(dead_code)]
+    pub async fn get_account_me(&self) -> Result<AccountProfile, String> {
+        self.get_json("/api/accounts/me").await
+    }
+
+    pub async fn list_my_characters(&self) -> Result<MyCharactersResponse, String> {
+        self.get_json("/api/characters/mine").await
+    }
+
+    pub async fn create_character(
+        &self,
+        request: &CreateCharacterRequest,
+    ) -> Result<CharacterProfile, String> {
+        self.post_json("/api/characters", request).await
+    }
+
+    pub async fn delete_character(&self, character_id: &str) -> Result<(), String> {
+        self.delete_empty(&format!("/api/characters/{character_id}"))
+            .await
+    }
+
+    pub async fn list_open_workshops(&self) -> Result<ListOpenWorkshopsResponse, String> {
+        self.get_json("/api/workshops/open").await
+    }
+
+    pub async fn eligible_characters(
+        &self,
+        workshop_code: &str,
+    ) -> Result<EligibleCharactersResponse, String> {
+        self.get_json(&format!(
+            "/api/workshops/{workshop_code}/eligible-characters"
+        ))
+        .await
+    }
+
+    pub async fn join_workshop_with_character(
+        &self,
+        request: &JoinWorkshopRequest,
+    ) -> Result<WorkshopJoinSuccess, String> {
+        Self::parse_join_response(self.post_json("/api/workshops/join", request).await?)
     }
 
     fn parse_join_response(payload: WorkshopJoinResult) -> Result<WorkshopJoinSuccess, String> {
@@ -118,6 +168,7 @@ impl AppWebApi {
         let init = web_sys::RequestInit::new();
         init.set_method("POST");
         init.set_body(&JsValue::from_str(&body_json));
+        init.set_credentials(web_sys::RequestCredentials::SameOrigin);
 
         let headers =
             web_sys::Headers::new().map_err(|_| "failed to prepare request headers".to_string())?;
@@ -153,6 +204,90 @@ impl AppWebApi {
             .map_err(|error| format!("failed to parse backend response: {error}"))
     }
 
+    /// POST that expects a 2xx with no JSON body (e.g. logout, 204 responses).
+    #[cfg(target_arch = "wasm32")]
+    async fn post_empty<Req>(&self, path: &str, body: &Req) -> Result<(), String>
+    where
+        Req: serde::Serialize,
+    {
+        let body_json = serde_json::to_string(body)
+            .map_err(|error| format!("failed to encode request body: {error}"))?;
+
+        let init = web_sys::RequestInit::new();
+        init.set_method("POST");
+        init.set_body(&JsValue::from_str(&body_json));
+        init.set_credentials(web_sys::RequestCredentials::SameOrigin);
+
+        let headers =
+            web_sys::Headers::new().map_err(|_| "failed to prepare request headers".to_string())?;
+        headers
+            .set("Content-Type", "application/json")
+            .map_err(|_| "failed to set request headers".to_string())?;
+        init.set_headers_headers(&headers);
+
+        let response = wasm_fetch(&self.base_url, path, &init).await?;
+        if !response.ok() {
+            let text = js_future_string(
+                response
+                    .text()
+                    .map_err(|_| "failed to read backend response".to_string())?,
+            )
+            .await?;
+            return Err(extract_backend_error(&text).unwrap_or_else(|| {
+                format!("backend request failed with status {}", response.status())
+            }));
+        }
+        Ok(())
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    async fn get_json<Res>(&self, path: &str) -> Result<Res, String>
+    where
+        Res: DeserializeOwned,
+    {
+        let init = web_sys::RequestInit::new();
+        init.set_method("GET");
+        init.set_credentials(web_sys::RequestCredentials::SameOrigin);
+
+        let response = wasm_fetch(&self.base_url, path, &init).await?;
+        let text = js_future_string(
+            response
+                .text()
+                .map_err(|_| "failed to read backend response".to_string())?,
+        )
+        .await?;
+
+        if !response.ok() {
+            return Err(extract_backend_error(&text).unwrap_or_else(|| {
+                format!("backend request failed with status {}", response.status())
+            }));
+        }
+
+        serde_json::from_str(&text)
+            .map_err(|error| format!("failed to parse backend response: {error}"))
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    async fn delete_empty(&self, path: &str) -> Result<(), String> {
+        let init = web_sys::RequestInit::new();
+        init.set_method("DELETE");
+        init.set_credentials(web_sys::RequestCredentials::SameOrigin);
+
+        let response = wasm_fetch(&self.base_url, path, &init).await?;
+        if !response.ok() {
+            let text = js_future_string(
+                response
+                    .text()
+                    .map_err(|_| "failed to read backend response".to_string())?,
+            )
+            .await?;
+            return Err(extract_backend_error(&text).unwrap_or_else(|| {
+                format!("backend request failed with status {}", response.status())
+            }));
+        }
+        Ok(())
+    }
+
     #[cfg(not(target_arch = "wasm32"))]
     async fn post_json<Req, Res>(&self, path: &str, body: &Req) -> Result<Res, String>
     where
@@ -171,6 +306,79 @@ impl AppWebApi {
             .await
             .map_err(|error| format!("failed to parse backend response: {error}"))
     }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    async fn post_empty<Req>(&self, path: &str, body: &Req) -> Result<(), String>
+    where
+        Req: serde::Serialize,
+    {
+        let response = reqwest::Client::new()
+            .post(format!("{}{}", self.base_url, path))
+            .json(body)
+            .send()
+            .await
+            .map_err(|error| format!("failed to reach backend: {error}"))?;
+
+        if !response.status().is_success() {
+            return Err(format!(
+                "backend request failed with status {}",
+                response.status()
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    async fn get_json<Res>(&self, path: &str) -> Result<Res, String>
+    where
+        Res: DeserializeOwned,
+    {
+        let response = reqwest::Client::new()
+            .get(format!("{}{}", self.base_url, path))
+            .send()
+            .await
+            .map_err(|error| format!("failed to reach backend: {error}"))?;
+
+        response
+            .json::<Res>()
+            .await
+            .map_err(|error| format!("failed to parse backend response: {error}"))
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    async fn delete_empty(&self, path: &str) -> Result<(), String> {
+        let response = reqwest::Client::new()
+            .delete(format!("{}{}", self.base_url, path))
+            .send()
+            .await
+            .map_err(|error| format!("failed to reach backend: {error}"))?;
+
+        if !response.status().is_success() {
+            return Err(format!(
+                "backend request failed with status {}",
+                response.status()
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn wasm_fetch(
+    base_url: &str,
+    path: &str,
+    init: &web_sys::RequestInit,
+) -> Result<web_sys::Response, String> {
+    let url = format!("{}{}", base_url, path);
+    let request = web_sys::Request::new_with_str_and_init(&url, init)
+        .map_err(|_| "failed to prepare browser request".to_string())?;
+    let window = web_sys::window().ok_or_else(|| "window is unavailable".to_string())?;
+    let response = JsFuture::from(window.fetch_with_request(&request))
+        .await
+        .map_err(|e| format!("failed to reach backend: {}", js_error_message(e)))?;
+    response
+        .dyn_into()
+        .map_err(|_| "failed to read browser response".to_string())
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -223,6 +431,7 @@ pub fn build_reconnect_request(session_code: &str, reconnect_token: &str) -> Joi
     JoinWorkshopRequest {
         session_code: session_code.trim().to_string(),
         name: None,
+        character_id: None,
         reconnect_token: Some(reconnect_token.trim().to_string()),
     }
 }
@@ -255,17 +464,6 @@ pub fn build_judge_bundle_request(snapshot: &ClientSessionSnapshot) -> WorkshopJ
         session_code: snapshot.session_code.clone(),
         reconnect_token: snapshot.reconnect_token.clone(),
         coordinator_type: Some(snapshot.coordinator_type),
-    }
-}
-
-pub fn build_sprite_sheet_request(
-    snapshot: &ClientSessionSnapshot,
-    description: &str,
-) -> SpriteSheetRequest {
-    SpriteSheetRequest {
-        session_code: snapshot.session_code.clone(),
-        reconnect_token: snapshot.reconnect_token.clone(),
-        description: description.to_string(),
     }
 }
 

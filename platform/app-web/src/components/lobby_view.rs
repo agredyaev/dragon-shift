@@ -1,7 +1,7 @@
 use dioxus::prelude::*;
 use protocol::{ClientGameState, SessionCommand};
 
-use crate::flows::submit_workshop_command;
+use crate::flows::{leave_workshop, submit_workshop_command};
 use crate::helpers::{current_player, lobby_player_rows, lobby_ready_summary, lobby_status_copy};
 use crate::state::{IdentityState, OperationState};
 
@@ -40,14 +40,12 @@ pub fn LobbyView(
             p { class: "panel__body", {status_label} }
 
             div { class: "panel__stack",
-                // Ready counter
                 div { style: "background:#0f172a;padding:16px;border:4px solid #0f172a;text-align:center;box-shadow:inset 4px 4px 0 rgba(0,0,0,0.5);",
                     p { style: "font-family:var(--font-display);font-size:20px;font-weight:900;letter-spacing:0.12em;color:#34d399;",
                         {ready_label}
                     }
                 }
 
-                // Player roster
                 div { class: "roster",
                     for row in rows {
                         article { class: "roster__item",
@@ -63,29 +61,36 @@ pub fn LobbyView(
                     }
                 }
 
-                // Host controls
                 if is_host {
                     div { class: "button-row",
                         button {
                             class: "button button--primary",
                             style: "width:100%;",
-                            "data-testid": "start-phase0-button",
+                            "data-testid": "start-phase1-button",
                             disabled: commands_disabled,
                             onclick: move |_| {
                                 spawn(submit_workshop_command(
-                                    identity,
-                                    ops,
-                                    handover_tags_input,
-                                    judge_bundle,
-                                    SessionCommand::StartPhase0,
-                                    None,
+                                    identity, ops, handover_tags_input, judge_bundle,
+                                    SessionCommand::StartPhase1, None,
                                 ));
                             },
-                            "Open Character Creation"
+                            "Start Phase 1"
                         }
                     }
                 } else {
-                    p { class: "meta", style: "text-align:center;", "Waiting for the host to open character creation." }
+                    p { class: "meta", style: "text-align:center;", "Waiting for the host to start Phase 1." }
+                }
+
+                div { class: "button-row",
+                    button {
+                        class: "button button--secondary",
+                        "data-testid": "leave-workshop-button",
+                        disabled: commands_disabled,
+                        onclick: move |_| {
+                            leave_workshop(identity, ops);
+                        },
+                        "Leave workshop"
+                    }
                 }
             }
         }

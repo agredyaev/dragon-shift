@@ -1,9 +1,9 @@
 use dioxus::prelude::*;
 use protocol::{ClientGameState, JudgeBundle, SessionCommand};
 
-use crate::flows::submit_workshop_command;
+use crate::flows::{leave_workshop, submit_workshop_command};
 use crate::helpers::*;
-use crate::state::{clear_session_identity, IdentityState, OperationState};
+use crate::state::{IdentityState, OperationState};
 
 use super::archive_panel::ArchivePanel;
 
@@ -59,9 +59,7 @@ pub fn EndView(
         }
     });
     let active_tab_value = active_tab.read().clone();
-    let active_tab_key = if is_end_screen {
-        "design"
-    } else if results_revealed && active_tab_value == "vote" {
+    let active_tab_key = if is_end_screen || (results_revealed && active_tab_value == "vote") {
         "design"
     } else {
         active_tab_value.as_str()
@@ -344,7 +342,7 @@ pub fn EndView(
                         class: "button button--secondary",
                         "data-testid": "leave-workshop-button",
                         onclick: move |_| {
-                            clear_session_identity(&mut identity.write());
+                            leave_workshop(identity, ops);
                         },
                         "Leave workshop"
                     }
@@ -367,7 +365,7 @@ pub fn EndView(
                         class: "button button--secondary",
                         "data-testid": "leave-workshop-button",
                         onclick: move |_| {
-                            clear_session_identity(&mut identity.write());
+                            leave_workshop(identity, ops);
                         },
                         "Leave workshop"
                     }

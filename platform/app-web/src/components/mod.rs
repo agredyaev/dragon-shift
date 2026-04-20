@@ -1,13 +1,13 @@
+pub mod account_home;
 pub mod archive_panel;
-pub mod create_panel;
+pub mod create_character;
 pub mod end_view;
 pub mod handover_view;
 pub mod hero;
-pub mod join_panel;
 pub mod lobby_view;
 pub mod notice;
-pub mod phase0_view;
 pub mod phase1_view;
 pub mod phase2_view;
+pub mod pick_character;
+pub mod sign_in;
 pub mod voting_view;
-pub mod workshop_brief;

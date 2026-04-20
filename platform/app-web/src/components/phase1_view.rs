@@ -15,7 +15,7 @@ pub fn Phase1View(
     handover_tags_input: Signal<String>,
     judge_bundle: Signal<Option<JudgeBundle>>,
 ) -> Element {
-    let observation_input = use_signal(|| String::new());
+    let observation_input = use_signal(String::new);
 
     let gs = game_state.read();
     let Some(state) = gs.as_ref() else {

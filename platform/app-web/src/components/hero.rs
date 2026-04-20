@@ -31,7 +31,6 @@ pub fn Hero(
         section { class: "hero", "data-testid": "hero-panel",
             h1 { class: "hero__title", "Dragon Shift" }
             p { class: "hero__body", {screen_title(&id.screen)} }
-            p { class: "meta", "Raise a dragon for one short shift, pass along practical care notes, and keep the whole room aligned from lobby to final results." }
             div { class: "hero__meta",
                 span { class: connection_badge_class, "data-testid": "connection-badge", "Connection: " {connection_status_label(&id.connection_status)} }
                 if has_session_snapshot {

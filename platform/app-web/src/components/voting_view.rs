@@ -131,7 +131,7 @@ pub fn VotingView(
         if is_host {
             p {
                 class: "meta",
-                "The host can finish voting whenever the workshop is ready, even if some players skip voting."
+                "The host can finish voting after at least one eligible vote is submitted, even if some players skip it."
             }
             div { class: "button-row",
                 button {

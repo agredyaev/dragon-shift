@@ -13,10 +13,10 @@ pub fn HandoverView(
     handover_tags_input: Signal<String>,
     judge_bundle: Signal<Option<JudgeBundle>>,
 ) -> Element {
-    let rule1 = use_signal(|| String::new());
-    let rule2 = use_signal(|| String::new());
-    let rule3 = use_signal(|| String::new());
-    let sprite_recommendation = use_signal(|| String::new());
+    let rule1 = use_signal(String::new);
+    let rule2 = use_signal(String::new);
+    let rule3 = use_signal(String::new);
+    let sprite_recommendation = use_signal(String::new);
 
     let gs = game_state.read();
     let Some(state) = gs.as_ref() else {
