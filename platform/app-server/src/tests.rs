@@ -10176,6 +10176,58 @@ async fn signin_rejects_wrong_password_for_existing_name() {
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     // No cookie on failure.
     assert!(extract_session_cookie(&response).is_none());
+
+    // Structured error body so the SignIn screen can render the spec copy
+    // from refactor.md:50 without string-matching free text.
+    let bytes = to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .expect("read wrong-password body");
+    let value: serde_json::Value =
+        serde_json::from_slice(&bytes).expect("wrong-password body is json");
+    assert_eq!(value["error"], "name_taken_wrong_password");
+    assert_eq!(
+        value["message"],
+        "That name is already registered. Enter the correct password or choose a different name."
+    );
+}
+
+#[tokio::test]
+async fn signin_with_unknown_name_does_not_leak_name_taken_code() {
+    // Enumeration guard: unknown name must NOT surface the
+    // `name_taken_wrong_password` code (which would leak "name exists").
+    // Today the unknown-name branch runs the argon2 timing dummy then
+    // creates the account (201). This test locks that contract: the code
+    // only appears after argon2 verify fails against a real stored hash.
+    let state = test_state();
+    let app = build_app(state);
+
+    let body = serde_json::json!({
+        "hero": "ghost",
+        "name": "NeverSeen",
+        "password": "anypasswordlong",
+    })
+    .to_string();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/auth/signin")
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body))
+                .expect("build unknown-name request"),
+        )
+        .await
+        .expect("unknown-name response");
+
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let bytes = to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .expect("read unknown-name body");
+    let text = String::from_utf8(bytes.to_vec()).expect("utf8 body");
+    assert!(
+        !text.contains("name_taken_wrong_password"),
+        "unknown-name branch must not surface name_taken_wrong_password; got {text}"
+    );
 }
 
 #[tokio::test]
@@ -11293,4 +11345,352 @@ async fn character_create_rate_limit_returns_429() {
         .await
         .expect("response");
     assert_eq!(response2.status(), StatusCode::TOO_MANY_REQUESTS);
+}
+
+// ---------------------------------------------------------------------------
+// POST /api/characters/preview-sprites (plan2.md item 2)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn preview_sprites_requires_account_cookie() {
+    let state = test_state();
+    let app = build_app(state);
+
+    let body = serde_json::json!({
+        "description": "A tiny green dragon with a fiery tail",
+    })
+    .to_string();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/characters/preview-sprites")
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body))
+                .expect("build preview request"),
+        )
+        .await
+        .expect("preview response");
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn preview_sprites_returns_sprites_for_authenticated_account() {
+    // No LLM providers are configured in the default test_state, so the
+    // handler falls back to the default companion sprites — which is exactly
+    // the behavior we want to assert (non-empty sprite URLs returned).
+    let state = test_state();
+    let app = build_app(state);
+    let cookie = signin_and_get_cookie(&app, "knight", "PreviewAlice", "correcthorse").await;
+
+    let body = serde_json::json!({
+        "description": "A tiny green dragon with a fiery tail",
+    })
+    .to_string();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/characters/preview-sprites")
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .header(axum::http::header::COOKIE, &cookie)
+                .body(Body::from(body))
+                .expect("build preview request"),
+        )
+        .await
+        .expect("preview response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .expect("read preview body");
+    let value: serde_json::Value = serde_json::from_slice(&bytes).expect("body is json");
+    let sprites = &value["sprites"];
+    assert!(sprites["neutral"].as_str().is_some_and(|s| !s.is_empty()));
+    assert!(sprites["happy"].as_str().is_some_and(|s| !s.is_empty()));
+    assert!(sprites["angry"].as_str().is_some_and(|s| !s.is_empty()));
+    assert!(sprites["sleepy"].as_str().is_some_and(|s| !s.is_empty()));
+}
+
+#[tokio::test]
+async fn preview_sprites_does_not_create_character_record() {
+    let state = test_state();
+    let app = build_app(state);
+    let cookie = signin_and_get_cookie(&app, "knight", "PreviewNoPersist", "correcthorse").await;
+
+    // Baseline: list-my-characters returns zero.
+    let before = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/characters/mine")
+                .header(axum::http::header::COOKIE, &cookie)
+                .body(Body::empty())
+                .expect("build list request"),
+        )
+        .await
+        .expect("list response");
+    assert_eq!(before.status(), StatusCode::OK);
+    let before_bytes = to_bytes(before.into_body(), 64 * 1024)
+        .await
+        .expect("read list body");
+    let before_json: serde_json::Value =
+        serde_json::from_slice(&before_bytes).expect("list is json");
+    assert_eq!(before_json["characters"].as_array().unwrap().len(), 0);
+
+    // Call preview-sprites.
+    let body = serde_json::json!({
+        "description": "A tiny green dragon with a fiery tail",
+    })
+    .to_string();
+    let preview = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/characters/preview-sprites")
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .header(axum::http::header::COOKIE, &cookie)
+                .body(Body::from(body))
+                .expect("build preview request"),
+        )
+        .await
+        .expect("preview response");
+    assert_eq!(preview.status(), StatusCode::OK);
+
+    // After: list-my-characters still returns zero — preview did not persist.
+    let after = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/characters/mine")
+                .header(axum::http::header::COOKIE, &cookie)
+                .body(Body::empty())
+                .expect("build list request"),
+        )
+        .await
+        .expect("list response");
+    assert_eq!(after.status(), StatusCode::OK);
+    let after_bytes = to_bytes(after.into_body(), 64 * 1024)
+        .await
+        .expect("read list body");
+    let after_json: serde_json::Value =
+        serde_json::from_slice(&after_bytes).expect("list is json");
+    assert_eq!(after_json["characters"].as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn preview_sprites_rejects_empty_description() {
+    let state = test_state();
+    let app = build_app(state);
+    let cookie = signin_and_get_cookie(&app, "knight", "PreviewEmpty", "correcthorse").await;
+
+    let body = serde_json::json!({ "description": "   " }).to_string();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/characters/preview-sprites")
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .header(axum::http::header::COOKIE, &cookie)
+                .body(Body::from(body))
+                .expect("build preview request"),
+        )
+        .await
+        .expect("preview response");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn preview_sprites_rate_limit_returns_429() {
+    // The preview route shares the per-account `character_create_limiter`
+    // with `POST /api/characters`, so setting the limit to 1 and calling
+    // preview twice must trip the limiter on the second call.
+    let base_config = (*test_state().config).clone();
+    let config = AppConfig {
+        character_create_rate_limit: 1,
+        ..base_config
+    };
+    let state = AppState::new(
+        Arc::new(config),
+        Arc::new(InMemorySessionStore::new()),
+        timeout_companion_defaults().sprites,
+    );
+    let app = build_app(state);
+    let cookie = signin_and_get_cookie(&app, "knight", "PreviewRate", "correcthorse").await;
+
+    let body = serde_json::json!({
+        "description": "A tiny green dragon with a fiery tail",
+    })
+    .to_string();
+    let first = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/characters/preview-sprites")
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .header(axum::http::header::COOKIE, &cookie)
+                .body(Body::from(body.clone()))
+                .expect("build first preview request"),
+        )
+        .await
+        .expect("first preview response");
+    assert_eq!(first.status(), StatusCode::OK);
+
+    let second = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/characters/preview-sprites")
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .header(axum::http::header::COOKIE, &cookie)
+                .body(Body::from(body))
+                .expect("build second preview request"),
+        )
+        .await
+        .expect("second preview response");
+    assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+}
+
+// ---------------------------------------------------------------------------
+// plan2.md item 3: starter-lease uniqueness inside a workshop
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn join_workshop_assigns_distinct_starters_to_two_accounts() {
+    // `InMemorySessionStore::new()` seeds 4 starters so any two zero-character
+    // accounts that lease from the pool must receive distinct ids.
+    let state = test_state();
+    let app = build_app(state);
+
+    // Alice creates the workshop (zero owned characters → leased starter).
+    let alice_cookie = test_auth_cookie(&app, "Alice").await;
+    let session_code = create_test_workshop(&app, &alice_cookie).await;
+
+    // Bob joins with zero owned characters → should lease a different starter.
+    let bob_cookie = test_auth_cookie(&app, "Bob").await;
+    let join_body = format!(r#"{{"sessionCode":"{}","name":"Bob"}}"#, session_code);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops/join")
+                .header("content-type", "application/json")
+                .header(axum::http::header::COOKIE, &bob_cookie)
+                .body(Body::from(join_body))
+                .expect("build join request"),
+        )
+        .await
+        .expect("join response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    let result: WorkshopJoinResult = serde_json::from_slice(&bytes).expect("parse result");
+    let success = match result {
+        WorkshopJoinResult::Success(s) => s,
+        WorkshopJoinResult::Error(e) => panic!("expected success, got: {}", e.error),
+    };
+
+    // Both players are in the state snapshot returned to Bob. Collect their
+    // character ids and assert they differ.
+    let mut character_ids: Vec<String> = success
+        .state
+        .players
+        .values()
+        .filter_map(|player| player.character_id.clone())
+        .collect();
+    assert_eq!(
+        character_ids.len(),
+        2,
+        "expected both players to have a leased character, got: {:?}",
+        success.state.players
+    );
+    character_ids.sort();
+    character_ids.dedup();
+    assert_eq!(
+        character_ids.len(),
+        2,
+        "expected two distinct starter character ids across the two players, got: {:?}",
+        success.state.players
+    );
+}
+
+#[tokio::test]
+async fn join_workshop_returns_error_when_all_starters_leased_in_session() {
+    // `InMemorySessionStore::new()` seeds exactly 4 starters (see
+    // `starter_character_defaults`). With 4 zero-character accounts the pool
+    // is fully leased; the 5th joiner has no starter left and must be
+    // rejected with the "no starter available" error.
+    let state = test_state();
+    let app = build_app(state);
+
+    let alice_cookie = test_auth_cookie(&app, "Alice").await;
+    let session_code = create_test_workshop(&app, &alice_cookie).await;
+
+    // 3 more joiners fill up the remaining 3 seeded starters.
+    for name in ["Bob", "Carol", "Dave"] {
+        let cookie = test_auth_cookie(&app, name).await;
+        let body = format!(r#"{{"sessionCode":"{}","name":"{}"}}"#, session_code, name);
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/workshops/join")
+                    .header("content-type", "application/json")
+                    .header(axum::http::header::COOKIE, &cookie)
+                    .body(Body::from(body))
+                    .expect("build join request"),
+            )
+            .await
+            .expect("join response");
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "joiner {name} should have leased a distinct starter"
+        );
+    }
+
+    // 5th joiner: pool exhausted → expect "no starter available".
+    let eve_cookie = test_auth_cookie(&app, "Eve").await;
+    let eve_body = format!(r#"{{"sessionCode":"{}","name":"Eve"}}"#, session_code);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops/join")
+                .header("content-type", "application/json")
+                .header(axum::http::header::COOKIE, &eve_cookie)
+                .body(Body::from(eve_body))
+                .expect("build join request"),
+        )
+        .await
+        .expect("join response");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let bytes = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    let result: WorkshopJoinResult = serde_json::from_slice(&bytes).expect("parse result");
+    match result {
+        WorkshopJoinResult::Error(e) => {
+            assert!(
+                e.error.contains("no starter available"),
+                "expected 'no starter available' in error, got: {}",
+                e.error
+            );
+        }
+        WorkshopJoinResult::Success(s) => {
+            panic!(
+                "expected error when all starters already leased in session; got success with players: {:?}",
+                s.state.players
+            )
+        }
+    }
 }

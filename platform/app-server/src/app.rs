@@ -37,8 +37,8 @@ use tower_http::{
 
 use crate::http::{
     create_character, create_workshop, delete_character, eligible_characters,
-    generate_character_sprite_sheet, generate_sprite_sheet, join_workshop,
-    list_character_catalog, list_my_characters, list_open_workshops, live,
+    generate_character_sprite_preview, generate_character_sprite_sheet, generate_sprite_sheet,
+    join_workshop, list_character_catalog, list_my_characters, list_open_workshops, live,
     llm_generate_image, llm_judge, ready, workshop_command,
     workshop_judge_bundle,
 };
@@ -219,6 +219,7 @@ pub(crate) fn build_app(state: AppState) -> Router {
         .route("/accounts/me", get(accounts_me))
         .route("/characters", post(create_character))
         .route("/characters/mine", get(list_my_characters))
+        .route("/characters/preview-sprites", post(generate_character_sprite_preview))
         .route("/characters/{id}", delete(delete_character))
         .route("/workshops", post(create_workshop))
         .route("/workshops/open", get(list_open_workshops))

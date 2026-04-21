@@ -1,5 +1,6 @@
 use protocol::{
-    AccountProfile, AuthRequest, AuthResponse, CharacterProfile, ClientSessionSnapshot,
+    AccountProfile, AuthRequest, AuthResponse, CharacterProfile,
+    CharacterSpritePreviewRequest, CharacterSpritePreviewResponse, ClientSessionSnapshot,
     CreateCharacterRequest, CreateWorkshopRequest, EligibleCharactersResponse,
     JoinWorkshopRequest, JudgeBundle, ListOpenWorkshopsResponse, MyCharactersResponse,
     SessionCommand, SessionEnvelope, WorkshopCommandRequest, WorkshopCommandResult,
@@ -121,6 +122,16 @@ impl AppWebApi {
         request: &CreateCharacterRequest,
     ) -> Result<CharacterProfile, String> {
         self.post_json("/api/characters", request).await
+    }
+
+    /// Generate a sprite-sheet preview for the CreateCharacter screen.
+    /// Account-scoped; does not persist anything server-side.
+    pub async fn preview_character_sprites(
+        &self,
+        request: &CharacterSpritePreviewRequest,
+    ) -> Result<CharacterSpritePreviewResponse, String> {
+        self.post_json("/api/characters/preview-sprites", request)
+            .await
     }
 
     pub async fn delete_character(&self, character_id: &str) -> Result<(), String> {

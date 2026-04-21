@@ -1,7 +1,24 @@
 use dioxus::prelude::*;
+use protocol::AUTH_ERR_NAME_TAKEN_WRONG_PASSWORD;
 
 use crate::flows::submit_signin_flow;
 use crate::state::{IdentityState, OperationState};
+
+/// Map a backend signin error code (the `error` field of the JSON body,
+/// surfaced by `api::extract_backend_error` as the `Err` string) to the
+/// copy the SignIn screen renders in `NoticeBar`.
+///
+/// Unknown codes fall through so operators/tests still see the raw backend
+/// string instead of a generic swallow.
+pub fn map_signin_error(error: &str) -> String {
+    match error {
+        AUTH_ERR_NAME_TAKEN_WRONG_PASSWORD => {
+            "That name is already registered. Enter the correct password or choose a different name."
+                .to_string()
+        }
+        other => other.to_string(),
+    }
+}
 
 #[component]
 pub fn SignInView(

@@ -6,24 +6,26 @@ use axum::{
 };
 use axum_extra::extract::cookie::{Key, SignedCookieJar};
 use chrono::{DateTime, Utc};
-use domain::{DomainError, Phase1Assignment, SessionCode, SessionPlayer, WorkshopSession, MAX_CHARACTERS_PER_ACCOUNT};
+use domain::{
+    DomainError, MAX_CHARACTERS_PER_ACCOUNT, Phase1Assignment, SessionCode, SessionPlayer,
+    WorkshopSession,
+};
 use persistence::CharacterRecord;
 use protocol::{
     ActionPayload, CharacterCatalogRequest, CharacterCatalogResult, CharacterCatalogSuccess,
-    CharacterProfile, CharacterSpriteSheetRequest, CharacterSpriteSheetResult,
-    CharacterSpriteSheetSuccess, CoordinatorType, CreateCharacterRequest, CreateWorkshopRequest,
-    DiscoveryObservationRequest, EligibleCharactersResponse,
-    JoinWorkshopRequest, JudgeBundle, JudgeDragonBundle, LlmDragonEvaluation, LlmImageRequest,
-    LlmImageResult, LlmImageSuccess, LlmJudgeEvaluation, LlmJudgeRequest, LlmJudgeResult,
-    LlmJudgeSuccess, ListOpenWorkshopsResponse, MyCharactersResponse,
-    OpenWorkshopSummary, SessionArtifactKind, SessionArtifactRecord, SessionCommand,
-    SPRITE_ATELIER_ACCEPTED_NOTICE_MESSAGE, SPRITE_ATELIER_DRAWING_NOTICE_MESSAGE,
-    SPRITE_ATELIER_NOTICE_TITLE,
-    SPRITE_ATELIER_FALLBACK_NOTICE_MESSAGE, SPRITE_ATELIER_QUEUED_NOTICE_MESSAGE,
-    SelectCharacterRequest, SessionNoticeCode, SpriteSheetRequest, SpriteSheetResult,
-    SpriteSheetSuccess, VotePayload,
-    WorkshopCommandRequest, WorkshopCommandResult, WorkshopCommandSuccess, WorkshopError,
-    WorkshopJoinResult, WorkshopJoinSuccess, WorkshopJudgeBundleRequest, WorkshopJudgeBundleResult,
+    CharacterProfile, CharacterSpritePreviewRequest, CharacterSpritePreviewResponse,
+    CharacterSpriteSheetRequest, CharacterSpriteSheetResult, CharacterSpriteSheetSuccess,
+    CoordinatorType, CreateCharacterRequest, CreateWorkshopRequest, DiscoveryObservationRequest,
+    EligibleCharactersResponse, JoinWorkshopRequest, JudgeBundle, JudgeDragonBundle,
+    ListOpenWorkshopsResponse, LlmDragonEvaluation, LlmImageRequest, LlmImageResult,
+    LlmImageSuccess, LlmJudgeEvaluation, LlmJudgeRequest, LlmJudgeResult, LlmJudgeSuccess,
+    MyCharactersResponse, OpenWorkshopSummary, SPRITE_ATELIER_ACCEPTED_NOTICE_MESSAGE,
+    SPRITE_ATELIER_DRAWING_NOTICE_MESSAGE, SPRITE_ATELIER_FALLBACK_NOTICE_MESSAGE,
+    SPRITE_ATELIER_NOTICE_TITLE, SPRITE_ATELIER_QUEUED_NOTICE_MESSAGE, SelectCharacterRequest,
+    SessionArtifactKind, SessionArtifactRecord, SessionCommand, SessionNoticeCode,
+    SpriteSheetRequest, SpriteSheetResult, SpriteSheetSuccess, VotePayload, WorkshopCommandRequest,
+    WorkshopCommandResult, WorkshopCommandSuccess, WorkshopError, WorkshopJoinResult,
+    WorkshopJoinSuccess, WorkshopJudgeBundleRequest, WorkshopJudgeBundleResult,
     WorkshopJudgeBundleSuccess,
 };
 use security::{FixedWindowRateLimiter, OriginPolicy};
@@ -66,6 +68,46 @@ async fn wait_for_image_job_turn(
     }
 }
 
+/// Outcome returned by [`acquire_image_job_permit`] when admission to the
+/// image-job queue fails. Callers map each variant to their own
+/// response/fallback contract (workshop notices, HTTP error body, or
+/// session-less preview fallback).
+enum ImageQueueAdmissionOutcome {
+    TimedOut,
+    Unavailable,
+}
+
+/// Consolidate the `try_acquire_owned → NoPermits→wait_for_image_job_turn
+/// → Closed` admission ladder used by every image-job producer.
+///
+/// `on_queued` is invoked exactly once, only when the first non-blocking
+/// attempt fails with `NoPermits` (i.e., the caller will actually have to
+/// wait). The workshop sprite-sheet path uses it to send a "queued"
+/// session notice; paths without a session pass a no-op future.
+async fn acquire_image_job_permit<F, Fut>(
+    state: &AppState,
+    on_queued: F,
+) -> Result<OwnedSemaphorePermit, ImageQueueAdmissionOutcome>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    match state.image_job_queue.clone().try_acquire_owned() {
+        Ok(permit) => Ok(permit),
+        Err(TryAcquireError::NoPermits) => {
+            on_queued().await;
+            match wait_for_image_job_turn(state).await {
+                Ok(permit) => Ok(permit),
+                Err(ImageJobAdmissionError::TimedOut) => Err(ImageQueueAdmissionOutcome::TimedOut),
+                Err(ImageJobAdmissionError::QueueUnavailable) => {
+                    Err(ImageQueueAdmissionOutcome::Unavailable)
+                }
+            }
+        }
+        Err(TryAcquireError::Closed) => Err(ImageQueueAdmissionOutcome::Unavailable),
+    }
+}
+
 async fn sprite_sheet_fallback_with_notice(
     state: &AppState,
     session_code: &str,
@@ -103,36 +145,31 @@ async fn generate_sprite_sheet_with_queue(
     )
     .await;
 
-    let _queue_lease = match state.image_job_queue.clone().try_acquire_owned() {
+    let _queue_lease = match acquire_image_job_permit(&state, || async {
+        send_player_notice_with_code(
+            &state,
+            session_code,
+            player_id,
+            protocol::NoticeLevel::Info,
+            SPRITE_ATELIER_NOTICE_TITLE,
+            SPRITE_ATELIER_QUEUED_NOTICE_MESSAGE,
+            Some(SessionNoticeCode::SpriteAtelierQueued),
+        )
+        .await;
+    })
+    .await
+    {
         Ok(permit) => permit,
-        Err(TryAcquireError::NoPermits) => {
-            send_player_notice_with_code(
+        Err(ImageQueueAdmissionOutcome::TimedOut) => {
+            return sprite_sheet_fallback_with_notice(
                 &state,
                 session_code,
                 player_id,
-                protocol::NoticeLevel::Info,
-                SPRITE_ATELIER_NOTICE_TITLE,
-                SPRITE_ATELIER_QUEUED_NOTICE_MESSAGE,
-                Some(SessionNoticeCode::SpriteAtelierQueued),
+                protocol::NoticeLevel::Warning,
             )
             .await;
-            match wait_for_image_job_turn(&state).await {
-                Ok(permit) => permit,
-                Err(ImageJobAdmissionError::TimedOut) => {
-                    return sprite_sheet_fallback_with_notice(
-                        &state,
-                        session_code,
-                        player_id,
-                        protocol::NoticeLevel::Warning,
-                    )
-                    .await;
-                }
-                Err(ImageJobAdmissionError::QueueUnavailable) => {
-                    return Err("image generation queue is unavailable".to_string());
-                }
-            }
         }
-        Err(TryAcquireError::Closed) => {
+        Err(ImageQueueAdmissionOutcome::Unavailable) => {
             return Err("image generation queue is unavailable".to_string());
         }
     };
@@ -178,7 +215,6 @@ fn clamp_score(score: i32) -> i32 {
     score.clamp(0, 100)
 }
 
-
 async fn load_character_profile(
     state: &AppState,
     character_id: &str,
@@ -206,6 +242,7 @@ async fn resolve_character_for_session(
     state: &AppState,
     account_id: &str,
     requested_character_id: Option<&str>,
+    excluded_character_ids: &BTreeSet<String>,
 ) -> Result<Option<CharacterProfile>, String> {
     // Explicit selection — must be owned by the requesting account or be a
     // starter-pool character (owner_account_id IS NULL).
@@ -243,12 +280,22 @@ async fn resolve_character_for_session(
         return Err("please select a character".to_string());
     }
 
-    // Zero characters — lease a random starter.
-    pick_random_starter_profile(state).await
+    // Zero characters — lease a random starter, excluding any already leased
+    // to other players in the same session (plan2.md item 3). Duplicate
+    // starters would produce two indistinguishable pets in one session and
+    // break voting/judging UX. Callers that cannot tolerate `Ok(None)` (e.g.
+    // the join-workshop path) inspect the result and produce a join error.
+    pick_random_starter_profile(state, excluded_character_ids).await
 }
 
-/// Pick a random character from the starter pool (owner_account_id IS NULL).
-async fn pick_random_starter_profile(state: &AppState) -> Result<Option<CharacterProfile>, String> {
+/// Pick a random character from the starter pool (owner_account_id IS NULL),
+/// excluding any character ids already in use by other players in the caller's
+/// session. Returns `Ok(None)` when the filtered pool is empty; the caller
+/// decides how to surface that (same path as "no starters seeded at all").
+async fn pick_random_starter_profile(
+    state: &AppState,
+    excluded_character_ids: &BTreeSet<String>,
+) -> Result<Option<CharacterProfile>, String> {
     let characters = state
         .store
         .list_characters()
@@ -256,7 +303,7 @@ async fn pick_random_starter_profile(state: &AppState) -> Result<Option<Characte
         .map_err(|error| format!("failed to list characters: {error}"))?;
     let starters: Vec<_> = characters
         .iter()
-        .filter(|r| r.owner_account_id.is_none())
+        .filter(|r| r.owner_account_id.is_none() && !excluded_character_ids.contains(&r.id))
         .collect();
     if starters.is_empty() {
         return Ok(None);
@@ -687,10 +734,13 @@ pub(crate) async fn create_workshop(
     // Derive name from authenticated account (locked decision #9).
     let normalized_name = session.account.name.clone();
     let timestamp = Utc::now();
+    // Creator is the first player in a brand-new session; no other players
+    // exist yet, so the starter-exclusion set is trivially empty.
     let selected_character = match resolve_character_for_session(
         &state,
         &session.account.id,
         payload.character_id.as_deref(),
+        &BTreeSet::new(),
     )
     .await
     {
@@ -718,7 +768,9 @@ pub(crate) async fn create_workshop(
         id: player_id.clone(),
         name: normalized_name.clone(),
         account_id: Some(session.account.id.clone()),
-        character_id: selected_character.as_ref().map(|character| character.id.clone()),
+        character_id: selected_character
+            .as_ref()
+            .map(|character| character.id.clone()),
         selected_character: selected_character.clone(),
         is_host: true,
         is_connected: true,
@@ -781,7 +833,10 @@ pub(crate) async fn create_workshop(
         .await
         .insert(workshop.code.0.clone(), workshop);
 
-    (StatusCode::CREATED, Json(WorkshopJoinResult::Success(response)))
+    (
+        StatusCode::CREATED,
+        Json(WorkshopJoinResult::Success(response)),
+    )
 }
 
 pub(crate) async fn join_workshop(
@@ -924,19 +979,62 @@ pub(crate) async fn join_workshop(
     // Extract the account manually from the signed cookie jar.
     let account = match extract_account_from_headers(&state, &headers).await {
         Some(a) => a,
-        None => return (
-            StatusCode::UNAUTHORIZED,
-            Json(WorkshopJoinResult::Error(WorkshopError {
-                ok: false,
-                error: "Authentication required to join a workshop.".to_string(),
-            })),
-        ),
+        None => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(WorkshopJoinResult::Error(WorkshopError {
+                    ok: false,
+                    error: "Authentication required to join a workshop.".to_string(),
+                })),
+            );
+        }
     };
     let normalized_name = account.name.clone();
+
+    // Build the starter-exclusion set from the existing session roster so two
+    // players joining with zero owned characters cannot be leased the same
+    // starter (plan2.md item 3). Ensure the session is cached; if it is not
+    // found we fall through with an empty set and let the downstream
+    // "Workshop not found." branch (after the write lease) produce the real
+    // error response with the correct status.
+    //
+    // Note: this snapshot is taken without the write lease, so two concurrent
+    // new-join requests could both observe a starter as free. The final
+    // seating happens later under `state.sessions.lock()`, but the leased
+    // character is fixed here — so a TOCTOU race could still yield a
+    // duplicate. Refactoring the lock scheme is out of scope for item 3.
+    let excluded_starter_ids: BTreeSet<String> =
+        match ensure_session_cached(&state, session_code).await {
+            Ok(true) => {
+                let sessions = state.sessions.lock().await;
+                sessions
+                    .get(session_code)
+                    .map(|session| {
+                        session
+                            .players
+                            .values()
+                            .filter(|player| player.account_id.as_deref() != Some(&account.id))
+                            .filter_map(|player| {
+                                player
+                                    .selected_character
+                                    .as_ref()
+                                    .map(|character| character.id.clone())
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            }
+            Ok(false) => BTreeSet::new(),
+            Err(error) => {
+                return internal_join_error(format!("failed to load session: {error}"));
+            }
+        };
+
     let selected_character = match resolve_character_for_session(
         &state,
         &account.id,
         payload.character_id.as_deref(),
+        &excluded_starter_ids,
     )
     .await
     {
@@ -951,6 +1049,20 @@ pub(crate) async fn join_workshop(
             );
         }
     };
+
+    // Starter-lease path (no explicit selection) that yielded no character
+    // means every starter is already leased to another player in this session
+    // (or none are seeded). Surface a join error so the UI can prompt the
+    // player to create their own character instead of silently seating them
+    // with an unset pet (plan2.md item 3).
+    let requested_character_id = payload
+        .character_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty());
+    if selected_character.is_none() && requested_character_id.is_none() {
+        return bad_join_request("no starter available");
+    }
 
     let (_, _write_guard, write_lease) =
         match SessionWriteLease::acquire(&state, session_code).await {
@@ -1012,7 +1124,9 @@ pub(crate) async fn join_workshop(
             id: player_id.clone(),
             name: normalized_name.clone(),
             account_id: Some(account.id.clone()),
-            character_id: selected_character.as_ref().map(|character| character.id.clone()),
+            character_id: selected_character
+                .as_ref()
+                .map(|character| character.id.clone()),
             selected_character: selected_character.clone(),
             is_host: false,
             is_connected: true,
@@ -1240,7 +1354,9 @@ pub(crate) async fn workshop_command(
                 let record = match state.store.load_character(character_id).await {
                     Ok(Some(r)) => r,
                     Ok(None) => return bad_command_request("Selected character was not found."),
-                    Err(error) => return internal_command_error(format!("failed to load character: {error}")),
+                    Err(error) => {
+                        return internal_command_error(format!("failed to load character: {error}"));
+                    }
                 };
 
                 // Ownership check: must be owned by the requesting player's
@@ -1257,7 +1373,9 @@ pub(crate) async fn workshop_command(
                 }
                 let character = record.profile();
 
-                if let Err(error) = session.assign_player_character(&identity.player_id, character.clone()) {
+                if let Err(error) =
+                    session.assign_player_character(&identity.player_id, character.clone())
+                {
                     return bad_command_request(&error.to_string());
                 }
                 session_to_persist = Some(session.clone());
@@ -1517,7 +1635,10 @@ pub(crate) async fn workshop_command(
                 if session.host_player_id.as_deref() != Some(identity.player_id.as_str()) {
                     return bad_command_request("Only the host can end the workshop.");
                 }
-                if !matches!(session.phase, protocol::Phase::Phase2 | protocol::Phase::Judge) {
+                if !matches!(
+                    session.phase,
+                    protocol::Phase::Phase2 | protocol::Phase::Judge
+                ) {
                     return bad_command_request("Design voting can only begin from Phase 2.");
                 }
                 session.award_phase_end_achievements();
@@ -1834,12 +1955,15 @@ pub(crate) async fn workshop_judge_bundle(
         return internal_judge_bundle_error(format!("failed to touch player identity: {error}"));
     }
 
-    let (_, _write_guard, write_lease) = match SessionWriteLease::acquire(&state, session_code).await {
-        Ok(guard) => guard,
-        Err(error) => {
-            return internal_judge_bundle_error(format!("failed to acquire session lease: {error}"));
-        }
-    };
+    let (_, _write_guard, write_lease) =
+        match SessionWriteLease::acquire(&state, session_code).await {
+            Ok(guard) => guard,
+            Err(error) => {
+                return internal_judge_bundle_error(format!(
+                    "failed to acquire session lease: {error}"
+                ));
+            }
+        };
     if let Err(error) = write_lease.ensure_active() {
         return internal_judge_bundle_error(format!(
             "lost session lease before workshop archive load: {error}"
@@ -2271,20 +2395,14 @@ pub(crate) async fn llm_generate_image(
         );
     }
 
-    let _queue_lease = match state.image_job_queue.clone().try_acquire_owned() {
+    let _queue_lease = match acquire_image_job_permit(&state, || async {}).await {
         Ok(permit) => permit,
-        Err(TryAcquireError::NoPermits) => match wait_for_image_job_turn(&state).await {
-            Ok(permit) => permit,
-            Err(ImageJobAdmissionError::TimedOut) => {
-                return internal_llm_image_error(
-                    "image request timed out while waiting for generation capacity".to_string(),
-                );
-            }
-            Err(ImageJobAdmissionError::QueueUnavailable) => {
-                return internal_llm_image_error("image generation queue is unavailable".to_string());
-            }
-        },
-        Err(TryAcquireError::Closed) => {
+        Err(ImageQueueAdmissionOutcome::TimedOut) => {
+            return internal_llm_image_error(
+                "image request timed out while waiting for generation capacity".to_string(),
+            );
+        }
+        Err(ImageQueueAdmissionOutcome::Unavailable) => {
             return internal_llm_image_error("image generation queue is unavailable".to_string());
         }
     };
@@ -2373,7 +2491,8 @@ pub(crate) async fn list_character_catalog(
     headers: HeaderMap,
     Json(_request): Json<CharacterCatalogRequest>,
 ) -> (StatusCode, Json<CharacterCatalogResult>) {
-    if let Some(response) = reject_disallowed_character_catalog_origin(&headers, &state.config.origin_policy)
+    if let Some(response) =
+        reject_disallowed_character_catalog_origin(&headers, &state.config.origin_policy)
     {
         return response;
     }
@@ -2562,7 +2681,9 @@ async fn generate_or_update_character_sprite_sheet(
             updated_at: timestamp,
             owner_account_id: None,
         };
-        if let Err(error) = session.assign_player_character(&identity.player_id, character_record.profile()) {
+        if let Err(error) =
+            session.assign_player_character(&identity.player_id, character_record.profile())
+        {
             return bad_character_sprite_sheet_request(&error.to_string());
         }
         let artifact = SessionArtifactRecord {
@@ -2606,12 +2727,15 @@ async fn generate_or_update_character_sprite_sheet(
 
     (
         StatusCode::OK,
-        Json(CharacterSpriteSheetResult::Success(CharacterSpriteSheetSuccess {
-            ok: true,
-            character_id: next_character_record.id,
-            sprites,
-            remaining_sprite_regenerations: next_character_record.remaining_sprite_regenerations,
-        })),
+        Json(CharacterSpriteSheetResult::Success(
+            CharacterSpriteSheetSuccess {
+                ok: true,
+                character_id: next_character_record.id,
+                sprites,
+                remaining_sprite_regenerations: next_character_record
+                    .remaining_sprite_regenerations,
+            },
+        )),
     )
 }
 
@@ -2936,6 +3060,96 @@ pub(crate) async fn create_character(
     (StatusCode::CREATED, Json(record.profile())).into_response()
 }
 
+/// `POST /api/characters/preview-sprites` — generate a 4-frame sprite sheet
+/// from a description without persisting anything.
+///
+/// Account-scoped companion to the workshop-scoped
+/// `POST /api/characters/sprite-sheet`. Requires `AccountSession`; does
+/// NOT create a `CharacterRecord`, does NOT mutate any session, does NOT
+/// broadcast. The frontend holds the returned `SpriteSet` in memory and
+/// submits it via `POST /api/characters` on confirm.
+///
+/// Rate limit: shares the per-account `character_create_limiter` quota
+/// (20/hr) so preview + save together stay bounded. See `app.rs`.
+pub(crate) async fn generate_character_sprite_preview(
+    State(state): State<AppState>,
+    session: AccountSession,
+    Json(request): Json<CharacterSpritePreviewRequest>,
+) -> Response {
+    if is_rate_limited(&state.character_create_limiter, &session.account.id).await {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(json!({ "error": "Too many requests. Please slow down and try again." })),
+        )
+            .into_response();
+    }
+
+    let description = request.description.trim();
+    if description.is_empty() || description.len() > 512 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "description must be 1-512 characters" })),
+        )
+            .into_response();
+    }
+
+    // Reuse the same image-job queue semaphore used by the workshop-scoped
+    // sprite-sheet producer so preview requests do not starve it. We do not
+    // send session notices (no session exists); on timeout or LLM failure
+    // we fall back to the default companion sprite set so the UI can proceed.
+    let _queue_permit = match acquire_image_job_permit(&state, || async {}).await {
+        Ok(permit) => permit,
+        Err(ImageQueueAdmissionOutcome::TimedOut) => {
+            return (
+                StatusCode::OK,
+                Json(CharacterSpritePreviewResponse {
+                    sprites: (*state.fallback_companion_sprites).clone(),
+                }),
+            )
+                .into_response();
+        }
+        Err(ImageQueueAdmissionOutcome::Unavailable) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "image generation queue is unavailable" })),
+            )
+                .into_response();
+        }
+    };
+
+    // Note: we intentionally do NOT extract the subsequent
+    // `generate_sprite_sheet_with_lease → on Err, fallback` block into a
+    // shared helper. The workshop sprite-sheet path at
+    // `generate_sprite_sheet_with_queue` must also send a Warning-level
+    // session notice on fallback (via `sprite_sheet_fallback_with_notice`),
+    // while this session-less preview path just returns the fallback
+    // sprites. Factoring would either re-introduce the notice contract or
+    // leave two near-identical wrappers, so each site stays inlined.
+
+    let lease = state.llm_client.acquire_image_generation_lease();
+    let sprites = match state
+        .llm_client
+        .generate_sprite_sheet_with_lease(&lease, description)
+        .await
+    {
+        Ok(sprites) => sprites,
+        Err(error) => {
+            tracing::warn!(
+                account_id = %session.account.id,
+                %error,
+                "character sprite preview generation failed, using fallback companion"
+            );
+            (*state.fallback_companion_sprites).clone()
+        }
+    };
+
+    (
+        StatusCode::OK,
+        Json(CharacterSpritePreviewResponse { sprites }),
+    )
+        .into_response()
+}
+
 /// `GET /api/characters/mine` — list the authenticated account's characters.
 pub(crate) async fn list_my_characters(
     State(state): State<AppState>,
@@ -3058,5 +3272,9 @@ pub(crate) async fn eligible_characters(
         }
     };
     let characters: Vec<CharacterProfile> = records.iter().map(|r| r.profile()).collect();
-    (StatusCode::OK, Json(EligibleCharactersResponse { characters })).into_response()
+    (
+        StatusCode::OK,
+        Json(EligibleCharactersResponse { characters }),
+    )
+        .into_response()
 }

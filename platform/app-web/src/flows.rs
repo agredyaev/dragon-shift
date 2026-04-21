@@ -293,9 +293,13 @@ pub async fn submit_signin_flow(
             });
         }
         Err(error) => {
+            // Map structured backend error codes (e.g.
+            // `name_taken_wrong_password`) to the spec copy rendered in the
+            // SignIn NoticeBar. See `components/sign_in.rs::map_signin_error`.
+            let message = crate::components::sign_in::map_signin_error(&error);
             ops.with_mut(|o| {
                 o.pending_flow = None;
-                o.notice = Some(error_notice(&error));
+                o.notice = Some(error_notice(&message));
             });
         }
     }
@@ -499,6 +503,11 @@ pub async fn load_eligible_characters_flow(
 
 /// Create a character (standalone, account-scoped). On success, navigates back
 /// to AccountHome.
+///
+/// Superseded by the inline flow in `components/create_character.rs`, which
+/// performs a two-step preview-then-save interaction. Kept temporarily for
+/// any remaining consumer; safe to delete in a follow-up pass.
+#[allow(dead_code)]
 pub async fn submit_create_character_flow(
     mut identity: Signal<IdentityState>,
     mut ops: Signal<OperationState>,

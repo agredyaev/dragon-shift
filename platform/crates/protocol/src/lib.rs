@@ -16,6 +16,12 @@ pub const SPRITE_ATELIER_DRAWING_NOTICE_MESSAGE: &str =
 pub const SPRITE_ATELIER_FALLBACK_NOTICE_MESSAGE: &str =
     "The atelier prepared a reserve companion sprite sheet so you can keep playing.";
 
+/// Error code returned by `POST /api/auth/signin` when the submitted name
+/// exists but the password does not match. Shared wire constant so the
+/// backend handler (`app-server/src/auth.rs`) and the frontend matcher
+/// (`app-web/src/components/sign_in.rs`) cannot drift. Spec: `refactor.md:50`.
+pub const AUTH_ERR_NAME_TAKEN_WRONG_PASSWORD: &str = "name_taken_wrong_password";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionNoticeCode {
@@ -981,6 +987,28 @@ pub struct AuthResponse {
 #[serde(rename_all = "camelCase")]
 pub struct CreateCharacterRequest {
     pub description: String,
+    pub sprites: SpriteSet,
+}
+
+/// Request body for `POST /api/characters/preview-sprites`.
+///
+/// Account-scoped sprite-sheet preview. Unlike the workshop-scoped
+/// `CharacterSpriteSheetRequest`, this carries no session credentials —
+/// authentication is via the signed session cookie (`AccountSession`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CharacterSpritePreviewRequest {
+    pub description: String,
+}
+
+/// Response body for `POST /api/characters/preview-sprites`.
+///
+/// Returns the generated 4-frame sprite sheet without persisting anything.
+/// The frontend holds this in memory and, on confirm, submits it via
+/// `POST /api/characters`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CharacterSpritePreviewResponse {
     pub sprites: SpriteSet,
 }
 

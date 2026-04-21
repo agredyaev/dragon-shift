@@ -20,7 +20,7 @@ use axum_extra::extract::cookie::{Cookie, Key, SameSite, SignedCookieJar};
 use chrono::Utc;
 use domain::Account;
 use persistence::{AccountRecord, PersistenceError};
-use protocol::{AccountProfile, AuthRequest, AuthResponse};
+use protocol::{AUTH_ERR_NAME_TAKEN_WRONG_PASSWORD, AccountProfile, AuthRequest, AuthResponse};
 use security::{PasswordHashError, hash_password, verify_password};
 use serde_json::json;
 use std::convert::Infallible;
@@ -223,7 +223,11 @@ fn account_profile(account: &Account) -> AccountProfile {
 /// Semantics (locked in session 4 planning):
 /// - name free → create new account, hash password, return 201.
 /// - name exists + password matches → login, touch last_login, return 200.
-/// - name exists + password mismatch → 401 "invalid credentials".
+/// - name exists + password mismatch → 401 with structured error code
+///   `name_taken_wrong_password` so the client can render "This name is
+///   already registered — enter the correct password or choose a different
+///   name." (spec `refactor.md:50`). Any other auth 401 uses the generic
+///   `invalid_credentials` code so enumeration surface is unchanged.
 ///
 /// Validation rules (MVP; tightened in a later checkpoint if needed):
 /// - hero: 1..=64 chars, trimmed non-empty.
@@ -277,7 +281,7 @@ pub(crate) async fn signin(
                     };
                     (StatusCode::OK, jar, Json(body)).into_response()
                 }
-                Ok(false) => unauthorized("invalid credentials"),
+                Ok(false) => name_taken_wrong_password(),
                 Err(error) => {
                     tracing::error!(%error, account_id = %record.id, "verify_password failed");
                     internal_error()
@@ -366,8 +370,21 @@ fn bad_request(message: &'static str) -> Response {
     (StatusCode::BAD_REQUEST, Json(json!({ "error": message }))).into_response()
 }
 
-fn unauthorized(message: &'static str) -> Response {
-    (StatusCode::UNAUTHORIZED, Json(json!({ "error": message }))).into_response()
+fn name_taken_wrong_password() -> Response {
+    // Structured error body: distinct `error` code + human-readable `message`.
+    // The client (components/sign_in.rs) matches on `error` to render the
+    // spec copy from refactor.md:50. Any future generic 401 from this
+    // handler should use a different code (e.g. `invalid_credentials`) so
+    // we never leak "name exists" on branches other than the known-name
+    // + wrong-password path that already distinguishes itself via argon2.
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(json!({
+            "error": AUTH_ERR_NAME_TAKEN_WRONG_PASSWORD,
+            "message": "That name is already registered. Enter the correct password or choose a different name.",
+        })),
+    )
+        .into_response()
 }
 
 fn internal_error() -> Response {
