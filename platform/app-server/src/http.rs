@@ -1591,7 +1591,16 @@ pub(crate) async fn workshop_command(
                     return bad_command_request("Handover notes must be sent as a list.");
                 };
 
-                session.save_handover_tags(&identity.player_id, tags);
+                if let Err(error) = session.save_handover_tags(&identity.player_id, tags) {
+                    return match error {
+                        DomainError::InvalidHandoverTagCount { expected, got } => {
+                            bad_command_request(&format!(
+                                "Exactly {expected} handover notes are required (got {got})."
+                            ))
+                        }
+                        _ => bad_command_request(&error.to_string()),
+                    };
+                }
                 let saved_tags = session
                     .players
                     .get(&identity.player_id)

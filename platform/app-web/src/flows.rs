@@ -174,11 +174,6 @@ pub async fn submit_handover_tags_command(
         parse_tags_input(&tags_input)
     };
 
-    if tags.len() != 3 {
-        ops.with_mut(|o| o.notice = Some(error_notice("Enter exactly three handover rules before starting Phase 2.")));
-        return;
-    }
-
     submit_workshop_command(
         identity,
         ops,

@@ -9,6 +9,11 @@ use std::collections::BTreeMap;
 use thiserror::Error;
 use uuid::Uuid;
 
+/// The exact number of handover notes (tags) a player must submit before
+/// Phase 2 can begin. Enforced at the domain boundary by
+/// [`WorkshopSession::save_handover_tags`].
+pub const HANDOVER_TAG_COUNT: usize = 3;
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SessionCode(pub String);
 
@@ -196,6 +201,8 @@ pub enum DomainError {
     InvalidSessionTransition { from: Phase, to: Phase },
     #[error("phase2 transition blocked; missing handover tags for: {players:?}")]
     MissingHandoverTags { players: Vec<String> },
+    #[error("exactly {expected} handover tags are required (got {got})")]
+    InvalidHandoverTagCount { expected: usize, got: usize },
     #[error("voting is not active right now")]
     VotingNotActive,
     #[error("player is not eligible to vote")]
@@ -378,18 +385,29 @@ impl WorkshopSession {
         Ok(())
     }
 
-    pub fn save_handover_tags(&mut self, player_id: &str, tags: Vec<String>) {
+    pub fn save_handover_tags(
+        &mut self,
+        player_id: &str,
+        tags: Vec<String>,
+    ) -> Result<(), DomainError> {
+        if tags.len() != HANDOVER_TAG_COUNT {
+            return Err(DomainError::InvalidHandoverTagCount {
+                expected: HANDOVER_TAG_COUNT,
+                got: tags.len(),
+            });
+        }
         let Some(dragon_id) = self
             .players
             .get(player_id)
             .and_then(|player| player.current_dragon_id.clone())
         else {
-            return;
+            return Ok(());
         };
         if let Some(dragon) = self.dragons.get_mut(&dragon_id) {
-            dragon.handover_tags = tags.into_iter().take(3).collect();
+            dragon.handover_tags = tags;
         }
         self.touch();
+        Ok(())
     }
 
     pub fn enter_phase2(&mut self) -> Result<Phase2TransitionResult, DomainError> {
@@ -401,7 +419,7 @@ impl WorkshopSession {
             let Some(dragon) = self.dragons.get_mut(&dragon_id) else {
                 continue;
             };
-            if !player.is_connected && dragon.handover_tags.len() < 3 {
+            if !player.is_connected && dragon.handover_tags.len() < HANDOVER_TAG_COUNT {
                 dragon.handover_tags = fallback_handover_tags();
                 auto_filled_players.push(player.name.clone());
             }
@@ -413,7 +431,7 @@ impl WorkshopSession {
             .filter_map(|player| {
                 let dragon_id = player.current_dragon_id.as_ref()?;
                 let dragon = self.dragons.get(dragon_id)?;
-                if player.is_connected && dragon.handover_tags.len() < 3 {
+                if player.is_connected && dragon.handover_tags.len() < HANDOVER_TAG_COUNT {
                     Some(player.name.clone())
                 } else {
                     None
@@ -1214,11 +1232,13 @@ pub fn can_transition(current: Phase, next: Phase) -> bool {
 }
 
 fn fallback_handover_tags() -> Vec<String> {
-    vec![
+    let tags = vec![
         "Auto handover: teammate went offline before finishing notes.".to_string(),
         "Start with safe observations and watch how the dragon reacts.".to_string(),
         "Pay attention to food and play preferences — they stay the same.".to_string(),
-    ]
+    ];
+    debug_assert_eq!(tags.len(), HANDOVER_TAG_COUNT);
+    tags
 }
 
 /// 48-tick cycle. Each "hour" = 2 ticks.
@@ -1755,8 +1775,8 @@ mod tests {
             ])
             .expect("start phase1");
         session.transition_to(Phase::Handover).expect("to handover");
-        session.save_handover_tags("p1", vec!["a".into(), "b".into(), "c".into()]);
-        session.save_handover_tags("p2", vec!["d".into(), "e".into(), "f".into()]);
+        session.save_handover_tags("p1", vec!["a".into(), "b".into(), "c".into()]).expect("save handover tags");
+        session.save_handover_tags("p2", vec!["d".into(), "e".into(), "f".into()]).expect("save handover tags");
 
         let result = session.enter_phase2().expect("enter phase2");
 
@@ -1808,7 +1828,7 @@ mod tests {
             }])
             .expect("start phase1");
         session.transition_to(Phase::Handover).expect("to handover");
-        session.save_handover_tags("p1", vec!["a".into(), "b".into(), "c".into()]);
+        session.save_handover_tags("p1", vec!["a".into(), "b".into(), "c".into()]).expect("save handover tags");
 
         let result = session.enter_phase2().expect("enter phase2");
 
@@ -1852,8 +1872,8 @@ mod tests {
             ])
             .expect("start phase1");
         session.transition_to(Phase::Handover).expect("to handover");
-        session.save_handover_tags("p1", vec!["a".into(), "b".into(), "c".into()]);
-        session.save_handover_tags("p2", vec!["d".into(), "e".into(), "f".into()]);
+        session.save_handover_tags("p1", vec!["a".into(), "b".into(), "c".into()]).expect("save handover tags");
+        session.save_handover_tags("p2", vec!["d".into(), "e".into(), "f".into()]).expect("save handover tags");
         session.enter_phase2().expect("enter phase2");
         session.enter_voting().expect("enter voting");
 
@@ -1886,8 +1906,8 @@ mod tests {
             ])
             .expect("start phase1");
         session.transition_to(Phase::Handover).expect("to handover");
-        session.save_handover_tags("p1", vec!["a".into(), "b".into(), "c".into()]);
-        session.save_handover_tags("p2", vec!["d".into(), "e".into(), "f".into()]);
+        session.save_handover_tags("p1", vec!["a".into(), "b".into(), "c".into()]).expect("save handover tags");
+        session.save_handover_tags("p2", vec!["d".into(), "e".into(), "f".into()]).expect("save handover tags");
         session.enter_phase2().expect("enter phase2");
         session.enter_voting().expect("enter voting");
 
@@ -1926,8 +1946,8 @@ mod tests {
             ])
             .expect("start phase1");
         session.transition_to(Phase::Handover).expect("to handover");
-        session.save_handover_tags("p1", vec!["a".into(), "b".into(), "c".into()]);
-        session.save_handover_tags("p2", vec!["d".into(), "e".into(), "f".into()]);
+        session.save_handover_tags("p1", vec!["a".into(), "b".into(), "c".into()]).expect("save handover tags");
+        session.save_handover_tags("p2", vec!["d".into(), "e".into(), "f".into()]).expect("save handover tags");
         session.enter_phase2().expect("enter phase2");
         session.enter_voting().expect("enter voting");
 
@@ -1971,8 +1991,8 @@ mod tests {
             ])
             .expect("start phase1");
         session.transition_to(Phase::Handover).expect("to handover");
-        session.save_handover_tags("p1", vec!["a".into(), "b".into(), "c".into()]);
-        session.save_handover_tags("p2", vec!["d".into(), "e".into(), "f".into()]);
+        session.save_handover_tags("p1", vec!["a".into(), "b".into(), "c".into()]).expect("save handover tags");
+        session.save_handover_tags("p2", vec!["d".into(), "e".into(), "f".into()]).expect("save handover tags");
         session.enter_phase2().expect("enter phase2");
         session.enter_voting().expect("enter voting");
 
@@ -2005,8 +2025,8 @@ mod tests {
             ])
             .expect("start phase1");
         session.transition_to(Phase::Handover).expect("to handover");
-        session.save_handover_tags("p1", vec!["a".into(), "b".into(), "c".into()]);
-        session.save_handover_tags("p2", vec!["d".into(), "e".into(), "f".into()]);
+        session.save_handover_tags("p1", vec!["a".into(), "b".into(), "c".into()]).expect("save handover tags");
+        session.save_handover_tags("p2", vec!["d".into(), "e".into(), "f".into()]).expect("save handover tags");
         session.enter_phase2().expect("enter phase2");
         session.enter_voting().expect("enter voting");
         session.submit_vote("p1", "dragon-b").expect("p1 vote");
@@ -2048,8 +2068,8 @@ mod tests {
             ])
             .expect("start phase1");
         session.transition_to(Phase::Handover).expect("to handover");
-        session.save_handover_tags("p1", vec!["a".into(), "b".into(), "c".into()]);
-        session.save_handover_tags("p2", vec!["d".into(), "e".into(), "f".into()]);
+        session.save_handover_tags("p1", vec!["a".into(), "b".into(), "c".into()]).expect("save handover tags");
+        session.save_handover_tags("p2", vec!["d".into(), "e".into(), "f".into()]).expect("save handover tags");
         session.enter_phase2().expect("enter phase2");
         session.enter_voting().expect("enter voting");
         session.submit_vote("p1", "dragon-b").expect("p1 vote");
@@ -2214,7 +2234,7 @@ mod tests {
             }])
             .expect("start phase1");
         session.transition_to(Phase::Handover).expect("to handover");
-        session.save_handover_tags("p1", vec!["a".into(), "b".into(), "c".into()]);
+        session.save_handover_tags("p1", vec!["a".into(), "b".into(), "c".into()]).expect("save handover tags");
         session.enter_phase2().expect("enter phase2");
         let dragon = session.dragons.get_mut("dragon-a").expect("dragon-a");
         dragon.hunger = 100;
@@ -2565,7 +2585,7 @@ mod tests {
         let mut s = setup_deterministic_session();
         // Move to Phase 2
         s.transition_to(Phase::Handover).unwrap();
-        s.save_handover_tags("p1", vec!["a".into(), "b".into(), "c".into()]);
+        s.save_handover_tags("p1", vec!["a".into(), "b".into(), "c".into()]).expect("save handover tags");
         s.enter_phase2().unwrap();
         let d = s.dragons.get_mut("d1").unwrap();
         d.active_time = ActiveTime::Day;
@@ -2601,7 +2621,7 @@ mod tests {
         // Negative case: if lowest happiness was below 60, achievement should NOT fire
         let mut s2 = setup_deterministic_session();
         s2.transition_to(Phase::Handover).unwrap();
-        s2.save_handover_tags("p1", vec!["a".into(), "b".into(), "c".into()]);
+        s2.save_handover_tags("p1", vec!["a".into(), "b".into(), "c".into()]).expect("save handover tags");
         s2.enter_phase2().unwrap();
         let d2 = s2.dragons.get_mut("d1").unwrap();
         d2.active_time = ActiveTime::Day;
@@ -2625,7 +2645,7 @@ mod tests {
     fn validator2_no_mistakes_phase_end() {
         let mut s = setup_deterministic_session();
         s.transition_to(Phase::Handover).unwrap();
-        s.save_handover_tags("p1", vec!["a".into(), "b".into(), "c".into()]);
+        s.save_handover_tags("p1", vec!["a".into(), "b".into(), "c".into()]).expect("save handover tags");
         s.enter_phase2().unwrap();
         let d = s.dragons.get_mut("d1").unwrap();
         d.active_time = ActiveTime::Day;
@@ -2659,7 +2679,7 @@ mod tests {
     fn validator2_zen_master_zero_penalty_stacks_eight_actions() {
         let mut s = setup_deterministic_session();
         s.transition_to(Phase::Handover).unwrap();
-        s.save_handover_tags("p1", vec!["a".into(), "b".into(), "c".into()]);
+        s.save_handover_tags("p1", vec!["a".into(), "b".into(), "c".into()]).expect("save handover tags");
         s.enter_phase2().unwrap();
         let d = s.dragons.get_mut("d1").unwrap();
         d.active_time = ActiveTime::Day;
@@ -2691,7 +2711,7 @@ mod tests {
     fn validator2_button_masher_five_cooldown_violations() {
         let mut s = setup_deterministic_session();
         s.transition_to(Phase::Handover).unwrap();
-        s.save_handover_tags("p1", vec!["a".into(), "b".into(), "c".into()]);
+        s.save_handover_tags("p1", vec!["a".into(), "b".into(), "c".into()]).expect("save handover tags");
         s.enter_phase2().unwrap();
         let d = s.dragons.get_mut("d1").unwrap();
         d.active_time = ActiveTime::Day;
@@ -2720,7 +2740,7 @@ mod tests {
     fn validator2_rock_bottom_happiness_hits_zero() {
         let mut s = setup_deterministic_session();
         s.transition_to(Phase::Handover).unwrap();
-        s.save_handover_tags("p1", vec!["a".into(), "b".into(), "c".into()]);
+        s.save_handover_tags("p1", vec!["a".into(), "b".into(), "c".into()]).expect("save handover tags");
         s.enter_phase2().unwrap();
         let d = s.dragons.get_mut("d1").unwrap();
         d.active_time = ActiveTime::Day;
@@ -2744,7 +2764,7 @@ mod tests {
     fn validator2_helicopter_parent_twenty_actions() {
         let mut s = setup_deterministic_session();
         s.transition_to(Phase::Handover).unwrap();
-        s.save_handover_tags("p1", vec!["a".into(), "b".into(), "c".into()]);
+        s.save_handover_tags("p1", vec!["a".into(), "b".into(), "c".into()]).expect("save handover tags");
         s.enter_phase2().unwrap();
         let d = s.dragons.get_mut("d1").unwrap();
         d.active_time = ActiveTime::Day;
@@ -2769,7 +2789,7 @@ mod tests {
     fn validator2_comeback_kid_low_to_high_happiness() {
         let mut s = setup_deterministic_session();
         s.transition_to(Phase::Handover).unwrap();
-        s.save_handover_tags("p1", vec!["a".into(), "b".into(), "c".into()]);
+        s.save_handover_tags("p1", vec!["a".into(), "b".into(), "c".into()]).expect("save handover tags");
         s.enter_phase2().unwrap();
         let d = s.dragons.get_mut("d1").unwrap();
         d.active_time = ActiveTime::Day;
@@ -2813,7 +2833,7 @@ mod tests {
     fn validator2_chaos_gremlin_peak_penalty_stacks() {
         let mut s = setup_deterministic_session();
         s.transition_to(Phase::Handover).unwrap();
-        s.save_handover_tags("p1", vec!["a".into(), "b".into(), "c".into()]);
+        s.save_handover_tags("p1", vec!["a".into(), "b".into(), "c".into()]).expect("save handover tags");
         s.enter_phase2().unwrap();
         let d = s.dragons.get_mut("d1").unwrap();
         d.active_time = ActiveTime::Day;
@@ -2845,7 +2865,7 @@ mod tests {
     fn validator2_perfectionist_high_correct_ratio() {
         let mut s = setup_deterministic_session();
         s.transition_to(Phase::Handover).unwrap();
-        s.save_handover_tags("p1", vec!["a".into(), "b".into(), "c".into()]);
+        s.save_handover_tags("p1", vec!["a".into(), "b".into(), "c".into()]).expect("save handover tags");
         s.enter_phase2().unwrap();
         let d = s.dragons.get_mut("d1").unwrap();
         d.active_time = ActiveTime::Day;
@@ -2905,7 +2925,7 @@ mod tests {
     fn validator3_penalty_stacks_increase_happiness_decay() {
         let mut s = setup_deterministic_session();
         s.transition_to(Phase::Handover).unwrap();
-        s.save_handover_tags("p1", vec!["a".into(), "b".into(), "c".into()]);
+        s.save_handover_tags("p1", vec!["a".into(), "b".into(), "c".into()]).expect("save handover tags");
         s.enter_phase2().unwrap();
         let d = s.dragons.get_mut("d1").unwrap();
         d.active_time = ActiveTime::Day;
@@ -3111,7 +3131,7 @@ mod tests {
     fn validator4_energy_clamped_at_zero_after_tick() {
         let mut s = setup_deterministic_session();
         s.transition_to(Phase::Handover).unwrap();
-        s.save_handover_tags("p1", vec!["a".into(), "b".into(), "c".into()]);
+        s.save_handover_tags("p1", vec!["a".into(), "b".into(), "c".into()]).expect("save handover tags");
         s.enter_phase2().unwrap();
         let d = s.dragons.get_mut("d1").unwrap();
         d.active_time = ActiveTime::Day;
@@ -4449,20 +4469,30 @@ mod tests {
     // ── Validator 12: Tags, scores, observation edge cases ────────────────
 
     #[test]
-    fn validator12_handover_tags_truncated_to_three() {
+    fn validator12_handover_tags_rejects_wrong_count() {
         let mut s = setup_deterministic_session();
-        s.save_handover_tags(
+        let result = s.save_handover_tags(
             "p1",
             vec!["a".into(), "b".into(), "c".into(), "d".into(), "e".into()],
         );
-        assert_eq!(s.dragons.get("d1").unwrap().handover_tags.len(), 3);
+        assert!(matches!(
+            result,
+            Err(DomainError::InvalidHandoverTagCount {
+                expected: HANDOVER_TAG_COUNT,
+                got: 5,
+            })
+        ));
+        // Dragon's tags must be untouched by a rejected save.
+        assert_eq!(s.dragons.get("d1").unwrap().handover_tags.len(), 0);
     }
 
     #[test]
     fn validator12_handover_tags_ghost_player_noop() {
         let mut s = setup_deterministic_session();
         let dragon_count_before = s.dragons.len();
-        s.save_handover_tags("ghost", vec!["a".into()]);
+        let result =
+            s.save_handover_tags("ghost", vec!["a".into(), "b".into(), "c".into()]);
+        assert!(result.is_ok());
         assert_eq!(s.dragons.len(), dragon_count_before);
     }
 
@@ -4630,7 +4660,7 @@ mod tests {
         let mut s = setup_deterministic_session();
         // Move to Phase 2
         s.transition_to(Phase::Handover).unwrap();
-        s.save_handover_tags("p1", vec!["a".into(), "b".into(), "c".into()]);
+        s.save_handover_tags("p1", vec!["a".into(), "b".into(), "c".into()]).expect("save handover tags");
         s.enter_phase2().unwrap();
 
         let d = s.dragons.get_mut("d1").unwrap();
@@ -4729,7 +4759,7 @@ mod tests {
     fn phase2_following_instructions_succeeds() {
         let mut s = setup_deterministic_session();
         s.transition_to(Phase::Handover).unwrap();
-        s.save_handover_tags("p1", vec!["a".into(), "b".into(), "c".into()]);
+        s.save_handover_tags("p1", vec!["a".into(), "b".into(), "c".into()]).expect("save handover tags");
         s.enter_phase2().unwrap();
 
         let d = s.dragons.get_mut("d1").unwrap();

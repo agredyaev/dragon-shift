@@ -6168,6 +6168,132 @@ async fn workshop_command_rejects_invalid_submit_tags_payload() {
 }
 
 #[tokio::test]
+async fn workshop_command_rejects_submit_tags_with_wrong_count() {
+    let state = test_state();
+    let app = build_app(state.clone());
+    let cookie = test_auth_cookie(&app, "Alice").await;
+    let create_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops")
+                .header("content-type", "application/json")
+                .header(axum::http::header::COOKIE, &cookie)
+                .body(Body::from(create_workshop_body("Alice")))
+                .expect("build create request"),
+        )
+        .await
+        .expect("call create workshop");
+    let create_body = to_bytes(create_response.into_body(), usize::MAX)
+        .await
+        .expect("read create body");
+    let create_result: WorkshopJoinResult =
+        serde_json::from_slice(&create_body).expect("parse create result");
+    let create_success = match create_result {
+        WorkshopJoinResult::Success(success) => success,
+        WorkshopJoinResult::Error(error) => {
+            panic!("expected create success, got error: {}", error.error)
+        }
+    };
+
+    seed_selected_characters(&state, &create_success.session_code).await;
+    let start_phase1_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops/command")
+                .header("content-type", "application/json")
+                .body(Body::from(setup_phase1_body(
+                    &create_success.session_code,
+                    &create_success.reconnect_token,
+                )))
+                .expect("build start phase1 request"),
+        )
+        .await
+        .expect("call startPhase1 command");
+    assert_eq!(start_phase1_response.status(), StatusCode::OK);
+
+    let start_handover_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops/command")
+                .header("content-type", "application/json")
+                .body(Body::from(format!(
+                    r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"startHandover"}}"#,
+                    create_success.session_code, create_success.reconnect_token
+                )))
+                .expect("build start handover request"),
+            )
+        .await
+        .expect("call startHandover command");
+    assert_eq!(start_handover_response.status(), StatusCode::OK);
+
+    let response = app
+             .clone()
+             .oneshot(
+                 Request::builder()
+                     .method("POST")
+                     .uri("/api/workshops/command")
+                     .header("content-type", "application/json")
+                     .body(Body::from(format!(r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"submitTags","payload":["one","two"]}}"#, create_success.session_code, create_success.reconnect_token)))
+                     .expect("build command request"),
+             )
+             .await
+             .expect("call command endpoint");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read command body");
+    let result: WorkshopCommandResult =
+        serde_json::from_slice(&body).expect("parse command result");
+    match result {
+        WorkshopCommandResult::Error(error) => {
+            assert!(
+                error.error.contains("handover notes") && error.error.contains("Exactly 3"),
+                "unexpected error message: {}",
+                error.error
+            );
+        }
+        WorkshopCommandResult::Success(_) => panic!("expected error response"),
+    }
+
+    // Also reject a payload with too many tags (4).
+    let response = app
+             .oneshot(
+                 Request::builder()
+                     .method("POST")
+                     .uri("/api/workshops/command")
+                     .header("content-type", "application/json")
+                     .body(Body::from(format!(r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"submitTags","payload":["one","two","three","four"]}}"#, create_success.session_code, create_success.reconnect_token)))
+                     .expect("build command request"),
+             )
+             .await
+             .expect("call command endpoint");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read command body");
+    let result: WorkshopCommandResult =
+        serde_json::from_slice(&body).expect("parse command result");
+    match result {
+        WorkshopCommandResult::Error(error) => {
+            assert!(
+                error.error.contains("handover notes") && error.error.contains("Exactly 3"),
+                "unexpected error message: {}",
+                error.error
+            );
+        }
+        WorkshopCommandResult::Success(_) => panic!("expected error response"),
+    }
+}
+
+#[tokio::test]
 async fn workshop_command_saves_submit_tags_in_handover_phase() {
     let state = test_state();
     let app = build_app(state.clone());
@@ -6237,7 +6363,7 @@ async fn workshop_command_saves_submit_tags_in_handover_phase() {
                      .method("POST")
                      .uri("/api/workshops/command")
                      .header("content-type", "application/json")
-                     .body(Body::from(format!(r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"submitTags","payload":["first","second","third","fourth"]}}"#, create_success.session_code, create_success.reconnect_token)))
+                     .body(Body::from(format!(r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"submitTags","payload":["first","second","third"]}}"#, create_success.session_code, create_success.reconnect_token)))
                      .expect("build command request"),
              )
              .await
@@ -10182,14 +10308,18 @@ fn to_client_game_state_includes_dragons_and_voting_details() {
     session
         .transition_to(protocol::Phase::Handover)
         .expect("enter handover");
-    session.save_handover_tags(
-        "p1",
-        vec!["Rule 1".into(), "Rule 2".into(), "Rule 3".into()],
-    );
-    session.save_handover_tags(
-        "p2",
-        vec!["Rule A".into(), "Rule B".into(), "Rule C".into()],
-    );
+    session
+        .save_handover_tags(
+            "p1",
+            vec!["Rule 1".into(), "Rule 2".into(), "Rule 3".into()],
+        )
+        .expect("save handover tags for p1");
+    session
+        .save_handover_tags(
+            "p2",
+            vec!["Rule A".into(), "Rule B".into(), "Rule C".into()],
+        )
+        .expect("save handover tags for p2");
     session.enter_phase2().expect("enter phase2");
     session
         .apply_action("p1", domain::PlayerAction::Sleep)

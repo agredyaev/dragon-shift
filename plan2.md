@@ -160,6 +160,37 @@ Source: consolidated must-fix findings from 10-validator readiness audit against
 - **Residual attack vector:** stolen reconnect_token + stolen signed cookie → still accepted by design. Cookie is HttpOnly + Signed + SameSite=Lax, raising the bar. Documented.
 - **Log hygiene:** `expected_account_id` (raw account UUID) logged on mismatch — acceptable operational data, not a credential. Attacker-controlled account ids are collapsed to `"mismatch"` literal to avoid log poisoning.
 
+### Item 5 — Enforce "exactly 3 handover tags" invariant in domain
+
+**Status:** COMPLETED (consensus 13/14, gate ≥8/14)
+
+- Round A (7 lenses): 6 READY / 1 NOT READY.
+  - **Architecture (High):** invariant scattered across 3 layers — `== 3` in `http.rs` SubmitTags arm, `.take(3)` silent truncation inside domain `save_handover_tags`, `< 3` duplicated in `enter_phase2`. No single source of truth.
+  - Drift, Completeness, Correctness, Security, Testing, Simplicity: READY.
+- Path decision (user): **Path A — DDD-aligned fallible domain method** (over Path B thin-fix).
+- Fix: consolidate via a const + fallible domain method; strip frontend pre-check.
+- Round B (7 lenses): 7 READY / 0 NOT READY.
+
+**Artifacts:**
+- Domain (`crates/domain/src/lib.rs`): `pub const HANDOVER_TAG_COUNT: usize = 3` (`:11-15`), new `DomainError::InvalidHandoverTagCount { expected, got }` variant (`:200-201`), `save_handover_tags` rewritten as `Result<(), DomainError>` — count check before any player/dragon lookup, `.take(3)` truncation removed (`:387-410`). `enter_phase2` preconditions reference the const (`:422`, `:434`). `fallback_handover_tags` gains `debug_assert_eq!` guard (`:1234-1242`).
+- HTTP (`app-server/src/http.rs:1590-1603`): `SubmitTags` arm pattern-matches `InvalidHandoverTagCount { expected, got }` → `bad_command_request(format!("Exactly {expected} handover notes are required (got {got})."))`. Mirrors `StartPhase2 → MissingHandoverTags` peer at `:1627-1633` exactly. Copy changed from "rules" to "notes".
+- Frontend (`app-web/src/flows.rs:174-178`): 4-line `tags.len() != 3` pre-check deleted — frontend now purely submits, server is sole validator. Removes refactor.md line 20 violation ("Do not place business rules in frontend").
+- Tests:
+  - Repurposed `validator12_handover_tags_truncated_to_three` → `validator12_handover_tags_rejects_wrong_count` (domain `:4471-4495`): 5-tag input → `Err(InvalidHandoverTagCount)`, asserts `handover_tags.len() == 0` (no partial mutation).
+  - `validator12_handover_tags_ghost_player_noop`: payload bumped 1→3 tags; Ok(()) ghost path coverage preserved.
+  - `workshop_command_rejects_submit_tags_with_wrong_count` (`app-server/src/tests.rs:6235-6293`): asserts 400 + exact copy `"Exactly 3"` + `"handover notes"` for both 2-tag and 4-tag sub-cases.
+  - Mechanical: ~30 existing callers suffixed with `.expect("save handover tags")` — all statically 3-element, all inside `#[cfg(test)]` modules (audited: zero production call sites).
+- Suites: `cargo test -p domain` 137/137, `cargo test -p app-server` 178/178.
+- Diff stat: 4 files, +220 / -56.
+
+**Residual risks (accepted, not blocking):**
+- **Completeness (Low):** literal `3` survives in UI display copy (`app-web/src/helpers.rs:514,521,524` — "{n} / 3 handover rules saved", countdown hint), `app-web/src/components/handover_view.rs:64` ("Provide exactly 3 key rules" static label), `xtask/src/main.rs:1208` (judge-bundle observed-invariant smoke check), and `e2e/tests/restart-reconnect.spec.ts:109,132`. These are cosmetic / observation, not enforcement; a future `HANDOVER_TAG_COUNT` bump would need coordinated copy updates. Explicitly out of Item 5 scope (domain/HTTP boundary).
+- **Testing (Low):** no 0-tag (empty payload) sub-case — covered by the general `!= 3` branch via 2/4/5-tag tests. No independent test for "ghost player + wrong count" — count check precedes ghost lookup in impl, so covered by `validator12_handover_tags_rejects_wrong_count` transitively. No integration test asserting frontend pre-check was removed — acceptable, since server rejection is authoritatively tested and removal is pure deletion.
+- **Simplicity (Low):** `workshop_command_rejects_submit_tags_with_wrong_count` duplicates ~60 lines of create/seed/startPhase1/startHandover boilerplate from the sibling success test. Helper `seed_handover_ready()` could halve it — orthogonal cleanup, defer.
+- **Simplicity (Low):** `debug_assert_eq!` in `fallback_handover_tags` is arguably noise (the preceding `vec![...]` literal is self-evidently length 3), but guards future edits without runtime cost.
+
+**Committed in:** `feat(platform): close plan2 item 5 enforce handover-tag count in domain` (applied on top of `cd0574e`).
+
 ### Item 2 — Account-scoped sprite preview route
 
 **Status:** COMPLETED (consensus 8/10)
@@ -193,7 +224,6 @@ Source: consolidated must-fix findings from 10-validator readiness audit against
 
 Tracked for future passes. Each remains unresolved:
 
-5. Remove frontend `tags.len() != 3` check (`flows.rs:177`).
 6. Remove frontend hardcoded phase minutes (`flows.rs:344-348`).
 7. Strip character roster + Delete UI from AccountHome (Block 2 scope).
 8. Split Voting/Judge/End screens (wire `voting_view.rs` or document merge).
