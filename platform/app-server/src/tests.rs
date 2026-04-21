@@ -11694,3 +11694,72 @@ async fn join_workshop_returns_error_when_all_starters_leased_in_session() {
         }
     }
 }
+
+#[tokio::test]
+async fn join_workshop_rejects_explicit_starter_already_leased() {
+    // plan2.md item 3: an explicit `characterId` pointing at a starter that
+    // another seated player already leased in this session must be rejected.
+    // Without this guard, a client can observe another player's starter id
+    // from a GameState broadcast and POST /api/workshops/join with that id to
+    // bypass the auto-lease exclusion.
+    let state = test_state();
+    let app = build_app(state.clone());
+
+    // Alice creates the workshop; auto-lease grants her one of the seeded
+    // starters. Capture that starter id from the persisted session.
+    let alice_cookie = test_auth_cookie(&app, "Alice").await;
+    let session_code = create_test_workshop(&app, &alice_cookie).await;
+
+    let session = state
+        .store
+        .load_session_by_code(&session_code)
+        .await
+        .expect("load session")
+        .expect("session exists");
+    let alice_starter_id = session
+        .players
+        .values()
+        .find_map(|player| player.character_id.clone())
+        .expect("alice has a leased starter character_id");
+
+    // Bob attempts to join with Alice's starter id explicitly. Must be
+    // rejected with HTTP 400 and the "already taken" error string.
+    let bob_cookie = test_auth_cookie(&app, "Bob").await;
+    let join_body = format!(
+        r#"{{"sessionCode":"{}","name":"Bob","characterId":"{}"}}"#,
+        session_code, alice_starter_id
+    );
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops/join")
+                .header("content-type", "application/json")
+                .header(axum::http::header::COOKIE, &bob_cookie)
+                .body(Body::from(join_body))
+                .expect("build join request"),
+        )
+        .await
+        .expect("join response");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let bytes = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    let result: WorkshopJoinResult = serde_json::from_slice(&bytes).expect("parse result");
+    match result {
+        WorkshopJoinResult::Error(e) => {
+            assert!(
+                e.error.contains("that starter is already taken"),
+                "expected 'that starter is already taken' in error, got: {}",
+                e.error
+            );
+        }
+        WorkshopJoinResult::Success(s) => {
+            panic!(
+                "expected error when Bob explicitly requested Alice's leased starter; got success with players: {:?}",
+                s.state.players
+            )
+        }
+    }
+}

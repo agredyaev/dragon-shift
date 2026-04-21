@@ -110,6 +110,33 @@ Source: consolidated must-fix findings from 10-validator readiness audit against
 - Frontend: `map_signin_error` in `sign_in.rs` + NoticeBar mapping in `flows.rs`.
 - Tests: 2 new unit tests in `tests.rs` (~10134-10231). Timing-dummy argon2 preserved on unknown-name branch.
 
+### Item 3 — Starter-lease uniqueness inside a workshop
+
+**Status:** COMPLETED (consensus 12/14, gate ≥8/14)
+
+- Round A (7 lenses): 5 READY / 2 NOT READY.
+  - **Correctness (Medium):** `resolve_character_for_session` explicit-characterId branch (`http.rs:249-269`) ignored `excluded_character_ids`, letting a client pass `{characterId: X}` with X already leased to another seated player.
+  - **Security (High):** same root cause escalated — attacker observes victim starter id from `GameState` broadcast, replays it via explicit-id join to duplicate the seat during voting/judging, biasing outcomes.
+  - Architect, Drift, Completeness, Testing, Simplicity: READY.
+- Fix: 12-line guard added inside the explicit branch of `resolve_character_for_session` (`http.rs:262-276`): if `is_starter && excluded_character_ids.contains(character_id)` → `Err("that starter is already taken in this workshop")` → mapped to HTTP 400. Owned-by-requester path untouched (owned chars cannot collide by construction).
+- Round B (7 lenses): 7 READY / 0 NOT READY.
+
+**Artifacts:**
+- Backend: `http.rs` helpers (241-314), `create_workshop` passes `&BTreeSet::new()` (738-744), `join_workshop` builds exclusion set under `state.sessions.lock()` and handles `Ok(None)` → HTTP 400 `"no starter available"` (994-1065).
+- Shape chosen: `excluded_character_ids: &BTreeSet<String>` threaded as parameter (keeps lock discipline caller-side).
+- Tests: 3 new unit tests in `tests.rs` (~11606-11765):
+  - `join_workshop_assigns_distinct_starters_to_two_accounts`
+  - `join_workshop_returns_error_when_all_starters_leased_in_session`
+  - `join_workshop_rejects_explicit_starter_already_leased` (closes Round A bypass).
+
+**Residual risks (accepted, not blocking):**
+- **TOCTOU** between exclusion snapshot and write lease (`http.rs:1001-1017`) — two concurrent new-join requests could both observe starter X free and both seat. Documented in-code; requires racing window; impact limited to accidental duplication (not targeted impersonation, since pre-seat). Fix would require taking write lease before snapshot — out of scope for item 3.
+- Tri-state `Result<Option<CharacterProfile>, String>` + re-parse of `requested_character_id` at `http.rs:1058-1062` is mildly overloaded (readability smell, not correctness risk). Simplicity lens kept READY. Defer to future consolidation pass.
+- Non-existent `characterId` silently seats player with no pet (pre-existing behavior at `http.rs:279 → 1075`, unchanged by this item).
+- Exhaustion test asserts status-only across fills 2-4, not mid-pool distinctness (Testing Low, implicitly covered by distinct-assignment test).
+
+**Committed in:** `feat(platform): land plan2 item 3 starter uniqueness` (baseline `390760e` + Round A fix).
+
 ### Item 2 — Account-scoped sprite preview route
 
 **Status:** COMPLETED (consensus 8/10)
@@ -143,7 +170,6 @@ Source: consolidated must-fix findings from 10-validator readiness audit against
 
 Tracked for future passes. Each remains unresolved:
 
-3. Starter-lease uniqueness inside a workshop (`http.rs:251-266`).
 4. WS handler `cookie.account_id == player.account_id` assertion (`ws.rs:195-214`).
 5. Remove frontend `tags.len() != 3` check (`flows.rs:177`).
 6. Remove frontend hardcoded phase minutes (`flows.rs:344-348`).

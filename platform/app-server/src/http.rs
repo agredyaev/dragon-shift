@@ -262,6 +262,18 @@ async fn resolve_character_for_session(
                 if !is_owned_by_requester && !is_starter {
                     return Err("you do not own this character".to_string());
                 }
+                // plan2.md item 3: an explicit starter selection must also
+                // respect session-level uniqueness. Otherwise a client could
+                // observe another seated player's starter id (broadcast in
+                // GameState) and intentionally duplicate it by POSTing
+                // /api/workshops/join with that id, bypassing the auto-lease
+                // exclusion. Owned-by-requester characters cannot collide by
+                // construction, so only gate the starter branch.
+                if is_starter && excluded_character_ids.contains(character_id) {
+                    return Err(
+                        "that starter is already taken in this workshop".to_string()
+                    );
+                }
                 Ok(Some(r.profile()))
             }
             None => Ok(None),
