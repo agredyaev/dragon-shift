@@ -950,12 +950,25 @@ async fn spawn_test_server(app: Router) -> (SocketAddr, tokio::task::JoinHandle<
 }
 
 fn ws_request(addr: SocketAddr) -> tokio_tungstenite::tungstenite::handshake::client::Request {
+    ws_request_with_cookie(addr, None)
+}
+
+fn ws_request_with_cookie(
+    addr: SocketAddr,
+    cookie: Option<&str>,
+) -> tokio_tungstenite::tungstenite::handshake::client::Request {
     let mut request = format!("ws://{addr}/api/workshops/ws")
         .into_client_request()
         .expect("ws client request");
     request
         .headers_mut()
         .insert("origin", HeaderValue::from_static("http://localhost:5173"));
+    if let Some(cookie) = cookie {
+        request.headers_mut().insert(
+            axum::http::header::COOKIE,
+            HeaderValue::from_str(cookie).expect("cookie header value"),
+        );
+    }
     request
 }
 
@@ -986,11 +999,22 @@ fn masked_ws_text_frame(payload: &str) -> Vec<u8> {
 }
 
 async fn connect_raw_ws(addr: SocketAddr) -> tokio::net::TcpStream {
+    connect_raw_ws_with_cookie(addr, None).await
+}
+
+async fn connect_raw_ws_with_cookie(
+    addr: SocketAddr,
+    cookie: Option<&str>,
+) -> tokio::net::TcpStream {
     let mut stream = tokio::net::TcpStream::connect(addr)
         .await
         .expect("connect raw ws tcp stream");
+    let cookie_header = match cookie {
+        Some(cookie) => format!("Cookie: {cookie}\r\n"),
+        None => String::new(),
+    };
     let request = format!(
-        "GET /api/workshops/ws HTTP/1.1\r\nHost: {addr}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\nOrigin: http://localhost:5173\r\n\r\n"
+        "GET /api/workshops/ws HTTP/1.1\r\nHost: {addr}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\nOrigin: http://localhost:5173\r\n{cookie_header}\r\n"
     );
     stream
         .write_all(request.as_bytes())
@@ -1488,7 +1512,9 @@ async fn workshop_ws_attach_sends_current_state_for_valid_identity() {
     };
 
     let (addr, server_handle) = spawn_test_server(app).await;
-    let (mut socket, _) = connect_async(ws_request(addr)).await.expect("connect ws");
+    let (mut socket, _) = connect_async(ws_request_with_cookie(addr, Some(&cookie)))
+        .await
+        .expect("connect ws");
     let attach_message = ClientWsMessage::AttachSession(SessionEnvelope {
         session_code: create_success.session_code.clone(),
         player_id: create_success.player_id.clone(),
@@ -1533,6 +1559,343 @@ async fn workshop_ws_attach_sends_current_state_for_valid_identity() {
             .session_connection_count(&create_success.session_code),
         1
     );
+
+    let _ = socket.close(None).await;
+    server_handle.abort();
+}
+
+// ---------------------------------------------------------------------------
+// Item-4 tests: WS attach binds session identity to authenticated account.
+//
+// `workshop_ws` extracts the signed `ds_session` cookie's account id and
+// `attach_ws_session` asserts it matches `player.account_id` for
+// account-owned players. Legacy anonymous players (`account_id: None`) are
+// unaffected. Rejections surface as `ServerWsMessage::Error { message }`
+// over the opened socket (see ws.rs ~337-347).
+// ---------------------------------------------------------------------------
+
+/// Read the next text frame from `socket` and parse it as a `ServerWsMessage`.
+async fn next_server_ws_message(
+    socket: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+) -> ServerWsMessage {
+    let message = socket
+        .next()
+        .await
+        .expect("server ws frame")
+        .expect("server ws message");
+    let payload = match message {
+        WsMessage::Text(payload) => payload,
+        other => panic!("expected text frame, got {other:?}"),
+    };
+    serde_json::from_str(&payload).expect("parse ServerWsMessage")
+}
+
+#[tokio::test]
+async fn ws_attach_rejects_account_mismatch_cookie() {
+    // Alice signs in and creates a workshop; her player is account-owned.
+    // A separate Bob account signs in and we replay Bob's cookie on the WS
+    // upgrade. The attach assertion must reject the mismatch.
+    let state = test_state();
+    let app = build_app(state.clone());
+    let alice_cookie = test_auth_cookie(&app, "AliceMismatch").await;
+    let bob_cookie = test_auth_cookie(&app, "BobMismatch").await;
+
+    let create_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops")
+                .header("content-type", "application/json")
+                .header(axum::http::header::COOKIE, &alice_cookie)
+                .body(Body::from(create_workshop_body("AliceMismatch")))
+                .expect("build create request"),
+        )
+        .await
+        .expect("call create workshop");
+    let create_body = to_bytes(create_response.into_body(), usize::MAX)
+        .await
+        .expect("read create body");
+    let create_success = match serde_json::from_slice::<WorkshopJoinResult>(&create_body)
+        .expect("parse create result")
+    {
+        WorkshopJoinResult::Success(success) => success,
+        WorkshopJoinResult::Error(error) => {
+            panic!("expected create success, got error: {}", error.error)
+        }
+    };
+
+    let (addr, server_handle) = spawn_test_server(app).await;
+    // Upgrade the WS carrying Bob's cookie — mismatching the account-owned
+    // player that Alice just created.
+    let (mut socket, _) = connect_async(ws_request_with_cookie(addr, Some(&bob_cookie)))
+        .await
+        .expect("connect ws");
+    let attach_message = ClientWsMessage::AttachSession(SessionEnvelope {
+        session_code: create_success.session_code.clone(),
+        player_id: create_success.player_id.clone(),
+        reconnect_token: create_success.reconnect_token.clone(),
+        coordinator_type: Some(CoordinatorType::Rust),
+    });
+    socket
+        .send(WsMessage::Text(
+            serde_json::to_string(&attach_message)
+                .expect("encode attach")
+                .into(),
+        ))
+        .await
+        .expect("send attach");
+
+    match next_server_ws_message(&mut socket).await {
+        ServerWsMessage::Error { message } => {
+            assert!(
+                message.contains("does not match authenticated account"),
+                "unexpected error message: {message}"
+            );
+        }
+        other => panic!("expected Error rejecting account mismatch, got {other:?}"),
+    }
+
+    // Server must hard-close after rejecting the attach: the next frame is
+    // either a Close frame or a stream termination. Anything else means the
+    // socket was left open in a retryable state (regression lock).
+    match socket.next().await {
+        None => {}
+        Some(Ok(WsMessage::Close(_))) => {}
+        Some(Ok(other)) => panic!("expected Close or stream end after rejection, got {other:?}"),
+        Some(Err(_)) => {}
+    }
+
+    let _ = socket.close(None).await;
+    server_handle.abort();
+}
+
+#[tokio::test]
+async fn ws_attach_rejects_missing_cookie_for_account_owned_player() {
+    // Same account-owned player, but the WS upgrade carries no cookie at
+    // all. The assertion must fail closed — a cookieless client cannot
+    // attach to an account-owned session.
+    let state = test_state();
+    let app = build_app(state.clone());
+    let alice_cookie = test_auth_cookie(&app, "AliceMissing").await;
+
+    let create_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops")
+                .header("content-type", "application/json")
+                .header(axum::http::header::COOKIE, &alice_cookie)
+                .body(Body::from(create_workshop_body("AliceMissing")))
+                .expect("build create request"),
+        )
+        .await
+        .expect("call create workshop");
+    let create_body = to_bytes(create_response.into_body(), usize::MAX)
+        .await
+        .expect("read create body");
+    let create_success = match serde_json::from_slice::<WorkshopJoinResult>(&create_body)
+        .expect("parse create result")
+    {
+        WorkshopJoinResult::Success(success) => success,
+        WorkshopJoinResult::Error(error) => {
+            panic!("expected create success, got error: {}", error.error)
+        }
+    };
+
+    let (addr, server_handle) = spawn_test_server(app).await;
+    // Upgrade without any cookie.
+    let (mut socket, _) = connect_async(ws_request(addr)).await.expect("connect ws");
+    let attach_message = ClientWsMessage::AttachSession(SessionEnvelope {
+        session_code: create_success.session_code.clone(),
+        player_id: create_success.player_id.clone(),
+        reconnect_token: create_success.reconnect_token.clone(),
+        coordinator_type: Some(CoordinatorType::Rust),
+    });
+    socket
+        .send(WsMessage::Text(
+            serde_json::to_string(&attach_message)
+                .expect("encode attach")
+                .into(),
+        ))
+        .await
+        .expect("send attach");
+
+    match next_server_ws_message(&mut socket).await {
+        ServerWsMessage::Error { message } => {
+            assert!(
+                message.contains("does not match authenticated account"),
+                "unexpected error message: {message}"
+            );
+        }
+        other => panic!("expected Error rejecting missing cookie, got {other:?}"),
+    }
+
+    // Server must hard-close after rejecting the attach: the next frame is
+    // either a Close frame or a stream termination. Anything else means the
+    // socket was left open in a retryable state (regression lock).
+    match socket.next().await {
+        None => {}
+        Some(Ok(WsMessage::Close(_))) => {}
+        Some(Ok(other)) => panic!("expected Close or stream end after rejection, got {other:?}"),
+        Some(Err(_)) => {}
+    }
+
+    let _ = socket.close(None).await;
+    server_handle.abort();
+}
+
+#[tokio::test]
+async fn ws_attach_allows_anonymous_player_without_cookie() {
+    // Legacy no-regression case: seed a session whose player has
+    // `account_id = None`. A cookieless WS attach must succeed. This
+    // mirrors the pre-auth fixture pattern at
+    // `workshop_command_does_not_leave_mutated_cache_when_persisted_command_write_fails`.
+    let state = test_state();
+    let session_code = "714141";
+    let player_id = "player-anon".to_string();
+    let reconnect_token = "token-anon".to_string();
+    let timestamp = Utc::now();
+
+    let mut session = WorkshopSession::new(
+        Uuid::new_v4(),
+        SessionCode(session_code.into()),
+        timestamp,
+        protocol::WorkshopCreateConfig::default(),
+    );
+    let host_player =
+        session_player_with_state(&player_id, "Anon", timestamp, true, false);
+    assert!(
+        host_player.account_id.is_none(),
+        "fixture precondition: anonymous player has no account_id"
+    );
+    session.add_player(host_player);
+    session.host_player_id = Some(player_id.clone());
+    state
+        .store
+        .save_session(&session)
+        .await
+        .expect("seed session");
+    state
+        .store
+        .create_player_identity(&persistence::PlayerIdentity {
+            session_id: session.id.to_string(),
+            player_id: player_id.clone(),
+            reconnect_token: reconnect_token.clone(),
+            created_at: timestamp.to_rfc3339(),
+            last_seen_at: timestamp.to_rfc3339(),
+        })
+        .await
+        .expect("seed identity");
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(session_code.to_string(), session);
+
+    let app = build_app(state.clone());
+    let (addr, server_handle) = spawn_test_server(app).await;
+    let (mut socket, _) = connect_async(ws_request(addr)).await.expect("connect ws");
+    let attach_message = ClientWsMessage::AttachSession(SessionEnvelope {
+        session_code: session_code.to_string(),
+        player_id: player_id.clone(),
+        reconnect_token: reconnect_token.clone(),
+        coordinator_type: Some(CoordinatorType::Rust),
+    });
+    socket
+        .send(WsMessage::Text(
+            serde_json::to_string(&attach_message)
+                .expect("encode attach")
+                .into(),
+        ))
+        .await
+        .expect("send attach");
+
+    match next_server_ws_message(&mut socket).await {
+        ServerWsMessage::StateUpdate(client_state) => {
+            assert_eq!(client_state.session.code, session_code);
+            assert_eq!(client_state.current_player_id.as_deref(), Some(player_id.as_str()));
+        }
+        ServerWsMessage::Error { message } => {
+            panic!("anonymous attach rejected unexpectedly: {message}")
+        }
+        other => panic!("expected StateUpdate, got {other:?}"),
+    }
+
+    let _ = socket.close(None).await;
+    server_handle.abort();
+}
+
+#[tokio::test]
+async fn ws_attach_accepts_matching_account_cookie() {
+    // Happy path: Alice signs in, creates a workshop, and replays her
+    // cookie on the WS upgrade. The signed cookie's account id matches
+    // `player.account_id`, so the attach succeeds and the server emits a
+    // `StateUpdate` frame.
+    let state = test_state();
+    let app = build_app(state.clone());
+    let alice_cookie = test_auth_cookie(&app, "AliceMatch").await;
+
+    let create_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops")
+                .header("content-type", "application/json")
+                .header(axum::http::header::COOKIE, &alice_cookie)
+                .body(Body::from(create_workshop_body("AliceMatch")))
+                .expect("build create request"),
+        )
+        .await
+        .expect("call create workshop");
+    let create_body = to_bytes(create_response.into_body(), usize::MAX)
+        .await
+        .expect("read create body");
+    let create_success = match serde_json::from_slice::<WorkshopJoinResult>(&create_body)
+        .expect("parse create result")
+    {
+        WorkshopJoinResult::Success(success) => success,
+        WorkshopJoinResult::Error(error) => {
+            panic!("expected create success, got error: {}", error.error)
+        }
+    };
+
+    let (addr, server_handle) = spawn_test_server(app).await;
+    let (mut socket, _) = connect_async(ws_request_with_cookie(addr, Some(&alice_cookie)))
+        .await
+        .expect("connect ws");
+    let attach_message = ClientWsMessage::AttachSession(SessionEnvelope {
+        session_code: create_success.session_code.clone(),
+        player_id: create_success.player_id.clone(),
+        reconnect_token: create_success.reconnect_token.clone(),
+        coordinator_type: Some(CoordinatorType::Rust),
+    });
+    socket
+        .send(WsMessage::Text(
+            serde_json::to_string(&attach_message)
+                .expect("encode attach")
+                .into(),
+        ))
+        .await
+        .expect("send attach");
+
+    match next_server_ws_message(&mut socket).await {
+        ServerWsMessage::StateUpdate(client_state) => {
+            assert_eq!(client_state.session.code, create_success.session_code);
+            assert_eq!(
+                client_state.current_player_id.as_deref(),
+                Some(create_success.player_id.as_str())
+            );
+        }
+        ServerWsMessage::Error { message } => {
+            panic!("matching-cookie attach rejected unexpectedly: {message}")
+        }
+        other => panic!("expected StateUpdate, got {other:?}"),
+    }
 
     let _ = socket.close(None).await;
     server_handle.abort();
@@ -1637,7 +2000,9 @@ async fn workshop_command_pushes_state_update_to_attached_websocket() {
     };
 
     let (addr, server_handle) = spawn_test_server(app.clone()).await;
-    let (mut socket, _) = connect_async(ws_request(addr)).await.expect("connect ws");
+    let (mut socket, _) = connect_async(ws_request_with_cookie(addr, Some(&cookie)))
+        .await
+        .expect("connect ws");
     let attach_message = ClientWsMessage::AttachSession(SessionEnvelope {
         session_code: create_success.session_code.clone(),
         player_id: create_success.player_id.clone(),
@@ -2232,7 +2597,7 @@ async fn retired_connection_id_cannot_reattach_before_socket_closes() {
     });
 
     let (addr, server_handle) = spawn_test_server(app).await;
-    let mut stream = connect_raw_ws(addr).await;
+    let mut stream = connect_raw_ws_with_cookie(addr, Some(&cookie)).await;
     send_raw_ws_message(&mut stream, &attach_message).await;
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
@@ -2304,7 +2669,7 @@ async fn same_replica_replaced_connection_is_retired_before_close_signal() {
     });
 
     let (addr, server_handle) = spawn_test_server(app).await;
-    let mut first_stream = connect_raw_ws(addr).await;
+    let mut first_stream = connect_raw_ws_with_cookie(addr, Some(&cookie)).await;
     send_raw_ws_message(&mut first_stream, &attach_message).await;
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
@@ -2322,7 +2687,7 @@ async fn same_replica_replaced_connection_is_retired_before_close_signal() {
         registrations[0].connection_id.clone()
     };
 
-    let (mut second_socket, _) = connect_async(ws_request(addr))
+    let (mut second_socket, _) = connect_async(ws_request_with_cookie(addr, Some(&cookie)))
         .await
         .expect("connect replacement ws");
     second_socket
@@ -2442,7 +2807,9 @@ async fn same_socket_cannot_attach_to_different_player_after_already_attached() 
     });
 
     let (addr, server_handle) = spawn_test_server(app).await;
-    let (mut socket, _) = connect_async(ws_request(addr)).await.expect("connect ws");
+    let (mut socket, _) = connect_async(ws_request_with_cookie(addr, Some(&cookie)))
+        .await
+        .expect("connect ws");
     socket
         .send(WsMessage::Text(
             serde_json::to_string(&first_attach)
@@ -4449,7 +4816,8 @@ async fn postgres_restart_reload_and_reconnect_keep_presence_runtime_only() {
     };
 
     let (addr, server_handle) = spawn_test_server(app2.clone()).await;
-    let (mut socket, _) = connect_async(ws_request(addr))
+    let cookie2 = test_auth_cookie(&app2, "Alice").await;
+    let (mut socket, _) = connect_async(ws_request_with_cookie(addr, Some(&cookie2)))
         .await
         .expect("connect ws after restart");
     let attach_message = ClientWsMessage::AttachSession(SessionEnvelope {
@@ -4754,7 +5122,7 @@ async fn postgres_replaced_connection_cannot_reclaim_before_notification_is_proc
     });
 
     let (addr, server_handle) = spawn_test_server(app).await;
-    let mut first_stream = connect_raw_ws(addr).await;
+    let mut first_stream = connect_raw_ws_with_cookie(addr, Some(&cookie)).await;
     send_raw_ws_message(&mut first_stream, &attach_message).await;
     let first_connection_id = loop {
         let registrations = pg
@@ -7994,7 +8362,9 @@ async fn workshop_ws_close_marks_player_offline_and_reassigns_host() {
     };
 
     let (addr, server_handle) = spawn_test_server(app).await;
-    let (mut socket, _) = connect_async(ws_request(addr)).await.expect("connect ws");
+    let (mut socket, _) = connect_async(ws_request_with_cookie(addr, Some(&cookie)))
+        .await
+        .expect("connect ws");
     let attach_message = ClientWsMessage::AttachSession(SessionEnvelope {
         session_code: create_success.session_code.clone(),
         player_id: create_success.player_id.clone(),
@@ -8015,7 +8385,7 @@ async fn workshop_ws_close_marks_player_offline_and_reassigns_host() {
         .await
         .expect("state update frame")
         .expect("state update message");
-    let (mut guest_socket, _) = connect_async(ws_request(addr))
+    let (mut guest_socket, _) = connect_async(ws_request_with_cookie(addr, Some(&cookie_bob)))
         .await
         .expect("connect guest ws");
     let guest_attach_message = ClientWsMessage::AttachSession(SessionEnvelope {
@@ -8410,7 +8780,9 @@ async fn workshop_ws_attach_does_not_leave_registration_when_initial_state_send_
         .store(true, std::sync::atomic::Ordering::SeqCst);
 
     let (addr, server_handle) = spawn_test_server(app).await;
-    let (mut socket, _) = connect_async(ws_request(addr)).await.expect("connect ws");
+    let (mut socket, _) = connect_async(ws_request_with_cookie(addr, Some(&cookie)))
+        .await
+        .expect("connect ws");
     socket
         .send(WsMessage::Text(
             serde_json::to_string(&ClientWsMessage::AttachSession(SessionEnvelope {
@@ -8516,7 +8888,9 @@ async fn workshop_ws_attach_restores_connected_state_when_initial_state_send_fai
         .store(true, std::sync::atomic::Ordering::SeqCst);
 
     let (addr, server_handle) = spawn_test_server(app).await;
-    let (mut socket, _) = connect_async(ws_request(addr)).await.expect("connect ws");
+    let (mut socket, _) = connect_async(ws_request_with_cookie(addr, Some(&cookie)))
+        .await
+        .expect("connect ws");
     socket
         .send(WsMessage::Text(
             serde_json::to_string(&ClientWsMessage::AttachSession(SessionEnvelope {
@@ -8657,7 +9031,9 @@ async fn workshop_ws_attach_restores_connected_state_when_realtime_claim_fails()
     store.fail_realtime_claims();
 
     let (addr, server_handle) = spawn_test_server(app).await;
-    let (mut socket, _) = connect_async(ws_request(addr)).await.expect("connect ws");
+    let (mut socket, _) = connect_async(ws_request_with_cookie(addr, Some(&cookie)))
+        .await
+        .expect("connect ws");
     socket
         .send(WsMessage::Text(
             serde_json::to_string(&ClientWsMessage::AttachSession(SessionEnvelope {
@@ -8765,7 +9141,7 @@ async fn workshop_ws_failed_reattach_restores_replaced_registration() {
     });
 
     let (addr, server_handle) = spawn_test_server(app).await;
-    let mut first_stream = connect_raw_ws(addr).await;
+    let mut first_stream = connect_raw_ws_with_cookie(addr, Some(&cookie)).await;
     send_raw_ws_message(&mut first_stream, &attach_message).await;
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
@@ -8783,7 +9159,7 @@ async fn workshop_ws_failed_reattach_restores_replaced_registration() {
         registrations[0].connection_id.clone()
     };
 
-    let (mut second_socket, _) = connect_async(ws_request(addr))
+    let (mut second_socket, _) = connect_async(ws_request_with_cookie(addr, Some(&cookie)))
         .await
         .expect("connect replacement ws");
     second_socket
@@ -9461,7 +9837,9 @@ async fn workshop_ws_messages_are_rate_limited_after_attach() {
     };
 
     let (addr, server_handle) = spawn_test_server(app).await;
-    let (mut socket, _) = connect_async(ws_request(addr)).await.expect("connect ws");
+    let (mut socket, _) = connect_async(ws_request_with_cookie(addr, Some(&cookie)))
+        .await
+        .expect("connect ws");
     let attach_message = ClientWsMessage::AttachSession(SessionEnvelope {
         session_code: create_success.session_code.clone(),
         player_id: create_success.player_id.clone(),
@@ -9595,7 +9973,9 @@ async fn phase_timer_broadcasts_warning_notice_at_thirty_seconds_remaining() {
     assert_eq!(command_response.status(), StatusCode::OK);
 
     let (addr, server_handle) = spawn_test_server(app).await;
-    let (mut socket, _) = connect_async(ws_request(addr)).await.expect("connect ws");
+    let (mut socket, _) = connect_async(ws_request_with_cookie(addr, Some(&cookie)))
+        .await
+        .expect("connect ws");
     let attach_message = ClientWsMessage::AttachSession(SessionEnvelope {
         session_code: create_success.session_code.clone(),
         player_id: create_success.player_id.clone(),

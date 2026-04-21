@@ -137,6 +137,29 @@ Source: consolidated must-fix findings from 10-validator readiness audit against
 
 **Committed in:** `feat(platform): land plan2 item 3 starter uniqueness` (baseline `390760e` + Round A fix).
 
+### Item 4 — Bind WS identity to authenticated cookie
+
+**Status:** COMPLETED (consensus 13/14, gate ≥8/14)
+
+- Round A (7 lenses): 6 READY / 1 NOT READY.
+  - **Correctness (Medium):** hard-close missing — on `attach_ws_session` Err, code sent `ServerWsMessage::Error` frame but left socket open for retry. Must-fix: queue `WsOutbound::Close` + `continue` after Error frame, mirroring retired-connection path at `ws.rs:316-326`.
+  - Drift, Completeness, Architect, Security, Testing, Simplicity: READY.
+- Fix: in `handle_workshop_ws` Err arm (`ws.rs:337-356`), after `send_ws_message` of Error frame, queue `outbound_tx.send(WsOutbound::Close)` and `continue` — mirrors retired-connection path (:316-326) exactly. All attach failures now terminal; `WsOutbound::Close` breaks select at `ws.rs:252`. Two reject tests (`ws_attach_rejects_account_mismatch_cookie`, `ws_attach_rejects_missing_cookie_for_account_owned_player`) updated to assert `socket.next()` after Error yields `None | Close | Err` (regression lock on hard-close).
+- Round B (7 lenses): 7 READY / 0 NOT READY.
+
+**Artifacts:**
+- Backend: `ws.rs` upgrade handler extracts `cookie_account_id: Option<String>` from `SignedCookieJar` (`:205-224`, rejecting tampered cookies at `:218-220` with 401 pre-upgrade). Threaded via `handle_workshop_ws` (`:231-237`, call site `:330`) into `attach_ws_session` (signature at `:716-723`, check block `:772-812`). Check runs inside same `state.sessions.lock()` as `player.is_connected` mutation (no TOCTOU). `tracing::warn!` on rejection logs `session_code`, `player_id`, `expected_account_id`, `observed_account` (literal `"mismatch"`/`"none"`, no cookie bytes).
+- Legacy anonymous bypass: `if let Some(expected_account_id) = player.account_id.as_deref()` — players with `account_id: None` skip check, preserving pre-auth fixture flow.
+- Tests: 4 new tests in `tests.rs` (~1595-1770): `ws_attach_rejects_account_mismatch_cookie`, `ws_attach_rejects_missing_cookie_for_account_owned_player`, `ws_attach_allows_anonymous_player_without_cookie` (with fixture precondition assert `account_id.is_none()`), `ws_attach_accepts_matching_account_cookie`. 2 new helpers: `ws_request_with_cookie`, `connect_raw_ws_with_cookie`. 11 pre-existing WS tests updated to thread owner cookie through the new `_with_cookie` helpers (mechanical fix — account-owned players created via `test_auth_cookie` now require matching cookie on WS upgrade).
+- Full suite `cargo test -p app-server`: 177/177 pass.
+
+**Residual risks (accepted, not blocking):**
+- **Architect (Medium, deferred):** WS cookie extraction (`ws.rs:205-224`) re-implements half of `AccountSession::from_request_parts` (`auth.rs:114-150`) but intentionally skips `find_account_by_id`. Consequence: a signed cookie for a *deleted* account passes the WS attach if `player.account_id` still matches, while the HTTP path would reject. Consolidate into a shared `signed_cookie_account_id` helper before the next auth-touching item.
+- **Testing Medium (pre-existing gap, not regression):** no test covers the tampered-cookie 401 branch on the WS upgrade route (`ws.rs:218-220`). `signin_rejects_tampered_cookie` covers HTTP; WS equivalent missing. Not item 4 scope.
+- **Testing Low:** hard-close assertions use `socket.next().await` without a timeout — a regression leaving the socket open would stall tests until runtime cancels rather than failing fast. Consider wrapping in `tokio::time::timeout`.
+- **Residual attack vector:** stolen reconnect_token + stolen signed cookie → still accepted by design. Cookie is HttpOnly + Signed + SameSite=Lax, raising the bar. Documented.
+- **Log hygiene:** `expected_account_id` (raw account UUID) logged on mismatch — acceptable operational data, not a credential. Attacker-controlled account ids are collapsed to `"mismatch"` literal to avoid log poisoning.
+
 ### Item 2 — Account-scoped sprite preview route
 
 **Status:** COMPLETED (consensus 8/10)
@@ -170,7 +193,6 @@ Source: consolidated must-fix findings from 10-validator readiness audit against
 
 Tracked for future passes. Each remains unresolved:
 
-4. WS handler `cookie.account_id == player.account_id` assertion (`ws.rs:195-214`).
 5. Remove frontend `tags.len() != 3` check (`flows.rs:177`).
 6. Remove frontend hardcoded phase minutes (`flows.rs:344-348`).
 7. Strip character roster + Delete UI from AccountHome (Block 2 scope).
