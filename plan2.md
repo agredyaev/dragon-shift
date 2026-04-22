@@ -222,6 +222,36 @@ Source: consolidated must-fix findings from 10-validator readiness audit against
 
 **Committed in:** `feat(platform): close plan2 item 6 apply server-side default for workshop config` (applied on top of `2eff356`).
 
+### Item 7 — Strip character roster + Delete UI from AccountHome
+
+**Status:** COMPLETED (consensus 13/14, gate ≥8/14)
+
+- Round A (7 lenses): 6 READY / 1 NOT READY.
+  - **Architecture (Medium):** TODO(PickCharacter) annotation above retained `load_my_characters_flow` / `submit_delete_character_flow` was on a false premise — `PickCharacterView` (`platform/app-web/src/components/pick_character.rs:28`) uses `load_eligible_characters_flow` + `ops.eligible_characters`, NOT those kept flows. No current or planned consumer.
+  - Drift, Completeness, Correctness, Security, Testing, Simplicity: READY.
+- **Path decision (user):** Path A — frontend-only strip; retain backend, api.rs methods, state fields, and flow functions with `#[allow(dead_code)]` pending possible future reuse. Round A fix: "Rewrite TODOs honestly" over "Full YAGNI cleanup".
+- Fix: replaced both TODOs with honest retention comment (no fabricated tracking issue, no false consumer named). Added a compile-only smoke test to lock retained-flow signatures against future API drift (testing-lens Medium follow-up).
+- Round B (7 lenses): 7 READY / 0 NOT READY.
+
+**Artifacts:**
+- Frontend (`platform/app-web/src/components/account_home.rs`): removed imports of `load_my_characters_flow` / `submit_delete_character_flow`; removed `my_characters` / `my_characters_limit` / `character_count` bindings; removed mount-time `spawn(load_my_characters_flow(...))`; deleted roster + per-row delete UI block. Added minimal Create Character panel (single `button--secondary`, `data-testid="create-character-button"`, `disabled: pending`, onclick navigates to `ShellScreen::CreateCharacter`). Block order preserved: Create Workshop → Create Character → Open Workshops (matches refactor.md:52-57). Frontend business rule `character_count >= my_characters_limit` gate deleted (refactor.md:20 compliance).
+- Flows (`platform/app-web/src/flows.rs`): `load_my_characters_flow` (:423) and `submit_delete_character_flow` (:541) retained with `#[allow(dead_code)]` + comment `// Retained without a current consumer; no plan2 item schedules reuse. Remove if still unused after plan2 reintroduces per-account character management UI.`
+- Frontend test (`platform/app-web/src/flows.rs` test mod): new `retained_flows_remain_linkable` smoke test coerces both kept flows by reference to force signature monomorphization — future API drift surfaces at compile time.
+- Unchanged by design: `platform/app-server/src/http.rs` (`MAX_CHARACTERS_PER_ACCOUNT` enforcement at :3058, `delete_character_by_owner` IDOR guard at :3218), `platform/app-web/src/api.rs` (`list_my_characters` :115, `delete_character` :136), `platform/app-web/src/state.rs` (fields `my_characters` :96, `my_characters_limit` :97), `platform/app-web/src/components/pick_character.rs`.
+- Suites: `cargo check --workspace` clean (no new warnings), `cargo test -p protocol` 11/11, `cargo test -p domain` 137/137, `cargo test -p app-server` 179/179, `cargo test -p app-web retained_flows_remain_linkable` 1/1. Backend regression tests preserved: `create_character_enforces_limit` (tests.rs:11117), `delete_character_rejects_wrong_owner` (tests.rs:11591), `delete_character_rejects_unauthenticated` (tests.rs:11460), `character_create_rate_limit_returns_429` (tests.rs:11865).
+- Diff stat: 2 files, +10 / -39.
+
+**Residual risks (accepted, not blocking):**
+- **Testing (Low):** no frontend view-level test asserts AccountHome's new block shape (Create Character button present, roster/delete absent). Pre-existing gap across the whole `platform/app-web/src/components/` layer (zero `#[test]` fns in components); not regression-introduced by item 7. Playwright view-validator follow-up deferred.
+- **Testing (Low):** no frontend test covers 409 render path when `MAX_CHARACTERS_PER_ACCOUNT` triggers from CreateCharacter (UI no longer lists existing characters, so user has no path to discover saturation before hitting the cap). Out of item 7 scope; relates to item 10 (status code remap) + future UX pass.
+- **Completeness (Low):** stale comment `account_home.rs:27` "Load characters + workshops on mount." — characters no longer loaded on mount. Cosmetic.
+- **Simplicity (Low):** state fields `my_characters` / `my_characters_limit` still written (via `state.rs:610` clear-site + dead flows) but never read by any live UI. Full dead chain (state → flow → api → http) retained transitively under Path A by explicit user choice. Natural second-pass cleanup if user later opts into full YAGNI.
+- **Security (Low):** retained flows still compile into the WASM bundle. Not an info-leak (endpoints are auth-scoped), but dead-surface drift risk documented in retention comment.
+
+**Deferred-list impact:** closes item 7.
+
+**Committed in:** `feat(platform): close plan2 item 7 strip character roster from account home` (applied on top of `d5def89`).
+
 ### Item 2 — Account-scoped sprite preview route
 
 **Status:** COMPLETED (consensus 8/10)
@@ -255,7 +285,6 @@ Source: consolidated must-fix findings from 10-validator readiness audit against
 
 Tracked for future passes. Each remains unresolved:
 
-7. Strip character roster + Delete UI from AccountHome (Block 2 scope).
 8. Split Voting/Judge/End screens (wire `voting_view.rs` or document merge).
 9. Workshop list cap 50 + Postgres order by `created_at`.
 10. Character-limit 409 → 400; "workshop already started" 400 → 409.

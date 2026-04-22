@@ -1,8 +1,7 @@
 use dioxus::prelude::*;
 
 use crate::flows::{
-    load_my_characters_flow, load_open_workshops_flow, submit_create_workshop_flow,
-    submit_delete_character_flow, submit_logout_flow,
+    load_open_workshops_flow, submit_create_workshop_flow, submit_logout_flow,
 };
 use crate::state::{IdentityState, OperationState, ShellScreen};
 use protocol::{ClientGameState, JudgeBundle};
@@ -23,16 +22,12 @@ pub fn AccountHomeView(
         .map(|a| a.name.clone())
         .unwrap_or_default();
     let pending = ops.read().pending_flow.is_some();
-    let my_characters = ops.read().my_characters.clone();
-    let my_characters_limit = ops.read().my_characters_limit;
     let open_workshops = ops.read().open_workshops.clone();
-    let character_count = my_characters.len();
 
     // Load characters + workshops on mount.
     let mut loaded = use_signal(|| false);
     if !*loaded.read() {
         loaded.set(true);
-        spawn(load_my_characters_flow(identity, ops));
         spawn(load_open_workshops_flow(identity, ops));
     }
 
@@ -95,46 +90,16 @@ pub fn AccountHomeView(
                 }
             }
 
-            // ---- My Characters ----
+            // ---- Create Character ----
             article { class: "panel",
-                h2 { class: "panel__title",
-                    "My Characters ({character_count}/{my_characters_limit})"
-                }
+                h2 { class: "panel__title", "Create Character" }
                 div { class: "panel__stack",
-                    if my_characters.is_empty() {
-                        p { class: "meta", "No characters yet." }
-                    } else {
-                        div { class: "roster",
-                            for character in my_characters.iter() {
-                                {
-                                    let char_id = character.id.clone();
-                                    rsx! {
-                                        article { class: "roster__item",
-                                            div {
-                                                p { class: "roster__name", "{character.description}" }
-                                            }
-                                            button {
-                                                class: "button button--danger button--small",
-                                                "data-testid": "delete-character-button",
-                                                disabled: pending,
-                                                onclick: move |_| {
-                                                    let cid = char_id.clone();
-                                                    spawn(submit_delete_character_flow(identity, ops, cid));
-                                                },
-                                                "Delete"
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
                     div { class: "button-row",
                         button {
                             class: "button button--secondary",
                             style: "width:100%;",
                             "data-testid": "create-character-button",
-                            disabled: pending || character_count >= my_characters_limit as usize,
+                            disabled: pending,
                             onclick: move |_| {
                                 identity.with_mut(|id| {
                                     id.screen = ShellScreen::CreateCharacter;

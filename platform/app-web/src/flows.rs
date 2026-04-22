@@ -421,6 +421,8 @@ pub async fn submit_join_with_character_flow(
 }
 
 /// Load the player's characters into `ops.my_characters`.
+// Retained without a current consumer; no plan2 item schedules reuse. Remove if still unused after plan2 reintroduces per-account character management UI.
+#[allow(dead_code)]
 pub async fn load_my_characters_flow(
     identity: Signal<IdentityState>,
     mut ops: Signal<OperationState>,
@@ -539,6 +541,8 @@ pub async fn submit_create_character_flow(
 }
 
 /// Delete a character and refresh the character list.
+// Retained without a current consumer; no plan2 item schedules reuse. Remove if still unused after plan2 reintroduces per-account character management UI.
+#[allow(dead_code)]
 pub async fn submit_delete_character_flow(
     identity: Signal<IdentityState>,
     mut ops: Signal<OperationState>,
@@ -763,5 +767,13 @@ mod tests {
                 Some("Reconnected to workshop.")
             );
         });
+    }
+
+    // Compile-only guard for retained speculative flows (no runtime consumer).
+    // Forces signature monomorphization so future API drift surfaces here.
+    #[test]
+    fn retained_flows_remain_linkable() {
+        let _ = &load_my_characters_flow;
+        let _ = &submit_delete_character_flow;
     }
 }
