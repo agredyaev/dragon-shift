@@ -3,6 +3,9 @@ image:
   tag: kind-local
   pullPolicy: IfNotPresent
 
+sessionCookieKey:
+  existingSecretName: dragon-shift-session-cookie-key
+
 service:
   type: NodePort
   port: 3000

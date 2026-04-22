@@ -12,6 +12,7 @@ NAMESPACE="dragon-shift"
 RELEASE_NAME="dragon-shift"
 IMAGE_NAME="dragon-shift-rust:kind-local"
 ADC_SECRET_NAME="dragon-shift-gcp-adc"
+SESSION_COOKIE_SECRET_NAME="dragon-shift-session-cookie-key"
 PORT_FORWARD_LOG="/tmp/dragon-shift-k8s-port-4100.log"
 
 need_cmd() {
@@ -26,6 +27,7 @@ need_cmd docker
 need_cmd kind
 need_cmd kubectl
 need_cmd helm
+need_cmd openssl
 
 if ! command -v cargo-zigbuild >/dev/null 2>&1 && ! cargo zigbuild --help >/dev/null 2>&1; then
   printf 'cargo zigbuild is required\n' >&2
@@ -50,6 +52,12 @@ docker build -f "$ROOT_DIR/Dockerfile.local" -t "$IMAGE_NAME" "$ROOT_DIR"
 printf 'Refreshing ADC secret...\n'
 kubectl --context "$KUBE_CONTEXT" -n "$NAMESPACE" create secret generic "$ADC_SECRET_NAME" \
   --from-file=credentials.json="$ADC_FILE" \
+  --dry-run=client -o yaml | kubectl --context "$KUBE_CONTEXT" apply -f -
+
+printf 'Refreshing session cookie secret...\n'
+SESSION_COOKIE_KEY_VALUE="$(openssl rand -base64 64)"
+kubectl --context "$KUBE_CONTEXT" -n "$NAMESPACE" create secret generic "$SESSION_COOKIE_SECRET_NAME" \
+  --from-literal=SESSION_COOKIE_KEY="$SESSION_COOKIE_KEY_VALUE" \
   --dry-run=client -o yaml | kubectl --context "$KUBE_CONTEXT" apply -f -
 
 printf 'Loading image into kind...\n'
