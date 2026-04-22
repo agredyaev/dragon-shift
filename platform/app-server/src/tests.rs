@@ -16,20 +16,19 @@ use axum::{
     http::{HeaderValue, Request, StatusCode},
 };
 use chrono::{Duration as ChronoDuration, Utc};
-use domain::{SessionCode, SessionPlayer, WorkshopSession};
+use domain::{MAX_CHARACTERS_PER_ACCOUNT, SessionCode, SessionPlayer, WorkshopSession};
 use futures_util::{SinkExt, StreamExt};
 use persistence::{
     AccountRecord, AppSpriteDefaults, InMemorySessionStore, PersistenceError, PlayerIdentityMatch,
-    PostgresSessionStore,
-    RealtimeConnectionClaim, RealtimeConnectionRegistration, RealtimeConnectionRestore,
-    SessionStore, SessionUpdateNotification, timeout_companion_defaults,
+    PostgresSessionStore, RealtimeConnectionClaim, RealtimeConnectionRegistration,
+    RealtimeConnectionRestore, SessionStore, SessionUpdateNotification, timeout_companion_defaults,
 };
 use protocol::{
-    ClientWsMessage, CoordinatorType, DragonStats, JoinWorkshopRequest, NoticeLevel,
-    LlmProviderKind, ServerWsMessage, SessionArtifactKind, SessionArtifactRecord, SessionCommand,
+    ClientWsMessage, CoordinatorType, DragonStats, JoinWorkshopRequest, LlmProviderKind,
+    NoticeLevel, ServerWsMessage, SessionArtifactKind, SessionArtifactRecord, SessionCommand,
     SessionEnvelope, SpriteSheetResult, WorkshopCommandRequest, WorkshopCommandResult,
     WorkshopJoinResult, WorkshopJudgeBundleResult,
-    };
+};
 use security::{DEFAULT_RUST_SESSION_CODE_PREFIX, OriginPolicyOptions, create_origin_policy};
 use sqlx::PgPool;
 use std::{
@@ -648,7 +647,9 @@ impl SessionStore for FaultyStore {
     fn load_app_sprite_defaults(
         &self,
         key: &str,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<AppSpriteDefaults>, PersistenceError>> + Send + '_>> {
+    ) -> Pin<
+        Box<dyn Future<Output = Result<Option<AppSpriteDefaults>, PersistenceError>> + Send + '_>,
+    > {
         self.inner.load_app_sprite_defaults(key)
     }
 
@@ -668,7 +669,11 @@ impl SessionStore for FaultyStore {
     fn list_characters(
         &self,
     ) -> Pin<
-        Box<dyn Future<Output = Result<Vec<persistence::CharacterRecord>, PersistenceError>> + Send + '_>,
+        Box<
+            dyn Future<Output = Result<Vec<persistence::CharacterRecord>, PersistenceError>>
+                + Send
+                + '_,
+        >,
     > {
         self.inner.list_characters()
     }
@@ -722,7 +727,11 @@ impl SessionStore for FaultyStore {
         &self,
         owner_account_id: &str,
     ) -> Pin<
-        Box<dyn Future<Output = Result<Vec<persistence::CharacterRecord>, PersistenceError>> + Send + '_>,
+        Box<
+            dyn Future<Output = Result<Vec<persistence::CharacterRecord>, PersistenceError>>
+                + Send
+                + '_,
+        >,
     > {
         self.inner.list_characters_by_owner(owner_account_id)
     }
@@ -1221,10 +1230,7 @@ fn load_config_rejects_short_cookie_key() {
     let result = crate::app::load_config();
     assert!(result.is_err());
     assert!(
-        result
-            .as_ref()
-            .unwrap_err()
-            .contains("at least 64 bytes"),
+        result.as_ref().unwrap_err().contains("at least 64 bytes"),
         "unexpected error: {:?}",
         result.err()
     );
@@ -1767,8 +1773,7 @@ async fn ws_attach_allows_anonymous_player_without_cookie() {
         timestamp,
         protocol::WorkshopCreateConfig::default(),
     );
-    let host_player =
-        session_player_with_state(&player_id, "Anon", timestamp, true, false);
+    let host_player = session_player_with_state(&player_id, "Anon", timestamp, true, false);
     assert!(
         host_player.account_id.is_none(),
         "fixture precondition: anonymous player has no account_id"
@@ -1818,7 +1823,10 @@ async fn ws_attach_allows_anonymous_player_without_cookie() {
     match next_server_ws_message(&mut socket).await {
         ServerWsMessage::StateUpdate(client_state) => {
             assert_eq!(client_state.session.code, session_code);
-            assert_eq!(client_state.current_player_id.as_deref(), Some(player_id.as_str()));
+            assert_eq!(
+                client_state.current_player_id.as_deref(),
+                Some(player_id.as_str())
+            );
         }
         ServerWsMessage::Error { message } => {
             panic!("anonymous attach rejected unexpectedly: {message}")
@@ -1940,11 +1948,7 @@ async fn ensure_session_cached_clears_restored_transient_connectivity() {
         protocol::WorkshopCreateConfig::default(),
     );
     session.add_player(session_player_with_state(
-        "player-1",
-        "Alice",
-        timestamp,
-        true,
-        true,
+        "player-1", "Alice", timestamp, true, true,
     ));
     session.host_player_id = Some("player-1".to_string());
     state
@@ -2086,11 +2090,7 @@ async fn session_update_notification_skip_does_not_evict_cache_or_broadcast() {
         protocol::WorkshopCreateConfig::default(),
     );
     session.add_player(session_player_with_state(
-        "player-1",
-        "Alice",
-        timestamp,
-        true,
-        true,
+        "player-1", "Alice", timestamp, true, true,
     ));
 
     state
@@ -2262,11 +2262,7 @@ async fn typed_notification_followed_by_legacy_notification_does_not_rebroadcast
         protocol::WorkshopCreateConfig::default(),
     );
     session.add_player(session_player_with_state(
-        "player-1",
-        "Alice",
-        timestamp,
-        true,
-        true,
+        "player-1", "Alice", timestamp, true, true,
     ));
 
     state
@@ -2371,11 +2367,7 @@ async fn realtime_replaced_notification_clears_local_registration_without_persis
         protocol::WorkshopCreateConfig::default(),
     );
     session.add_player(session_player_with_state(
-        "player-1",
-        "Alice",
-        timestamp,
-        true,
-        true,
+        "player-1", "Alice", timestamp, true, true,
     ));
     state
         .store
@@ -2490,11 +2482,7 @@ async fn clearing_local_realtime_before_close_prevents_false_disconnect_fallback
         protocol::WorkshopCreateConfig::default(),
     );
     session.add_player(session_player_with_state(
-        "player-1",
-        "Alice",
-        timestamp,
-        true,
-        true,
+        "player-1", "Alice", timestamp, true, true,
     ));
     state
         .store
@@ -3546,7 +3534,9 @@ async fn workshop_judge_bundle_rejects_non_host_requests() {
         serde_json::from_slice(&create_body).expect("parse create result");
     let create_success = match create_result {
         WorkshopJoinResult::Success(success) => success,
-        WorkshopJoinResult::Error(error) => panic!("expected create success, got error: {}", error.error),
+        WorkshopJoinResult::Error(error) => {
+            panic!("expected create success, got error: {}", error.error)
+        }
     };
 
     let join_response = app
@@ -3572,7 +3562,9 @@ async fn workshop_judge_bundle_rejects_non_host_requests() {
         serde_json::from_slice(&join_body).expect("parse join result");
     let join_success = match join_result {
         WorkshopJoinResult::Success(success) => success,
-        WorkshopJoinResult::Error(error) => panic!("expected join success, got error: {}", error.error),
+        WorkshopJoinResult::Error(error) => {
+            panic!("expected join success, got error: {}", error.error)
+        }
     };
 
     let response = app
@@ -3650,7 +3642,7 @@ async fn workshop_judge_bundle_rejects_requests_before_end_phase() {
         .await
         .expect("call judge bundle endpoint");
 
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(response.status(), StatusCode::CONFLICT);
     let body = to_bytes(response.into_body(), usize::MAX)
         .await
         .expect("read judge bundle body");
@@ -3658,7 +3650,10 @@ async fn workshop_judge_bundle_rejects_requests_before_end_phase() {
         serde_json::from_slice(&body).expect("parse judge bundle result");
     match result {
         WorkshopJudgeBundleResult::Error(error) => {
-            assert_eq!(error.error, "Workshop archive can only be built after the game ends.");
+            assert_eq!(
+                error.error,
+                "Workshop archive can only be built after the game ends."
+            );
         }
         WorkshopJudgeBundleResult::Success(_) => panic!("expected error response"),
     }
@@ -3690,7 +3685,9 @@ async fn generate_sprite_sheet_times_out_to_fallback_companion() {
         serde_json::from_slice(&create_body).expect("parse create result");
     let create_success = match create_result {
         WorkshopJoinResult::Success(success) => success,
-        WorkshopJoinResult::Error(error) => panic!("expected create success, got error: {}", error.error),
+        WorkshopJoinResult::Error(error) => {
+            panic!("expected create success, got error: {}", error.error)
+        }
     };
 
     seed_selected_characters(&state, &create_success.session_code).await;
@@ -3724,7 +3721,8 @@ async fn generate_sprite_sheet_times_out_to_fallback_companion() {
     let body = to_bytes(response.into_body(), usize::MAX)
         .await
         .expect("read sprite sheet body");
-    let result: SpriteSheetResult = serde_json::from_slice(&body).expect("parse sprite sheet result");
+    let result: SpriteSheetResult =
+        serde_json::from_slice(&body).expect("parse sprite sheet result");
     let success = match result {
         SpriteSheetResult::Success(success) => success,
         SpriteSheetResult::Error(error) => panic!("expected success, got error: {}", error.error),
@@ -3745,9 +3743,18 @@ async fn generate_sprite_sheet_times_out_to_fallback_companion() {
         .as_ref()
         .expect("selected character saved");
     let character_id = player.character_id.clone().expect("character id present");
-    assert_eq!(Some(character_id.as_str()), Some(selected_character.id.as_str()));
-    assert_eq!(selected_character.description, "A bronze dragon with bright wings");
-    assert_eq!(selected_character.sprites, timeout_companion_defaults().sprites);
+    assert_eq!(
+        Some(character_id.as_str()),
+        Some(selected_character.id.as_str())
+    );
+    assert_eq!(
+        selected_character.description,
+        "A bronze dragon with bright wings"
+    );
+    assert_eq!(
+        selected_character.sprites,
+        timeout_companion_defaults().sprites
+    );
     assert_eq!(selected_character.remaining_sprite_regenerations, 0);
     drop(sessions);
 
@@ -3757,8 +3764,14 @@ async fn generate_sprite_sheet_times_out_to_fallback_companion() {
         .await
         .expect("load saved character")
         .expect("saved character exists");
-    assert_eq!(persisted_character.description, "A bronze dragon with bright wings");
-    assert_eq!(persisted_character.sprites, timeout_companion_defaults().sprites);
+    assert_eq!(
+        persisted_character.description,
+        "A bronze dragon with bright wings"
+    );
+    assert_eq!(
+        persisted_character.sprites,
+        timeout_companion_defaults().sprites
+    );
     assert_eq!(persisted_character.remaining_sprite_regenerations, 0);
 
     let artifacts = state
@@ -3772,7 +3785,10 @@ async fn generate_sprite_sheet_times_out_to_fallback_companion() {
         .find(|artifact| artifact.kind == SessionArtifactKind::PetProfileUpdated)
         .expect("pet profile artifact exists");
     assert!(artifact.payload.get("characterId").is_some());
-    assert_eq!(artifact.payload.get("fallbackUsed"), Some(&serde_json::json!(true)));
+    assert_eq!(
+        artifact.payload.get("fallbackUsed"),
+        Some(&serde_json::json!(true))
+    );
     assert_eq!(
         artifact.payload.get("remainingSpriteRegenerations"),
         Some(&serde_json::json!(0))
@@ -3854,7 +3870,8 @@ async fn generate_sprite_sheet_provider_failure_uses_fallback_companion() {
     let body = to_bytes(response.into_body(), usize::MAX)
         .await
         .expect("read sprite sheet body");
-    let result: SpriteSheetResult = serde_json::from_slice(&body).expect("parse sprite sheet result");
+    let result: SpriteSheetResult =
+        serde_json::from_slice(&body).expect("parse sprite sheet result");
     let success = match result {
         SpriteSheetResult::Success(success) => success,
         SpriteSheetResult::Error(error) => panic!("expected success, got error: {}", error.error),
@@ -3875,9 +3892,18 @@ async fn generate_sprite_sheet_provider_failure_uses_fallback_companion() {
         .as_ref()
         .expect("selected character saved");
     let character_id = player.character_id.clone().expect("character id present");
-    assert_eq!(Some(character_id.as_str()), Some(selected_character.id.as_str()));
-    assert_eq!(selected_character.description, "A bronze dragon with bright wings");
-    assert_eq!(selected_character.sprites, timeout_companion_defaults().sprites);
+    assert_eq!(
+        Some(character_id.as_str()),
+        Some(selected_character.id.as_str())
+    );
+    assert_eq!(
+        selected_character.description,
+        "A bronze dragon with bright wings"
+    );
+    assert_eq!(
+        selected_character.sprites,
+        timeout_companion_defaults().sprites
+    );
     assert_eq!(selected_character.remaining_sprite_regenerations, 0);
     drop(sessions);
 
@@ -3887,8 +3913,14 @@ async fn generate_sprite_sheet_provider_failure_uses_fallback_companion() {
         .await
         .expect("load saved character")
         .expect("saved character exists");
-    assert_eq!(persisted_character.description, "A bronze dragon with bright wings");
-    assert_eq!(persisted_character.sprites, timeout_companion_defaults().sprites);
+    assert_eq!(
+        persisted_character.description,
+        "A bronze dragon with bright wings"
+    );
+    assert_eq!(
+        persisted_character.sprites,
+        timeout_companion_defaults().sprites
+    );
     assert_eq!(persisted_character.remaining_sprite_regenerations, 0);
 
     let artifacts = state
@@ -3902,7 +3934,10 @@ async fn generate_sprite_sheet_provider_failure_uses_fallback_companion() {
         .find(|artifact| artifact.kind == SessionArtifactKind::PetProfileUpdated)
         .expect("pet profile artifact exists");
     assert!(artifact.payload.get("characterId").is_some());
-    assert_eq!(artifact.payload.get("fallbackUsed"), Some(&serde_json::json!(true)));
+    assert_eq!(
+        artifact.payload.get("fallbackUsed"),
+        Some(&serde_json::json!(true))
+    );
     assert_eq!(
         artifact.payload.get("remainingSpriteRegenerations"),
         Some(&serde_json::json!(0))
@@ -5029,11 +5064,7 @@ async fn reload_cached_session_clears_stale_cached_presence_without_realtime_reg
         protocol::WorkshopCreateConfig::default(),
     );
     session.add_player(session_player_with_state(
-        &player_id,
-        "Alice",
-        timestamp,
-        true,
-        false,
+        &player_id, "Alice", timestamp, true, false,
     ));
     state
         .store
@@ -5087,11 +5118,7 @@ async fn postgres_reload_ignores_stale_distributed_realtime_presence() {
         protocol::WorkshopCreateConfig::default(),
     );
     session.add_player(session_player_with_state(
-        &player_id,
-        "Alice",
-        timestamp,
-        true,
-        false,
+        &player_id, "Alice", timestamp, true, false,
     ));
     pg.store
         .save_session(&session)
@@ -5832,7 +5859,12 @@ async fn workshop_command_starts_phase1_from_lobby() {
         .get(&create_success.session_code)
         .expect("session cached after phase1 start");
     assert_eq!(session.phase, protocol::Phase::Phase1);
-    assert!(session.players.values().all(|player| player.current_dragon_id.is_some()));
+    assert!(
+        session
+            .players
+            .values()
+            .all(|player| player.current_dragon_id.is_some())
+    );
 }
 
 #[tokio::test]
@@ -5879,7 +5911,7 @@ async fn workshop_command_rejects_start_handover_outside_phase1() {
         .await
         .expect("call command endpoint");
 
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(response.status(), StatusCode::CONFLICT);
     let body = to_bytes(response.into_body(), usize::MAX)
         .await
         .expect("read command body");
@@ -6121,7 +6153,7 @@ async fn workshop_command_rejects_submit_tags_outside_handover() {
              .await
              .expect("call command endpoint");
 
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(response.status(), StatusCode::CONFLICT);
     let body = to_bytes(response.into_body(), usize::MAX)
         .await
         .expect("read command body");
@@ -6289,7 +6321,7 @@ async fn workshop_command_rejects_submit_tags_with_wrong_count() {
                     create_success.session_code, create_success.reconnect_token
                 )))
                 .expect("build start handover request"),
-            )
+        )
         .await
         .expect("call startHandover command");
     assert_eq!(start_handover_response.status(), StatusCode::OK);
@@ -6501,7 +6533,7 @@ async fn workshop_command_rejects_start_phase2_outside_handover() {
         .await
         .expect("call command endpoint");
 
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(response.status(), StatusCode::CONFLICT);
     let body = to_bytes(response.into_body(), usize::MAX)
         .await
         .expect("read command body");
@@ -6729,7 +6761,7 @@ async fn workshop_command_rejects_start_phase2_when_tags_are_missing() {
         .await
         .expect("call command endpoint");
 
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(response.status(), StatusCode::CONFLICT);
     let body = to_bytes(response.into_body(), usize::MAX)
         .await
         .expect("read command body");
@@ -6900,7 +6932,7 @@ async fn workshop_command_rejects_end_game_outside_phase2() {
         .await
         .expect("call command endpoint");
 
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(response.status(), StatusCode::CONFLICT);
     let body = to_bytes(response.into_body(), usize::MAX)
         .await
         .expect("read command body");
@@ -7084,7 +7116,8 @@ async fn workshop_command_rejects_non_host_end_game() {
 }
 
 #[tokio::test]
-async fn workshop_command_enters_voting_and_runs_judge_in_background_when_host_ends_multiplayer_phase2() {
+async fn workshop_command_enters_voting_and_runs_judge_in_background_when_host_ends_multiplayer_phase2()
+ {
     let state = test_state();
     let app = build_app(state.clone());
     let cookie = test_auth_cookie(&app, "Alice").await;
@@ -7273,7 +7306,7 @@ async fn workshop_command_rejects_submit_vote_outside_voting() {
              .await
              .expect("call command endpoint");
 
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(response.status(), StatusCode::CONFLICT);
     let body = to_bytes(response.into_body(), usize::MAX)
         .await
         .expect("read command body");
@@ -7328,7 +7361,7 @@ async fn workshop_command_rejects_invalid_submit_vote_payload() {
              .await
              .expect("call command endpoint");
 
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(response.status(), StatusCode::CONFLICT);
     let body = to_bytes(response.into_body(), usize::MAX)
         .await
         .expect("read command body");
@@ -7462,7 +7495,7 @@ async fn workshop_command_rejects_self_vote_in_voting() {
              .await
              .expect("call submitVote command");
 
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(response.status(), StatusCode::CONFLICT);
     let body = to_bytes(response.into_body(), usize::MAX)
         .await
         .expect("read command body");
@@ -7651,7 +7684,7 @@ async fn workshop_command_rejects_reveal_results_outside_voting() {
              .await
              .expect("call command endpoint");
 
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(response.status(), StatusCode::CONFLICT);
     let body = to_bytes(response.into_body(), usize::MAX)
         .await
         .expect("read command body");
@@ -7901,7 +7934,7 @@ async fn workshop_command_rejects_reveal_results_while_votes_are_pending() {
              .await
              .expect("call command endpoint");
 
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(response.status(), StatusCode::CONFLICT);
     let body = to_bytes(response.into_body(), usize::MAX)
         .await
         .expect("read command body");
@@ -8030,7 +8063,7 @@ async fn workshop_command_rejects_end_session_before_results_are_revealed() {
         .await
         .expect("call endSession command");
 
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(response.status(), StatusCode::CONFLICT);
     let body = to_bytes(response.into_body(), usize::MAX)
         .await
         .expect("read command body");
@@ -8211,10 +8244,12 @@ async fn workshop_command_reveals_voting_results_after_all_votes() {
     let sessions = state.sessions.lock().await;
     let session = sessions.get(&session_code).expect("session exists");
     assert_eq!(session.phase, protocol::Phase::Voting);
-    assert!(session
-        .voting
-        .as_ref()
-        .is_some_and(|voting| voting.results_revealed));
+    assert!(
+        session
+            .voting
+            .as_ref()
+            .is_some_and(|voting| voting.results_revealed)
+    );
     assert!(session.players.values().all(|player| player.score >= 0));
 }
 
@@ -8306,7 +8341,9 @@ async fn advance_game_ticks_updates_cached_session_without_persisting_each_tick(
     advance_game_ticks(&state).await; // → 20, 20 % 5 == 0 → persist
 
     let cached = state.sessions.lock().await;
-    let updated = cached.get("955555").expect("cached session after persist tick");
+    let updated = cached
+        .get("955555")
+        .expect("cached session after persist tick");
     assert_eq!(updated.time, 20);
     assert_eq!(
         store.save_session_calls(),
@@ -8814,11 +8851,7 @@ async fn workshop_ws_attach_restores_cache_state_when_grouped_reconnect_persist_
         protocol::WorkshopCreateConfig::default(),
     );
     session.add_player(session_player_with_state(
-        &player_id,
-        "Alice",
-        timestamp,
-        true,
-        false,
+        &player_id, "Alice", timestamp, true, false,
     ));
     store
         .inner
@@ -9435,11 +9468,7 @@ async fn reconnect_join_restores_cache_state_when_grouped_reconnect_persist_fail
         protocol::WorkshopCreateConfig::default(),
     );
     session.add_player(session_player_with_state(
-        &player_id,
-        "Alice",
-        timestamp,
-        true,
-        false,
+        &player_id, "Alice", timestamp, true, false,
     ));
     store
         .inner
@@ -9505,11 +9534,7 @@ async fn websocket_reconnect_persistence_does_not_store_connected_presence() {
         protocol::WorkshopCreateConfig::default(),
     );
     session.add_player(session_player_with_state(
-        &player_id,
-        "Alice",
-        timestamp,
-        true,
-        false,
+        &player_id, "Alice", timestamp, true, false,
     ));
     state
         .store
@@ -9592,11 +9617,7 @@ async fn websocket_disconnect_restores_cache_state_when_grouped_disconnect_persi
         protocol::WorkshopCreateConfig::default(),
     );
     session.add_player(session_player_with_state(
-        &player_id,
-        "Alice",
-        timestamp,
-        true,
-        true,
+        &player_id, "Alice", timestamp, true, true,
     ));
     store
         .inner
@@ -9676,11 +9697,7 @@ async fn replaced_connection_close_before_notification_does_not_persist_false_di
         protocol::WorkshopCreateConfig::default(),
     );
     session.add_player(session_player_with_state(
-        &player_id,
-        "Alice",
-        timestamp,
-        true,
-        true,
+        &player_id, "Alice", timestamp, true, true,
     ));
     pg.store
         .save_session(&session)
@@ -9841,11 +9858,7 @@ async fn fresh_join_restores_cache_state_when_grouped_join_persist_fails() {
         protocol::WorkshopCreateConfig::default(),
     );
     session.add_player(session_player_with_state(
-        "host-1",
-        "Alice",
-        timestamp,
-        true,
-        true,
+        "host-1", "Alice", timestamp, true, true,
     ));
     store
         .inner
@@ -10636,8 +10649,7 @@ async fn signin_creates_new_account_and_sets_cookie() {
     let bytes = to_bytes(response.into_body(), 64 * 1024)
         .await
         .expect("read signin body");
-    let value: serde_json::Value =
-        serde_json::from_slice(&bytes).expect("signin body is json");
+    let value: serde_json::Value = serde_json::from_slice(&bytes).expect("signin body is json");
     assert_eq!(value["created"], serde_json::Value::Bool(true));
     assert_eq!(value["account"]["hero"], "knight");
     assert_eq!(value["account"]["name"], "Alice");
@@ -10697,8 +10709,7 @@ async fn signin_logs_in_existing_account_when_password_matches() {
     let bytes = to_bytes(second.into_body(), 64 * 1024)
         .await
         .expect("read login body");
-    let value: serde_json::Value =
-        serde_json::from_slice(&bytes).expect("login body is json");
+    let value: serde_json::Value = serde_json::from_slice(&bytes).expect("login body is json");
     assert_eq!(value["created"], serde_json::Value::Bool(false));
 }
 
@@ -10955,8 +10966,7 @@ async fn signin_is_case_insensitive_on_login() {
     let bytes = to_bytes(response.into_body(), 64 * 1024)
         .await
         .expect("read login body");
-    let value: serde_json::Value =
-        serde_json::from_slice(&bytes).expect("login body is json");
+    let value: serde_json::Value = serde_json::from_slice(&bytes).expect("login body is json");
     assert_eq!(value["created"], serde_json::Value::Bool(false));
     // Response carries the originally-stored casing, not the request's.
     assert_eq!(value["account"]["name"], "Alice");
@@ -11145,7 +11155,11 @@ async fn create_character_enforces_limit() {
             )
             .await
             .expect("create character response");
-        assert_eq!(response.status(), StatusCode::CREATED, "character #{i} should succeed");
+        assert_eq!(
+            response.status(),
+            StatusCode::CREATED,
+            "character #{i} should succeed"
+        );
     }
 
     // 6th should fail.
@@ -11171,7 +11185,7 @@ async fn create_character_enforces_limit() {
         )
         .await
         .expect("6th create response");
-    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
@@ -11460,9 +11474,7 @@ async fn list_open_workshops_forward_paging_returns_older_rows() {
         assert!(created < ts.as_str(), "row {created} older than {ts}");
     }
     // No further forward pages exist; prev cursor points back to page 1.
-    assert!(
-        page2.get("nextCursor").map(|v| v.is_null()).unwrap_or(true)
-    );
+    assert!(page2.get("nextCursor").map(|v| v.is_null()).unwrap_or(true));
     assert!(page2["prevCursor"].is_object());
 }
 
@@ -11479,16 +11491,14 @@ async fn list_open_workshops_backward_paging_returns_newer_rows() {
     let ts = next["createdAt"].as_str().unwrap().to_string();
     let code = next["sessionCode"].as_str().unwrap().to_string();
     let ts_encoded = ts.replace(':', "%3A").replace('+', "%2B");
-    let forward_query =
-        format!("after_created_at={ts_encoded}&after_session_code={code}");
+    let forward_query = format!("after_created_at={ts_encoded}&after_session_code={code}");
     let (_, page2) = get_open_workshops_json(&app, &cookie, &forward_query).await;
 
     let prev = page2["prevCursor"].as_object().expect("prev cursor");
     let prev_ts = prev["createdAt"].as_str().unwrap().to_string();
     let prev_code = prev["sessionCode"].as_str().unwrap().to_string();
     let prev_ts_encoded = prev_ts.replace(':', "%3A").replace('+', "%2B");
-    let back_query =
-        format!("before_created_at={prev_ts_encoded}&before_session_code={prev_code}");
+    let back_query = format!("before_created_at={prev_ts_encoded}&before_session_code={prev_code}");
     let (status, back_page) = get_open_workshops_json(&app, &cookie, &back_query).await;
     assert_eq!(status, StatusCode::OK);
     // Prev from page 2's first row returns page 1's 50 rows.
@@ -11523,17 +11533,12 @@ async fn list_open_workshops_rejects_unpaired_cursor_half() {
     let cookie = signin_and_get_cookie(&app, "knight", "Alice", "correcthorse").await;
 
     // Only `after_created_at`, no `after_session_code`.
-    let (status, _) = get_open_workshops_json(
-        &app,
-        &cookie,
-        "after_created_at=2026-01-01T00%3A00%3A00Z",
-    )
-    .await;
+    let (status, _) =
+        get_open_workshops_json(&app, &cookie, "after_created_at=2026-01-01T00%3A00%3A00Z").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
 
     // Only `before_session_code`, no `before_created_at`.
-    let (status, _) =
-        get_open_workshops_json(&app, &cookie, "before_session_code=000002").await;
+    let (status, _) = get_open_workshops_json(&app, &cookie, "before_session_code=000002").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
@@ -11549,23 +11554,15 @@ async fn list_open_workshops_treats_empty_string_params_as_absent() {
     let app = build_app(state);
     let cookie = signin_and_get_cookie(&app, "knight", "Alice", "correcthorse").await;
 
-    let (status, value) = get_open_workshops_json(
-        &app,
-        &cookie,
-        "after_created_at=&after_session_code=",
-    )
-    .await;
+    let (status, value) =
+        get_open_workshops_json(&app, &cookie, "after_created_at=&after_session_code=").await;
     assert_eq!(status, StatusCode::OK);
     // Should behave identically to `?` (no params) — return all 3 seeded rows.
     assert_eq!(value["workshops"].as_array().unwrap().len(), 3);
 
     // Symmetric check for the `before_*` side.
-    let (status, value) = get_open_workshops_json(
-        &app,
-        &cookie,
-        "before_created_at=&before_session_code=",
-    )
-    .await;
+    let (status, value) =
+        get_open_workshops_json(&app, &cookie, "before_created_at=&before_session_code=").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(value["workshops"].as_array().unwrap().len(), 3);
 }
@@ -12032,7 +12029,10 @@ async fn join_workshop_leases_starter_when_zero_owned_characters() {
                 .players
                 .get(&success.player_id)
                 .expect("player in state");
-            assert!(player.is_ready, "player should be ready with leased character");
+            assert!(
+                player.is_ready,
+                "player should be ready with leased character"
+            );
             assert!(
                 player.pet_description.is_some(),
                 "leased starter should provide a pet_description"
@@ -12270,8 +12270,7 @@ async fn preview_sprites_does_not_create_character_record() {
     let after_bytes = to_bytes(after.into_body(), 64 * 1024)
         .await
         .expect("read list body");
-    let after_json: serde_json::Value =
-        serde_json::from_slice(&after_bytes).expect("list is json");
+    let after_json: serde_json::Value = serde_json::from_slice(&after_bytes).expect("list is json");
     assert_eq!(after_json["characters"].as_array().unwrap().len(), 0);
 }
 
@@ -12467,7 +12466,7 @@ async fn join_workshop_returns_error_when_all_starters_leased_in_session() {
         .await
         .expect("join response");
 
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(response.status(), StatusCode::CONFLICT);
     let bytes = to_bytes(response.into_body(), usize::MAX)
         .await
         .expect("read body");
@@ -12555,5 +12554,288 @@ async fn join_workshop_rejects_explicit_starter_already_leased() {
                 s.state.players
             )
         }
+    }
+}
+
+#[tokio::test]
+async fn create_character_returns_400_when_character_limit_reached() {
+    // Covers plan2 item 10: character-limit exhaustion is a client input
+    // problem (the account simply cannot hold more), not a state conflict.
+    let state = test_state();
+    let app = build_app(state);
+    let cookie = signin_and_get_cookie(&app, "knight", "Alice", "correcthorse").await;
+
+    for i in 0..MAX_CHARACTERS_PER_ACCOUNT {
+        let body = serde_json::json!({
+            "description": format!("Dragon #{i}"),
+            "sprites": {
+                "neutral": "base64neutral",
+                "happy": "base64happy",
+                "angry": "base64angry",
+                "sleepy": "base64sleepy"
+            }
+        })
+        .to_string();
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/characters")
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .header(axum::http::header::COOKIE, &cookie)
+                    .body(Body::from(body))
+                    .expect("build create character request"),
+            )
+            .await
+            .expect("create character response");
+        assert_eq!(response.status(), StatusCode::CREATED);
+    }
+
+    let body = serde_json::json!({
+        "description": "One too many",
+        "sprites": {
+            "neutral": "base64neutral",
+            "happy": "base64happy",
+            "angry": "base64angry",
+            "sleepy": "base64sleepy"
+        }
+    })
+    .to_string();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/characters")
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .header(axum::http::header::COOKIE, &cookie)
+                .body(Body::from(body))
+                .expect("build over-limit create request"),
+        )
+        .await
+        .expect("over-limit create response");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body_bytes = to_bytes(response.into_body(), 4096)
+        .await
+        .expect("read over-limit body");
+    let body_json: serde_json::Value =
+        serde_json::from_slice(&body_bytes).expect("over-limit body is JSON");
+    let error_string = body_json
+        .get("error")
+        .and_then(|v| v.as_str())
+        .expect("over-limit body carries error string");
+    assert!(
+        error_string.contains("character limit reached"),
+        "expected error string to mention 'character limit reached', got {error_string:?}"
+    );
+}
+
+#[tokio::test]
+async fn join_workshop_returns_409_when_workshop_already_started() {
+    // Covers plan2 item 10: joining a workshop that has advanced past Lobby
+    // is a state conflict (the resource is not in an acceptable state), not
+    // a validation problem with the request body.
+    let state = test_state();
+    let app = build_app(state);
+    let host_cookie = test_auth_cookie(&app, "Alice").await;
+    let joiner_cookie = test_auth_cookie(&app, "Bob").await;
+
+    let create_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops")
+                .header("content-type", "application/json")
+                .header(axum::http::header::COOKIE, &host_cookie)
+                .body(Body::from(create_workshop_body("Alice")))
+                .expect("build create request"),
+        )
+        .await
+        .expect("call create workshop");
+    let create_body = to_bytes(create_response.into_body(), usize::MAX)
+        .await
+        .expect("read create body");
+    let create_success = match serde_json::from_slice::<WorkshopJoinResult>(&create_body)
+        .expect("parse create result")
+    {
+        WorkshopJoinResult::Success(success) => success,
+        WorkshopJoinResult::Error(error) => {
+            panic!("expected create success, got error: {}", error.error)
+        }
+    };
+
+    // Advance past Lobby so the next join attempt is rejected as a conflict.
+    let start_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops/command")
+                .header("content-type", "application/json")
+                .body(Body::from(format!(
+                    r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"startPhase1"}}"#,
+                    create_success.session_code, create_success.reconnect_token
+                )))
+                .expect("build startPhase1 request"),
+        )
+        .await
+        .expect("call startPhase1");
+    assert_eq!(start_response.status(), StatusCode::OK);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops/join")
+                .header("content-type", "application/json")
+                .header(axum::http::header::COOKIE, &joiner_cookie)
+                .body(Body::from(format!(
+                    r#"{{"sessionCode":"{}","name":"Bob"}}"#,
+                    create_success.session_code
+                )))
+                .expect("build join request"),
+        )
+        .await
+        .expect("call join workshop");
+
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read join body");
+    let result: WorkshopJoinResult = serde_json::from_slice(&body).expect("parse join result");
+    match result {
+        WorkshopJoinResult::Error(error) => {
+            assert_eq!(
+                error.error,
+                "This workshop has already started. New players can only join in the lobby."
+            );
+        }
+        WorkshopJoinResult::Success(_) => panic!("expected 409 error response"),
+    }
+}
+
+#[tokio::test]
+async fn workshop_command_returns_409_when_phase_gate_blocks_transition() {
+    // Covers plan2 item 10: phase-gated transitions are state conflicts. A
+    // fresh workshop is in Lobby, so `beginPhase2` (which requires Handover)
+    // must fail with 409, not 400.
+    let app = build_app(test_state());
+    let cookie = test_auth_cookie(&app, "Alice").await;
+    let create_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops")
+                .header("content-type", "application/json")
+                .header(axum::http::header::COOKIE, &cookie)
+                .body(Body::from(create_workshop_body("Alice")))
+                .expect("build create request"),
+        )
+        .await
+        .expect("call create workshop");
+    let create_body = to_bytes(create_response.into_body(), usize::MAX)
+        .await
+        .expect("read create body");
+    let create_success = match serde_json::from_slice::<WorkshopJoinResult>(&create_body)
+        .expect("parse create result")
+    {
+        WorkshopJoinResult::Success(success) => success,
+        WorkshopJoinResult::Error(error) => {
+            panic!("expected create success, got error: {}", error.error)
+        }
+    };
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops/command")
+                .header("content-type", "application/json")
+                .body(Body::from(format!(
+                    r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"startPhase2"}}"#,
+                    create_success.session_code, create_success.reconnect_token
+                )))
+                .expect("build startPhase2 request"),
+        )
+        .await
+        .expect("call startPhase2");
+
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read command body");
+    let result: WorkshopCommandResult =
+        serde_json::from_slice(&body).expect("parse command result");
+    match result {
+        WorkshopCommandResult::Error(error) => {
+            assert_eq!(error.error, "Phase 2 can only begin from handover.");
+        }
+        WorkshopCommandResult::Success(_) => panic!("expected error response"),
+    }
+}
+
+#[tokio::test]
+async fn llm_generate_image_returns_409_when_outside_phase0() {
+    // Covers plan2 item 10: image generation is gated to Phase0 (character
+    // creation). A fresh workshop is in Lobby, so requesting image generation
+    // is a state conflict (409), not a malformed request (400).
+    let app = build_app(test_state());
+    let cookie = test_auth_cookie(&app, "Alice").await;
+    let create_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops")
+                .header("content-type", "application/json")
+                .header(axum::http::header::COOKIE, &cookie)
+                .body(Body::from(create_workshop_body("Alice")))
+                .expect("build create request"),
+        )
+        .await
+        .expect("call create workshop");
+    let create_body = to_bytes(create_response.into_body(), usize::MAX)
+        .await
+        .expect("read create body");
+    let create_success = match serde_json::from_slice::<WorkshopJoinResult>(&create_body)
+        .expect("parse create result")
+    {
+        WorkshopJoinResult::Success(success) => success,
+        WorkshopJoinResult::Error(error) => {
+            panic!("expected create success, got error: {}", error.error)
+        }
+    };
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/llm/images")
+                .header("content-type", "application/json")
+                .body(Body::from(format!(
+                    r#"{{"sessionCode":"{}","reconnectToken":"{}","dragonId":"dragon-1","prompt":"a fierce dragon"}}"#,
+                    create_success.session_code, create_success.reconnect_token
+                )))
+                .expect("build llm image request"),
+        )
+        .await
+        .expect("call llm image");
+
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read llm image body");
+    let result: protocol::LlmImageResult =
+        serde_json::from_slice(&body).expect("parse llm image result");
+    match result {
+        protocol::LlmImageResult::Error(error) => {
+            assert_eq!(
+                error.error,
+                "Image generation is only available during character creation."
+            );
+        }
+        protocol::LlmImageResult::Success(_) => panic!("expected error response"),
     }
 }

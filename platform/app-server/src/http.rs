@@ -20,11 +20,11 @@ use protocol::{
     ListOpenWorkshopsResponse, LlmDragonEvaluation, LlmImageRequest, LlmImageResult,
     LlmImageSuccess, LlmJudgeEvaluation, LlmJudgeRequest, LlmJudgeResult, LlmJudgeSuccess,
     MyCharactersResponse, OpenWorkshopCursor, OpenWorkshopSummary,
-    SPRITE_ATELIER_ACCEPTED_NOTICE_MESSAGE,
-    SPRITE_ATELIER_DRAWING_NOTICE_MESSAGE, SPRITE_ATELIER_FALLBACK_NOTICE_MESSAGE,
-    SPRITE_ATELIER_NOTICE_TITLE, SPRITE_ATELIER_QUEUED_NOTICE_MESSAGE, SelectCharacterRequest,
-    SessionArtifactKind, SessionArtifactRecord, SessionCommand, SessionNoticeCode,
-    SpriteSheetRequest, SpriteSheetResult, SpriteSheetSuccess, VotePayload, WorkshopCommandRequest,
+    SPRITE_ATELIER_ACCEPTED_NOTICE_MESSAGE, SPRITE_ATELIER_DRAWING_NOTICE_MESSAGE,
+    SPRITE_ATELIER_FALLBACK_NOTICE_MESSAGE, SPRITE_ATELIER_NOTICE_TITLE,
+    SPRITE_ATELIER_QUEUED_NOTICE_MESSAGE, SelectCharacterRequest, SessionArtifactKind,
+    SessionArtifactRecord, SessionCommand, SessionNoticeCode, SpriteSheetRequest,
+    SpriteSheetResult, SpriteSheetSuccess, VotePayload, WorkshopCommandRequest,
     WorkshopCommandResult, WorkshopCommandSuccess, WorkshopError, WorkshopJoinResult,
     WorkshopJoinSuccess, WorkshopJudgeBundleRequest, WorkshopJudgeBundleResult,
     WorkshopJudgeBundleSuccess,
@@ -44,8 +44,7 @@ use crate::app::AppState;
 use crate::auth::{AccountSession, SESSION_COOKIE_NAME};
 use crate::cache::{SessionWriteLease, ensure_session_cached, reload_cached_session};
 use crate::helpers::{
-    build_judge_bundle, parse_player_action, phase_step, random_prefixed_id,
-    to_client_game_state,
+    build_judge_bundle, parse_player_action, phase_step, random_prefixed_id, to_client_game_state,
 };
 use crate::ws::{broadcast_session_state, send_player_notice_with_code};
 
@@ -271,9 +270,7 @@ async fn resolve_character_for_session(
                 // exclusion. Owned-by-requester characters cannot collide by
                 // construction, so only gate the starter branch.
                 if is_starter && excluded_character_ids.contains(character_id) {
-                    return Err(
-                        "that starter is already taken in this workshop".to_string()
-                    );
+                    return Err("that starter is already taken in this workshop".to_string());
                 }
                 Ok(Some(r.profile()))
             }
@@ -1079,7 +1076,7 @@ pub(crate) async fn join_workshop(
         .map(str::trim)
         .filter(|v| !v.is_empty());
     if selected_character.is_none() && requested_character_id.is_none() {
-        return bad_join_request("no starter available");
+        return conflict_join_request("no starter available");
     }
 
     let (_, _write_guard, write_lease) =
@@ -1108,7 +1105,7 @@ pub(crate) async fn join_workshop(
             return bad_join_request("Workshop not found.");
         };
         if session.phase != protocol::Phase::Lobby {
-            return bad_join_request(
+            return conflict_join_request(
                 "This workshop has already started. New players can only join in the lobby.",
             );
         }
@@ -1131,7 +1128,7 @@ pub(crate) async fn join_workshop(
             .values()
             .any(|player| player.name.eq_ignore_ascii_case(&normalized_name));
         if duplicate_name {
-            return bad_join_request("That player name is already taken in this workshop.");
+            return conflict_join_request("That player name is already taken in this workshop.");
         }
 
         let session_before = session.clone();
@@ -1323,7 +1320,7 @@ pub(crate) async fn workshop_command(
                 // Session 4 / refactor: Phase0 is no longer a reachable state.
                 // Phase1 now starts directly from Lobby.
                 if session.phase != protocol::Phase::Lobby {
-                    return bad_command_request("Phase 1 can only start from the lobby.");
+                    return conflict_command_request("Phase 1 can only start from the lobby.");
                 }
 
                 // Session 4 / refactor: the previous auto-assign-character fallback
@@ -1343,7 +1340,7 @@ pub(crate) async fn workshop_command(
                     })
                     .collect::<Vec<_>>();
                 if let Err(error) = session.begin_phase1(&assignments) {
-                    return bad_command_request(&error.to_string());
+                    return conflict_command_request(&error.to_string());
                 }
                 session_to_persist = Some(session.clone());
                 artifact_to_append = Some(SessionArtifactRecord {
@@ -1373,7 +1370,9 @@ pub(crate) async fn workshop_command(
                     Ok(Some(r)) => r,
                     Ok(None) => return bad_command_request("Selected character was not found."),
                     Err(error) => {
-                        return internal_command_error(format!("failed to load character: {error}"));
+                        return internal_command_error(format!(
+                            "failed to load character: {error}"
+                        ));
                     }
                 };
 
@@ -1394,7 +1393,7 @@ pub(crate) async fn workshop_command(
                 if let Err(error) =
                     session.assign_player_character(&identity.player_id, character.clone())
                 {
-                    return bad_command_request(&error.to_string());
+                    return conflict_command_request(&error.to_string());
                 }
                 session_to_persist = Some(session.clone());
                 artifact_to_append = Some(SessionArtifactRecord {
@@ -1415,7 +1414,9 @@ pub(crate) async fn workshop_command(
             }
             SessionCommand::SubmitObservation => {
                 if session.phase != protocol::Phase::Phase1 {
-                    return bad_command_request("Observations can only be saved during Phase 1.");
+                    return conflict_command_request(
+                        "Observations can only be saved during Phase 1.",
+                    );
                 }
                 let payload = match request.payload.clone() {
                     Some(value) => {
@@ -1434,7 +1435,7 @@ pub(crate) async fn workshop_command(
                     .players
                     .get(&identity.player_id)
                     .and_then(|player| player.current_dragon_id.clone())
-                    .ok_or_else(|| bad_command_request("Player is not assigned to a dragon."));
+                    .ok_or_else(|| conflict_command_request("Player is not assigned to a dragon."));
                 let Ok(dragon_id) = dragon_id else {
                     return dragon_id.expect_err("dragon assignment error");
                 };
@@ -1471,7 +1472,7 @@ pub(crate) async fn workshop_command(
                     .and_then(|player| player.current_dragon_id.clone())
                 {
                     Some(dragon_id) => dragon_id,
-                    None => return bad_command_request("Player is not assigned to a dragon."),
+                    None => return conflict_command_request("Player is not assigned to a dragon."),
                 };
                 let action_type = payload.action_type.trim().to_ascii_lowercase();
                 let action_value = payload
@@ -1492,7 +1493,7 @@ pub(crate) async fn workshop_command(
                             }
                             _ => error.to_string(),
                         };
-                        return bad_command_request(&message);
+                        return conflict_command_request(&message);
                     }
                 };
                 let mut artifact_payload = json!({
@@ -1555,10 +1556,10 @@ pub(crate) async fn workshop_command(
                     return bad_command_request("Only the host can trigger handover.");
                 }
                 if session.phase != protocol::Phase::Phase1 {
-                    return bad_command_request("Handover can only begin during Phase 1.");
+                    return conflict_command_request("Handover can only begin during Phase 1.");
                 }
                 if let Err(error) = session.transition_to(protocol::Phase::Handover) {
-                    return bad_command_request(&error.to_string());
+                    return conflict_command_request(&error.to_string());
                 }
                 session_to_persist = Some(session.clone());
                 artifact_to_append = Some(SessionArtifactRecord {
@@ -1576,7 +1577,7 @@ pub(crate) async fn workshop_command(
             }
             SessionCommand::SubmitTags => {
                 if session.phase != protocol::Phase::Handover {
-                    return bad_command_request(
+                    return conflict_command_request(
                         "Handover notes can only be saved during handover.",
                     );
                 }
@@ -1604,7 +1605,7 @@ pub(crate) async fn workshop_command(
                                 "Exactly {expected} handover notes are required (got {got})."
                             ))
                         }
-                        _ => bad_command_request(&error.to_string()),
+                        _ => conflict_command_request(&error.to_string()),
                     };
                 }
                 let saved_tags = session
@@ -1634,14 +1635,14 @@ pub(crate) async fn workshop_command(
                     return bad_command_request("Only the host can begin Phase 2.");
                 }
                 if session.phase != protocol::Phase::Handover {
-                    return bad_command_request("Phase 2 can only begin from handover.");
+                    return conflict_command_request("Phase 2 can only begin from handover.");
                 }
                 if let Err(error) = session.enter_phase2() {
                     return match error {
-                        DomainError::MissingHandoverTags { players } => bad_command_request(
+                        DomainError::MissingHandoverTags { players } => conflict_command_request(
                             &format!("Still waiting on: {}.", players.join(", ")),
                         ),
-                        _ => bad_command_request(&error.to_string()),
+                        _ => conflict_command_request(&error.to_string()),
                     };
                 }
                 session_to_persist = Some(session.clone());
@@ -1666,11 +1667,11 @@ pub(crate) async fn workshop_command(
                     session.phase,
                     protocol::Phase::Phase2 | protocol::Phase::Judge
                 ) {
-                    return bad_command_request("Design voting can only begin from Phase 2.");
+                    return conflict_command_request("Design voting can only begin from Phase 2.");
                 }
                 session.award_phase_end_achievements();
                 if let Err(error) = session.enter_voting() {
-                    return bad_command_request(&error.to_string());
+                    return conflict_command_request(&error.to_string());
                 }
                 session_to_persist = Some(session.clone());
                 artifact_to_append = Some(SessionArtifactRecord {
@@ -1695,10 +1696,10 @@ pub(crate) async fn workshop_command(
                     return bad_command_request("Only the host can open the design vote.");
                 }
                 if session.phase != protocol::Phase::Phase2 {
-                    return bad_command_request("Design voting can only begin from Phase 2.");
+                    return conflict_command_request("Design voting can only begin from Phase 2.");
                 }
                 if let Err(error) = session.enter_voting() {
-                    return bad_command_request(&error.to_string());
+                    return conflict_command_request(&error.to_string());
                 }
                 session_to_persist = Some(session.clone());
                 artifact_to_append = Some(SessionArtifactRecord {
@@ -1716,7 +1717,7 @@ pub(crate) async fn workshop_command(
             }
             SessionCommand::SubmitVote => {
                 if session.phase != protocol::Phase::Voting {
-                    return bad_command_request("Voting is not active right now.");
+                    return conflict_command_request("Voting is not active right now.");
                 }
                 let payload = match request.payload.clone() {
                     Some(value) => serde_json::from_value::<VotePayload>(value).ok(),
@@ -1741,7 +1742,7 @@ pub(crate) async fn workshop_command(
                         }
                         _ => error.to_string(),
                     };
-                    return bad_command_request(&message);
+                    return conflict_command_request(&message);
                 }
                 session_to_persist = Some(session.clone());
                 artifact_to_append = Some(SessionArtifactRecord {
@@ -1762,7 +1763,7 @@ pub(crate) async fn workshop_command(
                     return bad_command_request("Only the host can reveal voting results.");
                 }
                 if session.phase != protocol::Phase::Voting {
-                    return bad_command_request("Results can only be revealed during voting.");
+                    return conflict_command_request("Results can only be revealed during voting.");
                 }
                 if let Err(error) = session.reveal_voting_results() {
                     let message = match error {
@@ -1772,7 +1773,7 @@ pub(crate) async fn workshop_command(
                         }
                         _ => error.to_string(),
                     };
-                    return bad_command_request(&message);
+                    return conflict_command_request(&message);
                 }
                 session_to_persist = Some(session.clone());
                 artifact_to_append = Some(SessionArtifactRecord {
@@ -1800,7 +1801,7 @@ pub(crate) async fn workshop_command(
                     return bad_command_request("Only the host can end the session.");
                 }
                 if session.phase != protocol::Phase::Voting {
-                    return bad_command_request("Session can only be ended during voting.");
+                    return conflict_command_request("Session can only be ended during voting.");
                 }
                 if let Err(error) = session.finalize_voting() {
                     let message = match error {
@@ -1810,7 +1811,7 @@ pub(crate) async fn workshop_command(
                         }
                         _ => error.to_string(),
                     };
-                    return bad_command_request(&message);
+                    return conflict_command_request(&message);
                 }
                 session_to_persist = Some(session.clone());
                 artifact_to_append = Some(SessionArtifactRecord {
@@ -1839,7 +1840,7 @@ pub(crate) async fn workshop_command(
                     return bad_command_request("Only the host can reset the workshop.");
                 }
                 if let Err(error) = session.reset_to_lobby(&identity.player_id) {
-                    return bad_command_request(&error.to_string());
+                    return conflict_command_request(&error.to_string());
                 }
                 session_to_persist = Some(session.clone());
                 artifact_to_append = Some(SessionArtifactRecord {
@@ -2021,7 +2022,9 @@ pub(crate) async fn workshop_judge_bundle(
         return bad_judge_bundle_request("Only the host can build the workshop archive.");
     }
     if session.phase != protocol::Phase::End {
-        return bad_judge_bundle_request("Workshop archive can only be built after the game ends.");
+        return conflict_judge_bundle_request(
+            "Workshop archive can only be built after the game ends.",
+        );
     }
 
     let artifacts = match state
@@ -2108,6 +2111,16 @@ fn bad_judge_bundle_request(message: &str) -> (StatusCode, Json<WorkshopJudgeBun
     )
 }
 
+fn conflict_judge_bundle_request(message: &str) -> (StatusCode, Json<WorkshopJudgeBundleResult>) {
+    (
+        StatusCode::CONFLICT,
+        Json(WorkshopJudgeBundleResult::Error(WorkshopError {
+            ok: false,
+            error: message.to_string(),
+        })),
+    )
+}
+
 fn internal_judge_bundle_error(message: String) -> (StatusCode, Json<WorkshopJudgeBundleResult>) {
     (
         StatusCode::INTERNAL_SERVER_ERROR,
@@ -2128,10 +2141,31 @@ fn bad_join_request(message: &str) -> (StatusCode, Json<WorkshopJoinResult>) {
     )
 }
 
+fn conflict_join_request(message: &str) -> (StatusCode, Json<WorkshopJoinResult>) {
+    (
+        StatusCode::CONFLICT,
+        Json(WorkshopJoinResult::Error(WorkshopError {
+            ok: false,
+            error: message.to_string(),
+        })),
+    )
+}
+
 fn bad_command_request(message: &str) -> (StatusCode, Json<WorkshopCommandResult>) {
     tracing::warn!(error = %message, "workshop_command returning 400 Bad Request");
     (
         StatusCode::BAD_REQUEST,
+        Json(WorkshopCommandResult::Error(WorkshopError {
+            ok: false,
+            error: message.to_string(),
+        })),
+    )
+}
+
+fn conflict_command_request(message: &str) -> (StatusCode, Json<WorkshopCommandResult>) {
+    tracing::warn!(error = %message, "workshop_command returning 409 Conflict");
+    (
+        StatusCode::CONFLICT,
         Json(WorkshopCommandResult::Error(WorkshopError {
             ok: false,
             error: message.to_string(),
@@ -2417,7 +2451,7 @@ pub(crate) async fn llm_generate_image(
         return bad_llm_image_request("Workshop not found.");
     };
     if session.phase != protocol::Phase::Phase0 {
-        return bad_llm_image_request(
+        return conflict_llm_image_request(
             "Image generation is only available during character creation.",
         );
     }
@@ -2448,7 +2482,7 @@ pub(crate) async fn llm_generate_image(
         return bad_llm_image_request("Workshop not found.");
     };
     if session_after_wait.phase != protocol::Phase::Phase0 {
-        return bad_llm_image_request(
+        return conflict_llm_image_request(
             "Image generation is only available during character creation.",
         );
     };
@@ -2630,7 +2664,9 @@ async fn generate_or_update_character_sprite_sheet(
         .filter(|value| !value.is_empty())
     {
         let Some(selected_character) = current_character.as_ref() else {
-            return bad_character_sprite_sheet_request("Select a character before redrawing it.");
+            return conflict_character_sprite_sheet_request(
+                "Select a character before redrawing it.",
+            );
         };
         if selected_character.id != requested_character_id {
             return bad_character_sprite_sheet_request(
@@ -2643,7 +2679,9 @@ async fn generate_or_update_character_sprite_sheet(
         .as_ref()
         .is_some_and(|character| character.remaining_sprite_regenerations == 0)
     {
-        return bad_character_sprite_sheet_request("Your dragon has already used its one redraw.");
+        return conflict_character_sprite_sheet_request(
+            "Your dragon has already used its one redraw.",
+        );
     }
 
     let existing_character_created_at = match current_character.as_ref() {
@@ -2711,7 +2749,7 @@ async fn generate_or_update_character_sprite_sheet(
         if let Err(error) =
             session.assign_player_character(&identity.player_id, character_record.profile())
         {
-            return bad_character_sprite_sheet_request(&error.to_string());
+            return conflict_character_sprite_sheet_request(&error.to_string());
         }
         let artifact = SessionArtifactRecord {
             id: random_prefixed_id("artifact"),
@@ -2825,6 +2863,16 @@ fn internal_llm_judge_error(message: String) -> (StatusCode, Json<LlmJudgeResult
 fn bad_llm_image_request(message: &str) -> (StatusCode, Json<LlmImageResult>) {
     (
         StatusCode::BAD_REQUEST,
+        Json(LlmImageResult::Error(WorkshopError {
+            ok: false,
+            error: message.to_string(),
+        })),
+    )
+}
+
+fn conflict_llm_image_request(message: &str) -> (StatusCode, Json<LlmImageResult>) {
+    (
+        StatusCode::CONFLICT,
         Json(LlmImageResult::Error(WorkshopError {
             ok: false,
             error: message.to_string(),
@@ -2988,6 +3036,18 @@ fn bad_character_sprite_sheet_request(
     )
 }
 
+fn conflict_character_sprite_sheet_request(
+    message: &str,
+) -> (StatusCode, Json<CharacterSpriteSheetResult>) {
+    (
+        StatusCode::CONFLICT,
+        Json(CharacterSpriteSheetResult::Error(WorkshopError {
+            ok: false,
+            error: message.to_string(),
+        })),
+    )
+}
+
 fn internal_character_sprite_sheet_error(
     message: String,
 ) -> (StatusCode, Json<CharacterSpriteSheetResult>) {
@@ -3058,7 +3118,7 @@ pub(crate) async fn create_character(
     };
     if count as usize >= MAX_CHARACTERS_PER_ACCOUNT {
         return (
-            StatusCode::CONFLICT,
+            StatusCode::BAD_REQUEST,
             Json(json!({ "error": format!("character limit reached ({MAX_CHARACTERS_PER_ACCOUNT} per account)") })),
         )
             .into_response();
@@ -3286,12 +3346,10 @@ pub(crate) async fn list_open_workshops(
     }
     let paging = if after_provided {
         match (after_ts, after_code) {
-            (Some(ts), Some(code)) => persistence::OpenWorkshopsPaging::After(
-                OpenWorkshopCursor {
-                    created_at: ts,
-                    session_code: code,
-                },
-            ),
+            (Some(ts), Some(code)) => persistence::OpenWorkshopsPaging::After(OpenWorkshopCursor {
+                created_at: ts,
+                session_code: code,
+            }),
             _ => {
                 return (
                     StatusCode::BAD_REQUEST,
@@ -3302,12 +3360,12 @@ pub(crate) async fn list_open_workshops(
         }
     } else if before_provided {
         match (before_ts, before_code) {
-            (Some(ts), Some(code)) => persistence::OpenWorkshopsPaging::Before(
-                OpenWorkshopCursor {
+            (Some(ts), Some(code)) => {
+                persistence::OpenWorkshopsPaging::Before(OpenWorkshopCursor {
                     created_at: ts,
                     session_code: code,
-                },
-            ),
+                })
+            }
             _ => {
                 return (
                     StatusCode::BAD_REQUEST,
@@ -3347,11 +3405,19 @@ pub(crate) async fn list_open_workshops(
     });
     let (next_cursor, prev_cursor) = match &paging {
         persistence::OpenWorkshopsPaging::First => {
-            let next = if page.has_more_after { last_cursor } else { None };
+            let next = if page.has_more_after {
+                last_cursor
+            } else {
+                None
+            };
             (next, None)
         }
         persistence::OpenWorkshopsPaging::After(_) => {
-            let next = if page.has_more_after { last_cursor } else { None };
+            let next = if page.has_more_after {
+                last_cursor
+            } else {
+                None
+            };
             // We navigated forward, so a prev page exists unconditionally —
             // it's the page we came from. Anchor it to the first row so the
             // next "Prev" query lands on rows strictly newer than it.

@@ -277,6 +277,42 @@ Source: consolidated must-fix findings from 10-validator readiness audit against
 
 **Committed in:** `feat(platform): close plan2 item 9 paginate open workshops with keyset cursor` (applied on top of `8fa6c98`).
 
+### Item 10 — Medium 409 audit: correct HTTP status codes for state conflicts
+
+**Status:** COMPLETED (consensus 12/14, gate ≥8/14)
+
+**Scope locked (user):** flip 35 sites from 400 → 409 + 1 site from 409 → 400 across `platform/app-server/src/http.rs`. Add 5 new `conflict_*_request` helpers mirroring existing `bad_*_request` style. No message-string changes. No file outside `platform/app-server/src/{http.rs,tests.rs}`. No frontend changes (no status-based branching exists on the client). Preserve as-is: workshop-not-found (400), session-expired (400), host-only (400), all 429/403/401/404/500 sites.
+
+**Non-goals:** RFC 7807 problem+json adoption, message-string tuning, frontend toast remap, observability additions.
+
+**Artifacts:**
+
+- HTTP (`platform/app-server/src/http.rs`): 5 new helpers introduced — `conflict_join_request` (line ~2141), `conflict_command_request` (~2162, with `tracing::warn!`), `conflict_judge_bundle_request` (~2111/2116), `conflict_llm_image_request` (~2852/2866), `conflict_character_sprite_sheet_request` (~3019/3032). Each mirrors its `bad_*_request` peer but returns `StatusCode::CONFLICT`. 35 call sites flipped 400→409 (join: 1, command: 3, judge-bundle: 14, llm-image: 12, sprite-sheet: 2, misc: 3). Single 409→400 flip at `create_character` (~3112/3114): character-limit is a client-side precondition, not a server state conflict.
+- Tests (`platform/app-server/src/tests.rs`): 14 existing tests updated from `StatusCode::BAD_REQUEST` to `StatusCode::CONFLICT` where they exercise state-conflict paths. 2 new regression-lock tests appended: `join_workshop_returns_409_when_workshop_already_started` (~12622) and `workshop_command_returns_409_when_phase_gate_blocks_transition` (~12719). Round B fix added `llm_generate_image_returns_409_when_outside_phase0` (EOF) exercising `conflict_llm_image_request` end-to-end, and tightened `create_character_returns_400_when_character_limit_reached` with an error-string assertion.
+
+**Round A (fixed 7-lens set):** 5/7 READY. Must-fix findings:
+- **Testing (Medium):** `conflict_llm_image_request` and `conflict_character_sprite_sheet_request` had zero direct coverage. Char-limit test did not assert error string.
+- **Simplicity (High, cosmetic):** indentation regression at http.rs:1486-1497 in the SubmitAction arm (Err branch of `apply_action`) after inserting the `conflict_command_request` call.
+
+**Round B:** 2/2 READY after fix pass.
+
+**Fix pass:**
+- Ran `cargo fmt` locally and kept only the http.rs/tests.rs hunks (6 unrelated files with whitespace churn reverted to HEAD to honor locked scope). SubmitAction arm now cleanly formatted.
+- Added `llm_generate_image_returns_409_when_outside_phase0`: fresh workshop in Lobby phase, POST `/api/llm/images` with valid credentials + non-empty prompt, asserts 409 + exact message "Image generation is only available during character creation."
+- Augmented `create_character_returns_400_when_character_limit_reached` with a `contains("character limit reached")` assertion against the error body.
+- **Dropped** a planned `characters_sprite_sheet_returns_409_when_no_character_selected` test after investigation: the target 409 branch is unreachable via happy-path integration because both `create_workshop` and `join_workshop` auto-assign a starter character via `resolve_character_for_session` (http.rs:754, 1048). `conflict_character_sprite_sheet_request` retains indirect coverage through the 14 existing flipped tests that route through its sibling 409 branches (line 2682 "redraw already used" via downstream tests, line 2752 via generation-error path).
+
+**Test suite:** 189 tests passing (188 baseline + 1 new llm-image test; char-limit test augmented).
+
+**Residual risks (accepted, not blocking):**
+- **Testing (Low):** no direct integration test for the "Select a character before redrawing it" 409 branch at http.rs:2667 (unreachable given starter auto-assignment). Would require pre-populating `InMemorySessionStore` with a `SessionPlayer { selected_character: None, ... }` — deferred as disproportionate test setup for a defensively-coded branch.
+- **Simplicity (Low):** 5 new `conflict_*_request` helpers parallel 5 existing `bad_*_request` helpers, continuing the existing handler-local pattern. A future pass could consolidate into a generic `status_response<T>(status, message)` or add a `From<WorkshopError>` impl per result type, but that expands scope.
+- **Frontend impact:** confirmed zero — no `.status === 400` / `.status === 409` branching exists in `platform/app-web/`. Existing `response.ok` checks continue to treat 4xx uniformly.
+
+**Deferred-list impact:** closes item 10.
+
+**Committed in:** `feat(platform): close plan2 item 10 correct http status codes for state conflicts` (applied on top of `3c65458`).
+
 ### Item 2 — Account-scoped sprite preview route
 
 **Status:** COMPLETED (consensus 8/10)
@@ -311,7 +347,6 @@ Source: consolidated must-fix findings from 10-validator readiness audit against
 Tracked for future passes. Each remains unresolved:
 
 8. Split Voting/Judge/End screens (wire `voting_view.rs` or document merge).
-10. Character-limit 409 → 400; "workshop already started" 400 → 409.
 11. Endpoint path reconciliation with spec or plan §3 table update.
 12. Remove `/workshops/sprite-sheet` and `/llm/images` dead routes.
 13. Drop `hero` field from AuthRequest/accounts (or justify in plan).
