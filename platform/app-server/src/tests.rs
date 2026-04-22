@@ -1262,6 +1262,28 @@ fn load_config_reads_database_url_directly() {
     );
 }
 
+#[test]
+fn load_config_accepts_multiline_cookie_key() {
+    let _env_lock = lock_env();
+    let _bind = ScopedEnvVar::set("APP_SERVER_BIND_ADDR", "127.0.0.1:4100");
+    let _app_url = ScopedEnvVar::set("VITE_APP_URL", "http://127.0.0.1:4100");
+    let _origins = ScopedEnvVar::set("ALLOWED_ORIGINS", "http://127.0.0.1:4100");
+    let _node_env = ScopedEnvVar::set("NODE_ENV", "production");
+    let multiline_key = {
+        let key = fake_cookie_key_base64();
+        format!("{}\n{}", &key[..64], &key[64..])
+    };
+    let _cookie_key = ScopedEnvVar::set("SESSION_COOKIE_KEY", &multiline_key);
+    let _database = ScopedEnvVar::set("DATABASE_URL", "postgres://inline:pass@localhost:5432/db");
+
+    let config = crate::app::load_config().expect("load config");
+
+    assert_eq!(
+        config.database_url.as_deref(),
+        Some("postgres://inline:pass@localhost:5432/db")
+    );
+}
+
 /// Returns a deterministic 64-byte key encoded as standard base64. Used by
 /// env-driven `load_config` tests that need a valid cookie key without the
 /// developer-fallback warning path.

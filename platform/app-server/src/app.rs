@@ -353,17 +353,17 @@ pub(crate) fn load_config() -> Result<AppConfig, String> {
 fn load_cookie_key(is_production: bool) -> Result<Key, String> {
     match env::var("SESSION_COOKIE_KEY") {
         Ok(raw) => {
-            let trimmed = raw.trim();
-            if trimmed.is_empty() {
+            let normalized: String = raw.chars().filter(|ch| !ch.is_ascii_whitespace()).collect();
+            if normalized.is_empty() {
                 if is_production {
                     return Err("SESSION_COOKIE_KEY is required when NODE_ENV=production".into());
                 }
                 return Ok(random_cookie_key_with_warning());
             }
             let decoded = base64::engine::general_purpose::STANDARD
-                .decode(trimmed)
-                .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(trimmed))
-                .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(trimmed))
+                .decode(&normalized)
+                .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(&normalized))
+                .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(&normalized))
                 .map_err(|error| format!("invalid SESSION_COOKIE_KEY (expected base64): {error}"))?;
             if decoded.len() < 64 {
                 return Err(format!(
