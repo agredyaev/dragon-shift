@@ -4,6 +4,7 @@
 - `APP_SERVER_BIND_ADDR` - Axum bind address
 - `VITE_APP_URL` - public app URL used for same-origin bootstrap
 - `DATABASE_URL` - Postgres connection string; required in production
+- `SESSION_COOKIE_KEY` - base64-encoded random bytes (>=64 decoded bytes) used to sign/encrypt session cookies; required in production (the server fails fast on startup when `NODE_ENV=production` and this is unset). Generate with `openssl rand -base64 64`.
 - `ALLOWED_ORIGINS` - comma-separated origin allowlist
 - `RUST_SESSION_CODE_PREFIX` - optional single-digit workshop code prefix
 - `TRUST_X_FORWARDED_FOR` - trust forwarded client IPs only behind a trusted edge
@@ -38,6 +39,8 @@
 - `serviceAccount.annotations` - Kubernetes service account annotations including `iam.gke.io/gcp-service-account`
 - `database.url` - inline database URL
 - `database.existingSecretName` - Kubernetes secret name for `DATABASE_URL`
+- `sessionCookieKey.existingSecretName` - Kubernetes secret name holding the `SESSION_COOKIE_KEY` value; required in production
+- `sessionCookieKey.existingSecretKey` - Kubernetes secret key, default `SESSION_COOKIE_KEY`
 
 ## Notes
 - LLM provider pools are configured as ordered arrays in Helm values (`judgeProviders` / `imageProviders`). The runtime starts each request from a round-robin provider index and then fails over left-to-right on 429 or provider failure.
@@ -64,6 +67,8 @@
 - `image_repository` - deployed image repository
 - `image_digest` - deployed image digest
 - `image_tag` - deployed image tag
+- `database_url_secret_id` - Secret Manager secret ID for the runtime `DATABASE_URL` (default `dragon-shift-production-database-url`)
+- `session_cookie_key_secret_id` - Secret Manager secret ID for the runtime `SESSION_COOKIE_KEY` (default `dragon-shift-production-session-cookie-key`); operators must create this secret and populate its first version with `openssl rand -base64 64` output **before** the first production apply
 - `database_pool_size` - runtime `DATABASE_POOL_SIZE` override for production
 - `app_cpu_request` - optional production app pod CPU request override
 - `app_cpu_limit` - optional production app pod CPU limit override

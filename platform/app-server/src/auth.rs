@@ -230,7 +230,9 @@ fn account_profile(account: &Account) -> AccountProfile {
 ///   `invalid_credentials` code so enumeration surface is unchanged.
 ///
 /// Validation rules (MVP; tightened in a later checkpoint if needed):
-/// - hero: 1..=64 chars, trimmed non-empty.
+/// - hero: 0..=64 chars; empty accepted and backfilled with `name` on signup.
+///   (Retained in the request shape for back-compat with plan2 item 13, which
+///   tracks full removal; the SignIn UI submits an empty string.)
 /// - name: 1..=64 chars, trimmed non-empty.
 /// - password: 8..=256 chars.
 pub(crate) async fn signin(
@@ -240,12 +242,12 @@ pub(crate) async fn signin(
     jar: SignedCookieJar<Key>,
     Json(request): Json<AuthRequest>,
 ) -> Response {
-    let hero = request.hero.trim().to_string();
+    let hero_input = request.hero.trim().to_string();
     let name = request.name.trim().to_string();
     let password = request.password;
 
-    if hero.is_empty() || hero.chars().count() > 64 {
-        return bad_request("hero must be 1-64 characters");
+    if hero_input.chars().count() > 64 {
+        return bad_request("hero must be 0-64 characters");
     }
     if name.is_empty() || name.chars().count() > 64 {
         return bad_request("name must be 1-64 characters");
@@ -253,6 +255,15 @@ pub(crate) async fn signin(
     if password.chars().count() < 8 || password.chars().count() > 256 {
         return bad_request("password must be 8-256 characters");
     }
+    // Empty hero is accepted for the SignIn UI (which no longer collects a
+    // hero slug). Default to `name` on signup so downstream code that still
+    // expects a non-empty display string (protocol::AccountProfile.hero,
+    // domain::Account.hero) keeps its invariant.
+    let hero = if hero_input.is_empty() {
+        name.clone()
+    } else {
+        hero_input
+    };
 
     let ip_key = client_key(&state, connect_info, &headers);
     let is_production = state.config.is_production;

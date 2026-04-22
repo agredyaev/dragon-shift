@@ -199,6 +199,12 @@ variable "database_url_secret_id" {
   default     = "dragon-shift-production-database-url"
 }
 
+variable "session_cookie_key_secret_id" {
+  description = "Secret Manager secret ID that stores the runtime SESSION_COOKIE_KEY (base64-encoded, >=64 decoded bytes). Generate once per environment with `openssl rand -base64 64` and store under the latest version of this secret before the first production apply."
+  type        = string
+  default     = "dragon-shift-production-session-cookie-key"
+}
+
 variable "enable_uptime_checks" {
   description = "Whether to create uptime checks and the related alert policy. Keep false until DNS delegation and managed certificate issuance are complete."
   type        = bool

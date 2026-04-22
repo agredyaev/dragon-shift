@@ -235,6 +235,29 @@ resource "kubernetes_secret" "database_url" {
   depends_on = [kubernetes_namespace.app]
 }
 
+data "google_secret_manager_secret_version" "session_cookie_key" {
+  project = var.project_id
+  secret  = var.session_cookie_key_secret_id
+}
+
+resource "kubernetes_secret" "session_cookie_key" {
+  metadata {
+    name      = "dragon-shift-session-cookie-key"
+    namespace = kubernetes_namespace.app.metadata[0].name
+
+    labels = {
+      "app.kubernetes.io/name"    = "dragon-shift"
+      "app.kubernetes.io/part-of" = "dragon-shift"
+    }
+  }
+
+  data = {
+    SESSION_COOKIE_KEY = data.google_secret_manager_secret_version.session_cookie_key.secret_data
+  }
+
+  depends_on = [kubernetes_namespace.app]
+}
+
 resource "kubernetes_secret" "llm" {
   count = var.llm_provider_type == "api_key" && length(local.gemini_api_keys) > 0 ? 1 : 0
 
@@ -468,6 +491,10 @@ resource "helm_release" "app" {
         existingSecretName = kubernetes_secret.database_url.metadata[0].name
         existingSecretKey  = "DATABASE_URL"
       }
+      sessionCookieKey = {
+        existingSecretName = kubernetes_secret.session_cookie_key.metadata[0].name
+        existingSecretKey  = "SESSION_COOKIE_KEY"
+      }
       postgresql = {
         enabled = false
       }
@@ -489,6 +516,7 @@ resource "helm_release" "app" {
     kubernetes_manifest.backend_config,
     kubernetes_manifest.managed_certificate,
     kubernetes_secret.database_url,
+    kubernetes_secret.session_cookie_key,
     kubernetes_service_account.app,
     google_service_account.app,
     google_service_account_iam_member.app_workload_identity,

@@ -685,6 +685,14 @@ impl SessionStore for FaultyStore {
         self.inner.save_character(character)
     }
 
+    fn save_character_enforcing_cap(
+        &self,
+        character: &persistence::CharacterRecord,
+        max: u32,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + '_>> {
+        self.inner.save_character_enforcing_cap(character, max)
+    }
+
     fn publish_session_notification(
         &self,
         notification: &SessionUpdateNotification,
@@ -12838,4 +12846,150 @@ async fn llm_generate_image_returns_409_when_outside_phase0() {
         }
         protocol::LlmImageResult::Success(_) => panic!("expected error response"),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Round B regression tests
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn signin_accepts_empty_hero_and_defaults_to_name() {
+    // Regression for orchestrator Round A ship-blocker: the SignIn UI submits
+    // `hero: ""`; the server must accept it and backfill `hero` with `name`
+    // so the new SignIn screen (components/sign_in.rs) is reachable.
+    let state = test_state();
+    let app = build_app(state);
+    let body = serde_json::json!({
+        "hero": "",
+        "name": "Alice",
+        "password": "correcthorse",
+    })
+    .to_string();
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/auth/signin")
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body))
+                .expect("build signin request"),
+        )
+        .await
+        .expect("signin response");
+    assert_eq!(
+        response.status(),
+        StatusCode::CREATED,
+        "empty hero should be accepted as signup"
+    );
+    let body_bytes = to_bytes(response.into_body(), 4096)
+        .await
+        .expect("read signin body");
+    let body_json: serde_json::Value =
+        serde_json::from_slice(&body_bytes).expect("signin body is JSON");
+    // Hero is backfilled with the name so AccountProfile invariants hold.
+    assert_eq!(
+        body_json
+            .pointer("/account/hero")
+            .and_then(|v| v.as_str())
+            .unwrap_or(""),
+        "Alice"
+    );
+}
+
+#[tokio::test]
+async fn signin_rejects_hero_longer_than_64_chars() {
+    let state = test_state();
+    let app = build_app(state);
+    let body = serde_json::json!({
+        "hero": "x".repeat(65),
+        "name": "Alice",
+        "password": "correcthorse",
+    })
+    .to_string();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/auth/signin")
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body))
+                .expect("build signin request"),
+        )
+        .await
+        .expect("signin response");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn create_character_is_atomic_under_concurrent_creates() {
+    // Regression for orchestrator Round A V3 correctness ship-blocker: the
+    // previous count+insert was not atomic; concurrent POSTs at count=4
+    // could both observe 4 and insert, yielding 6 rows.
+    //
+    // This test fires MAX+N concurrent requests from the same account at
+    // the same instant and asserts the server never allows more than MAX
+    // rows through. Uses the in-memory store (serializes via RwLock write
+    // guard); the Postgres path uses `SELECT ... FOR UPDATE` for the same
+    // invariant (see persistence::save_character_enforcing_cap).
+    use std::sync::Arc;
+
+    let state = test_state();
+    let app = build_app(state);
+    let cookie = signin_and_get_cookie(&app, "knight", "Alice", "correcthorse").await;
+    let app = Arc::new(app);
+    let cookie = Arc::new(cookie);
+
+    const ATTEMPTS: usize = MAX_CHARACTERS_PER_ACCOUNT + 5;
+    let mut handles = Vec::with_capacity(ATTEMPTS);
+    for i in 0..ATTEMPTS {
+        let app = Arc::clone(&app);
+        let cookie = Arc::clone(&cookie);
+        handles.push(tokio::spawn(async move {
+            let body = serde_json::json!({
+                "description": format!("Concurrent dragon #{i}"),
+                "sprites": {
+                    "neutral": "base64neutral",
+                    "happy": "base64happy",
+                    "angry": "base64angry",
+                    "sleepy": "base64sleepy"
+                }
+            })
+            .to_string();
+            let response = app
+                .as_ref()
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/characters")
+                        .header(axum::http::header::CONTENT_TYPE, "application/json")
+                        .header(axum::http::header::COOKIE, cookie.as_str())
+                        .body(Body::from(body))
+                        .expect("build concurrent create request"),
+                )
+                .await
+                .expect("concurrent create response");
+            response.status()
+        }));
+    }
+
+    let mut successes = 0usize;
+    let mut limit_hits = 0usize;
+    for handle in handles {
+        match handle.await.expect("join concurrent task") {
+            StatusCode::CREATED => successes += 1,
+            StatusCode::BAD_REQUEST => limit_hits += 1,
+            other => panic!("unexpected status {other} from concurrent create"),
+        }
+    }
+    assert_eq!(
+        successes, MAX_CHARACTERS_PER_ACCOUNT,
+        "exactly MAX_CHARACTERS_PER_ACCOUNT creates should succeed under concurrency"
+    );
+    assert_eq!(
+        limit_hits,
+        ATTEMPTS - MAX_CHARACTERS_PER_ACCOUNT,
+        "remaining creates should all hit the cap"
+    );
 }

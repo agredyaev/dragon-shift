@@ -3101,29 +3101,6 @@ pub(crate) async fn create_character(
             .into_response();
     }
 
-    let count = match state
-        .store
-        .count_characters_by_owner(&session.account.id)
-        .await
-    {
-        Ok(n) => n,
-        Err(error) => {
-            tracing::error!(%error, "count_characters_by_owner failed");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": "internal error" })),
-            )
-                .into_response();
-        }
-    };
-    if count as usize >= MAX_CHARACTERS_PER_ACCOUNT {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "error": format!("character limit reached ({MAX_CHARACTERS_PER_ACCOUNT} per account)") })),
-        )
-            .into_response();
-    }
-
     let now = Utc::now().to_rfc3339();
     let record = CharacterRecord {
         id: random_prefixed_id("character"),
@@ -3135,16 +3112,29 @@ pub(crate) async fn create_character(
         owner_account_id: Some(session.account.id.clone()),
     };
 
-    if let Err(error) = state.store.save_character(&record).await {
-        tracing::error!(%error, "save_character failed");
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": "internal error" })),
+    // Atomic cap enforcement: count + insert happen under a single per-owner
+    // lock in the persistence layer to prevent concurrent creates from
+    // racing past `MAX_CHARACTERS_PER_ACCOUNT`.
+    match state
+        .store
+        .save_character_enforcing_cap(&record, MAX_CHARACTERS_PER_ACCOUNT as u32)
+        .await
+    {
+        Ok(()) => (StatusCode::CREATED, Json(record.profile())).into_response(),
+        Err(persistence::PersistenceError::CharacterLimitReached { max }) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": format!("character limit reached ({max} per account)") })),
         )
-            .into_response();
+            .into_response(),
+        Err(error) => {
+            tracing::error!(%error, "save_character_enforcing_cap failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "internal error" })),
+            )
+                .into_response()
+        }
     }
-
-    (StatusCode::CREATED, Json(record.profile())).into_response()
 }
 
 /// `POST /api/characters/preview-sprites` — generate a 4-frame sprite sheet

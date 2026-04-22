@@ -36,6 +36,8 @@ pub enum PersistenceError {
     RetiredRealtimeConnection { connection_id: String },
     #[error("account name already in use")]
     DuplicateAccountName,
+    #[error("character limit reached ({max} per account)")]
+    CharacterLimitReached { max: u32 },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -490,6 +492,18 @@ pub trait SessionStore: Send + Sync {
     fn save_character(
         &self,
         character: &CharacterRecord,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + '_>>;
+    /// Atomically enforce a per-owner character cap and insert. Intended for
+    /// owner-scoped character creation where the cap (`max`) must be checked
+    /// under the same lock as the insert to prevent a TOCTOU race between
+    /// `count_characters_by_owner` and `save_character`.
+    ///
+    /// Returns `CharacterLimitReached` if the owner already has `max` rows.
+    /// Callers must set `character.owner_account_id = Some(owner_id)`.
+    fn save_character_enforcing_cap(
+        &self,
+        character: &CharacterRecord,
+        max: u32,
     ) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + '_>>;
     fn publish_session_notification(
         &self,
@@ -1628,6 +1642,55 @@ impl SessionStore for PostgresSessionStore {
         })
     }
 
+    /// Atomic per-owner cap enforcement. Serializes concurrent creates for
+    /// the same owner by taking a `FOR UPDATE` row lock on the owner's
+    /// `accounts` row, then counting the owner's existing characters inside
+    /// that lock, inserting only if under `max`, and committing. Concurrent
+    /// creates for the same owner block on the account row lock and are
+    /// processed one at a time; different owners never contend.
+    fn save_character_enforcing_cap(
+        &self,
+        character: &CharacterRecord,
+        max: u32,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + '_>> {
+        let character = character.clone();
+        Box::pin(async move {
+            use sqlx::Row;
+            let owner = match character.owner_account_id.clone() {
+                Some(id) => id,
+                None => {
+                    // Defensive: cap enforcement only makes sense for owned
+                    // characters. Fall back to the plain save path.
+                    let mut tx = self.pool.begin().await?;
+                    Self::save_character_in_tx(&mut tx, &character).await?;
+                    tx.commit().await?;
+                    return Ok(());
+                }
+            };
+            let mut tx = self.pool.begin().await?;
+            // Lock the owner's account row. Any other in-flight cap-enforcing
+            // create for the same owner blocks here until we commit.
+            sqlx::query("SELECT 1 FROM accounts WHERE account_id = $1 FOR UPDATE")
+                .bind(&owner)
+                .fetch_optional(&mut *tx)
+                .await?;
+            let row = sqlx::query(
+                "SELECT COUNT(*)::BIGINT AS cnt FROM characters WHERE owner_account_id = $1",
+            )
+            .bind(&owner)
+            .fetch_one(&mut *tx)
+            .await?;
+            let count: i64 = row.get("cnt");
+            if count.max(0) as u32 >= max {
+                // Rollback by dropping tx without commit.
+                return Err(PersistenceError::CharacterLimitReached { max });
+            }
+            Self::save_character_in_tx(&mut tx, &character).await?;
+            tx.commit().await?;
+            Ok(())
+        })
+    }
+
     fn insert_account(
         &self,
         account: &AccountRecord,
@@ -1863,6 +1926,7 @@ impl SessionStore for PostgresSessionStore {
                     )
                     .bind(&cursor.created_at)
                     .bind(&cursor.session_code)
+                    .bind(fetch_limit)
                     .fetch_all(&self.pool)
                     .await?;
                     (rows, false)
@@ -1884,6 +1948,7 @@ impl SessionStore for PostgresSessionStore {
                     )
                     .bind(&cursor.created_at)
                     .bind(&cursor.session_code)
+                    .bind(fetch_limit)
                     .fetch_all(&self.pool)
                     .await?;
                     (rows, true)
@@ -2736,6 +2801,34 @@ impl SessionStore for InMemorySessionStore {
                 .write()
                 .map_err(|_| PersistenceError::LockPoisoned)?
                 .insert(character.id.clone(), character);
+            Ok(())
+        })
+    }
+
+    fn save_character_enforcing_cap(
+        &self,
+        character: &CharacterRecord,
+        max: u32,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + '_>> {
+        let character = character.clone();
+        Box::pin(async move {
+            // Hold the write lock across count + insert so concurrent creates
+            // for the same owner serialize here, mirroring the Postgres
+            // `FOR UPDATE` path.
+            let mut characters = self
+                .characters_by_id
+                .write()
+                .map_err(|_| PersistenceError::LockPoisoned)?;
+            if let Some(owner_id) = character.owner_account_id.as_deref() {
+                let count = characters
+                    .values()
+                    .filter(|c| c.owner_account_id.as_deref() == Some(owner_id))
+                    .count() as u32;
+                if count >= max {
+                    return Err(PersistenceError::CharacterLimitReached { max });
+                }
+            }
+            characters.insert(character.id.clone(), character);
             Ok(())
         })
     }

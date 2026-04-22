@@ -76,6 +76,8 @@
 - `database.url` - inline database URL
 - `database.existingSecretName` - Kubernetes secret name for `DATABASE_URL`
 - `database.existingSecretKey` - Kubernetes secret key name
+- `sessionCookieKey.existingSecretName` - Kubernetes secret name holding `SESSION_COOKIE_KEY`; required in production
+- `sessionCookieKey.existingSecretKey` - Kubernetes secret key name, default `SESSION_COOKIE_KEY`
 
 ## Notes
 - LLM provider pools are configured as ordered arrays. The runtime now starts each request from a round-robin provider index and still fails over left-to-right on 429 or provider failure.

@@ -148,6 +148,13 @@ spec:
             - name: DATABASE_URL
               value: {{ include "dragon-shift.databaseUrl" . | quote }}
             {{- end }}
+            {{- if .Values.sessionCookieKey.existingSecretName }}
+            - name: SESSION_COOKIE_KEY
+              valueFrom:
+                secretKeyRef:
+                   name: {{ .Values.sessionCookieKey.existingSecretName | quote }}
+                   key: {{ .Values.sessionCookieKey.existingSecretKey | quote }}
+            {{- end }}
             {{- with .Values.app.extraEnv }}
 {{ toYaml . | nindent 12 }}
             {{- end }}
