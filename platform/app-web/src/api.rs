@@ -4,7 +4,7 @@ use protocol::{
     CreateCharacterRequest, CreateWorkshopRequest, EligibleCharactersResponse,
     JoinWorkshopRequest, JudgeBundle, ListOpenWorkshopsResponse, MyCharactersResponse,
     SessionCommand, SessionEnvelope, WorkshopCommandRequest, WorkshopCommandResult,
-    WorkshopCreateConfig, WorkshopJoinResult, WorkshopJoinSuccess, WorkshopJudgeBundleRequest,
+    WorkshopJoinResult, WorkshopJoinSuccess, WorkshopJudgeBundleRequest,
     WorkshopJudgeBundleResult,
 };
 
@@ -40,7 +40,6 @@ impl AppWebApi {
     pub async fn create_workshop(
         &self,
         name: String,
-        config: WorkshopCreateConfig,
         character_id: Option<String>,
     ) -> Result<WorkshopJoinSuccess, String> {
         Self::parse_join_response(
@@ -48,7 +47,7 @@ impl AppWebApi {
                 "/api/workshops",
                 &CreateWorkshopRequest {
                     name: Some(name),
-                    config,
+                    config: None,
                     character_id,
                 },
             )

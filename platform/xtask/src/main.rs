@@ -1908,11 +1908,11 @@ async fn create_workshop_with_auth(
         .header("Origin", base_url)
         .json(&CreateWorkshopRequest {
             name: None,
-            config: protocol::WorkshopCreateConfig {
+            config: Some(protocol::WorkshopCreateConfig {
                 phase0_minutes: 5,
                 phase1_minutes: 10,
                 phase2_minutes: 10,
-            },
+            }),
             character_id,
         });
     if !cookie.is_empty() {

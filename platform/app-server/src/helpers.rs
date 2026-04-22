@@ -465,12 +465,4 @@ pub(crate) fn build_judge_bundle(
     }
 }
 
-pub(crate) fn session_config_from_request(
-    payload: &protocol::CreateWorkshopRequest,
-) -> protocol::WorkshopCreateConfig {
-    protocol::WorkshopCreateConfig {
-        phase0_minutes: payload.config.phase0_minutes,
-        phase1_minutes: payload.config.phase1_minutes,
-        phase2_minutes: payload.config.phase2_minutes,
-    }
-}
+

@@ -3,7 +3,6 @@
 use dioxus::prelude::*;
 use protocol::{
     AuthRequest, ClientGameState, JoinWorkshopRequest, JudgeBundle, SessionCommand, SpriteSet,
-    WorkshopCreateConfig,
 };
 
 use crate::api::{
@@ -340,15 +339,9 @@ pub async fn submit_create_workshop_flow(
         o.notice = Some(info_notice("Creating workshop…"));
     });
 
-    let config = WorkshopCreateConfig {
-        phase0_minutes: 8,
-        phase1_minutes: 8,
-        phase2_minutes: 8,
-    };
-
     let api = AppWebApi::new(base_url);
     match api
-        .create_workshop(String::new(), config, None)
+        .create_workshop(String::new(), None)
         .await
     {
         Ok(success) => {

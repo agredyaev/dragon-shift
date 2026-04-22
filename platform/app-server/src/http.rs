@@ -44,7 +44,7 @@ use crate::auth::{AccountSession, SESSION_COOKIE_NAME};
 use crate::cache::{SessionWriteLease, ensure_session_cached, reload_cached_session};
 use crate::helpers::{
     build_judge_bundle, parse_player_action, phase_step, random_prefixed_id,
-    session_config_from_request, to_client_game_state,
+    to_client_game_state,
 };
 use crate::ws::{broadcast_session_state, send_player_notice_with_code};
 
@@ -743,6 +743,11 @@ pub(crate) async fn create_workshop(
     if let Some(response) = reject_rate_limited(&state.create_limiter, &client_key).await {
         return response;
     }
+    // Resolve the effective session config at the HTTP boundary: callers may
+    // omit `config` to accept the server-side default (see
+    // `WorkshopCreateConfig::default`). The domain always stores a concrete
+    // config.
+    let session_config = payload.config.clone().unwrap_or_default();
     // Derive name from authenticated account (locked decision #9).
     let normalized_name = session.account.name.clone();
     let timestamp = Utc::now();
@@ -774,7 +779,7 @@ pub(crate) async fn create_workshop(
         Uuid::new_v4(),
         SessionCode(session_code.clone()),
         timestamp,
-        session_config_from_request(&payload),
+        session_config,
     );
     let host_player = SessionPlayer {
         id: player_id.clone(),

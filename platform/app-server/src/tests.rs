@@ -3321,6 +3321,67 @@ async fn create_workshop_endpoint_returns_join_success() {
 }
 
 #[tokio::test]
+async fn create_workshop_endpoint_applies_default_config_when_omitted() {
+    let app = build_app(test_state());
+    let cookie = test_auth_cookie(&app, "Alice").await;
+
+    // Body omits `config` entirely; the server must fall back to
+    // `WorkshopCreateConfig::default()` (8/8/8 minutes).
+    let body = serde_json::json!({ "name": "Alice" }).to_string();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops")
+                .header("content-type", "application/json")
+                .header(axum::http::header::COOKIE, &cookie)
+                .body(Body::from(body))
+                .expect("build request"),
+        )
+        .await
+        .expect("call create workshop");
+
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let bytes = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read create body");
+    let result: WorkshopJoinResult = serde_json::from_slice(&bytes).expect("parse join result");
+    let success = match result {
+        WorkshopJoinResult::Success(success) => success,
+        WorkshopJoinResult::Error(error) => {
+            panic!("expected success, got error: {}", error.error)
+        }
+    };
+
+    let phases = &success.state.session.settings.phases;
+    assert_eq!(
+        phases
+            .get(&protocol::Phase::Phase0)
+            .expect("phase0 settings")
+            .duration_seconds,
+        8 * 60,
+        "phase0 should default to 8 minutes",
+    );
+    assert_eq!(
+        phases
+            .get(&protocol::Phase::Phase1)
+            .expect("phase1 settings")
+            .duration_seconds,
+        8 * 60,
+        "phase1 should default to 8 minutes",
+    );
+    assert_eq!(
+        phases
+            .get(&protocol::Phase::Phase2)
+            .expect("phase2 settings")
+            .duration_seconds,
+        8 * 60,
+        "phase2 should default to 8 minutes",
+    );
+}
+
+#[tokio::test]
 async fn workshop_judge_bundle_rejects_invalid_credentials() {
     let state = test_state();
     let app = build_app(state.clone());

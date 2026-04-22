@@ -191,6 +191,37 @@ Source: consolidated must-fix findings from 10-validator readiness audit against
 
 **Committed in:** `feat(platform): close plan2 item 5 enforce handover-tag count in domain` (applied on top of `cd0574e`).
 
+### Item 6 — Remove frontend hardcoded phase minutes
+
+**Status:** COMPLETED (consensus 14/14, gate ≥8/14)
+
+- Round A (7 lenses): 7 READY / 0 NOT READY.
+- Round B (7 lenses): 7 READY / 0 NOT READY. All findings Low-severity (cosmetic, doc polish, pre-existing gaps).
+- **Path decision (user):** server-side default via `Option<WorkshopCreateConfig>` — also closes deferred item 20 (`phase0_minutes #[serde(default)]`) as a natural side-effect of wrapping the whole config.
+
+**Artifacts:**
+- Protocol (`crates/protocol/src/lib.rs:427-445`): `CreateWorkshopRequest.config: WorkshopCreateConfig` → `Option<WorkshopCreateConfig>` with `#[serde(default, skip_serializing_if = "Option::is_none")]`. Absent and explicit `null` both deserialize to `None`. `WorkshopCreateConfig::default()` (8/8/8 at `:417-425`) is the single source of truth; `create_session_settings_default` at `:822` already delegates to it.
+- HTTP (`app-server/src/http.rs:747-750 create_workshop`): resolves `payload.config.clone().unwrap_or_default()` at the HTTP boundary before `WorkshopSession::new`. Domain/persistence still take concrete `WorkshopCreateConfig` — no Option creep into lower layers.
+- Removed `session_config_from_request` helper from `app-server/src/helpers.rs` (single caller, pure field-copy; net simplification).
+- Frontend (`app-web/src/api.rs`): `create_workshop` API drops the `config` parameter; body sends `config: None`. `WorkshopCreateConfig` import pruned.
+- Frontend (`app-web/src/flows.rs:343-351`): hardcoded `WorkshopCreateConfig { phase0_minutes: 8, phase1_minutes: 8, phase2_minutes: 8 }` literal deleted; call site now `api.create_workshop(String::new(), None)`. Refactor.md line 20 violation ("Do not place business rules in frontend") resolved.
+- xtask (`xtask/src/main.rs:1911-1914`): explicit `5/10/10` config wrapped in `Some(...)` — intentional dev-override for smoke scenarios; wire serialization unchanged (Some + skip_serializing_if is a no-op for Some).
+- Test: new `create_workshop_endpoint_applies_default_config_when_omitted` (`app-server/src/tests.rs:~3324`) — POSTs `json!({"name":"Alice"})` with `config` absent, asserts 201 CREATED, parses `WorkshopJoinResult`, checks `state.session.settings.phases` durations all equal `8 * 60` seconds. Regression lock for the default.
+- Suites: `cargo test -p protocol` 11/11, `cargo test -p domain` 137/137, `cargo test -p app-server` 179/179 (+1 vs item 5).
+- Diff stat: 7 files, +76 / -25.
+
+**Residual risks (accepted, not blocking):**
+- **Simplicity (Low):** `payload.config.clone().unwrap_or_default()` clones a 12-byte struct; `payload.config.take()` with `mut payload` would elide it. Cosmetic.
+- **Simplicity (Low):** trailing blank line in `app-server/src/helpers.rs:468` after helper removal.
+- **Completeness (Low):** new `Option<WorkshopCreateConfig>` field has no doc comment explaining "omit to accept server default"; adjacent `name` field documents its optional semantics — inconsistency worth polishing later.
+- **Testing (Low):** no explicit test for `config: null` (serde default covers it, but a belt-and-braces test would guard future attribute churn). No `protocol`-crate serde round-trip test.
+- **Security (Low, pre-existing):** no min/max validation on `phase*_minutes: u32`. `phase0_minutes: 0` → instant expiry; `u32::MAX` → overflow in `* 60 as i32` cast at `protocol/src/lib.rs:853`. Bounded by `AccountSession` auth + `create_workshop_limiter` rate limit. Item 6 did NOT introduce or widen this; absence of config strictly reduces attacker control (server picks safe default). Tracked for a future hardening pass.
+- **Architecture (Low):** default policy lives in `protocol` crate (wire-layer default) while item 5's `HANDOVER_TAG_COUNT` lives in `domain` (game-rule invariant). Divergent placement is defensible — `protocol` already owns `create_session_settings_default` — but an ADR note on "wire-shape defaults in protocol; game-rule invariants in domain" would harden the rule for future items.
+
+**Deferred-list impact:** closes both item 6 and item 20.
+
+**Committed in:** `feat(platform): close plan2 item 6 apply server-side default for workshop config` (applied on top of `2eff356`).
+
 ### Item 2 — Account-scoped sprite preview route
 
 **Status:** COMPLETED (consensus 8/10)
@@ -224,7 +255,6 @@ Source: consolidated must-fix findings from 10-validator readiness audit against
 
 Tracked for future passes. Each remains unresolved:
 
-6. Remove frontend hardcoded phase minutes (`flows.rs:344-348`).
 7. Strip character roster + Delete UI from AccountHome (Block 2 scope).
 8. Split Voting/Judge/End screens (wire `voting_view.rs` or document merge).
 9. Workshop list cap 50 + Postgres order by `created_at`.
@@ -238,7 +268,6 @@ Tracked for future passes. Each remains unresolved:
 17. E2E rewrite (new helpers, delete phase0 helpers, new specs).
 18. Rollback SQL for migration 0007.
 19. Logging for rate-limit hits and join failures.
-20. `WorkshopCreateConfig.phase0_minutes` `#[serde(default)]`.
 
 ---
 

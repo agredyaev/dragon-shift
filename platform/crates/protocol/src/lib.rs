@@ -431,7 +431,8 @@ pub struct CreateWorkshopRequest {
     /// Kept as optional for backward compatibility with older clients.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
-    pub config: WorkshopCreateConfig,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config: Option<WorkshopCreateConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub character_id: Option<String>,
 }
