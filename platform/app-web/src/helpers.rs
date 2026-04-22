@@ -89,6 +89,7 @@ pub fn screen_title(screen: &ShellScreen) -> &'static str {
         ShellScreen::SignIn => "Sign in to Dragon Switch",
         ShellScreen::AccountHome => "Your account",
         ShellScreen::CreateCharacter => "Create a character",
+        ShellScreen::PickCharacter { workshop_code: None } => "Pick your host character",
         ShellScreen::PickCharacter { .. } => "Pick a character",
         ShellScreen::Session => "Your Dragon Shift session is live",
     }

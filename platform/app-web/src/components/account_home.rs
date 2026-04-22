@@ -1,20 +1,12 @@
 use dioxus::prelude::*;
 
-use crate::flows::{
-    OpenWorkshopsPaging, load_open_workshops_flow, submit_create_workshop_flow,
-    submit_logout_flow,
-};
+use crate::flows::{OpenWorkshopsPaging, load_open_workshops_flow, submit_logout_flow};
 use crate::state::{IdentityState, OperationState, ShellScreen};
-use protocol::{ClientGameState, JudgeBundle};
 
 #[component]
 pub fn AccountHomeView(
     identity: Signal<IdentityState>,
-    game_state: Signal<Option<ClientGameState>>,
     ops: Signal<OperationState>,
-    reconnect_session_code: Signal<String>,
-    reconnect_token: Signal<String>,
-    judge_bundle: Signal<Option<JudgeBundle>>,
 ) -> Element {
     let account_name = identity
         .read()
@@ -87,14 +79,11 @@ pub fn AccountHomeView(
                             "data-testid": "create-workshop-button",
                             disabled: pending,
                             onclick: move |_| {
-                                spawn(submit_create_workshop_flow(
-                                    identity,
-                                    game_state,
-                                    ops,
-                                    reconnect_session_code,
-                                    reconnect_token,
-                                    judge_bundle,
-                                ));
+                                identity.with_mut(|id| {
+                                    id.screen = ShellScreen::PickCharacter {
+                                        workshop_code: None,
+                                    };
+                                });
                             },
                             "Create Workshop"
                         }
@@ -149,7 +138,9 @@ pub fn AccountHomeView(
                                                 onclick: move |_| {
                                                     let c = code.clone();
                                                     identity.with_mut(|id| {
-                                                        id.screen = ShellScreen::PickCharacter { workshop_code: c };
+                                                        id.screen = ShellScreen::PickCharacter {
+                                                            workshop_code: Some(c),
+                                                        };
                                                     });
                                                 },
                                                 "Join"

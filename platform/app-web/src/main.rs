@@ -217,11 +217,7 @@ fn App() -> Element {
                         Some(ShellScreen::AccountHome) => rsx! {
                             AccountHomeView {
                                 identity,
-                                game_state,
                                 ops,
-                                reconnect_session_code,
-                                reconnect_token,
-                                judge_bundle,
                             }
                         },
                         Some(ShellScreen::CreateCharacter) => rsx! {

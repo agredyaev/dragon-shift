@@ -329,6 +329,7 @@ pub async fn submit_create_workshop_flow(
     mut reconnect_session_code: Signal<String>,
     mut reconnect_token: Signal<String>,
     mut judge_bundle: Signal<Option<JudgeBundle>>,
+    character_id: Option<String>,
 ) {
     let base_url = { identity.read().api_base_url.clone() };
 
@@ -341,10 +342,7 @@ pub async fn submit_create_workshop_flow(
     });
 
     let api = AppWebApi::new(base_url);
-    match api
-        .create_workshop(String::new(), None)
-        .await
-    {
+    match api.create_workshop(String::new(), character_id).await {
         Ok(success) => {
             apply_join_and_bootstrap(
                 &mut identity,
@@ -793,5 +791,18 @@ mod tests {
     fn retained_flows_remain_linkable() {
         let _ = &load_my_characters_flow;
         let _ = &submit_delete_character_flow;
+    }
+
+    #[test]
+    fn create_workshop_flow_accepts_optional_character_id() {
+        let _f: fn(
+            Signal<IdentityState>,
+            Signal<Option<ClientGameState>>,
+            Signal<OperationState>,
+            Signal<String>,
+            Signal<String>,
+            Signal<Option<JudgeBundle>>,
+            Option<String>,
+        ) -> _ = submit_create_workshop_flow;
     }
 }

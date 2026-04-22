@@ -1,12 +1,15 @@
 use dioxus::prelude::*;
 
-use crate::flows::{load_eligible_characters_flow, submit_join_with_character_flow};
+use crate::flows::{
+    load_eligible_characters_flow, load_my_characters_flow, submit_create_workshop_flow,
+    submit_join_with_character_flow,
+};
 use crate::state::{IdentityState, OperationState, ShellScreen};
 use protocol::{ClientGameState, JudgeBundle};
 
-/// Shown after clicking "Join" on an open workshop. Lists the player's
-/// characters eligible for this workshop. Selecting one (or choosing "Use a
-/// starter") dispatches `POST /api/workshops/join`.
+/// Shown when the player needs to pick a character before entering a workshop.
+/// `workshop_code = Some(...)` is the join flow; `None` is host-side workshop
+/// creation.
 #[component]
 pub fn PickCharacterView(
     identity: Signal<IdentityState>,
@@ -15,35 +18,66 @@ pub fn PickCharacterView(
     reconnect_session_code: Signal<String>,
     reconnect_token: Signal<String>,
     judge_bundle: Signal<Option<JudgeBundle>>,
-    workshop_code: String,
+    workshop_code: Option<String>,
 ) -> Element {
     let pending = ops.read().pending_flow.is_some();
-    let eligible = ops.read().eligible_characters.clone();
+    let characters = if workshop_code.is_some() {
+        ops.read().eligible_characters.clone()
+    } else {
+        ops.read().my_characters.clone()
+    };
+    let title = if workshop_code.is_some() {
+        "Pick Character"
+    } else {
+        "Pick Host Character"
+    };
+    let body = match workshop_code.as_deref() {
+        Some(code) => format!("Choose a character for workshop {code}"),
+        None => "Choose a character before creating your workshop".to_string(),
+    };
+    let empty_copy = if workshop_code.is_some() {
+        "No eligible characters. Use a starter instead."
+    } else {
+        "No saved characters yet. Use a starter instead."
+    };
+    let primary_button = if workshop_code.is_some() {
+        "Select"
+    } else {
+        "Create Workshop"
+    };
+    let starter_button = if workshop_code.is_some() {
+        "Use Starter Character"
+    } else {
+        "Create With Starter Character"
+    };
 
-    // Load eligible characters on mount.
+    // Load join-eligible characters or owned characters on mount.
     let mut loaded = use_signal(|| false);
     if !*loaded.read() {
         loaded.set(true);
-        let code = workshop_code.clone();
-        spawn(load_eligible_characters_flow(identity, ops, code));
+        if let Some(code) = workshop_code.clone() {
+            spawn(load_eligible_characters_flow(identity, ops, code));
+        } else {
+            spawn(load_my_characters_flow(identity, ops));
+        }
     }
 
     rsx! {
         section { class: "hero",
-            h1 { class: "hero__title", "Pick Character" }
-            p { class: "hero__body", "Choose a character for workshop {workshop_code}" }
+            h1 { class: "hero__title", {title} }
+            p { class: "hero__body", {body} }
         }
         article { class: "panel", "data-testid": "pick-character-panel",
             h2 { class: "panel__title", "Your Characters" }
             div { class: "panel__stack",
-                if eligible.is_empty() {
-                    p { class: "meta", "No eligible characters. Use a starter instead." }
+                if characters.is_empty() {
+                    p { class: "meta", {empty_copy} }
                 } else {
                     div { class: "roster",
-                        for character in eligible.iter() {
+                        for character in characters.iter() {
                             {
                                 let char_id = character.id.clone();
-                                let wcode = workshop_code.clone();
+                                let maybe_wcode = workshop_code.clone();
                                 rsx! {
                                     article { class: "roster__item",
                                         div {
@@ -55,14 +89,30 @@ pub fn PickCharacterView(
                                             disabled: pending,
                                             onclick: move |_| {
                                                 let cid = char_id.clone();
-                                                let wc = wcode.clone();
-                                                spawn(submit_join_with_character_flow(
-                                                    identity, game_state, ops,
-                                                    reconnect_session_code, reconnect_token,
-                                                    judge_bundle, wc, Some(cid),
-                                                ));
+                                                if let Some(wc) = maybe_wcode.clone() {
+                                                    spawn(submit_join_with_character_flow(
+                                                        identity,
+                                                        game_state,
+                                                        ops,
+                                                        reconnect_session_code,
+                                                        reconnect_token,
+                                                        judge_bundle,
+                                                        wc,
+                                                        Some(cid),
+                                                    ));
+                                                } else {
+                                                    spawn(submit_create_workshop_flow(
+                                                        identity,
+                                                        game_state,
+                                                        ops,
+                                                        reconnect_session_code,
+                                                        reconnect_token,
+                                                        judge_bundle,
+                                                        Some(cid),
+                                                    ));
+                                                }
                                             },
-                                            "Select"
+                                            {primary_button}
                                         }
                                     }
                                 }
@@ -84,21 +134,37 @@ pub fn PickCharacterView(
                         "Back"
                     }
                     {
-                        let wcode = workshop_code.clone();
+                        let maybe_wcode = workshop_code.clone();
                         rsx! {
                             button {
                                 class: "button button--primary",
                                 "data-testid": "use-starter-button",
                                 disabled: pending,
                                 onclick: move |_| {
-                                    let wc = wcode.clone();
-                                    spawn(submit_join_with_character_flow(
-                                        identity, game_state, ops,
-                                        reconnect_session_code, reconnect_token,
-                                        judge_bundle, wc, None,
-                                    ));
+                                    if let Some(wc) = maybe_wcode.clone() {
+                                        spawn(submit_join_with_character_flow(
+                                            identity,
+                                            game_state,
+                                            ops,
+                                            reconnect_session_code,
+                                            reconnect_token,
+                                            judge_bundle,
+                                            wc,
+                                            None,
+                                        ));
+                                    } else {
+                                        spawn(submit_create_workshop_flow(
+                                            identity,
+                                            game_state,
+                                            ops,
+                                            reconnect_session_code,
+                                            reconnect_token,
+                                            judge_bundle,
+                                            None,
+                                        ));
+                                    }
                                 },
-                                "Use Starter Character"
+                                {starter_button}
                             }
                         }
                     }

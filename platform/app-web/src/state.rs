@@ -17,7 +17,7 @@ pub enum ShellScreen {
     SignIn,
     AccountHome,
     CreateCharacter,
-    PickCharacter { workshop_code: String },
+    PickCharacter { workshop_code: Option<String> },
     Session,
 }
 
@@ -979,6 +979,20 @@ mod tests {
 
         assert_eq!(result.identity.screen, ShellScreen::SignIn);
         assert_eq!(result.identity.account, None);
+    }
+
+    #[test]
+    fn clear_session_identity_returns_to_account_home_after_host_character_pick() {
+        let mut identity = default_identity_state();
+        identity.screen = ShellScreen::PickCharacter {
+            workshop_code: None,
+        };
+
+        clear_session_identity(&mut identity);
+
+        assert_eq!(identity.screen, ShellScreen::AccountHome);
+        assert_eq!(identity.identity, None);
+        assert_eq!(identity.session_snapshot, None);
     }
 
     #[test]
