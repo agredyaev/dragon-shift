@@ -252,6 +252,31 @@ Source: consolidated must-fix findings from 10-validator readiness audit against
 
 **Committed in:** `feat(platform): close plan2 item 7 strip character roster from account home` (applied on top of `d5def89`).
 
+### Item 9 — Workshop list pagination + Postgres ordering by `created_at`
+
+**Status:** COMPLETED (consensus 10/14, gate ≥8/14)
+
+**Scope locked (user):** paginated (NOT hard cap), page size 50, bidirectional keyset cursor on `(created_at, session_code)`, Postgres JSONB extraction `payload->>'created_at'` (no migration), Prev/Next pager in AccountHome (no page numbers).
+
+**Non-goals:** migration, page numbers / offset, polling-interval change, character endpoint touches, rate-limit work.
+
+**Artifacts:**
+
+- Protocol (`platform/crates/protocol/src/lib.rs`): added `OpenWorkshopCursor` and `ListOpenWorkshopsResponse` (camelCase via `#[serde(rename_all = "camelCase")]`).
+- Persistence (`platform/crates/persistence/src/lib.rs`): `OpenWorkshopsPaging::{First, After(protocol::OpenWorkshopCursor), Before(protocol::OpenWorkshopCursor)}`. Postgres branch uses JSONB extraction `payload->>'created_at'` ordered DESC with `session_code` ASC tie-break; Before branch queries ASC, reverses, and drains from the FRONT (not `truncate`) to preserve the row flush against the cursor — any `truncate` would silently lose the adjacent row. +1 sentinel row drives `has_more_after` / `has_more_before` flags. Same semantics in in-memory store.
+- HTTP (`platform/app-server/src/http.rs`): list handler filters empty-string query params to `None` before XOR validation; static error strings for cursor-shape, cursor-conflict; returns `ListOpenWorkshopsResponse { rows, next_cursor, prev_cursor }` with cursors set from last/first rows when their respective `has_more_*` flag is true.
+- Frontend (`platform/app-web/src/api.rs`): `list_open_workshops` now takes optional `after`/`before` cursors and percent-encodes them via `percent_encode_component`. Flows (`flows.rs`) expose `OpenWorkshopsPaging` wrapping `protocol::OpenWorkshopCursor`; state (`state.rs`) stores `open_workshops_next_cursor` and `open_workshops_prev_cursor`. `account_home.rs` renders Prev/Next buttons with `disabled` wiring (`pending || !has_prev` / `!has_next`); poll resets to First.
+
+**Residual risks (accepted, not blocking):**
+
+- **Correctness (Medium) — Round B:** The F1 regression-lock test `list_open_workshops_postgres_before_cursor_round_trip_returns_same_page` originally asserted `has_more_before` after a First→After→Before round-trip. That flag is structurally false for any such round-trip (by definition there are exactly `page_size` rows newer than `page2.first`, which IS page 1). Resolved in fix pass: seed bumped to 151 rows (defense-in-depth for other tests), bogus flag assertion removed, comment added explaining the round-trip invariant. The critical row-by-row equality assertion (the real F1 lock) is intact.
+- **Simplicity (Low):** dangling doc comment near old `ListOpenWorkshopsRequest` in `protocol/src/lib.rs:1047-1052` describes the deleted request struct; safe to prune in follow-up.
+- **Testing (Low):** no Playwright pager smoke test; new in-memory boundary tests (exactly-50, exactly-51, non-lobby exclusion) + 5 `#[ignore]` Postgres tests (round-trip, tie-break, non-lobby exclusion, boundary) cover the server. Frontend pager interactions remain untested at E2E level (pre-existing gap across `platform/app-web/src/components/`).
+
+**Deferred-list impact:** closes item 9.
+
+**Committed in:** `feat(platform): close plan2 item 9 paginate open workshops with keyset cursor` (applied on top of `8fa6c98`).
+
 ### Item 2 — Account-scoped sprite preview route
 
 **Status:** COMPLETED (consensus 8/10)
@@ -286,7 +311,6 @@ Source: consolidated must-fix findings from 10-validator readiness audit against
 Tracked for future passes. Each remains unresolved:
 
 8. Split Voting/Judge/End screens (wire `voting_view.rs` or document merge).
-9. Workshop list cap 50 + Postgres order by `created_at`.
 10. Character-limit 409 → 400; "workshop already started" 400 → 409.
 11. Endpoint path reconciliation with spec or plan §3 table update.
 12. Remove `/workshops/sprite-sheet` and `/llm/images` dead routes.

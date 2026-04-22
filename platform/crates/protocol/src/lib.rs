@@ -1036,10 +1036,34 @@ pub struct OpenWorkshopSummary {
     pub created_at: String,
 }
 
+/// Keyset cursor over the "open workshops" list. Pairs the RFC3339 `created_at`
+/// timestamp with the `session_code` tie-breaker so pagination is stable when
+/// two lobbies are created in the same tick. Ordering is DESC by `created_at`,
+/// then ASC by `session_code` (both in-memory and Postgres backends agree).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenWorkshopCursor {
+    pub created_at: String,
+    pub session_code: String,
+}
+
+/// Request shape for `GET /api/workshops/open` is transported as query
+/// params on the wire (`after_created_at` / `after_session_code` XOR
+/// `before_created_at` / `before_session_code`). No dedicated request
+/// struct is needed — the server parses those params directly and the
+/// client builds them via query-string construction.
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ListOpenWorkshopsResponse {
     pub workshops: Vec<OpenWorkshopSummary>,
+    /// Cursor to pass as `after=` for the next (older) page, if one exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<OpenWorkshopCursor>,
+    /// Cursor to pass as `before=` for the previous (newer) page, if one
+    /// exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prev_cursor: Option<OpenWorkshopCursor>,
 }
 
 #[cfg(test)]

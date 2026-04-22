@@ -1,6 +1,6 @@
 use axum::{
     Json,
-    extract::{ConnectInfo, FromRequestParts, Path, State},
+    extract::{ConnectInfo, FromRequestParts, Path, Query, State},
     http::{HeaderMap, StatusCode, request::Parts},
     response::{IntoResponse, Response},
 };
@@ -19,7 +19,8 @@ use protocol::{
     EligibleCharactersResponse, JoinWorkshopRequest, JudgeBundle, JudgeDragonBundle,
     ListOpenWorkshopsResponse, LlmDragonEvaluation, LlmImageRequest, LlmImageResult,
     LlmImageSuccess, LlmJudgeEvaluation, LlmJudgeRequest, LlmJudgeResult, LlmJudgeSuccess,
-    MyCharactersResponse, OpenWorkshopSummary, SPRITE_ATELIER_ACCEPTED_NOTICE_MESSAGE,
+    MyCharactersResponse, OpenWorkshopCursor, OpenWorkshopSummary,
+    SPRITE_ATELIER_ACCEPTED_NOTICE_MESSAGE,
     SPRITE_ATELIER_DRAWING_NOTICE_MESSAGE, SPRITE_ATELIER_FALLBACK_NOTICE_MESSAGE,
     SPRITE_ATELIER_NOTICE_TITLE, SPRITE_ATELIER_QUEUED_NOTICE_MESSAGE, SelectCharacterRequest,
     SessionArtifactKind, SessionArtifactRecord, SessionCommand, SessionNoticeCode,
@@ -3239,13 +3240,88 @@ pub(crate) async fn delete_character(
 // Open workshops list (C2-b)
 // ---------------------------------------------------------------------------
 
+/// Query params for `GET /api/workshops/open`. All four fields are optional
+/// on the wire, but validation requires:
+///   - at most one of `{after_*}` or `{before_*}` groups may be supplied;
+///   - if any field from a group is present, both fields must be.
+/// These invariants give a clean keyset cursor shape without a separate
+/// opaque-cursor-string encoding.
+#[derive(Debug, Default, serde::Deserialize)]
+pub(crate) struct OpenWorkshopsQuery {
+    pub after_created_at: Option<String>,
+    pub after_session_code: Option<String>,
+    pub before_created_at: Option<String>,
+    pub before_session_code: Option<String>,
+}
+
 /// `GET /api/workshops/open` — list workshops in Lobby phase.
+/// Supports bidirectional keyset pagination via query params:
+///   `?after_created_at=<rfc3339>&after_session_code=<code>` (Next) XOR
+///   `?before_created_at=<rfc3339>&before_session_code=<code>` (Prev).
 pub(crate) async fn list_open_workshops(
     State(state): State<AppState>,
     _session: AccountSession,
+    Query(query): Query<OpenWorkshopsQuery>,
 ) -> Response {
-    let records = match state.store.list_open_workshops().await {
-        Ok(r) => r,
+    // `serde_urlencoded` turns `?after_created_at=&after_session_code=` into
+    // `Some("")`/`Some("")` — not `None`/`None`. Treat empty-string params as
+    // absent so fully-empty pairs fall through to `First` instead of being
+    // fed into cursor logic (which would return HTTP 200 with an empty list,
+    // indistinguishable from a legitimate empty result). Unpaired halves
+    // (one present + one empty/absent) still get rejected with 400 below.
+    let after_ts = query.after_created_at.filter(|s| !s.is_empty());
+    let after_code = query.after_session_code.filter(|s| !s.is_empty());
+    let before_ts = query.before_created_at.filter(|s| !s.is_empty());
+    let before_code = query.before_session_code.filter(|s| !s.is_empty());
+
+    // Validate: at most one side, and each side's pair must be complete.
+    let after_provided = after_ts.is_some() || after_code.is_some();
+    let before_provided = before_ts.is_some() || before_code.is_some();
+    if after_provided && before_provided {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "only one of after_* or before_* may be supplied" })),
+        )
+            .into_response();
+    }
+    let paging = if after_provided {
+        match (after_ts, after_code) {
+            (Some(ts), Some(code)) => persistence::OpenWorkshopsPaging::After(
+                OpenWorkshopCursor {
+                    created_at: ts,
+                    session_code: code,
+                },
+            ),
+            _ => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({ "error": "after_created_at and after_session_code must both be supplied" })),
+                )
+                    .into_response();
+            }
+        }
+    } else if before_provided {
+        match (before_ts, before_code) {
+            (Some(ts), Some(code)) => persistence::OpenWorkshopsPaging::Before(
+                OpenWorkshopCursor {
+                    created_at: ts,
+                    session_code: code,
+                },
+            ),
+            _ => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({ "error": "before_created_at and before_session_code must both be supplied" })),
+                )
+                    .into_response();
+            }
+        }
+    } else {
+        persistence::OpenWorkshopsPaging::First
+    };
+
+    let page = match state.store.list_open_workshops(paging.clone()).await {
+        Ok(p) => p,
         Err(error) => {
             tracing::error!(%error, "list_open_workshops failed");
             return (
@@ -3255,7 +3331,46 @@ pub(crate) async fn list_open_workshops(
                 .into_response();
         }
     };
-    let workshops: Vec<OpenWorkshopSummary> = records
+
+    // Compute next/prev cursors from the page's bookends + has_more flags.
+    // Semantics are symmetric so the UI only needs to disable buttons when
+    // the respective cursor is None.
+    let first_row = page.rows.first();
+    let last_row = page.rows.last();
+    let first_cursor = first_row.map(|r| OpenWorkshopCursor {
+        created_at: r.created_at.clone(),
+        session_code: r.session_code.clone(),
+    });
+    let last_cursor = last_row.map(|r| OpenWorkshopCursor {
+        created_at: r.created_at.clone(),
+        session_code: r.session_code.clone(),
+    });
+    let (next_cursor, prev_cursor) = match &paging {
+        persistence::OpenWorkshopsPaging::First => {
+            let next = if page.has_more_after { last_cursor } else { None };
+            (next, None)
+        }
+        persistence::OpenWorkshopsPaging::After(_) => {
+            let next = if page.has_more_after { last_cursor } else { None };
+            // We navigated forward, so a prev page exists unconditionally —
+            // it's the page we came from. Anchor it to the first row so the
+            // next "Prev" query lands on rows strictly newer than it.
+            (next, first_cursor)
+        }
+        persistence::OpenWorkshopsPaging::Before(_) => {
+            // User clicked Prev, so a Next page (the one we came from) exists.
+            let next = last_cursor;
+            let prev = if page.has_more_before {
+                first_cursor
+            } else {
+                None
+            };
+            (next, prev)
+        }
+    };
+
+    let workshops: Vec<OpenWorkshopSummary> = page
+        .rows
         .into_iter()
         .map(|r| OpenWorkshopSummary {
             session_code: r.session_code,
@@ -3266,7 +3381,11 @@ pub(crate) async fn list_open_workshops(
         .collect();
     (
         StatusCode::OK,
-        Json(ListOpenWorkshopsResponse { workshops }),
+        Json(ListOpenWorkshopsResponse {
+            workshops,
+            next_cursor,
+            prev_cursor,
+        }),
     )
         .into_response()
 }

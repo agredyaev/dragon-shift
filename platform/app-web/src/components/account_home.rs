@@ -1,7 +1,8 @@
 use dioxus::prelude::*;
 
 use crate::flows::{
-    load_open_workshops_flow, submit_create_workshop_flow, submit_logout_flow,
+    OpenWorkshopsPaging, load_open_workshops_flow, submit_create_workshop_flow,
+    submit_logout_flow,
 };
 use crate::state::{IdentityState, OperationState, ShellScreen};
 use protocol::{ClientGameState, JudgeBundle};
@@ -23,15 +24,26 @@ pub fn AccountHomeView(
         .unwrap_or_default();
     let pending = ops.read().pending_flow.is_some();
     let open_workshops = ops.read().open_workshops.clone();
+    let next_cursor = ops.read().open_workshops_next_cursor.clone();
+    let prev_cursor = ops.read().open_workshops_prev_cursor.clone();
+    let has_next = next_cursor.is_some();
+    let has_prev = prev_cursor.is_some();
 
     // Load characters + workshops on mount.
     let mut loaded = use_signal(|| false);
     if !*loaded.read() {
         loaded.set(true);
-        spawn(load_open_workshops_flow(identity, ops));
+        spawn(load_open_workshops_flow(
+            identity,
+            ops,
+            OpenWorkshopsPaging::First,
+        ));
     }
 
-    // Poll open workshops every 5 seconds.
+    // Poll open workshops every 5 seconds. The poll always resets to the
+    // first page so AccountHome keeps surfacing the freshest lobbies at the
+    // top — paging through older lobbies is an explicit user gesture via
+    // the Prev / Next buttons below.
     use_future(move || {
         let identity = identity;
         let ops = ops;
@@ -41,7 +53,7 @@ pub fn AccountHomeView(
                 gloo_timers::future::TimeoutFuture::new(5_000).await;
                 #[cfg(not(target_arch = "wasm32"))]
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                load_open_workshops_flow(identity, ops).await;
+                load_open_workshops_flow(identity, ops, OpenWorkshopsPaging::First).await;
             }
         }
     });
@@ -146,6 +158,43 @@ pub fn AccountHomeView(
                                     }
                                 }
                             }
+                        }
+                    }
+                    // Prev / Next pager. Buttons are disabled when the
+                    // respective cursor is absent. No page numbers: the
+                    // keyset cursor is one-way on each side, so an "N of M"
+                    // indicator isn't cheap to compute and isn't part of
+                    // this pass's scope.
+                    div { class: "button-row",
+                        button {
+                            class: "button button--secondary button--small",
+                            "data-testid": "open-workshops-prev-button",
+                            disabled: pending || !has_prev,
+                            onclick: move |_| {
+                                if let Some(cursor) = prev_cursor.clone() {
+                                    spawn(load_open_workshops_flow(
+                                        identity,
+                                        ops,
+                                        OpenWorkshopsPaging::Before(cursor),
+                                    ));
+                                }
+                            },
+                            "Prev"
+                        }
+                        button {
+                            class: "button button--secondary button--small",
+                            "data-testid": "open-workshops-next-button",
+                            disabled: pending || !has_next,
+                            onclick: move |_| {
+                                if let Some(cursor) = next_cursor.clone() {
+                                    spawn(load_open_workshops_flow(
+                                        identity,
+                                        ops,
+                                        OpenWorkshopsPaging::After(cursor),
+                                    ));
+                                }
+                            },
+                            "Next"
                         }
                     }
                 }

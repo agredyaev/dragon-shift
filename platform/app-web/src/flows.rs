@@ -2,7 +2,8 @@
 
 use dioxus::prelude::*;
 use protocol::{
-    AuthRequest, ClientGameState, JoinWorkshopRequest, JudgeBundle, SessionCommand, SpriteSet,
+    AuthRequest, ClientGameState, JoinWorkshopRequest, JudgeBundle, OpenWorkshopCursor,
+    SessionCommand, SpriteSet,
 };
 
 use crate::api::{
@@ -444,17 +445,34 @@ pub async fn load_my_characters_flow(
     }
 }
 
-/// Load open workshops into `ops.open_workshops`.
+/// Paging direction for `load_open_workshops_flow`. Mirrors the server's
+/// keyset semantics: `First` for the initial / polled page, `After` for
+/// the "Next" (older) button, `Before` for the "Prev" (newer) button.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OpenWorkshopsPaging {
+    First,
+    After(OpenWorkshopCursor),
+    Before(OpenWorkshopCursor),
+}
+
+/// Load open workshops into `ops.open_workshops` and refresh the paging
+/// cursors on the operation state. The 5-second poll always calls this
+/// with `OpenWorkshopsPaging::First` so the user keeps seeing the
+/// freshest lobbies at the top; only the Prev/Next buttons on
+/// AccountHome use the `After` / `Before` variants.
 pub async fn load_open_workshops_flow(
     identity: Signal<IdentityState>,
     mut ops: Signal<OperationState>,
+    paging: OpenWorkshopsPaging,
 ) {
     let base_url = { identity.read().api_base_url.clone() };
     let api = AppWebApi::new(base_url);
-    match api.list_open_workshops().await {
+    match api.list_open_workshops(&paging).await {
         Ok(response) => {
             ops.with_mut(|o| {
                 o.open_workshops = response.workshops;
+                o.open_workshops_next_cursor = response.next_cursor;
+                o.open_workshops_prev_cursor = response.prev_cursor;
             });
         }
         Err(error) => {

@@ -126,6 +126,34 @@ pub struct OpenWorkshopRecord {
     pub created_at: String,
 }
 
+/// Paging direction for `SessionStore::list_open_workshops`. Cursors reuse
+/// `protocol::OpenWorkshopCursor` verbatim (same `{created_at, session_code}`
+/// shape) so the HTTP boundary is a trivial passthrough and the types can't
+/// drift apart.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OpenWorkshopsPaging {
+    First,
+    After(protocol::OpenWorkshopCursor),
+    Before(protocol::OpenWorkshopCursor),
+}
+
+/// Page returned by `SessionStore::list_open_workshops`. `rows` is already
+/// truncated to at most `OPEN_WORKSHOPS_PAGE_SIZE` and ordered DESC by
+/// `(created_at, session_code ASC)`. The `has_more_*` flags let callers
+/// synthesize next/prev cursors without another query.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenWorkshopsPage {
+    pub rows: Vec<OpenWorkshopRecord>,
+    /// True iff a strictly older row exists beyond the last returned row.
+    pub has_more_after: bool,
+    /// True iff a strictly newer row exists before the first returned row.
+    pub has_more_before: bool,
+}
+
+/// Page size for the "open workshops" list. Also the internal fetch is
+/// `PAGE_SIZE + 1` to let the impl compute `has_more_after` / `has_more_before`.
+pub const OPEN_WORKSHOPS_PAGE_SIZE: usize = 50;
+
 /// Row in the `accounts` table (migration 0007). Never carries plaintext
 /// password; only the argon2id PHC hash produced by `security::hash_password`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -527,12 +555,18 @@ pub trait SessionStore: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<bool, PersistenceError>> + Send + '_>>;
 
     /// List sessions currently in `Phase::Lobby` for AccountHome's "open
-    /// workshops" list. Ordered newest-first by `created_at` so the UI
-    /// surfaces the freshest lobbies. Only returns summary fields; callers
+    /// workshops" list. Ordered DESC by `created_at` with `session_code ASC`
+    /// as a stable tie-breaker so the UI surfaces the freshest lobbies.
+    /// Paginated via a bidirectional keyset cursor on `(created_at,
+    /// session_code)`; callers pass `OpenWorkshopsPaging::First` for the
+    /// initial page, `After(cursor)` to move to older rows, or
+    /// `Before(cursor)` to move back toward newer rows. Page size is
+    /// `OPEN_WORKSHOPS_PAGE_SIZE`. Only returns summary fields; callers
     /// needing full session state should still go through `load_session_by_code`.
     fn list_open_workshops(
         &self,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<OpenWorkshopRecord>, PersistenceError>> + Send + '_>>;
+        paging: OpenWorkshopsPaging,
+    ) -> Pin<Box<dyn Future<Output = Result<OpenWorkshopsPage, PersistenceError>> + Send + '_>>;
 }
 
 #[derive(Debug, Default)]
@@ -1776,30 +1810,87 @@ impl SessionStore for PostgresSessionStore {
 
     fn list_open_workshops(
         &self,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<OpenWorkshopRecord>, PersistenceError>> + Send + '_>>
+        paging: OpenWorkshopsPaging,
+    ) -> Pin<Box<dyn Future<Output = Result<OpenWorkshopsPage, PersistenceError>> + Send + '_>>
     {
         Box::pin(async move {
-            // `payload->>'phase'` reads the serde-lowercased Phase variant
-            // (see `protocol::Phase`). Ordering by the top-level `updated_at`
-            // TEXT column is safe because it's always RFC3339. We compute
-            // player_count and host_name from the JSON payload because
-            // sessions are stored as opaque blobs; the set of in-lobby
-            // sessions is expected to be small, so the per-row JSON parse
-            // cost is acceptable. Downstream callers should treat this as
-            // a lobby-listing read, not a hot path.
+            // Ordering: DESC by `payload->>'created_at'` with `session_code`
+            // ASC as tie-breaker. `created_at` is RFC3339 UTC (all writers go
+            // through `to_rfc3339`), so TEXT lex-compare gives the correct
+            // chronological order without a schema migration. `player_count`
+            // and `host_name` are still derived from the JSON payload because
+            // the lobby set is expected to be small; this query is cold
+            // relative to the command-handler hot paths.
+            //
+            // Keyset predicate uses Postgres's native tuple `<` / `>`
+            // operators on `(payload->>'created_at', session_code)`. We fetch
+            // `PAGE_SIZE + 1` rows to detect whether another page exists on
+            // the requested side without a second query.
             use sqlx::Row;
-            let rows = sqlx::query(
-                "
-                    SELECT payload
-                    FROM workshop_sessions
-                    WHERE payload->>'phase' = 'lobby'
-                    ORDER BY updated_at DESC
-                    LIMIT 100
-                ",
-            )
-            .fetch_all(&self.pool)
-            .await?;
-            let mut summaries = Vec::with_capacity(rows.len());
+            let fetch_limit = (OPEN_WORKSHOPS_PAGE_SIZE + 1) as i64;
+
+            // Outcomes depend on direction; keep the SQL as three small
+            // parameterized variants rather than stitching strings with
+            // bound placeholders at runtime.
+            let (rows, is_before) = match &paging {
+                OpenWorkshopsPaging::First => {
+                    let rows = sqlx::query(
+                        "
+                            SELECT payload
+                            FROM workshop_sessions
+                            WHERE payload->>'phase' = 'lobby'
+                            ORDER BY payload->>'created_at' DESC, session_code ASC
+                            LIMIT $1
+                        ",
+                    )
+                    .bind(fetch_limit)
+                    .fetch_all(&self.pool)
+                    .await?;
+                    (rows, false)
+                }
+                OpenWorkshopsPaging::After(cursor) => {
+                    // Strictly older than cursor: tuple (created_at, code) < (ts, code).
+                    // Postgres lex-compares TEXT tuples natively.
+                    let rows = sqlx::query(
+                        "
+                            SELECT payload
+                            FROM workshop_sessions
+                            WHERE payload->>'phase' = 'lobby'
+                              AND (payload->>'created_at', session_code) < ($1, $2)
+                            ORDER BY payload->>'created_at' DESC, session_code ASC
+                            LIMIT $3
+                        ",
+                    )
+                    .bind(&cursor.created_at)
+                    .bind(&cursor.session_code)
+                    .fetch_all(&self.pool)
+                    .await?;
+                    (rows, false)
+                }
+                OpenWorkshopsPaging::Before(cursor) => {
+                    // Strictly newer than cursor: tuple > (ts, code). We
+                    // query in the opposite order to grab the rows closest
+                    // to the cursor, then reverse so the final page is in
+                    // the canonical DESC form.
+                    let rows = sqlx::query(
+                        "
+                            SELECT payload
+                            FROM workshop_sessions
+                            WHERE payload->>'phase' = 'lobby'
+                              AND (payload->>'created_at', session_code) > ($1, $2)
+                            ORDER BY payload->>'created_at' ASC, session_code DESC
+                            LIMIT $3
+                        ",
+                    )
+                    .bind(&cursor.created_at)
+                    .bind(&cursor.session_code)
+                    .fetch_all(&self.pool)
+                    .await?;
+                    (rows, true)
+                }
+            };
+            // Deserialize + project to OpenWorkshopRecord.
+            let mut summaries: Vec<OpenWorkshopRecord> = Vec::with_capacity(rows.len());
             for row in rows {
                 let payload: sqlx::types::Json<serde_json::Value> = row.get("payload");
                 let session: WorkshopSession = match serde_json::from_value(payload.0) {
@@ -1813,7 +1904,59 @@ impl SessionStore for PostgresSessionStore {
                     summaries.push(summary);
                 }
             }
-            Ok(summaries)
+            // For `Before`, we asked the DB in ASC order; restore DESC.
+            if is_before {
+                summaries.reverse();
+            }
+            // Compute has_more_* based on whether we fetched the +1 sentinel,
+            // then truncate back to the page size. For Before we truncate
+            // from the front (drop the oldest extra) to keep the page
+            // adjacent to the cursor.
+            let fetched_extra = summaries.len() > OPEN_WORKSHOPS_PAGE_SIZE;
+            match &paging {
+                OpenWorkshopsPaging::First => {
+                    if fetched_extra {
+                        summaries.truncate(OPEN_WORKSHOPS_PAGE_SIZE);
+                    }
+                    Ok(OpenWorkshopsPage {
+                        rows: summaries,
+                        has_more_after: fetched_extra,
+                        has_more_before: false,
+                    })
+                }
+                OpenWorkshopsPaging::After(_) => {
+                    if fetched_extra {
+                        summaries.truncate(OPEN_WORKSHOPS_PAGE_SIZE);
+                    }
+                    Ok(OpenWorkshopsPage {
+                        rows: summaries,
+                        has_more_after: fetched_extra,
+                        has_more_before: true,
+                    })
+                }
+                OpenWorkshopsPaging::Before(_) => {
+                    if fetched_extra {
+                        // After the reverse above, rows sit in DESC order:
+                        // index 0 is the NEWEST (farthest from the cursor)
+                        // and the last index is the row flush against the
+                        // cursor. To keep the 50 rows adjacent to the cursor
+                        // — matching the in-memory `skip(total - take)`
+                        // semantics — we drop the extra from the FRONT, not
+                        // the back. A `truncate(PAGE_SIZE)` here would
+                        // silently lose the row immediately newer than the
+                        // cursor and it would be unreachable via any
+                        // subsequent Prev (its own cursor sits one tier
+                        // further up).
+                        let drop = summaries.len() - OPEN_WORKSHOPS_PAGE_SIZE;
+                        summaries.drain(0..drop);
+                    }
+                    Ok(OpenWorkshopsPage {
+                        rows: summaries,
+                        has_more_after: true,
+                        has_more_before: fetched_extra,
+                    })
+                }
+            }
         })
     }
 }
@@ -2739,28 +2882,92 @@ impl SessionStore for InMemorySessionStore {
 
     fn list_open_workshops(
         &self,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<OpenWorkshopRecord>, PersistenceError>> + Send + '_>>
+        paging: OpenWorkshopsPaging,
+    ) -> Pin<Box<dyn Future<Output = Result<OpenWorkshopsPage, PersistenceError>> + Send + '_>>
     {
         Box::pin(async move {
             let guard = self
                 .sessions_by_code
                 .read()
                 .map_err(|_| PersistenceError::LockPoisoned)?;
+            // Collect candidate lobbies and sort DESC by `created_at` with
+            // `session_code` ASC as tie-breaker. Matches the Postgres impl.
             let mut summaries: Vec<OpenWorkshopRecord> = guard
                 .values()
                 .filter(|session| session.phase == protocol::Phase::Lobby)
                 .filter_map(open_workshop_summary_from_session)
                 .collect();
-            // Newest-first by created_at, breaking ties on session_code for
-            // determinism. Matches the Postgres impl's ordering goal.
             summaries.sort_by(|left, right| {
                 right
                     .created_at
                     .cmp(&left.created_at)
                     .then_with(|| left.session_code.cmp(&right.session_code))
             });
-            summaries.truncate(100);
-            Ok(summaries)
+            drop(guard);
+
+            // Apply keyset filter in the sorted (DESC) list. For After we
+            // keep rows strictly older than cursor; for Before we keep rows
+            // strictly newer than cursor (which sit before the cursor in
+            // the DESC list).
+            let filtered: Vec<OpenWorkshopRecord> = match &paging {
+                OpenWorkshopsPaging::First => summaries,
+                OpenWorkshopsPaging::After(cursor) => summaries
+                    .into_iter()
+                    .filter(|row| {
+                        (row.created_at.as_str(), row.session_code.as_str())
+                            < (cursor.created_at.as_str(), cursor.session_code.as_str())
+                    })
+                    .collect(),
+                OpenWorkshopsPaging::Before(cursor) => summaries
+                    .into_iter()
+                    .filter(|row| {
+                        (row.created_at.as_str(), row.session_code.as_str())
+                            > (cursor.created_at.as_str(), cursor.session_code.as_str())
+                    })
+                    .collect(),
+            };
+
+            // For Before we need the 50 rows *immediately* newer than the
+            // cursor. The filtered slice is still DESC, so those 50 are the
+            // tail. Symmetrically: fetch `PAGE_SIZE + 1` on the relevant
+            // side, then truncate to `PAGE_SIZE`, and compute has_more_*.
+            let page = match &paging {
+                OpenWorkshopsPaging::First => {
+                    let has_more_after = filtered.len() > OPEN_WORKSHOPS_PAGE_SIZE;
+                    let mut rows = filtered;
+                    rows.truncate(OPEN_WORKSHOPS_PAGE_SIZE);
+                    OpenWorkshopsPage {
+                        rows,
+                        has_more_after,
+                        has_more_before: false,
+                    }
+                }
+                OpenWorkshopsPaging::After(_) => {
+                    let has_more_after = filtered.len() > OPEN_WORKSHOPS_PAGE_SIZE;
+                    let mut rows = filtered;
+                    rows.truncate(OPEN_WORKSHOPS_PAGE_SIZE);
+                    OpenWorkshopsPage {
+                        rows,
+                        has_more_after,
+                        has_more_before: true,
+                    }
+                }
+                OpenWorkshopsPaging::Before(_) => {
+                    // Take the tail (rows closest to the cursor) of the
+                    // DESC-sorted filtered list.
+                    let total = filtered.len();
+                    let take = OPEN_WORKSHOPS_PAGE_SIZE.min(total);
+                    let has_more_before = total > OPEN_WORKSHOPS_PAGE_SIZE;
+                    let start = total - take;
+                    let rows: Vec<_> = filtered.into_iter().skip(start).collect();
+                    OpenWorkshopsPage {
+                        rows,
+                        has_more_after: true,
+                        has_more_before,
+                    }
+                }
+            };
+            Ok(page)
         })
     }
 }
@@ -2841,7 +3048,7 @@ mod tests {
     use super::*;
     use chrono::{DateTime, Utc};
     use domain::{SessionCode, SessionPlayer, WorkshopSession};
-    use protocol::{Phase, SessionArtifactKind};
+    use protocol::{OpenWorkshopCursor, Phase, SessionArtifactKind};
     use serde_json::json;
     use uuid::Uuid;
 
@@ -3663,5 +3870,263 @@ mod tests {
                 .expect("retired fence is consumed")
                 .is_none()
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // Open-workshops pagination (plan2 item 9)
+    // ---------------------------------------------------------------------
+
+    /// Build a Lobby session with a host player named "Alice-<code>" and a
+    /// caller-supplied `created_at`. `created_at` is what the paging keyset
+    /// orders on; the `updated_at` stamp is irrelevant for pagination.
+    fn lobby_session_at(code: &str, created_at_seconds: i64) -> WorkshopSession {
+        let mut session = WorkshopSession::new(
+            Uuid::new_v4(),
+            SessionCode(code.to_string()),
+            ts(created_at_seconds),
+            config(),
+        );
+        session.phase = Phase::Lobby;
+        let host_id = format!("host-{code}");
+        session.host_player_id = Some(host_id.clone());
+        session.add_player(SessionPlayer {
+            id: host_id,
+            name: format!("Alice-{code}"),
+            account_id: None,
+            character_id: None,
+            selected_character: None,
+            is_host: true,
+            is_connected: true,
+            is_ready: true,
+            score: 0,
+            current_dragon_id: None,
+            achievements: Vec::new(),
+            joined_at: ts(created_at_seconds),
+        });
+        session
+    }
+
+    async fn seed_lobbies(store: &InMemorySessionStore, count: usize, start_seconds: i64) {
+        // Stagger `created_at` so every row sorts to a unique position. The
+        // oldest row is at `start_seconds`; newest at
+        // `start_seconds + count - 1`.
+        for i in 0..count {
+            let code = format!("{:06}", 100_000 + i);
+            let session = lobby_session_at(&code, start_seconds + i as i64);
+            store
+                .save_session(&session)
+                .await
+                .expect("seed lobby session");
+        }
+    }
+
+    #[tokio::test]
+    async fn list_open_workshops_first_page_returns_50_newest_desc() {
+        let store = InMemorySessionStore::new();
+        seed_lobbies(&store, 120, 1_000).await;
+
+        let page = store
+            .list_open_workshops(OpenWorkshopsPaging::First)
+            .await
+            .expect("first page");
+
+        assert_eq!(page.rows.len(), OPEN_WORKSHOPS_PAGE_SIZE);
+        assert!(page.has_more_after);
+        assert!(!page.has_more_before);
+        // Strict DESC on (created_at, session_code ASC). With unique
+        // created_ats the session_code tie-breaker doesn't kick in here;
+        // see the dedicated test below.
+        for pair in page.rows.windows(2) {
+            assert!(pair[0].created_at > pair[1].created_at);
+        }
+        // Newest seeded row is `start + count - 1 = 1000 + 119 = 1119`.
+        let newest = DateTime::from_timestamp(1_119, 0).unwrap().to_rfc3339();
+        assert_eq!(page.rows.first().unwrap().created_at, newest);
+    }
+
+    #[tokio::test]
+    async fn list_open_workshops_after_next_page_continues_desc() {
+        let store = InMemorySessionStore::new();
+        seed_lobbies(&store, 120, 1_000).await;
+
+        let first = store
+            .list_open_workshops(OpenWorkshopsPaging::First)
+            .await
+            .expect("first page");
+        let cursor = {
+            let last = first.rows.last().unwrap();
+            OpenWorkshopCursor {
+                created_at: last.created_at.clone(),
+                session_code: last.session_code.clone(),
+            }
+        };
+
+        let page2 = store
+            .list_open_workshops(OpenWorkshopsPaging::After(cursor.clone()))
+            .await
+            .expect("after page");
+
+        assert_eq!(page2.rows.len(), OPEN_WORKSHOPS_PAGE_SIZE);
+        assert!(page2.has_more_after);
+        assert!(page2.has_more_before);
+        // Strict DESC and strictly older than the first page's last row.
+        assert!(page2.rows.first().unwrap().created_at < cursor.created_at);
+        for pair in page2.rows.windows(2) {
+            assert!(pair[0].created_at > pair[1].created_at);
+        }
+
+        // Now page 3 should return the last 20 rows.
+        let cursor3 = {
+            let last = page2.rows.last().unwrap();
+            OpenWorkshopCursor {
+                created_at: last.created_at.clone(),
+                session_code: last.session_code.clone(),
+            }
+        };
+        let page3 = store
+            .list_open_workshops(OpenWorkshopsPaging::After(cursor3))
+            .await
+            .expect("page 3");
+        assert_eq!(page3.rows.len(), 20);
+        assert!(!page3.has_more_after);
+        assert!(page3.has_more_before);
+    }
+
+    #[tokio::test]
+    async fn list_open_workshops_before_returns_page_symmetric_to_after() {
+        let store = InMemorySessionStore::new();
+        seed_lobbies(&store, 120, 1_000).await;
+
+        // Walk forward to page 3, then Prev back: the returned slice must
+        // match page 2 exactly.
+        let page1 = store
+            .list_open_workshops(OpenWorkshopsPaging::First)
+            .await
+            .expect("page 1");
+        let p1_last = page1.rows.last().unwrap();
+        let page2 = store
+            .list_open_workshops(OpenWorkshopsPaging::After(OpenWorkshopCursor {
+                created_at: p1_last.created_at.clone(),
+                session_code: p1_last.session_code.clone(),
+            }))
+            .await
+            .expect("page 2");
+        let p2_last = page2.rows.last().unwrap();
+        let page3 = store
+            .list_open_workshops(OpenWorkshopsPaging::After(OpenWorkshopCursor {
+                created_at: p2_last.created_at.clone(),
+                session_code: p2_last.session_code.clone(),
+            }))
+            .await
+            .expect("page 3");
+
+        // Now Prev from page 3's first row.
+        let p3_first = page3.rows.first().unwrap();
+        let prev = store
+            .list_open_workshops(OpenWorkshopsPaging::Before(OpenWorkshopCursor {
+                created_at: p3_first.created_at.clone(),
+                session_code: p3_first.session_code.clone(),
+            }))
+            .await
+            .expect("prev page");
+
+        assert_eq!(prev.rows, page2.rows);
+        assert!(prev.has_more_after);
+        assert!(prev.has_more_before);
+    }
+
+    #[tokio::test]
+    async fn list_open_workshops_orders_ties_by_session_code_asc() {
+        let store = InMemorySessionStore::new();
+        // Two lobbies with identical created_at but different codes.
+        let a = lobby_session_at("AAAAAA", 2_000);
+        let b = lobby_session_at("BBBBBB", 2_000);
+        store.save_session(&a).await.expect("save a");
+        store.save_session(&b).await.expect("save b");
+
+        let page = store
+            .list_open_workshops(OpenWorkshopsPaging::First)
+            .await
+            .expect("first page");
+
+        // DESC on created_at, but both are equal — tie-breaker sorts by
+        // session_code ASC within the same created_at.
+        assert_eq!(page.rows.len(), 2);
+        assert_eq!(page.rows[0].session_code, "AAAAAA");
+        assert_eq!(page.rows[1].session_code, "BBBBBB");
+    }
+
+    #[tokio::test]
+    async fn list_open_workshops_first_page_with_exactly_50_rows_has_no_more_after() {
+        // Boundary: no `+1` sentinel row beyond the page size. The page must
+        // fill exactly and both has_more_* flags must be false.
+        let store = InMemorySessionStore::new();
+        seed_lobbies(&store, OPEN_WORKSHOPS_PAGE_SIZE, 1_000).await;
+
+        let page = store
+            .list_open_workshops(OpenWorkshopsPaging::First)
+            .await
+            .expect("first page");
+
+        assert_eq!(page.rows.len(), OPEN_WORKSHOPS_PAGE_SIZE);
+        assert!(!page.has_more_after, "no older rows exist beyond the 50th");
+        assert!(!page.has_more_before, "First page has no newer rows");
+    }
+
+    #[tokio::test]
+    async fn list_open_workshops_first_page_with_exactly_51_rows_returns_50_and_signals_more() {
+        // Boundary: exactly one extra sentinel. First page must truncate to
+        // 50 and flag more_after; a subsequent After(last) must yield the
+        // lone remaining row with more_after = false.
+        let store = InMemorySessionStore::new();
+        seed_lobbies(&store, OPEN_WORKSHOPS_PAGE_SIZE + 1, 1_000).await;
+
+        let page = store
+            .list_open_workshops(OpenWorkshopsPaging::First)
+            .await
+            .expect("first page");
+        assert_eq!(page.rows.len(), OPEN_WORKSHOPS_PAGE_SIZE);
+        assert!(page.has_more_after);
+
+        let last = page.rows.last().unwrap();
+        let next = store
+            .list_open_workshops(OpenWorkshopsPaging::After(OpenWorkshopCursor {
+                created_at: last.created_at.clone(),
+                session_code: last.session_code.clone(),
+            }))
+            .await
+            .expect("after page");
+        assert_eq!(next.rows.len(), 1);
+        assert!(!next.has_more_after);
+    }
+
+    #[tokio::test]
+    async fn list_open_workshops_excludes_non_lobby_sessions() {
+        // Regression lock: a typo in the phase filter would silently return
+        // Playing/Finished sessions in the open-workshops feed.
+        let store = InMemorySessionStore::new();
+        // 3 lobby sessions at ts 1000..1003.
+        for i in 0..3 {
+            let code = format!("LBBY{:02}", i);
+            let session = lobby_session_at(&code, 1_000 + i);
+            store.save_session(&session).await.expect("save lobby");
+        }
+        // 2 non-lobby sessions at later ts (so they would sort first if
+        // erroneously included).
+        for i in 0..2 {
+            let code = format!("PLAY{:02}", i);
+            let mut session = lobby_session_at(&code, 2_000 + i);
+            session.phase = Phase::Phase1;
+            store.save_session(&session).await.expect("save non-lobby");
+        }
+
+        let page = store
+            .list_open_workshops(OpenWorkshopsPaging::First)
+            .await
+            .expect("first page");
+        assert_eq!(page.rows.len(), 3);
+        for row in &page.rows {
+            assert!(row.session_code.starts_with("LBBY"));
+        }
     }
 }

@@ -745,14 +745,15 @@ impl SessionStore for FaultyStore {
 
     fn list_open_workshops(
         &self,
+        paging: persistence::OpenWorkshopsPaging,
     ) -> Pin<
         Box<
-            dyn Future<Output = Result<Vec<persistence::OpenWorkshopRecord>, PersistenceError>>
+            dyn Future<Output = Result<persistence::OpenWorkshopsPage, PersistenceError>>
                 + Send
                 + '_,
         >,
     > {
-        self.inner.list_open_workshops()
+        self.inner.list_open_workshops(paging)
     }
 }
 
@@ -11345,6 +11346,228 @@ async fn list_open_workshops_returns_empty_when_none() {
         .expect("read body");
     let value: serde_json::Value = serde_json::from_slice(&bytes).expect("body is json");
     assert_eq!(value["workshops"].as_array().unwrap().len(), 0);
+    // Empty result must not synthesize bookend cursors — otherwise a Prev/Next
+    // click from an empty list would query with garbage cursor values.
+    assert!(value.get("nextCursor").map(|v| v.is_null()).unwrap_or(true));
+    assert!(value.get("prevCursor").map(|v| v.is_null()).unwrap_or(true));
+}
+
+// ---------------------------------------------------------------------------
+// Open workshops paging (plan2 item 9)
+// ---------------------------------------------------------------------------
+
+async fn seed_open_workshops(state: &AppState, count: usize, start_seconds: i64) {
+    // Seed `count` Lobby sessions with staggered created_at so pagination
+    // ordering is deterministic. Each session has a distinct 6-digit code
+    // and a single host player.
+    for i in 0..count {
+        let created_at = chrono::DateTime::<Utc>::from_timestamp(start_seconds + i as i64, 0)
+            .expect("valid timestamp");
+        let code = format!("{:06}", 200_000 + i);
+        let mut session = WorkshopSession::new(
+            Uuid::new_v4(),
+            SessionCode(code.clone()),
+            created_at,
+            protocol::WorkshopCreateConfig::default(),
+        );
+        session.add_player(session_player_with_state(
+            &format!("host-{code}"),
+            &format!("Host-{code}"),
+            created_at,
+            true,
+            true,
+        ));
+        state
+            .store
+            .save_session(&session)
+            .await
+            .expect("seed open workshop session");
+    }
+}
+
+async fn get_open_workshops_json(
+    app: &axum::Router,
+    cookie: &str,
+    query: &str,
+) -> (StatusCode, serde_json::Value) {
+    let uri = if query.is_empty() {
+        "/api/workshops/open".to_string()
+    } else {
+        format!("/api/workshops/open?{query}")
+    };
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(uri)
+                .header(axum::http::header::COOKIE, cookie)
+                .body(Body::empty())
+                .expect("build open workshops request"),
+        )
+        .await
+        .expect("open workshops response");
+    let status = response.status();
+    let bytes = to_bytes(response.into_body(), 512 * 1024)
+        .await
+        .expect("read body");
+    let value: serde_json::Value = serde_json::from_slice(&bytes).expect("body is json");
+    (status, value)
+}
+
+#[tokio::test]
+async fn list_open_workshops_first_page_returns_next_cursor_when_more_rows() {
+    let state = test_state();
+    seed_open_workshops(&state, 75, 1_000).await;
+    let app = build_app(state);
+    let cookie = signin_and_get_cookie(&app, "knight", "Alice", "correcthorse").await;
+
+    let (status, value) = get_open_workshops_json(&app, &cookie, "").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(value["workshops"].as_array().unwrap().len(), 50);
+    assert!(value["nextCursor"].is_object(), "expected nextCursor");
+    assert!(
+        value.get("prevCursor").map(|v| v.is_null()).unwrap_or(true),
+        "prevCursor must be absent on the first page"
+    );
+}
+
+#[tokio::test]
+async fn list_open_workshops_forward_paging_returns_older_rows() {
+    let state = test_state();
+    seed_open_workshops(&state, 75, 1_000).await;
+    let app = build_app(state);
+    let cookie = signin_and_get_cookie(&app, "knight", "Alice", "correcthorse").await;
+
+    let (_, page1) = get_open_workshops_json(&app, &cookie, "").await;
+    let next = page1["nextCursor"].as_object().expect("next cursor");
+    let ts = next["createdAt"].as_str().unwrap().to_string();
+    let code = next["sessionCode"].as_str().unwrap().to_string();
+    // `:` and `+` inside RFC3339 need percent-encoding on the wire; use the
+    // same encoding the web client uses so the test mirrors production.
+    let ts_encoded = ts.replace(':', "%3A").replace('+', "%2B");
+    let query = format!("after_created_at={ts_encoded}&after_session_code={code}");
+
+    let (status, page2) = get_open_workshops_json(&app, &cookie, &query).await;
+    assert_eq!(status, StatusCode::OK);
+    let workshops = page2["workshops"].as_array().unwrap();
+    // Seeded 75 rows; first page consumed 50, so page 2 returns the
+    // remaining 25.
+    assert_eq!(workshops.len(), 25);
+    // Every row must be strictly older than the cursor.
+    for row in workshops {
+        let created = row["createdAt"].as_str().unwrap();
+        assert!(created < ts.as_str(), "row {created} older than {ts}");
+    }
+    // No further forward pages exist; prev cursor points back to page 1.
+    assert!(
+        page2.get("nextCursor").map(|v| v.is_null()).unwrap_or(true)
+    );
+    assert!(page2["prevCursor"].is_object());
+}
+
+#[tokio::test]
+async fn list_open_workshops_backward_paging_returns_newer_rows() {
+    let state = test_state();
+    seed_open_workshops(&state, 75, 1_000).await;
+    let app = build_app(state);
+    let cookie = signin_and_get_cookie(&app, "knight", "Alice", "correcthorse").await;
+
+    // Walk forward to page 2, then Prev from there should return page 1's rows.
+    let (_, page1) = get_open_workshops_json(&app, &cookie, "").await;
+    let next = page1["nextCursor"].as_object().expect("next cursor");
+    let ts = next["createdAt"].as_str().unwrap().to_string();
+    let code = next["sessionCode"].as_str().unwrap().to_string();
+    let ts_encoded = ts.replace(':', "%3A").replace('+', "%2B");
+    let forward_query =
+        format!("after_created_at={ts_encoded}&after_session_code={code}");
+    let (_, page2) = get_open_workshops_json(&app, &cookie, &forward_query).await;
+
+    let prev = page2["prevCursor"].as_object().expect("prev cursor");
+    let prev_ts = prev["createdAt"].as_str().unwrap().to_string();
+    let prev_code = prev["sessionCode"].as_str().unwrap().to_string();
+    let prev_ts_encoded = prev_ts.replace(':', "%3A").replace('+', "%2B");
+    let back_query =
+        format!("before_created_at={prev_ts_encoded}&before_session_code={prev_code}");
+    let (status, back_page) = get_open_workshops_json(&app, &cookie, &back_query).await;
+    assert_eq!(status, StatusCode::OK);
+    // Prev from page 2's first row returns page 1's 50 rows.
+    assert_eq!(back_page["workshops"].as_array().unwrap().len(), 50);
+    // Every returned row is strictly newer than the cursor.
+    for row in back_page["workshops"].as_array().unwrap() {
+        let created = row["createdAt"].as_str().unwrap();
+        assert!(created > prev_ts.as_str());
+    }
+}
+
+#[tokio::test]
+async fn list_open_workshops_rejects_both_after_and_before() {
+    let state = test_state();
+    let app = build_app(state);
+    let cookie = signin_and_get_cookie(&app, "knight", "Alice", "correcthorse").await;
+
+    let (status, _) = get_open_workshops_json(
+        &app,
+        &cookie,
+        "after_created_at=2026-01-01T00%3A00%3A00Z&after_session_code=000001\
+         &before_created_at=2026-01-01T00%3A00%3A00Z&before_session_code=000002",
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn list_open_workshops_rejects_unpaired_cursor_half() {
+    let state = test_state();
+    let app = build_app(state);
+    let cookie = signin_and_get_cookie(&app, "knight", "Alice", "correcthorse").await;
+
+    // Only `after_created_at`, no `after_session_code`.
+    let (status, _) = get_open_workshops_json(
+        &app,
+        &cookie,
+        "after_created_at=2026-01-01T00%3A00%3A00Z",
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // Only `before_session_code`, no `before_created_at`.
+    let (status, _) =
+        get_open_workshops_json(&app, &cookie, "before_session_code=000002").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn list_open_workshops_treats_empty_string_params_as_absent() {
+    // Regression lock: `serde_urlencoded` turns `?after_created_at=` into
+    // `Some("")`, not `None`. Without the empty-string filter in the handler,
+    // fully-empty pairs would be fed to the cursor path and return an empty
+    // list indistinguishable from "no workshops exist". Fully-empty pairs
+    // must fall through to the First page instead.
+    let state = test_state();
+    seed_open_workshops(&state, 3, 1_000).await;
+    let app = build_app(state);
+    let cookie = signin_and_get_cookie(&app, "knight", "Alice", "correcthorse").await;
+
+    let (status, value) = get_open_workshops_json(
+        &app,
+        &cookie,
+        "after_created_at=&after_session_code=",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    // Should behave identically to `?` (no params) — return all 3 seeded rows.
+    assert_eq!(value["workshops"].as_array().unwrap().len(), 3);
+
+    // Symmetric check for the `before_*` side.
+    let (status, value) = get_open_workshops_json(
+        &app,
+        &cookie,
+        "before_created_at=&before_session_code=",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(value["workshops"].as_array().unwrap().len(), 3);
 }
 
 // ---------------------------------------------------------------------------

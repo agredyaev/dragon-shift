@@ -2,8 +2,8 @@
 
 use protocol::{
     AccountProfile, CharacterProfile, ClientGameState, ClientSessionSnapshot, CoordinatorType,
-    JudgeBundle, NoticeLevel, OpenWorkshopSummary, Phase, ServerWsMessage, SessionCommand,
-    SessionNotice as ProtocolSessionNotice, SessionNoticeCode, WorkshopJoinSuccess,
+    JudgeBundle, NoticeLevel, OpenWorkshopCursor, OpenWorkshopSummary, Phase, ServerWsMessage,
+    SessionCommand, SessionNotice as ProtocolSessionNotice, SessionNoticeCode, WorkshopJoinSuccess,
 };
 
 use crate::api::build_client_session_snapshot;
@@ -96,6 +96,10 @@ pub struct OperationState {
     pub my_characters: Vec<CharacterProfile>,
     pub my_characters_limit: u8,
     pub open_workshops: Vec<OpenWorkshopSummary>,
+    /// Cursor to use for the "Next" (older) pager button; `None` disables it.
+    pub open_workshops_next_cursor: Option<OpenWorkshopCursor>,
+    /// Cursor to use for the "Prev" (newer) pager button; `None` disables it.
+    pub open_workshops_prev_cursor: Option<OpenWorkshopCursor>,
     pub eligible_characters: Vec<CharacterProfile>,
     pub notice: Option<ShellNotice>,
     /// Notice to show on the first realtime attach instead of the default
@@ -200,6 +204,8 @@ pub fn default_operation_state() -> OperationState {
         my_characters: Vec::new(),
         my_characters_limit: 5,
         open_workshops: Vec::new(),
+        open_workshops_next_cursor: None,
+        open_workshops_prev_cursor: None,
         eligible_characters: Vec::new(),
         notice: None,
         pending_realtime_notice: None,

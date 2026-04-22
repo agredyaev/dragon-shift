@@ -21,6 +21,24 @@ use wasm_bindgen_futures::JsFuture;
 
 use crate::state::default_api_base_url;
 
+/// Minimal RFC3986 `application/x-www-form-urlencoded` percent-encoder for
+/// query-param values. Kept local to avoid pulling in a dedicated crate —
+/// only used by the open-workshops paging cursor fields (RFC3339 timestamps
+/// and digit-only session codes).
+fn percent_encode_component(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for byte in raw.bytes() {
+        let unreserved = byte.is_ascii_alphanumeric()
+            || matches!(byte, b'-' | b'_' | b'.' | b'~');
+        if unreserved {
+            out.push(byte as char);
+        } else {
+            out.push_str(&format!("%{:02X}", byte));
+        }
+    }
+    out
+}
+
 // ---------------------------------------------------------------------------
 // API client
 // ---------------------------------------------------------------------------
@@ -138,8 +156,25 @@ impl AppWebApi {
             .await
     }
 
-    pub async fn list_open_workshops(&self) -> Result<ListOpenWorkshopsResponse, String> {
-        self.get_json("/api/workshops/open").await
+    pub async fn list_open_workshops(
+        &self,
+        paging: &crate::flows::OpenWorkshopsPaging,
+    ) -> Result<ListOpenWorkshopsResponse, String> {
+        use crate::flows::OpenWorkshopsPaging;
+        let path = match paging {
+            OpenWorkshopsPaging::First => "/api/workshops/open".to_string(),
+            OpenWorkshopsPaging::After(cursor) => format!(
+                "/api/workshops/open?after_created_at={}&after_session_code={}",
+                percent_encode_component(&cursor.created_at),
+                percent_encode_component(&cursor.session_code),
+            ),
+            OpenWorkshopsPaging::Before(cursor) => format!(
+                "/api/workshops/open?before_created_at={}&before_session_code={}",
+                percent_encode_component(&cursor.created_at),
+                percent_encode_component(&cursor.session_code),
+            ),
+        };
+        self.get_json(&path).await
     }
 
     pub async fn eligible_characters(
