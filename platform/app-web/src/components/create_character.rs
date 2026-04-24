@@ -194,7 +194,7 @@ pub fn CreateCharacterView(
     let generate_button_class = if has_sprites {
         "button button--secondary phase0-action-button"
     } else {
-        "button button--primary phase0-action-button"
+        "button button--primary button--cta phase0-action-button"
     };
 
     rsx! {
@@ -310,7 +310,7 @@ pub fn CreateCharacterView(
                     "Back"
                 }
                 button {
-                    class: "button button--primary phase0-action-button",
+                    class: "button button--primary button--cta phase0-action-button",
                     "data-testid": "save-character-button",
                     disabled: !has_sprites
                         || saving_now

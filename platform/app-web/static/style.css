@@ -43,12 +43,32 @@
         font-family: var(--font-body);
         background: #0f172a;
         color: #f8fafc;
+        /* UX_RECOMPOSE_v2 §8 tokens (Tier 2) */
+        --btn-height-auto-desktop: 2.25rem;
+        --btn-height-auto-touch:   2.75rem;
+        --btn-height-cta:          2.75rem;
+        --btn-width-cta:           min(100%, 16rem);
+        --btn-padding-x-auto:      1.5rem;
+        --appbar-height-desktop:   4.5rem;
+        --appbar-height-tablet:    4rem;
+        --appbar-height-mobile:    3rem;
+        --container-max-wide:      72rem;
+        --container-max-card:      36rem;
+        --panel-padding-desktop:   2rem 2.5rem;
+        --panel-padding-mobile:    1.25rem;
     }
     * {
         box-sizing: border-box;
     }
     html {
         background: #0f172a;
+        scroll-padding-bottom: var(--appbar-height-desktop);
+    }
+    @media (max-width: 1023px) {
+        html { scroll-padding-bottom: var(--appbar-height-tablet); }
+    }
+    @media (max-width: 767px) {
+        html { scroll-padding-bottom: var(--appbar-height-mobile); }
     }
     body {
         margin: 0;
@@ -362,6 +382,15 @@
             inset -4px -4px 0 0 rgba(0,0,0,0.12),
             4px 4px 0 0 rgba(0,0,0,0.45);
         transition: transform 0.08s ease-out;
+    }
+    .button--cta {
+        width: var(--btn-width-cta);
+        height: var(--btn-height-cta);
+    }
+    @media (max-width: 767px) {
+        .button {
+            height: var(--btn-height-auto-touch);
+        }
     }
     .button:hover {
         filter: brightness(1.03);
@@ -940,7 +969,7 @@
         .button-row {
             flex-direction: column;
         }
-        .button {
+        .button:not(.button--cta) {
             width: 100%;
         }
         .roster__item {
@@ -1608,10 +1637,12 @@
         outline-offset: 4px;
     }
 
-    /* Full-width action buttons in Phase 0 */
+    /* Phase 0 action buttons: vertical spacing only; width handled by .button or .button--cta */
     .phase0-action-button {
-        width: 100%;
         margin-top: 8px;
+    }
+    .phase0-action-button:not(.button--cta) {
+        width: 100%;
     }
 
     .sr-only {

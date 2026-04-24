@@ -137,7 +137,7 @@ pub fn PickCharacterView(
                         let maybe_wcode = workshop_code.clone();
                         rsx! {
                             button {
-                                class: "button button--primary",
+                                class: "button button--primary button--cta",
                                 "data-testid": "use-starter-button",
                                 disabled: pending,
                                 onclick: move |_| {
