@@ -199,10 +199,7 @@ pub fn AppBar(identity: Signal<IdentityState>, ops: Signal<OperationState>) -> E
     // don't get a trap that looks interactive.
     // CreateCharacter holds draft form state; wordmark is disabled
     // there until Tier 3a-2 adds a T-5 confirmation modal.
-    let wordmark_disabled = !matches!(
-        current_screen,
-        ShellScreen::PickCharacter { .. }
-    );
+    let wordmark_disabled = !matches!(current_screen, ShellScreen::PickCharacter { .. });
 
     // Outside-click close (UX_RECOMPOSE_v2 §4.A contract A-3). Attach a
     // document-level pointerdown listener while `open` is true and

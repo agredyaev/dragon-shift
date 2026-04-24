@@ -6,15 +6,12 @@ use protocol::{
     SessionCommand, SpriteSet,
 };
 
-use crate::api::{
-    AppWebApi, build_command_request,
-    build_judge_bundle_request,
-};
+use crate::api::{AppWebApi, build_command_request, build_judge_bundle_request};
 use crate::helpers::{parse_tags_input, pending_command_label};
 use crate::realtime::bootstrap_realtime;
 use crate::state::{
-    ConnectionStatus, IdentityState, OperationState, PendingFlow, ShellScreen,
-    apply_command_error, apply_join_success, apply_judge_bundle_error, apply_judge_bundle_success,
+    ConnectionStatus, IdentityState, OperationState, PendingFlow, ShellScreen, apply_command_error,
+    apply_join_success, apply_judge_bundle_error, apply_judge_bundle_success,
     apply_realtime_bootstrap_error, apply_request_error, apply_successful_command,
     clear_account_identity, clear_session_identity, error_notice, info_notice,
     persist_browser_account_snapshot, persist_browser_session_snapshot, success_notice,
@@ -475,9 +472,7 @@ pub async fn load_open_workshops_flow(
         }
         Err(error) => {
             ops.with_mut(|o| {
-                o.notice = Some(error_notice(&format!(
-                    "Failed to load workshops: {error}"
-                )));
+                o.notice = Some(error_notice(&format!("Failed to load workshops: {error}")));
             });
         }
     }
@@ -575,17 +570,16 @@ pub async fn submit_delete_character_flow(
         }
         Err(error) => {
             ops.with_mut(|o| {
-                o.notice = Some(error_notice(&format!("Failed to delete character: {error}")));
+                o.notice = Some(error_notice(&format!(
+                    "Failed to delete character: {error}"
+                )));
             });
         }
     }
 }
 
 /// Leave the current workshop session and return to AccountHome.
-pub fn leave_workshop(
-    mut identity: Signal<IdentityState>,
-    mut ops: Signal<OperationState>,
-) {
+pub fn leave_workshop(mut identity: Signal<IdentityState>, mut ops: Signal<OperationState>) {
     identity.with_mut(|id| {
         clear_session_identity(id);
     });

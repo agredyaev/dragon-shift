@@ -21,10 +21,7 @@ pub fn map_signin_error(error: &str) -> String {
 }
 
 #[component]
-pub fn SignInView(
-    identity: Signal<IdentityState>,
-    ops: Signal<OperationState>,
-) -> Element {
+pub fn SignInView(identity: Signal<IdentityState>, ops: Signal<OperationState>) -> Element {
     let mut name = use_signal(String::new);
     let mut password = use_signal(String::new);
     let pending = ops.read().pending_flow.is_some();

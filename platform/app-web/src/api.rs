@@ -1,11 +1,10 @@
 use protocol::{
-    AccountProfile, AuthRequest, AuthResponse, CharacterProfile,
-    CharacterSpritePreviewRequest, CharacterSpritePreviewResponse, ClientSessionSnapshot,
-    CreateCharacterRequest, CreateWorkshopRequest, EligibleCharactersResponse,
-    JoinWorkshopRequest, JudgeBundle, ListOpenWorkshopsResponse, MyCharactersResponse,
-    SessionCommand, SessionEnvelope, WorkshopCommandRequest, WorkshopCommandResult,
-    WorkshopJoinResult, WorkshopJoinSuccess, WorkshopJudgeBundleRequest,
-    WorkshopJudgeBundleResult,
+    AccountProfile, AuthRequest, AuthResponse, CharacterProfile, CharacterSpritePreviewRequest,
+    CharacterSpritePreviewResponse, ClientSessionSnapshot, CreateCharacterRequest,
+    CreateWorkshopRequest, EligibleCharactersResponse, JoinWorkshopRequest, JudgeBundle,
+    ListOpenWorkshopsResponse, MyCharactersResponse, SessionCommand, SessionEnvelope,
+    WorkshopCommandRequest, WorkshopCommandResult, WorkshopJoinResult, WorkshopJoinSuccess,
+    WorkshopJudgeBundleRequest, WorkshopJudgeBundleResult,
 };
 
 use serde::de::DeserializeOwned;
@@ -28,8 +27,7 @@ use crate::state::default_api_base_url;
 fn percent_encode_component(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
     for byte in raw.bytes() {
-        let unreserved = byte.is_ascii_alphanumeric()
-            || matches!(byte, b'-' | b'_' | b'.' | b'~');
+        let unreserved = byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~');
         if unreserved {
             out.push(byte as char);
         } else {
@@ -69,7 +67,7 @@ impl AppWebApi {
                     character_id,
                 },
             )
-                .await?,
+            .await?,
         )
     }
 

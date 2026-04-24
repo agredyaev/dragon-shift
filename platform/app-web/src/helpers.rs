@@ -89,7 +89,9 @@ pub fn screen_title(screen: &ShellScreen) -> &'static str {
         ShellScreen::SignIn => "Sign in to Dragon Shift",
         ShellScreen::AccountHome => "Your account",
         ShellScreen::CreateCharacter => "Create a character",
-        ShellScreen::PickCharacter { workshop_code: None } => "Pick your host character",
+        ShellScreen::PickCharacter {
+            workshop_code: None,
+        } => "Pick your host character",
         ShellScreen::PickCharacter { .. } => "Pick a character",
         ShellScreen::Session => "Your Dragon Shift session is live",
     }
@@ -174,9 +176,7 @@ pub fn phase_screen_title(phase: Phase) -> &'static str {
 pub fn phase_screen_body(phase: Phase) -> &'static str {
     match phase {
         Phase::Lobby => "Wait for the host to gather the group and start Phase 1.",
-        Phase::Phase0 => {
-            "Legacy character creation phase (no longer used in the new flow)."
-        }
+        Phase::Phase0 => "Legacy character creation phase (no longer used in the new flow).",
         Phase::Phase1 => {
             "Observe your dragon, capture what stands out, and get ready for the handover."
         }
@@ -1020,8 +1020,8 @@ pub fn judge_bundle_dragon_rows(bundle: &JudgeBundle) -> Vec<JudgeBundleDragonRo
 pub mod tests {
     use super::*;
     use protocol::{
-        create_default_session_settings, ClientDragon, ClientGameState, CoordinatorType,
-        DragonAction, DragonEmotion, Phase, Player, SessionMeta, WorkshopJoinSuccess,
+        ClientDragon, ClientGameState, CoordinatorType, DragonAction, DragonEmotion, Phase, Player,
+        SessionMeta, WorkshopJoinSuccess, create_default_session_settings,
     };
     use std::collections::BTreeMap;
 
@@ -1419,7 +1419,9 @@ pub mod tests {
             ShellScreen::SignIn,
             ShellScreen::AccountHome,
             ShellScreen::CreateCharacter,
-            ShellScreen::PickCharacter { workshop_code: None },
+            ShellScreen::PickCharacter {
+                workshop_code: None,
+            },
             ShellScreen::PickCharacter {
                 workshop_code: Some("ABC123".to_string()),
             },
@@ -1487,10 +1489,11 @@ pub mod tests {
         let state = mock_voting_state();
         let rows = voting_option_rows(&state);
 
-        assert!(rows
-            .iter()
-            .find(|row| row.real_dragon_name == "Comet")
-            .is_some_and(|row| row.is_current_players_dragon));
+        assert!(
+            rows.iter()
+                .find(|row| row.real_dragon_name == "Comet")
+                .is_some_and(|row| row.is_current_players_dragon)
+        );
     }
 
     #[test]
@@ -1642,9 +1645,10 @@ pub mod tests {
         assert!(rows
             .iter()
             .any(|row| row.dragon_name.starts_with("Dragon #") && row.is_current_players_dragon));
-        assert!(rows
-            .iter()
-            .any(|row| row.dragon_name.starts_with("Dragon #") && row.is_selected));
+        assert!(
+            rows.iter()
+                .any(|row| row.dragon_name.starts_with("Dragon #") && row.is_selected)
+        );
     }
 
     #[test]
