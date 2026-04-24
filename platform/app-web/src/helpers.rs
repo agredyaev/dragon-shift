@@ -1435,6 +1435,53 @@ pub mod tests {
         }
     }
 
+    /// Regression guard for UX_RECOMPOSE_v2 §10.3 step 15: after the
+    /// app-bar migration, pre-session screens must no longer render a
+    /// duplicate wordmark heading. The wordmark now lives only in the
+    /// app bar, so `hero__title` with the "Dragon Shift" brand text
+    /// must not appear in any screen component source.
+    #[test]
+    fn pre_session_screens_do_not_render_hero_title_wordmark() {
+        let screens: &[(&str, &str)] = &[
+            (
+                "account_home.rs",
+                include_str!("components/account_home.rs"),
+            ),
+            ("sign_in.rs", include_str!("components/sign_in.rs")),
+            (
+                "pick_character.rs",
+                include_str!("components/pick_character.rs"),
+            ),
+        ];
+        for (name, source) in screens {
+            assert!(
+                !source.contains("hero__title"),
+                "{name} still renders a hero__title heading — wordmark must live in AppBar only"
+            );
+            assert!(
+                !source.contains("\"Dragon Shift\""),
+                "{name} still renders the \"Dragon Shift\" literal — moved to AppBar"
+            );
+        }
+    }
+
+    /// Regression guard for UX_RECOMPOSE_v2 §4.A / §10.3: PickCharacter
+    /// must use the "Pick your dragon" / "Pick a host dragon" h1 copy.
+    /// A grep-level check so refactors that accidentally revert the
+    /// copy (e.g. back to "Pick Character") fail loudly.
+    #[test]
+    fn pick_character_h1_copy_is_stable() {
+        let src = include_str!("components/pick_character.rs");
+        assert!(
+            src.contains("\"Pick your dragon\""),
+            "expected PickCharacter default h1 copy \"Pick your dragon\""
+        );
+        assert!(
+            src.contains("\"Pick a host dragon\""),
+            "expected PickCharacter host-variant h1 copy \"Pick a host dragon\""
+        );
+    }
+
     #[test]
     fn voting_helpers_block_original_creator_dragon_after_handover() {
         let state = mock_voting_state();

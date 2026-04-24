@@ -300,6 +300,18 @@
         font-size: 20px;
         text-transform: uppercase;
     }
+    /* Subordinate label beneath `.panel__title`. PickCharacter uses
+       this for its "Your Characters" h2 so the visual hierarchy
+       remains h1 (title) > h2 (subtitle). */
+    .panel__subtitle {
+        margin: 0 0 8px;
+        font-family: var(--font-body);
+        font-size: 14px;
+        font-weight: 600;
+        color: #475569;
+        text-transform: none;
+        letter-spacing: normal;
+    }
     .panel__list {
         margin: 0;
         padding-left: 18px;
@@ -1846,4 +1858,107 @@
         width: 16px;
         height: 16px;
         image-rendering: pixelated;
+    }
+
+    /* -----------------------------------------------------------------
+       App bar (UX_RECOMPOSE_v2 §4.A / Tier 3a-1 step 15).
+       Consumes the --appbar-height-* tokens declared in :root. Sticky
+       landmark at the top of the shell that hosts the wordmark, a
+       reserved center slot for Tier 3a-2's stepper/phase clock, and the
+       account disclosure menu on signed-in surfaces.
+       ----------------------------------------------------------------- */
+    .app-bar {
+        position: sticky;
+        top: 0;
+        z-index: 50;
+        display: grid;
+        grid-template-columns: auto 1fr auto;
+        align-items: center;
+        gap: 1.5rem;
+        height: var(--appbar-height-desktop);
+        padding: 0 1.5rem;
+        background: #0f172a;
+        border-bottom: 4px solid #1e293b;
+    }
+    .app-bar__wordmark {
+        font-family: var(--font-display);
+        font-size: 1.375rem;
+        font-weight: 700;
+        letter-spacing: 0.05em;
+        color: #fde047;
+        background: transparent;
+        border: 0;
+        padding: 0;
+        cursor: pointer;
+    }
+    .app-bar__wordmark[disabled] {
+        cursor: default;
+        opacity: 0.85;
+    }
+    .app-bar__wordmark:focus-visible {
+        outline: 4px solid #fde047;
+        outline-offset: 4px;
+    }
+    .app-bar__center {
+        /* Tier 3a-2 will fill this: stepper (pre-session) / phase+clock (in-session) */
+    }
+    .app-bar__menu-wrap {
+        position: relative;
+        justify-self: end;
+    }
+    .app-bar__menu-trigger {
+        font-family: var(--font-display);
+        font-size: 0.875rem;
+        background: transparent;
+        border: 2px solid #334155;
+        padding: 0.25rem 0.75rem;
+        color: #f8fafc;
+        cursor: pointer;
+    }
+    .app-bar__menu-trigger:focus-visible {
+        outline: 4px solid #fde047;
+        outline-offset: 4px;
+    }
+    .app-bar__menu {
+        position: absolute;
+        top: calc(var(--appbar-height-desktop) + 0.25rem);
+        right: 1.5rem;
+        min-width: 12rem;
+        margin: 0;
+        padding: 0.25rem 0;
+        list-style: none;
+        background: #0f172a;
+        border: 4px solid #1e293b;
+        z-index: 60;
+    }
+    .app-bar__menu[hidden] {
+        display: none;
+    }
+    .app-bar__menu-item {
+        display: block;
+        width: 100%;
+        padding: 0.5rem 1rem;
+        background: transparent;
+        border: 0;
+        font-family: var(--font-display);
+        font-size: 0.8125rem;
+        color: #f8fafc;
+        text-align: left;
+        cursor: pointer;
+    }
+    .app-bar__menu-item:focus-visible {
+        outline: 3px solid #fde047;
+        outline-offset: -3px;
+    }
+    .app-bar__menu-item:hover {
+        background: #1e293b;
+    }
+    @media (max-width: 1023px) {
+        .app-bar { height: var(--appbar-height-tablet); }
+        .app-bar__menu { top: calc(var(--appbar-height-tablet) + 0.25rem); }
+    }
+    @media (max-width: 767px) {
+        .app-bar { height: var(--appbar-height-mobile); padding: 0 0.75rem; gap: 0.75rem; }
+        .app-bar__menu { top: calc(var(--appbar-height-mobile) + 0.25rem); right: 0.75rem; }
+        .app-bar__wordmark { font-size: 1.125rem; }
     }

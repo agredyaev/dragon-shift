@@ -30,12 +30,9 @@ pub fn SignInView(
     let pending = ops.read().pending_flow.is_some();
 
     rsx! {
-        section { class: "hero", "data-testid": "signin-panel",
-            h1 { class: "hero__title", "Dragon Shift" }
-            p { class: "hero__body", "Sign in or create a new account" }
-        }
-        article { class: "panel",
-            h2 { class: "panel__title", "Sign In" }
+        article { class: "panel", "data-testid": "signin-panel",
+            h1 { class: "panel__title", "Sign in" }
+            p { class: "panel__body", "Sign in or create a new account" }
             div { class: "panel__stack",
                 input {
                     class: "input",

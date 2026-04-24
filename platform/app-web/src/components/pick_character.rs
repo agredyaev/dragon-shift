@@ -27,9 +27,9 @@ pub fn PickCharacterView(
         ops.read().my_characters.clone()
     };
     let title = if workshop_code.is_some() {
-        "Pick Character"
+        "Pick a host dragon"
     } else {
-        "Pick Host Character"
+        "Pick your dragon"
     };
     let body = match workshop_code.as_deref() {
         Some(code) => format!("Choose a character for workshop {code}"),
@@ -63,12 +63,10 @@ pub fn PickCharacterView(
     }
 
     rsx! {
-        section { class: "hero",
-            h1 { class: "hero__title", {title} }
-            p { class: "hero__body", {body} }
-        }
         article { class: "panel", "data-testid": "pick-character-panel",
-            h2 { class: "panel__title", "Your Characters" }
+            h1 { class: "panel__title", {title} }
+            p { class: "panel__body", {body} }
+            h2 { class: "panel__subtitle", "Your Characters" }
             div { class: "panel__stack",
                 if characters.is_empty() {
                     p { class: "meta", {empty_copy} }

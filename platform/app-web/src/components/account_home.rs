@@ -1,7 +1,7 @@
 use dioxus::prelude::*;
 
 use crate::flows::{
-    OpenWorkshopsPaging, load_my_characters_flow, load_open_workshops_flow, submit_logout_flow,
+    OpenWorkshopsPaging, load_my_characters_flow, load_open_workshops_flow,
 };
 use crate::state::{IdentityState, OperationState, ShellScreen};
 
@@ -10,12 +10,8 @@ pub fn AccountHomeView(
     identity: Signal<IdentityState>,
     ops: Signal<OperationState>,
 ) -> Element {
-    let account_name = identity
-        .read()
-        .account
-        .as_ref()
-        .map(|a| a.name.clone())
-        .unwrap_or_default();
+    // Account name is surfaced by the app bar's disclosure menu
+    // trigger; no need to read it here any more.
     let pending = ops.read().pending_flow.is_some();
     let open_workshops = ops.read().open_workshops.clone();
     let my_characters_empty = ops.read().my_characters.is_empty();
@@ -73,21 +69,10 @@ pub fn AccountHomeView(
     });
 
     rsx! {
-        section { class: "hero", "data-testid": "account-home-panel",
-            h1 { class: "hero__title", "Dragon Shift" }
-            p { class: "hero__body", "Welcome, {account_name}" }
-            div { class: "hero__meta",
-                button {
-                    class: "button button--secondary",
-                    "data-testid": "logout-button",
-                    disabled: pending,
-                    onclick: move |_| {
-                        spawn(submit_logout_flow(identity, ops));
-                    },
-                    "Logout"
-                }
-            }
-        }
+        // Page-level <h1> is visually hidden so screen readers still
+        // announce the landmark title; the wordmark lives in the app
+        // bar (see UX_RECOMPOSE_v2 §4.A line 173).
+        h1 { class: "sr-only", "Your workshops" }
 
         if is_first_visit {
             // Zero-state: single dominant CTA routing straight to
@@ -138,7 +123,7 @@ pub fn AccountHomeView(
 
                 // ---- Create Character ----
                 article { class: "panel",
-                    h2 { class: "panel__title", "Create Character" }
+                    h2 { class: "panel__title", "Create a dragon" }
                     div { class: "panel__stack",
                         div { class: "button-row",
                             button {
@@ -150,7 +135,7 @@ pub fn AccountHomeView(
                                         id.screen = ShellScreen::CreateCharacter;
                                     });
                                 },
-                                "Create Character"
+                                "Create a dragon"
                             }
                         }
                     }

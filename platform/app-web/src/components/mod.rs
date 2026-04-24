@@ -1,4 +1,5 @@
 pub mod account_home;
+pub mod app_bar;
 pub mod archive_panel;
 pub mod create_character;
 pub mod end_view;

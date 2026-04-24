@@ -667,7 +667,8 @@ fn write_app_web_index_html(out_dir: &Path) -> Result<(), String> {
     <link rel="preload" href="fonts/silkscreen-700-latin.woff2" as="font" type="font/woff2" crossorigin />
     <link rel="stylesheet" href="style.css" />
   </head>
-  <body id="main">
+  <body>
+    <div id="main"></div>
     <script type="module">
       import init from "./app-web.js";
       init();

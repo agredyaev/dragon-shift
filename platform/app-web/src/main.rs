@@ -8,6 +8,7 @@ mod state;
 use dioxus::prelude::*;
 
 use components::account_home::AccountHomeView;
+use components::app_bar::AppBar;
 use components::create_character::CreateCharacterView;
 use components::end_view::EndView;
 use components::handover_view::HandoverView;
@@ -133,6 +134,7 @@ fn App() -> Element {
     });
 
     rsx! {
+        AppBar { identity, ops }
         main { class: shell_class,
             // Clock HUD (Phase1/Phase2 only)
             if show_clock {
