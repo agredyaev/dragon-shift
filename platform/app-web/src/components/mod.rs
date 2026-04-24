@@ -3,7 +3,6 @@ pub mod archive_panel;
 pub mod create_character;
 pub mod end_view;
 pub mod handover_view;
-pub mod hero;
 pub mod lobby_view;
 pub mod notice;
 pub mod phase1_view;

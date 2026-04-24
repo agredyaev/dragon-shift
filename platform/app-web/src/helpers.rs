@@ -86,7 +86,7 @@ pub struct JudgeBundleDragonRow {
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn screen_title(screen: &ShellScreen) -> &'static str {
     match screen {
-        ShellScreen::SignIn => "Sign in to Dragon Switch",
+        ShellScreen::SignIn => "Sign in to Dragon Shift",
         ShellScreen::AccountHome => "Your account",
         ShellScreen::CreateCharacter => "Create a character",
         ShellScreen::PickCharacter { workshop_code: None } => "Pick your host character",
@@ -215,6 +215,33 @@ pub fn phase_remaining_seconds(state: &ClientGameState, now_epoch_seconds: i64) 
     let phase_started_at = parse_rfc3339_epoch_seconds(&state.session.phase_started_at)?;
     let elapsed = (now_epoch_seconds - phase_started_at).max(0) as i32;
     Some((duration_seconds - elapsed).max(0))
+}
+
+/// Current wall-clock time in epoch seconds. Used as the `now` input to
+/// [`phase_remaining_seconds`] from rsx render paths. Returns 0 on
+/// non-wasm targets (tests / server renders) — the helper treats the
+/// elapsed clamp at 0, so a stale timestamp simply renders the full
+/// phase duration instead of a negative countdown.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn now_epoch_seconds() -> i64 {
+    #[cfg(target_arch = "wasm32")]
+    {
+        (js_sys::Date::now() / 1000.0) as i64
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        0
+    }
+}
+
+/// Format a non-negative seconds value as `MM:SS` for phase countdown
+/// display.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn format_mm_ss(total_seconds: i32) -> String {
+    let total = total_seconds.max(0);
+    let mins = total / 60;
+    let secs = total % 60;
+    format!("{mins:02}:{secs:02}")
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -1338,7 +1365,7 @@ pub mod tests {
     fn shell_labels_match_bootstrap_state() {
         assert_eq!(
             screen_title(&ShellScreen::SignIn),
-            "Sign in to Dragon Switch"
+            "Sign in to Dragon Shift"
         );
         assert_eq!(
             connection_status_label(&ConnectionStatus::Offline),
@@ -1374,6 +1401,38 @@ pub mod tests {
     fn parse_tags_input_trims_and_filters_empty_segments() {
         let tags = parse_tags_input(" one, two ,, three , ");
         assert_eq!(tags, vec!["one", "two", "three"]);
+    }
+
+    #[test]
+    fn format_mm_ss_covers_boundary_cases() {
+        assert_eq!(format_mm_ss(0), "00:00");
+        assert_eq!(format_mm_ss(-5), "00:00");
+        assert_eq!(format_mm_ss(9), "00:09");
+        assert_eq!(format_mm_ss(61), "01:01");
+        assert_eq!(format_mm_ss(3600), "60:00");
+    }
+
+    #[test]
+    fn no_screen_title_contains_legacy_brand() {
+        use crate::state::ShellScreen;
+        for screen in [
+            ShellScreen::SignIn,
+            ShellScreen::AccountHome,
+            ShellScreen::CreateCharacter,
+            ShellScreen::PickCharacter { workshop_code: None },
+            ShellScreen::PickCharacter {
+                workshop_code: Some("ABC123".to_string()),
+            },
+            ShellScreen::Session,
+        ] {
+            let title = screen_title(&screen);
+            assert!(
+                !title.contains("Switch"),
+                "legacy brand leaked in {:?}: {}",
+                screen,
+                title
+            );
+        }
     }
 
     #[test]

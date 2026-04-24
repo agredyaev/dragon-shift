@@ -58,7 +58,6 @@ pub fn SignInView(
                 div { class: "button-row",
                     button {
                         class: "button button--primary",
-                        style: "width:100%;",
                         "data-testid": "signin-submit-button",
                         disabled: pending,
                         onclick: move |_| {

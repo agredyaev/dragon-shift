@@ -117,7 +117,6 @@ pub fn HandoverView(
             div { class: "button-row", style: "margin-top:20px;",
                 button {
                     class: "button button--secondary",
-                    style: "width:100%;",
                     "data-testid": "save-handover-tags-button",
                     disabled: commands_disabled,
                     onclick: move |_| {
@@ -142,7 +141,6 @@ pub fn HandoverView(
                 div { style: "margin-top:20px;padding-top:20px;border-top:4px solid #0f172a;",
                     button {
                         class: "button button--primary",
-                        style: "width:100%;",
                         "data-testid": "start-phase2-button",
                         disabled: commands_disabled,
                         onclick: move |_| {

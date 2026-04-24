@@ -65,7 +65,6 @@ pub fn LobbyView(
                     div { class: "button-row",
                         button {
                             class: "button button--primary",
-                            style: "width:100%;",
                             "data-testid": "start-phase1-button",
                             disabled: commands_disabled,
                             onclick: move |_| {

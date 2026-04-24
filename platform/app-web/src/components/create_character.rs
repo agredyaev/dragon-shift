@@ -184,6 +184,19 @@ pub fn CreateCharacterView(
         "Generate pet"
     };
 
+    // Button state machine (§10 step 7 / §4.F):
+    //   textarea empty            -> Generate disabled,   Save disabled
+    //   text entered, no sprites  -> Generate primary,    Save disabled (ghost)
+    //   sprites exist             -> Save primary,        Regenerate ghost, Generate hidden
+    // The Generate/Regenerate affordance lives on the same button because
+    // the existing component shape pairs it with `GenerationStatus`; we
+    // just swap the visual class between primary and ghost (secondary).
+    let generate_button_class = if has_sprites {
+        "button button--secondary phase0-action-button"
+    } else {
+        "button button--primary phase0-action-button"
+    };
+
     rsx! {
         article { class: "panel phase0-card", "data-testid": "create-character-panel",
             h1 { class: "phase0-card__title", "Create Character" }
@@ -247,7 +260,7 @@ pub fn CreateCharacterView(
             }
 
             button {
-                class: "button phase0-action-button",
+                class: "{generate_button_class}",
                 "data-testid": "generate-sprites-button",
                 disabled: generation_in_flight
                     || saving_now

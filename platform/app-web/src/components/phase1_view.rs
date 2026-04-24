@@ -66,6 +66,12 @@ pub fn Phase1View(
 
     let is_host = current_player(state).map(|p| p.is_host).unwrap_or(false);
 
+    // Phase countdown (§10 step 9). Renders `MM:SS` next to the phase
+    // label when `phase_remaining_seconds` resolves. Falls back to no
+    // extra node when the snapshot lacks the fields (helper returns
+    // None).
+    let phase_countdown = phase_remaining_seconds(state, now_epoch_seconds()).map(format_mm_ss);
+
     let observation_draft = observation_input.read().clone();
 
     // Drop read guards before rsx closures that capture mutable signals
@@ -87,6 +93,9 @@ pub fn Phase1View(
                         }
                         div { style: "display:flex;align-items:center;gap:12px;",
                             p { class: "pixel-header__title", style: "font-size:12px;", "Phase 1: Discovery" }
+                            if let Some(remaining) = phase_countdown.clone() {
+                                span { class: "pixel-header__title", style: "font-size:12px;", "data-testid": "phase-countdown", {remaining} }
+                            }
                         }
                     }
 
@@ -394,7 +403,6 @@ pub fn Phase1View(
                         div { style: "padding:16px;",
                             button {
                                 class: "button button--primary",
-                                style: "width:100%;",
                                 "data-testid": "start-handover-button",
                                 disabled: commands_disabled,
                                 onclick: move |_| {
