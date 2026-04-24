@@ -46,9 +46,9 @@ pub fn PickCharacterView(
         "Create Workshop"
     };
     let starter_button = if workshop_code.is_some() {
-        "Use Starter Character"
+        "Use Starter"
     } else {
-        "Create With Starter Character"
+        "Create With Starter"
     };
 
     // Load join-eligible characters or owned characters on mount.
@@ -135,7 +135,7 @@ pub fn PickCharacterView(
                         let maybe_wcode = workshop_code.clone();
                         rsx! {
                             button {
-                                class: "button button--primary button--cta",
+                                class: "button button--primary",
                                 "data-testid": "use-starter-button",
                                 disabled: pending,
                                 onclick: move |_| {

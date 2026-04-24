@@ -93,6 +93,15 @@ fn App() -> Element {
     let clock_icon = if is_daytime { "sun" } else { "moon" };
     let clock_icon_url = poke_icon_url(clock_icon);
 
+    let is_create_character_screen = matches!(
+        pre_session_screen.as_ref(),
+        Some(ShellScreen::CreateCharacter)
+    );
+    let is_centered_card_screen = matches!(
+        pre_session_screen.as_ref(),
+        Some(ShellScreen::SignIn) | Some(ShellScreen::PickCharacter { .. })
+    );
+
     // ---- Container class ----
     let container_class = if is_phase1 || is_phase2 {
         "shell__container shell__container--phase1"
@@ -102,6 +111,10 @@ fn App() -> Element {
         "shell__container shell__container--voting"
     } else if is_judge || is_end {
         "shell__container shell__container--end"
+    } else if is_create_character_screen {
+        "shell__container shell__container--phase0"
+    } else if is_centered_card_screen {
+        "shell__container shell__container--card"
     } else {
         "shell__container"
     };
@@ -114,6 +127,8 @@ fn App() -> Element {
         } else {
             "shell shell--night"
         }
+    } else if pre_session_screen.is_some() {
+        "shell shell--pre-session"
     } else {
         "shell"
     };

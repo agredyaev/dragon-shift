@@ -1,15 +1,10 @@
 use dioxus::prelude::*;
 
-use crate::flows::{
-    OpenWorkshopsPaging, load_my_characters_flow, load_open_workshops_flow,
-};
+use crate::flows::{OpenWorkshopsPaging, load_my_characters_flow, load_open_workshops_flow};
 use crate::state::{IdentityState, OperationState, ShellScreen};
 
 #[component]
-pub fn AccountHomeView(
-    identity: Signal<IdentityState>,
-    ops: Signal<OperationState>,
-) -> Element {
+pub fn AccountHomeView(identity: Signal<IdentityState>, ops: Signal<OperationState>) -> Element {
     // Account name is surfaced by the app bar's disclosure menu
     // trigger; no need to read it here any more.
     let pending = ops.read().pending_flow.is_some();
@@ -140,78 +135,77 @@ pub fn AccountHomeView(
                         }
                     }
                 }
+            }
 
-                // ---- Open Workshops ----
-                article { class: "panel",
-                    h2 { class: "panel__title", "Open Workshops" }
-                    div { class: "panel__stack",
-                        if open_workshops.is_empty() {
-                            p { class: "meta", "No open workshops at the moment." }
-                        } else {
-                            div { class: "roster",
-                                for workshop in open_workshops.iter() {
-                                    {
-                                        let code = workshop.session_code.clone();
-                                        rsx! {
-                                            article { class: "roster__item",
-                                                div {
-                                                    p { class: "roster__name", "{workshop.host_name}'s workshop" }
-                                                    p { class: "roster__meta",
-                                                        "{workshop.player_count} player(s) \u{2014} Code: {workshop.session_code}"
-                                                    }
+            section { class: "panel panel--wide", "data-testid": "open-workshops-panel",
+                h2 { class: "panel__title", "Open Workshops" }
+                div { class: "panel__stack",
+                    if open_workshops.is_empty() {
+                        p { class: "meta", "No open workshops at the moment." }
+                    } else {
+                        div { class: "roster",
+                            for workshop in open_workshops.iter() {
+                                {
+                                    let code = workshop.session_code.clone();
+                                    rsx! {
+                                        article { class: "roster__item",
+                                            div {
+                                                p { class: "roster__name", "{workshop.host_name}'s workshop" }
+                                                p { class: "roster__meta",
+                                                    "{workshop.player_count} player(s) \u{2014} Code: {workshop.session_code}"
                                                 }
-                                                button {
-                                                    class: "button button--primary button--small",
-                                                    "data-testid": "join-workshop-button",
-                                                    disabled: pending,
-                                                    onclick: move |_| {
-                                                        let c = code.clone();
-                                                        identity.with_mut(|id| {
-                                                            id.screen = ShellScreen::PickCharacter {
-                                                                workshop_code: Some(c),
-                                                            };
-                                                        });
-                                                    },
-                                                    "Join"
-                                                }
+                                            }
+                                            button {
+                                                class: "button button--primary button--small",
+                                                "data-testid": "join-workshop-button",
+                                                disabled: pending,
+                                                onclick: move |_| {
+                                                    let c = code.clone();
+                                                    identity.with_mut(|id| {
+                                                        id.screen = ShellScreen::PickCharacter {
+                                                            workshop_code: Some(c),
+                                                        };
+                                                    });
+                                                },
+                                                "Join"
                                             }
                                         }
                                     }
                                 }
                             }
                         }
-                        // Prev / Next pager — rendered only when the
-                        // server returned at least one cursor. When both
-                        // are absent the single-page case skips the
-                        // wrapper entirely (M-5).
-                        if has_prev || has_next {
-                            div { class: "button-row",
-                                button {
-                                    class: "button button--secondary button--small",
-                                    "data-testid": "open-workshops-prev-button",
-                                    disabled: pending || !has_prev,
-                                    onclick: move |_| {
-                                        if let Some(cursor) = prev_cursor.clone() {
-                                            let paging = OpenWorkshopsPaging::Before(cursor);
-                                            current_paging.set(paging.clone());
-                                            spawn(load_open_workshops_flow(identity, ops, paging));
-                                        }
-                                    },
-                                    "Prev"
-                                }
-                                button {
-                                    class: "button button--secondary button--small",
-                                    "data-testid": "open-workshops-next-button",
-                                    disabled: pending || !has_next,
-                                    onclick: move |_| {
-                                        if let Some(cursor) = next_cursor.clone() {
-                                            let paging = OpenWorkshopsPaging::After(cursor);
-                                            current_paging.set(paging.clone());
-                                            spawn(load_open_workshops_flow(identity, ops, paging));
-                                        }
-                                    },
-                                    "Next"
-                                }
+                    }
+                    // Prev / Next pager — rendered only when the
+                    // server returned at least one cursor. When both
+                    // are absent the single-page case skips the
+                    // wrapper entirely (M-5).
+                    if has_prev || has_next {
+                        div { class: "button-row",
+                            button {
+                                class: "button button--secondary button--small",
+                                "data-testid": "open-workshops-prev-button",
+                                disabled: pending || !has_prev,
+                                onclick: move |_| {
+                                    if let Some(cursor) = prev_cursor.clone() {
+                                        let paging = OpenWorkshopsPaging::Before(cursor);
+                                        current_paging.set(paging.clone());
+                                        spawn(load_open_workshops_flow(identity, ops, paging));
+                                    }
+                                },
+                                "Prev"
+                            }
+                            button {
+                                class: "button button--secondary button--small",
+                                "data-testid": "open-workshops-next-button",
+                                disabled: pending || !has_next,
+                                onclick: move |_| {
+                                    if let Some(cursor) = next_cursor.clone() {
+                                        let paging = OpenWorkshopsPaging::After(cursor);
+                                        current_paging.set(paging.clone());
+                                        spawn(load_open_workshops_flow(identity, ops, paging));
+                                    }
+                                },
+                                "Next"
                             }
                         }
                     }
