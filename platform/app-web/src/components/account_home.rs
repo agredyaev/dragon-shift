@@ -11,7 +11,7 @@ pub fn AccountHomeView(identity: Signal<IdentityState>, ops: Signal<OperationSta
     // Account name is surfaced by the app bar's disclosure menu
     // trigger; no need to read it here any more.
     let pending = ops.read().pending_flow.is_some();
-    let delete_pending = ops.read().pending_flow == Some(PendingFlow::DeleteWorkshop);
+    let delete_workshop_pending = ops.read().pending_flow == Some(PendingFlow::DeleteWorkshop);
     let open_workshops = ops.read().open_workshops.clone();
     let next_cursor = ops.read().open_workshops_next_cursor.clone();
     let prev_cursor = ops.read().open_workshops_prev_cursor.clone();
@@ -28,7 +28,7 @@ pub fn AccountHomeView(identity: Signal<IdentityState>, ops: Signal<OperationSta
     // back to page 1 on every tick.
     let mut current_paging = use_signal(|| OpenWorkshopsPaging::First);
 
-    // Load open workshops on mount.
+    // Load account-scoped lists on mount.
     let mut loaded = use_signal(|| false);
     let initial_open_workshops_loaded = loaded.read().clone();
     if !*loaded.read() {
@@ -88,13 +88,13 @@ pub fn AccountHomeView(identity: Signal<IdentityState>, ops: Signal<OperationSta
                     div { class: "button-row modal-card__actions",
                         button {
                             class: "button button--secondary",
-                            disabled: delete_pending,
+                            disabled: delete_workshop_pending,
                             onclick: move |_| pending_delete_workshop_code.set(None),
                             "Cancel"
                         }
                         button {
                             class: "button button--danger",
-                            disabled: delete_pending,
+                            disabled: delete_workshop_pending,
                             onclick: move |_| {
                                 let paging = current_paging.read().clone();
                                 pending_delete_workshop_code.set(None);
@@ -106,7 +106,7 @@ pub fn AccountHomeView(identity: Signal<IdentityState>, ops: Signal<OperationSta
                                     paging,
                                 ));
                             },
-                            if delete_pending { "Deleting..." } else { "Delete" }
+                            if delete_workshop_pending { "Deleting..." } else { "Delete" }
                         }
                     }
                 }
@@ -224,7 +224,7 @@ pub fn AccountHomeView(identity: Signal<IdentityState>, ops: Signal<OperationSta
                                                             pending_delete_workshop_code
                                                                 .set(Some(delete_code.clone()));
                                                         },
-                                                        if delete_pending { "Deleting..." } else { "Delete" }
+                                                        if delete_workshop_pending { "Deleting..." } else { "Delete" }
                                                     }
                                                 }
                                                 button {

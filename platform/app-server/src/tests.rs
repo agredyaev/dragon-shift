@@ -13602,10 +13602,10 @@ async fn preview_sprites_requires_account_cookie() {
 }
 
 #[tokio::test]
-async fn preview_sprites_returns_sprites_for_authenticated_account() {
-    // No LLM providers are configured in the default test_state, so the
-    // handler falls back to the default companion sprites — which is exactly
-    // the behavior we want to assert (non-empty sprite URLs returned).
+async fn preview_sprites_returns_busy_error_when_generation_unavailable() {
+    // No LLM providers are configured in the default test_state. The preview
+    // endpoint must surface a retryable busy error instead of returning the
+    // default companion as if generation had succeeded.
     let state = test_state();
     let app = build_app(state);
     let cookie = signin_and_get_cookie(&app, "knight", "PreviewAlice", "correcthorse").await;
@@ -13627,16 +13627,64 @@ async fn preview_sprites_returns_sprites_for_authenticated_account() {
         .await
         .expect("preview response");
 
-    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     let bytes = to_bytes(response.into_body(), 1024 * 1024)
         .await
         .expect("read preview body");
     let value: serde_json::Value = serde_json::from_slice(&bytes).expect("body is json");
-    let sprites = &value["sprites"];
-    assert!(sprites["neutral"].as_str().is_some_and(|s| !s.is_empty()));
-    assert!(sprites["happy"].as_str().is_some_and(|s| !s.is_empty()));
-    assert!(sprites["angry"].as_str().is_some_and(|s| !s.is_empty()));
-    assert!(sprites["sleepy"].as_str().is_some_and(|s| !s.is_empty()));
+    assert_eq!(
+        value["error"],
+        "Sprite API is busy. Please try again in a few minutes."
+    );
+    assert!(value.get("sprites").is_none());
+}
+
+#[tokio::test]
+async fn preview_sprites_queue_timeout_returns_busy_error_without_fallback() {
+    let state = test_state_with_sprite_queue_timeout(std::time::Duration::from_millis(20));
+    let mut queue_permits = Vec::new();
+    for _ in 0..state.config.image_job_max_concurrency {
+        queue_permits.push(
+            state
+                .image_job_queue
+                .clone()
+                .try_acquire_owned()
+                .expect("reserve queue permit for preview timeout test"),
+        );
+    }
+
+    let app = build_app(state);
+    let cookie = signin_and_get_cookie(&app, "knight", "PreviewQueue", "correcthorse").await;
+
+    let body = serde_json::json!({
+        "description": "A tiny green dragon with a fiery tail",
+    })
+    .to_string();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/characters/preview-sprites")
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .header(axum::http::header::COOKIE, &cookie)
+                .body(Body::from(body))
+                .expect("build preview request"),
+        )
+        .await
+        .expect("preview response");
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let bytes = to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .expect("read preview body");
+    let value: serde_json::Value = serde_json::from_slice(&bytes).expect("body is json");
+    assert_eq!(
+        value["error"],
+        "Sprite API is busy. Please try again in a few minutes."
+    );
+    assert!(value.get("sprites").is_none());
+
+    drop(queue_permits);
 }
 
 #[tokio::test]
@@ -13684,7 +13732,7 @@ async fn preview_sprites_does_not_create_character_record() {
         )
         .await
         .expect("preview response");
-    assert_eq!(preview.status(), StatusCode::OK);
+    assert_eq!(preview.status(), StatusCode::SERVICE_UNAVAILABLE);
 
     // After: list-my-characters still returns zero — preview did not persist.
     let after = app
@@ -13764,7 +13812,7 @@ async fn preview_sprites_rate_limit_returns_429() {
         )
         .await
         .expect("first preview response");
-    assert_eq!(first.status(), StatusCode::OK);
+    assert_eq!(first.status(), StatusCode::SERVICE_UNAVAILABLE);
 
     let second = app
         .oneshot(

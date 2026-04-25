@@ -1473,6 +1473,36 @@ pub mod tests {
     }
 
     #[test]
+    fn pick_character_renders_sprite_rows_not_descriptions() {
+        let src = include_str!("components/pick_character.rs");
+        assert!(
+            src.contains("pick-character-row__sprites"),
+            "expected PickCharacter to render character sprites"
+        );
+        assert!(
+            src.contains("data:image/png;base64"),
+            "expected PickCharacter to render embedded sprite images"
+        );
+        assert!(
+            !src.contains("character.description"),
+            "PickCharacter must not render prompt/description text in the selectable rows"
+        );
+    }
+
+    #[test]
+    fn pick_character_random_starter_copy_is_short_and_empty_only() {
+        let src = include_str!("components/pick_character.rs");
+        assert!(
+            src.contains("\"Summon random\""),
+            "expected short random starter button copy"
+        );
+        assert!(
+            src.contains("if characters.is_empty() {\n                        button"),
+            "random starter button must only render when no owned characters are eligible"
+        );
+    }
+
+    #[test]
     fn voting_helpers_block_original_creator_dragon_after_handover() {
         let state = mock_voting_state();
         let rows = voting_option_rows(&state);

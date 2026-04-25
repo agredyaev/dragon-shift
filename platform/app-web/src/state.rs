@@ -34,6 +34,7 @@ pub enum PendingFlow {
     Create,
     Join,
     Reconnect,
+    DeleteCharacter,
     DeleteWorkshop,
 }
 
@@ -624,6 +625,7 @@ pub fn apply_join_success(
         PendingFlow::Create => "Workshop created.",
         PendingFlow::Join => "Joined workshop.",
         PendingFlow::Reconnect => "Reconnected to workshop.",
+        PendingFlow::DeleteCharacter => "Character deleted.",
         PendingFlow::DeleteWorkshop => "Workshop deleted.",
         PendingFlow::SignIn => "Workshop created.",
     };
