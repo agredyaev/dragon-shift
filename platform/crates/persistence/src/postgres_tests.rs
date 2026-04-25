@@ -929,6 +929,59 @@ mod postgres_tests {
         store.cleanup().await;
     }
 
+    #[tokio::test]
+    async fn deleting_postgres_realtime_connections_for_session_retires_all_connections() {
+        let store = setup_store("deleting_postgres_realtime_connections_for_session_retires_all_connections").await;
+
+        store
+            .claim_realtime_connection(&crate::RealtimeConnectionRegistration {
+                session_code: "INTEGRT5".to_string(),
+                player_id: "player-1".to_string(),
+                connection_id: "conn-1".to_string(),
+                replica_id: "replica-a".to_string(),
+            })
+            .await
+            .expect("claim first realtime connection");
+        store
+            .claim_realtime_connection(&crate::RealtimeConnectionRegistration {
+                session_code: "INTEGRT5".to_string(),
+                player_id: "player-2".to_string(),
+                connection_id: "conn-2".to_string(),
+                replica_id: "replica-b".to_string(),
+            })
+            .await
+            .expect("claim second realtime connection");
+
+        let deleted = store
+            .delete_realtime_connections_for_session("INTEGRT5")
+            .await
+            .expect("delete session realtime connections");
+        assert_eq!(deleted.len(), 2);
+        assert!(
+            store
+                .list_realtime_connections("INTEGRT5")
+                .await
+                .expect("list cleared realtime connections")
+                .is_empty()
+        );
+        assert!(
+            store
+                .take_retired_realtime_connection("conn-1", "replica-a")
+                .await
+                .expect("take retired first connection")
+                .is_some()
+        );
+        assert!(
+            store
+                .take_retired_realtime_connection("conn-2", "replica-b")
+                .await
+                .expect("take retired second connection")
+                .is_some()
+        );
+
+        store.cleanup().await;
+    }
+
     // ── Artifact tests ──────────────────────────────────────────────────
 
     #[tokio::test]
@@ -1203,9 +1256,9 @@ mod postgres_tests {
 
     #[tokio::test]
     #[ignore]
-    async fn list_open_workshops_postgres_first_page_with_more_than_50_rows() {
+    async fn list_open_workshops_postgres_first_page_with_more_than_page_size_rows() {
         let store =
-            setup_store("list_open_workshops_postgres_first_page_with_more_than_50_rows").await;
+            setup_store("list_open_workshops_postgres_first_page_with_more_than_page_size_rows").await;
         pg_seed_lobbies(&store, 75, 1_000).await;
 
         let page = store
@@ -1245,8 +1298,8 @@ mod postgres_tests {
             .await
             .expect("after page");
 
-        assert_eq!(page2.rows.len(), 25);
-        assert!(!page2.has_more_after);
+        assert_eq!(page2.rows.len(), OPEN_WORKSHOPS_PAGE_SIZE);
+        assert!(page2.has_more_after);
         assert!(page2.has_more_before);
         for row in &page2.rows {
             assert!(row.created_at < cursor.created_at);
@@ -1312,7 +1365,7 @@ mod postgres_tests {
     async fn list_open_workshops_postgres_tie_breaks_by_session_code_asc() {
         let store =
             setup_store("list_open_workshops_postgres_tie_breaks_by_session_code_asc").await;
-        // 5 rows sharing ts 2_000 with distinct codes.
+        // More tied rows than the page size, so the ASC tie-break stays visible across the boundary.
         for code in ["AAAAAA", "BBBBBB", "CCCCCC", "DDDDDD", "EEEEEE"] {
             let session = pg_lobby_session_at(code, 2_000);
             store.save_session(&session).await.expect("save tied");
@@ -1333,10 +1386,10 @@ mod postgres_tests {
         let tied: Vec<&str> = page
             .rows
             .iter()
-            .take(5)
+            .take(OPEN_WORKSHOPS_PAGE_SIZE)
             .map(|r| r.session_code.as_str())
             .collect();
-        assert_eq!(tied, vec!["AAAAAA", "BBBBBB", "CCCCCC", "DDDDDD", "EEEEEE"]);
+        assert_eq!(tied, vec!["AAAAAA", "BBBBBB", "CCCCCC", "DDDDDD"]);
         store.cleanup().await;
     }
 

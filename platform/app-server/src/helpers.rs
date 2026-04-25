@@ -197,13 +197,14 @@ pub(crate) fn to_client_game_state(
                 session.phase,
                 protocol::Phase::Voting if !session.voting.as_ref().is_some_and(|v| v.results_revealed)
             );
+            let is_current_players_original_dragon = dragon.original_owner_id == current_player_id;
             (
                 dragon_id.clone(),
                 ClientDragon {
                     id: dragon.id.clone(),
                     name: dragon.name.clone(),
                     visuals: client_dragon_visuals(dragon),
-                    original_owner_id: if hide_owner_identity {
+                    original_owner_id: if hide_owner_identity && !is_current_players_original_dragon {
                         None
                     } else {
                         Some(dragon.original_owner_id.clone())
@@ -464,5 +465,3 @@ pub(crate) fn build_judge_bundle(
             .collect(),
     }
 }
-
-
