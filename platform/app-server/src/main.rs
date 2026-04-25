@@ -10,9 +10,7 @@ mod ws;
 
 use std::sync::Arc;
 
-use app::{
-    AppState, build_app, build_session_store, load_config, load_fallback_companion_sprites,
-};
+use app::{AppState, build_app, build_session_store, load_config, load_fallback_companion_sprites};
 use persistence::SessionUpdateNotification;
 use tracing::info;
 use ws::{
@@ -92,7 +90,12 @@ pub(crate) async fn handle_session_update_notification(
             .lock()
             .await
             .remove(&notification.session_code);
-        close_local_workshop_connections(state, &notification.session_code, Some("Workshop not found.")).await;
+        close_local_workshop_connections(
+            state,
+            &notification.session_code,
+            Some("Workshop not found."),
+        )
+        .await;
         return;
     }
 

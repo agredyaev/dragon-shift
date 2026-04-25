@@ -24,10 +24,10 @@ use persistence::{
     RealtimeConnectionRestore, SessionStore, SessionUpdateNotification, timeout_companion_defaults,
 };
 use protocol::{
-    ClientWsMessage, CoordinatorType, DragonStats, JoinWorkshopRequest, LlmProviderKind,
-    NoticeLevel, ServerWsMessage, SessionArtifactKind, SessionArtifactRecord, SessionCommand,
-    SessionEnvelope, SpriteSheetResult, WorkshopCommandRequest, WorkshopCommandResult,
-    WorkshopCreateResult, WorkshopJoinResult, WorkshopJudgeBundleResult,
+    ClientWsMessage, CoordinatorType, DragonStats, JoinWorkshopRequest, LlmJudgeResult,
+    LlmProviderKind, NoticeLevel, ServerWsMessage, SessionArtifactKind, SessionArtifactRecord,
+    SessionCommand, SessionEnvelope, SpriteSheetResult, WorkshopCommandRequest,
+    WorkshopCommandResult, WorkshopCreateResult, WorkshopJoinResult, WorkshopJudgeBundleResult,
 };
 use security::{DEFAULT_RUST_SESSION_CODE_PREFIX, OriginPolicyOptions, create_origin_policy};
 use sqlx::PgPool;
@@ -779,7 +779,8 @@ impl SessionStore for FaultyStore {
                 + '_,
         >,
     > {
-        self.inner.delete_realtime_connections_for_session(session_code)
+        self.inner
+            .delete_realtime_connections_for_session(session_code)
     }
 
     fn list_open_workshops(
@@ -925,6 +926,158 @@ async fn seed_selected_characters(state: &AppState, session_code: &str) {
             ));
         }
         player.is_ready = true;
+    }
+}
+
+async fn create_workshop_success(
+    app: &Router,
+    cookie: &str,
+    name: &str,
+) -> protocol::WorkshopJoinSuccess {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops")
+                .header("content-type", "application/json")
+                .header(axum::http::header::COOKIE, cookie)
+                .body(Body::from(create_workshop_body(name)))
+                .expect("build create request"),
+        )
+        .await
+        .expect("call create workshop");
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read create body");
+    match serde_json::from_slice::<WorkshopJoinResult>(&body).expect("parse create result") {
+        WorkshopJoinResult::Success(success) => success,
+        WorkshopJoinResult::Error(error) => {
+            panic!("expected create success, got error: {}", error.error)
+        }
+    }
+}
+
+async fn join_workshop_success(
+    app: &Router,
+    cookie: &str,
+    session_code: &str,
+    name: &str,
+) -> protocol::WorkshopJoinSuccess {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops/join")
+                .header("content-type", "application/json")
+                .header(axum::http::header::COOKIE, cookie)
+                .body(Body::from(format!(
+                    r#"{{"sessionCode":"{}","name":"{}"}}"#,
+                    session_code, name
+                )))
+                .expect("build join request"),
+        )
+        .await
+        .expect("call join workshop");
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read join body");
+    match serde_json::from_slice::<WorkshopJoinResult>(&body).expect("parse join result") {
+        WorkshopJoinResult::Success(success) => success,
+        WorkshopJoinResult::Error(error) => {
+            panic!("expected join success, got error: {}", error.error)
+        }
+    }
+}
+
+async fn send_command_ok(app: &Router, request_body: String) {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops/command")
+                .header("content-type", "application/json")
+                .body(Body::from(request_body))
+                .expect("build command request"),
+        )
+        .await
+        .expect("call command endpoint");
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+async fn progress_workshop_to_end(
+    app: &Router,
+    state: &AppState,
+    host: &protocol::WorkshopJoinSuccess,
+    guest: &protocol::WorkshopJoinSuccess,
+) {
+    let session_code = host.session_code.clone();
+    seed_selected_characters(state, &session_code).await;
+    for request_body in [
+        setup_phase1_body(&session_code, &host.reconnect_token),
+        format!(
+            r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"startHandover"}}"#,
+            session_code, host.reconnect_token
+        ),
+        format!(
+            r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"submitTags","payload":["one","two","three"]}}"#,
+            session_code, host.reconnect_token
+        ),
+        format!(
+            r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"submitTags","payload":["four","five","six"]}}"#,
+            session_code, guest.reconnect_token
+        ),
+        format!(
+            r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"startPhase2"}}"#,
+            session_code, host.reconnect_token
+        ),
+        format!(
+            r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"endGame"}}"#,
+            session_code, host.reconnect_token
+        ),
+    ] {
+        send_command_ok(app, request_body).await;
+    }
+
+    let (host_vote_target, guest_vote_target) = {
+        let sessions = state.sessions.lock().await;
+        let session = sessions
+            .get(&session_code)
+            .expect("session exists after endGame");
+        let host_vote_target = session
+            .players
+            .get(&host.player_id)
+            .and_then(|player| player.current_dragon_id.clone())
+            .expect("host current dragon id");
+        let guest_vote_target = session
+            .players
+            .get(&guest.player_id)
+            .and_then(|player| player.current_dragon_id.clone())
+            .expect("guest current dragon id");
+        (host_vote_target, guest_vote_target)
+    };
+
+    for request_body in [
+        format!(
+            r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"submitVote","payload":{{"dragonId":"{}"}}}}"#,
+            session_code, host.reconnect_token, host_vote_target
+        ),
+        format!(
+            r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"submitVote","payload":{{"dragonId":"{}"}}}}"#,
+            session_code, guest.reconnect_token, guest_vote_target
+        ),
+        format!(
+            r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"revealVotingResults"}}"#,
+            session_code, host.reconnect_token
+        ),
+        format!(
+            r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"endSession"}}"#,
+            session_code, host.reconnect_token
+        ),
+    ] {
+        send_command_ok(app, request_body).await;
     }
 }
 
@@ -3604,7 +3757,10 @@ async fn open_workshops_marks_legacy_reserved_lobby_as_deletable_for_owner() {
         .expect("read accounts/me body");
     let account_value: serde_json::Value =
         serde_json::from_slice(&account_body).expect("accounts/me json");
-    let account_id = account_value["id"].as_str().expect("account id").to_string();
+    let account_id = account_value["id"]
+        .as_str()
+        .expect("account id")
+        .to_string();
 
     let mut session = WorkshopSession::new(
         Uuid::new_v4(),
@@ -3614,7 +3770,11 @@ async fn open_workshops_marks_legacy_reserved_lobby_as_deletable_for_owner() {
     );
     session.reserve_host(account_id, "Alice");
     session.owner_account_id = None;
-    state.store.save_session(&session).await.expect("save legacy lobby");
+    state
+        .store
+        .save_session(&session)
+        .await
+        .expect("save legacy lobby");
 
     let (status, view) = get_open_workshops_json(&app, &cookie, "").await;
     assert_eq!(status, StatusCode::OK);
@@ -3630,7 +3790,8 @@ async fn open_workshops_marks_legacy_reserved_lobby_as_deletable_for_owner() {
 #[tokio::test]
 async fn list_open_workshops_same_timestamp_orders_by_session_code_and_pages_without_gaps() {
     let state = test_state();
-    let shared_created_at = chrono::DateTime::<Utc>::from_timestamp(2_000, 0).expect("valid timestamp");
+    let shared_created_at =
+        chrono::DateTime::<Utc>::from_timestamp(2_000, 0).expect("valid timestamp");
     for code in ["200003", "200001", "200002"] {
         let mut session = WorkshopSession::new(
             Uuid::new_v4(),
@@ -3639,7 +3800,11 @@ async fn list_open_workshops_same_timestamp_orders_by_session_code_and_pages_wit
             protocol::WorkshopCreateConfig::default(),
         );
         session.reserve_host(format!("acct-{code}"), format!("Host-{code}"));
-        state.store.save_session(&session).await.expect("save tied lobby");
+        state
+            .store
+            .save_session(&session)
+            .await
+            .expect("save tied lobby");
     }
     let app = build_app(state);
     let cookie = signin_and_get_cookie(&app, "knight", "Alice", "correcthorse").await;
@@ -4318,6 +4483,280 @@ async fn create_workshop_endpoint_succeeds_even_with_empty_payload_name() {
             assert!(success.ok);
         }
         WorkshopJoinResult::Error(error) => panic!("expected success, got error: {}", error.error),
+    }
+}
+
+#[tokio::test]
+async fn generate_character_sprite_sheet_preserves_owned_character_owner_account_id() {
+    let state = test_state();
+    let app = build_app(state.clone());
+    let cookie = test_auth_cookie(&app, "Alice").await;
+    let create_character_body = serde_json::json!({
+        "description": "Alice owned dragon",
+        "sprites": {
+            "neutral": "owned-neutral",
+            "happy": "owned-happy",
+            "angry": "owned-angry",
+            "sleepy": "owned-sleepy"
+        }
+    })
+    .to_string();
+    let create_character_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/characters")
+                .header("content-type", "application/json")
+                .header(axum::http::header::COOKIE, &cookie)
+                .body(Body::from(create_character_body))
+                .expect("build create character request"),
+        )
+        .await
+        .expect("call create character");
+    assert_eq!(create_character_response.status(), StatusCode::CREATED);
+    let create_character_body = to_bytes(create_character_response.into_body(), usize::MAX)
+        .await
+        .expect("read create character body");
+    let created_character: serde_json::Value =
+        serde_json::from_slice(&create_character_body).expect("parse created character");
+    let character_id = created_character["id"]
+        .as_str()
+        .expect("created character id")
+        .to_string();
+
+    let create_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops")
+                .header("content-type", "application/json")
+                .header(axum::http::header::COOKIE, &cookie)
+                .body(Body::from(format!(
+                    r#"{{"name":"Alice","characterId":"{}","config":{{"phase0Minutes":5,"phase1Minutes":10,"phase2Minutes":10}}}}"#,
+                    character_id
+                )))
+                .expect("build create workshop request"),
+        )
+        .await
+        .expect("call create workshop");
+    let create_body = to_bytes(create_response.into_body(), usize::MAX)
+        .await
+        .expect("read create workshop body");
+    let create_result: WorkshopJoinResult =
+        serde_json::from_slice(&create_body).expect("parse create workshop result");
+    let create_success = match create_result {
+        WorkshopJoinResult::Success(success) => success,
+        WorkshopJoinResult::Error(error) => {
+            panic!(
+                "expected create workshop success, got error: {}",
+                error.error
+            )
+        }
+    };
+
+    let session_code = create_success.session_code.clone();
+    let owner_account_id = {
+        let sessions = state.sessions.lock().await;
+        let session = sessions.get(&session_code).expect("session exists");
+        session
+            .owner_account_id
+            .clone()
+            .expect("workshop owner account id")
+    };
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/characters/sprite-sheet")
+                .header("content-type", "application/json")
+                .body(Body::from(format!(
+                    r#"{{"sessionCode":"{}","reconnectToken":"{}","characterId":"{}","description":"A bright silver dragon with teal horns"}}"#,
+                    session_code, create_success.reconnect_token, character_id
+                )))
+                .expect("build character sprite sheet request"),
+        )
+        .await
+        .expect("call character sprite sheet endpoint");
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let persisted_character = state
+        .store
+        .load_character(&character_id)
+        .await
+        .expect("load saved character")
+        .expect("saved character exists");
+    assert_eq!(persisted_character.owner_account_id, Some(owner_account_id));
+}
+
+#[tokio::test]
+async fn workshop_command_rejects_duplicate_starter_selection_in_lobby() {
+    let state = test_state();
+
+    let starter = persistence::CharacterRecord {
+        id: "starter_shared_001".to_string(),
+        description: "Shared starter dragon".to_string(),
+        sprites: protocol::SpriteSet {
+            neutral: "starter-neutral".to_string(),
+            happy: "starter-happy".to_string(),
+            angry: "starter-angry".to_string(),
+            sleepy: "starter-sleepy".to_string(),
+        },
+        remaining_sprite_regenerations: 0,
+        created_at: chrono::Utc::now().to_rfc3339(),
+        updated_at: chrono::Utc::now().to_rfc3339(),
+        owner_account_id: None,
+    };
+    state
+        .store
+        .save_character(&starter)
+        .await
+        .expect("seed starter");
+
+    let app = build_app(state.clone());
+    let alice_cookie = test_auth_cookie(&app, "Alice").await;
+    let bob_cookie = test_auth_cookie(&app, "Bob").await;
+
+    let create_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops/lobby")
+                .header("content-type", "application/json")
+                .header(axum::http::header::COOKIE, &alice_cookie)
+                .body(Body::from(create_workshop_body("Alice")))
+                .expect("build create lobby request"),
+        )
+        .await
+        .expect("call create lobby workshop");
+    assert_eq!(create_response.status(), StatusCode::CREATED);
+    let create_body = to_bytes(create_response.into_body(), usize::MAX)
+        .await
+        .expect("read create lobby body");
+    let create_result: WorkshopCreateResult =
+        serde_json::from_slice(&create_body).expect("parse create lobby result");
+    let session_code = match create_result {
+        WorkshopCreateResult::Success(success) => success.session_code,
+        WorkshopCreateResult::Error(error) => {
+            panic!("expected create lobby success, got error: {}", error.error)
+        }
+    };
+
+    let host_join_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops/join")
+                .header("content-type", "application/json")
+                .header(axum::http::header::COOKIE, &alice_cookie)
+                .body(Body::from(format!(
+                    r#"{{"sessionCode":"{}","name":"Alice"}}"#,
+                    session_code
+                )))
+                .expect("build host join request"),
+        )
+        .await
+        .expect("call host join");
+    assert_eq!(host_join_response.status(), StatusCode::OK);
+    let host_join_body = to_bytes(host_join_response.into_body(), usize::MAX)
+        .await
+        .expect("read host join body");
+    let host_join_result: WorkshopJoinResult =
+        serde_json::from_slice(&host_join_body).expect("parse host join result");
+    let host_join_success = match host_join_result {
+        WorkshopJoinResult::Success(success) => success,
+        WorkshopJoinResult::Error(error) => {
+            panic!("expected host join success, got error: {}", error.error)
+        }
+    };
+
+    let guest_join_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops/join")
+                .header("content-type", "application/json")
+                .header(axum::http::header::COOKIE, &bob_cookie)
+                .body(Body::from(format!(
+                    r#"{{"sessionCode":"{}","name":"Bob"}}"#,
+                    session_code
+                )))
+                .expect("build guest join request"),
+        )
+        .await
+        .expect("call guest join");
+    assert_eq!(guest_join_response.status(), StatusCode::OK);
+    let guest_join_body = to_bytes(guest_join_response.into_body(), usize::MAX)
+        .await
+        .expect("read guest join body");
+    let guest_join_result: WorkshopJoinResult =
+        serde_json::from_slice(&guest_join_body).expect("parse guest join result");
+    let guest_join_success = match guest_join_result {
+        WorkshopJoinResult::Success(success) => success,
+        WorkshopJoinResult::Error(error) => {
+            panic!("expected guest join success, got error: {}", error.error)
+        }
+    };
+
+    let host_select_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops/command")
+                .header("content-type", "application/json")
+                .body(Body::from(format!(
+                    r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"selectCharacter","payload":{{"characterId":"{}"}}}}"#,
+                    session_code, host_join_success.reconnect_token, starter.id
+                )))
+                .expect("build host select request"),
+        )
+        .await
+        .expect("call host selectCharacter");
+    if host_select_response.status() != StatusCode::OK {
+        let body = to_bytes(host_select_response.into_body(), usize::MAX)
+            .await
+            .expect("read host select body");
+        let result: WorkshopCommandResult =
+            serde_json::from_slice(&body).expect("parse host select result");
+        panic!("unexpected host select result: {:?}", result);
+    }
+
+    let guest_select_response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops/command")
+                .header("content-type", "application/json")
+                .body(Body::from(format!(
+                    r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"selectCharacter","payload":{{"characterId":"{}"}}}}"#,
+                    session_code, guest_join_success.reconnect_token, starter.id
+                )))
+                .expect("build guest select request"),
+        )
+        .await
+        .expect("call guest selectCharacter");
+
+    assert_eq!(guest_select_response.status(), StatusCode::BAD_REQUEST);
+    let guest_select_body = to_bytes(guest_select_response.into_body(), usize::MAX)
+        .await
+        .expect("read guest select body");
+    let result: WorkshopCommandResult =
+        serde_json::from_slice(&guest_select_body).expect("parse guest select result");
+    match result {
+        WorkshopCommandResult::Error(error) => {
+            assert_eq!(
+                error.error,
+                "That starter is already taken in this workshop."
+            );
+        }
+        WorkshopCommandResult::Success(_) => panic!("expected error response"),
     }
 }
 
@@ -7986,6 +8425,177 @@ async fn workshop_command_accepts_valid_vote_in_voting() {
         WorkshopCommandResult::Error(error) => {
             panic!("expected success, got error: {}", error.error)
         }
+    }
+}
+
+#[tokio::test]
+async fn workshop_command_rejects_submit_vote_after_results_are_revealed() {
+    let state = test_state();
+    let app = build_app(state.clone());
+    let cookie = test_auth_cookie(&app, "Alice").await;
+    let cookie_bob = test_auth_cookie(&app, "Bob").await;
+    let create_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops")
+                .header("content-type", "application/json")
+                .header(axum::http::header::COOKIE, &cookie)
+                .body(Body::from(create_workshop_body("Alice")))
+                .expect("build create request"),
+        )
+        .await
+        .expect("call create workshop");
+    let create_body = to_bytes(create_response.into_body(), usize::MAX)
+        .await
+        .expect("read create body");
+    let create_result: WorkshopJoinResult =
+        serde_json::from_slice(&create_body).expect("parse create result");
+    let create_success = match create_result {
+        WorkshopJoinResult::Success(success) => success,
+        WorkshopJoinResult::Error(error) => {
+            panic!("expected create success, got error: {}", error.error)
+        }
+    };
+    let session_code = create_success.session_code.clone();
+
+    let join_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops/join")
+                .header("content-type", "application/json")
+                .header(axum::http::header::COOKIE, &cookie_bob)
+                .body(Body::from(format!(
+                    r#"{{"sessionCode":"{}","name":"Bob"}}"#,
+                    session_code
+                )))
+                .expect("build join request"),
+        )
+        .await
+        .expect("call join workshop");
+    let join_body = to_bytes(join_response.into_body(), usize::MAX)
+        .await
+        .expect("read join body");
+    let join_result: WorkshopJoinResult =
+        serde_json::from_slice(&join_body).expect("parse join result");
+    let join_success = match join_result {
+        WorkshopJoinResult::Success(success) => success,
+        WorkshopJoinResult::Error(error) => {
+            panic!("expected join success, got error: {}", error.error)
+        }
+    };
+
+    seed_selected_characters(&state, &session_code).await;
+    for request_body in [
+        setup_phase1_body(&session_code, &create_success.reconnect_token),
+        format!(
+            r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"startHandover"}}"#,
+            session_code, create_success.reconnect_token
+        ),
+        format!(
+            r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"submitTags","payload":["one","two","three"]}}"#,
+            session_code, create_success.reconnect_token
+        ),
+        format!(
+            r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"submitTags","payload":["four","five","six"]}}"#,
+            session_code, join_success.reconnect_token
+        ),
+        format!(
+            r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"startPhase2"}}"#,
+            session_code, create_success.reconnect_token
+        ),
+        format!(
+            r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"endGame"}}"#,
+            session_code, create_success.reconnect_token
+        ),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/workshops/command")
+                    .header("content-type", "application/json")
+                    .body(Body::from(request_body))
+                    .expect("build setup request"),
+            )
+            .await
+            .expect("call setup command");
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    let sessions = state.sessions.lock().await;
+    let session = sessions.get(&session_code).expect("session exists");
+    let alice_current_dragon_id = session
+        .players
+        .get(&create_success.player_id)
+        .and_then(|player| player.current_dragon_id.clone())
+        .expect("alice current dragon id");
+    drop(sessions);
+
+    let submit_vote_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops/command")
+                .header("content-type", "application/json")
+                .body(Body::from(format!(
+                    r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"submitVote","payload":{{"dragonId":"{}"}}}}"#,
+                    session_code, create_success.reconnect_token, alice_current_dragon_id
+                )))
+                .expect("build submitVote request"),
+        )
+        .await
+        .expect("call submitVote command");
+    assert_eq!(submit_vote_response.status(), StatusCode::OK);
+
+    let reveal_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops/command")
+                .header("content-type", "application/json")
+                .body(Body::from(format!(
+                    r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"revealVotingResults"}}"#,
+                    session_code, create_success.reconnect_token
+                )))
+                .expect("build reveal request"),
+        )
+        .await
+        .expect("call revealVotingResults command");
+    assert_eq!(reveal_response.status(), StatusCode::OK);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops/command")
+                .header("content-type", "application/json")
+                .body(Body::from(format!(
+                    r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"submitVote","payload":{{"dragonId":"{}"}}}}"#,
+                    session_code, create_success.reconnect_token, alice_current_dragon_id
+                )))
+                .expect("build late submitVote request"),
+        )
+        .await
+        .expect("call submitVote command after reveal");
+
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read command body");
+    let result: WorkshopCommandResult =
+        serde_json::from_slice(&body).expect("parse command result");
+    match result {
+        WorkshopCommandResult::Error(error) => {
+            assert_eq!(error.error, "Voting is already closed.");
+        }
+        WorkshopCommandResult::Success(_) => panic!("expected error response"),
     }
 }
 
@@ -12290,7 +12900,10 @@ async fn delete_workshop_allows_legacy_reserved_lobby_owned_by_requester() {
         .expect("read accounts/me body");
     let account_value: serde_json::Value =
         serde_json::from_slice(&account_body).expect("accounts/me json");
-    let account_id = account_value["id"].as_str().expect("account id").to_string();
+    let account_id = account_value["id"]
+        .as_str()
+        .expect("account id")
+        .to_string();
 
     let mut session = WorkshopSession::new(
         Uuid::new_v4(),
@@ -12300,7 +12913,11 @@ async fn delete_workshop_allows_legacy_reserved_lobby_owned_by_requester() {
     );
     session.reserve_host(account_id, "Alice");
     session.owner_account_id = None;
-    state.store.save_session(&session).await.expect("save legacy lobby");
+    state
+        .store
+        .save_session(&session)
+        .await
+        .expect("save legacy lobby");
 
     let delete_response = app
         .clone()
@@ -12362,7 +12979,11 @@ async fn delete_workshop_rejects_non_lobby_session() {
         .expect("load created session")
         .expect("session exists");
     session.phase = protocol::Phase::Phase1;
-    state.store.save_session(&session).await.expect("save phase1 session");
+    state
+        .store
+        .save_session(&session)
+        .await
+        .expect("save phase1 session");
 
     let delete_response = app
         .clone()
@@ -13602,6 +14223,152 @@ async fn workshop_command_returns_409_when_phase_gate_blocks_transition() {
             assert_eq!(error.error, "Phase 2 can only begin from handover.");
         }
         WorkshopCommandResult::Success(_) => panic!("expected error response"),
+    }
+}
+
+#[tokio::test]
+async fn llm_judge_rejects_non_host_requests() {
+    let state = test_state();
+    let app = build_app(state.clone());
+    let alice_cookie = test_auth_cookie(&app, "Alice").await;
+    let bob_cookie = test_auth_cookie(&app, "Bob").await;
+
+    let host = create_workshop_success(&app, &alice_cookie, "Alice").await;
+    let guest = join_workshop_success(&app, &bob_cookie, &host.session_code, "Bob").await;
+    progress_workshop_to_end(&app, &state, &host, &guest).await;
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/llm/judge")
+                .header("content-type", "application/json")
+                .body(Body::from(format!(
+                    r#"{{"sessionCode":"{}","reconnectToken":"{}"}}"#,
+                    host.session_code, guest.reconnect_token
+                )))
+                .expect("build llm judge request"),
+        )
+        .await
+        .expect("call llm judge");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read llm judge body");
+    let result: LlmJudgeResult = serde_json::from_slice(&body).expect("parse llm judge result");
+    match result {
+        LlmJudgeResult::Error(error) => {
+            assert_eq!(error.error, "Only the host can run judge scoring.");
+        }
+        LlmJudgeResult::Success(_) => panic!("expected error response"),
+    }
+}
+
+#[tokio::test]
+async fn llm_judge_rejects_requests_before_game_end() {
+    let state = test_state();
+    let app = build_app(state.clone());
+    let alice_cookie = test_auth_cookie(&app, "Alice").await;
+    let bob_cookie = test_auth_cookie(&app, "Bob").await;
+
+    let host = create_workshop_success(&app, &alice_cookie, "Alice").await;
+    let guest = join_workshop_success(&app, &bob_cookie, &host.session_code, "Bob").await;
+
+    seed_selected_characters(&state, &host.session_code).await;
+    for request_body in [
+        setup_phase1_body(&host.session_code, &host.reconnect_token),
+        format!(
+            r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"startHandover"}}"#,
+            host.session_code, host.reconnect_token
+        ),
+        format!(
+            r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"submitTags","payload":["one","two","three"]}}"#,
+            host.session_code, host.reconnect_token
+        ),
+        format!(
+            r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"submitTags","payload":["four","five","six"]}}"#,
+            host.session_code, guest.reconnect_token
+        ),
+        format!(
+            r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"startPhase2"}}"#,
+            host.session_code, host.reconnect_token
+        ),
+    ] {
+        send_command_ok(&app, request_body).await;
+    }
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/llm/judge")
+                .header("content-type", "application/json")
+                .body(Body::from(format!(
+                    r#"{{"sessionCode":"{}","reconnectToken":"{}"}}"#,
+                    host.session_code, host.reconnect_token
+                )))
+                .expect("build llm judge request"),
+        )
+        .await
+        .expect("call llm judge");
+
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read llm judge body");
+    let result: LlmJudgeResult = serde_json::from_slice(&body).expect("parse llm judge result");
+    match result {
+        LlmJudgeResult::Error(error) => {
+            assert_eq!(
+                error.error,
+                "Judge scoring is only available after the game ends."
+            );
+        }
+        LlmJudgeResult::Success(_) => panic!("expected error response"),
+    }
+}
+
+#[tokio::test]
+async fn llm_judge_allows_host_after_game_end() {
+    let state = test_state();
+    let app = build_app(state.clone());
+    let alice_cookie = test_auth_cookie(&app, "Alice").await;
+    let bob_cookie = test_auth_cookie(&app, "Bob").await;
+
+    let host = create_workshop_success(&app, &alice_cookie, "Alice").await;
+    let guest = join_workshop_success(&app, &bob_cookie, &host.session_code, "Bob").await;
+    progress_workshop_to_end(&app, &state, &host, &guest).await;
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/llm/judge")
+                .header("content-type", "application/json")
+                .body(Body::from(format!(
+                    r#"{{"sessionCode":"{}","reconnectToken":"{}"}}"#,
+                    host.session_code, host.reconnect_token
+                )))
+                .expect("build llm judge request"),
+        )
+        .await
+        .expect("call llm judge");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read llm judge body");
+    let result: LlmJudgeResult = serde_json::from_slice(&body).expect("parse llm judge result");
+    match result {
+        LlmJudgeResult::Success(success) => {
+            assert!(success.ok);
+            assert!(!success.evaluation.summary.trim().is_empty());
+            assert_eq!(success.evaluation.dragon_evaluations.len(), 2);
+        }
+        LlmJudgeResult::Error(error) => {
+            panic!("expected success, got error: {}", error.error)
+        }
     }
 }
 

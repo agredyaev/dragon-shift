@@ -10,8 +10,8 @@ use axum_extra::extract::cookie::Key;
 use base64::Engine;
 use domain::WorkshopSession;
 use persistence::{
-    InMemorySessionStore, PostgresSessionStore, SessionStore,
-    TIMEOUT_COMPANION_SPRITE_KEY, timeout_companion_defaults,
+    InMemorySessionStore, PostgresSessionStore, SessionStore, TIMEOUT_COMPANION_SPRITE_KEY,
+    timeout_companion_defaults,
 };
 use protocol::SpriteSet;
 use realtime::SessionRegistry;
@@ -35,15 +35,14 @@ use tower_http::{
     trace::TraceLayer,
 };
 
+use crate::auth::{accounts_me, logout as auth_logout, signin as auth_signin};
 use crate::http::{
     create_character, create_workshop, create_workshop_lobby, delete_character, delete_workshop,
-    eligible_characters,
-    generate_character_sprite_preview, generate_character_sprite_sheet, generate_sprite_sheet,
-    join_workshop, list_character_catalog, list_my_characters, list_open_workshops, live,
-    llm_generate_image, llm_judge, ready, workshop_command,
+    eligible_characters, generate_character_sprite_preview, generate_character_sprite_sheet,
+    generate_sprite_sheet, join_workshop, list_character_catalog, list_my_characters,
+    list_open_workshops, live, llm_generate_image, llm_judge, ready, workshop_command,
     workshop_judge_bundle,
 };
-use crate::auth::{accounts_me, logout as auth_logout, signin as auth_signin};
 use crate::llm::{LlmClient, LlmPoolConfig, load_llm_pool_config};
 use crate::ws::{WsOutbound, workshop_ws};
 
@@ -92,7 +91,10 @@ impl std::fmt::Debug for AppConfig {
             .field("websocket_rate_limit", &self.websocket_rate_limit)
             .field("signup_rate_limit", &self.signup_rate_limit)
             .field("login_rate_limit", &self.login_rate_limit)
-            .field("character_create_rate_limit", &self.character_create_rate_limit)
+            .field(
+                "character_create_rate_limit",
+                &self.character_create_rate_limit,
+            )
             .field("reconnect_token_ttl", &self.reconnect_token_ttl)
             .field("database_pool_size", &self.database_pool_size)
             .field("origin_policy", &self.origin_policy)
@@ -220,7 +222,10 @@ pub(crate) fn build_app(state: AppState) -> Router {
         .route("/accounts/me", get(accounts_me))
         .route("/characters", post(create_character))
         .route("/characters/mine", get(list_my_characters))
-        .route("/characters/preview-sprites", post(generate_character_sprite_preview))
+        .route(
+            "/characters/preview-sprites",
+            post(generate_character_sprite_preview),
+        )
         .route("/characters/{id}", delete(delete_character))
         .route("/workshops", post(create_workshop))
         .route("/workshops/lobby", post(create_workshop_lobby))
@@ -231,9 +236,15 @@ pub(crate) fn build_app(state: AppState) -> Router {
         .route("/workshops/ws", get(workshop_ws))
         .route("/workshops/judge-bundle", post(workshop_judge_bundle))
         .route("/workshops/sprite-sheet", post(generate_sprite_sheet))
-        .route("/workshops/{code}/eligible-characters", get(eligible_characters))
+        .route(
+            "/workshops/{code}/eligible-characters",
+            get(eligible_characters),
+        )
         .route("/characters/catalog", post(list_character_catalog))
-        .route("/characters/sprite-sheet", post(generate_character_sprite_sheet))
+        .route(
+            "/characters/sprite-sheet",
+            post(generate_character_sprite_sheet),
+        )
         .route("/llm/judge", post(llm_judge))
         .route("/llm/images", post(llm_generate_image))
         .route("/live", get(live))
@@ -315,10 +326,8 @@ pub(crate) fn load_config() -> Result<AppConfig, String> {
         });
     let llm_pool = load_llm_pool_config()?;
     let database_url = load_database_url()?;
-    let sprite_queue_timeout = Duration::from_secs(load_duration_env(
-        "SPRITE_QUEUE_TIMEOUT_SECONDS",
-        20 * 60,
-    )?);
+    let sprite_queue_timeout =
+        Duration::from_secs(load_duration_env("SPRITE_QUEUE_TIMEOUT_SECONDS", 20 * 60)?);
     let image_job_max_concurrency = load_queue_concurrency_env("IMAGE_JOB_MAX_CONCURRENCY", 2)?;
     if is_production && database_url.is_none() {
         return Err("DATABASE_URL is required when NODE_ENV=production".to_string());
@@ -367,7 +376,9 @@ fn load_cookie_key(is_production: bool) -> Result<Key, String> {
                 .decode(&normalized)
                 .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(&normalized))
                 .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(&normalized))
-                .map_err(|error| format!("invalid SESSION_COOKIE_KEY (expected base64): {error}"))?;
+                .map_err(|error| {
+                    format!("invalid SESSION_COOKIE_KEY (expected base64): {error}")
+                })?;
             if decoded.len() < 64 {
                 return Err(format!(
                     "SESSION_COOKIE_KEY must decode to at least 64 bytes (got {})",

@@ -173,14 +173,10 @@ pub struct AccountRecord {
 
 pub const TIMEOUT_COMPANION_SPRITE_KEY: &str = "timeout_companion";
 
-const TIMEOUT_COMPANION_NEUTRAL_SPRITE: &str =
-    "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAApElEQVR42mNgGAWjYBQMFfD/asJ/WqrHaxA6Rpavjvn/nxT1VHEAyFJcmKoOwGYYPkfgUz80Q2BQOADZYHwWY3MIjE2WxWum/v+PjEmxHIbRzaDYAXJycmCMy0J0eZo4AATwOQBZnuoOGNAoePd4Hcl4eDvg/6S1ePk0dYCNbgBOPHyiAB2Q4wCqtAfQsxYxFqPrGV4OwCZPqh6qOoBaekbByAUAnY5G6OllDUkAAAAASUVORK5CYII=";
-const TIMEOUT_COMPANION_HAPPY_SPRITE: &str =
-    "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAAvElEQVR42mNgGAWjYBQMFfD/asJ/WqrHaxA6Rpavjvn/nxT1VHEAyFJcmKoOwGYYPkfgUz80Q2BQOADZYHwWY3MIjE2WxWum/v+PjEmxHIbRzaDYAXJycmCMy0J0eZo4AATwOQBZnuoOsNENIBjsyGqo6oB3j9eBMcgCGBsdo8vRxAGkYJo54P+ktVgtRBcfviGAKy1QNQ2gA1yJDhmjy1OlPYCezYgJenQ9w8sB2ORJ1UNVB1BLzygYuQAAmLxC6PcDH7YAAAAASUVORK5CYII=";
-const TIMEOUT_COMPANION_ANGRY_SPRITE: &str =
-    "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAArklEQVR42mNgGAWjYBQMFfD/asJ/WqrHaxA6Rpavjvn/nxT1VHEAyFJcmKoOwGYYPkfgUz80Q2BQOADZYHwWY3MIjE2WxWum/v+PjG10A8CYkMXI6tDNoMgBMAvk5ORwWo4uRxMHgIP3P5YgxyJGMwcQi6nqgHeP15GMRx1Acwf8T3ZHoenmAJCFuDDVHIAOyIkCqrQH0LMWMRaj6xleDsAmT6oeqjqAWnpGwcgFAAfTTcoNBh/0AAAAAElFTkSuQmCC";
-const TIMEOUT_COMPANION_SLEEPY_SPRITE: &str =
-    "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAApElEQVR42mNgGAWjYBQMFfD/asJ/WqrHaxA6Rpavjvn/nxT1VHEAyFJcmKoOwGYYPkfgUz80Q2BQOADZYHwWY3MIjE2WxWum/v+PjEmxHIbRzaDYATU7CFuKrIaqDgAZjIyxWYwuT/UQGNAoePd4Hcl41AHD1wE2ugFYMVUdgA7QDUe2EJvlIEyV9gB61iIm6NH1DC8HYJMnVQ9VHUAtPaNg5AIAXXpP4NPsjugAAAAASUVORK5CYII=";
+const TIMEOUT_COMPANION_NEUTRAL_SPRITE: &str = "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAApElEQVR42mNgGAWjYBQMFfD/asJ/WqrHaxA6Rpavjvn/nxT1VHEAyFJcmKoOwGYYPkfgUz80Q2BQOADZYHwWY3MIjE2WxWum/v+PjEmxHIbRzaDYAXJycmCMy0J0eZo4AATwOQBZnuoOGNAoePd4Hcl4eDvg/6S1ePk0dYCNbgBOPHyiAB2Q4wCqtAfQsxYxFqPrGV4OwCZPqh6qOoBaekbByAUAnY5G6OllDUkAAAAASUVORK5CYII=";
+const TIMEOUT_COMPANION_HAPPY_SPRITE: &str = "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAAvElEQVR42mNgGAWjYBQMFfD/asJ/WqrHaxA6Rpavjvn/nxT1VHEAyFJcmKoOwGYYPkfgUz80Q2BQOADZYHwWY3MIjE2WxWum/v+PjEmxHIbRzaDYAXJycmCMy0J0eZo4AATwOQBZnuoOsNENIBjsyGqo6oB3j9eBMcgCGBsdo8vRxAGkYJo54P+ktVgtRBcfviGAKy1QNQ2gA1yJDhmjy1OlPYCezYgJenQ9w8sB2ORJ1UNVB1BLzygYuQAAmLxC6PcDH7YAAAAASUVORK5CYII=";
+const TIMEOUT_COMPANION_ANGRY_SPRITE: &str = "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAArklEQVR42mNgGAWjYBQMFfD/asJ/WqrHaxA6Rpavjvn/nxT1VHEAyFJcmKoOwGYYPkfgUz80Q2BQOADZYHwWY3MIjE2WxWum/v+PjG10A8CYkMXI6tDNoMgBMAvk5ORwWo4uRxMHgIP3P5YgxyJGMwcQi6nqgHeP15GMRx1Acwf8T3ZHoenmAJCFuDDVHIAOyIkCqrQH0LMWMRaj6xleDsAmT6oeqjqAWnpGwcgFAAfTTcoNBh/0AAAAAElFTkSuQmCC";
+const TIMEOUT_COMPANION_SLEEPY_SPRITE: &str = "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAApElEQVR42mNgGAWjYBQMFfD/asJ/WqrHaxA6Rpavjvn/nxT1VHEAyFJcmKoOwGYYPkfgUz80Q2BQOADZYHwWY3MIjE2WxWum/v+PjEmxHIbRzaDYATU7CFuKrIaqDgAZjIyxWYwuT/UQGNAoePd4Hcl41AHD1wE2ugFYMVUdgA7QDUe2EJvlIEyV9gB61iIm6NH1DC8HYJMnVQ9VHUAtPaNg5AIAXXpP4NPsjugAAAAASUVORK5CYII=";
 
 pub fn timeout_companion_defaults() -> AppSpriteDefaults {
     AppSpriteDefaults {
@@ -199,7 +195,9 @@ pub fn starter_character_defaults() -> Vec<CharacterRecord> {
     vec![
         CharacterRecord {
             id: "starter_violet_crystal".to_string(),
-            description: "A violet crystal dragon with lantern eyes and a careful, observant posture.".to_string(),
+            description:
+                "A violet crystal dragon with lantern eyes and a careful, observant posture."
+                    .to_string(),
             sprites: defaults.clone(),
             remaining_sprite_regenerations: 1,
             created_at: "2026-01-01T00:00:00Z".to_string(),
@@ -208,7 +206,9 @@ pub fn starter_character_defaults() -> Vec<CharacterRecord> {
         },
         CharacterRecord {
             id: "starter_moss_forest".to_string(),
-            description: "A mossy forest dragon with fern-like frills and a warm trail-guide demeanor.".to_string(),
+            description:
+                "A mossy forest dragon with fern-like frills and a warm trail-guide demeanor."
+                    .to_string(),
             sprites: defaults.clone(),
             remaining_sprite_regenerations: 1,
             created_at: "2026-01-01T00:00:00Z".to_string(),
@@ -217,7 +217,9 @@ pub fn starter_character_defaults() -> Vec<CharacterRecord> {
         },
         CharacterRecord {
             id: "starter_sunset_coral".to_string(),
-            description: "A coral sunset dragon with tide-polished scales and a bright show-off streak.".to_string(),
+            description:
+                "A coral sunset dragon with tide-polished scales and a bright show-off streak."
+                    .to_string(),
             sprites: defaults.clone(),
             remaining_sprite_regenerations: 1,
             created_at: "2026-01-01T00:00:00Z".to_string(),
@@ -226,7 +228,9 @@ pub fn starter_character_defaults() -> Vec<CharacterRecord> {
         },
         CharacterRecord {
             id: "starter_midnight_moon".to_string(),
-            description: "A midnight moon dragon with silver horns, soft wings, and a nocturnal calm.".to_string(),
+            description:
+                "A midnight moon dragon with silver horns, soft wings, and a nocturnal calm."
+                    .to_string(),
             sprites: defaults,
             remaining_sprite_regenerations: 1,
             created_at: "2026-01-01T00:00:00Z".to_string(),
@@ -376,16 +380,22 @@ fn open_workshop_summary_from_session(session: &WorkshopSession) -> Option<OpenW
     })
 }
 
-fn is_older_open_workshop_cursor(created_at: &str, session_code: &str, cursor: &OpenWorkshopCursor) -> bool {
+fn is_older_open_workshop_cursor(
+    created_at: &str,
+    session_code: &str,
+    cursor: &OpenWorkshopCursor,
+) -> bool {
     created_at < cursor.created_at.as_str()
-        || (created_at == cursor.created_at.as_str()
-            && session_code > cursor.session_code.as_str())
+        || (created_at == cursor.created_at.as_str() && session_code > cursor.session_code.as_str())
 }
 
-fn is_newer_open_workshop_cursor(created_at: &str, session_code: &str, cursor: &OpenWorkshopCursor) -> bool {
+fn is_newer_open_workshop_cursor(
+    created_at: &str,
+    session_code: &str,
+    cursor: &OpenWorkshopCursor,
+) -> bool {
     created_at > cursor.created_at.as_str()
-        || (created_at == cursor.created_at.as_str()
-            && session_code < cursor.session_code.as_str())
+        || (created_at == cursor.created_at.as_str() && session_code < cursor.session_code.as_str())
 }
 
 pub trait SessionStore: Send + Sync {
@@ -516,7 +526,9 @@ pub trait SessionStore: Send + Sync {
     fn load_app_sprite_defaults(
         &self,
         key: &str,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<AppSpriteDefaults>, PersistenceError>> + Send + '_>>;
+    ) -> Pin<
+        Box<dyn Future<Output = Result<Option<AppSpriteDefaults>, PersistenceError>> + Send + '_>,
+    >;
     fn load_character(
         &self,
         character_id: &str,
@@ -614,9 +626,8 @@ pub trait SessionStore: Send + Sync {
         session_code: &str,
     ) -> Pin<
         Box<
-            dyn Future<
-                    Output = Result<Vec<RealtimeConnectionRegistration>, PersistenceError>,
-                > + Send
+            dyn Future<Output = Result<Vec<RealtimeConnectionRegistration>, PersistenceError>>
+                + Send
                 + '_,
         >,
     >;
@@ -668,7 +679,10 @@ impl InMemorySessionStore {
         store
     }
 
-    pub fn seed_app_sprite_defaults(&self, defaults: AppSpriteDefaults) -> Result<(), PersistenceError> {
+    pub fn seed_app_sprite_defaults(
+        &self,
+        defaults: AppSpriteDefaults,
+    ) -> Result<(), PersistenceError> {
         self.app_sprite_defaults_by_key
             .write()
             .map_err(|_| PersistenceError::LockPoisoned)?
@@ -1596,7 +1610,9 @@ impl SessionStore for PostgresSessionStore {
     fn load_app_sprite_defaults(
         &self,
         key: &str,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<AppSpriteDefaults>, PersistenceError>> + Send + '_>> {
+    ) -> Pin<
+        Box<dyn Future<Output = Result<Option<AppSpriteDefaults>, PersistenceError>> + Send + '_>,
+    > {
         let key = key.to_string();
         Box::pin(async move {
             use sqlx::Row;
@@ -1623,7 +1639,8 @@ impl SessionStore for PostgresSessionStore {
     fn load_character(
         &self,
         character_id: &str,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<CharacterRecord>, PersistenceError>> + Send + '_>> {
+    ) -> Pin<Box<dyn Future<Output = Result<Option<CharacterRecord>, PersistenceError>> + Send + '_>>
+    {
         let character_id = character_id.to_string();
         Box::pin(async move {
             let row = sqlx::query(
@@ -1653,7 +1670,8 @@ impl SessionStore for PostgresSessionStore {
 
     fn list_characters(
         &self,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<CharacterRecord>, PersistenceError>> + Send + '_>> {
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<CharacterRecord>, PersistenceError>> + Send + '_>>
+    {
         Box::pin(async move {
             let rows = sqlx::query(
                 "
@@ -1995,9 +2013,8 @@ impl SessionStore for PostgresSessionStore {
         session_code: &str,
     ) -> Pin<
         Box<
-            dyn Future<
-                    Output = Result<Vec<RealtimeConnectionRegistration>, PersistenceError>,
-                > + Send
+            dyn Future<Output = Result<Vec<RealtimeConnectionRegistration>, PersistenceError>>
+                + Send
                 + '_,
         >,
     > {
@@ -2923,7 +2940,9 @@ impl SessionStore for InMemorySessionStore {
     fn load_app_sprite_defaults(
         &self,
         key: &str,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<AppSpriteDefaults>, PersistenceError>> + Send + '_>> {
+    ) -> Pin<
+        Box<dyn Future<Output = Result<Option<AppSpriteDefaults>, PersistenceError>> + Send + '_>,
+    > {
         let key = key.to_string();
         Box::pin(async move {
             let defaults = self
@@ -2939,7 +2958,8 @@ impl SessionStore for InMemorySessionStore {
     fn load_character(
         &self,
         character_id: &str,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<CharacterRecord>, PersistenceError>> + Send + '_>> {
+    ) -> Pin<Box<dyn Future<Output = Result<Option<CharacterRecord>, PersistenceError>> + Send + '_>>
+    {
         let character_id = character_id.to_string();
         Box::pin(async move {
             let character = self
@@ -2954,7 +2974,8 @@ impl SessionStore for InMemorySessionStore {
 
     fn list_characters(
         &self,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<CharacterRecord>, PersistenceError>> + Send + '_>> {
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<CharacterRecord>, PersistenceError>> + Send + '_>>
+    {
         Box::pin(async move {
             let mut characters = self
                 .characters_by_id
@@ -3204,9 +3225,8 @@ impl SessionStore for InMemorySessionStore {
         session_code: &str,
     ) -> Pin<
         Box<
-            dyn Future<
-                    Output = Result<Vec<RealtimeConnectionRegistration>, PersistenceError>,
-                > + Send
+            dyn Future<Output = Result<Vec<RealtimeConnectionRegistration>, PersistenceError>>
+                + Send
                 + '_,
         >,
     > {
@@ -3238,8 +3258,10 @@ impl SessionStore for InMemorySessionStore {
                         registration.session_code.clone(),
                         registration.player_id.clone(),
                     ));
-                    retired_connections
-                        .insert(registration.connection_id.clone(), registration.replica_id.clone());
+                    retired_connections.insert(
+                        registration.connection_id.clone(),
+                        registration.replica_id.clone(),
+                    );
                     registrations.push(registration);
                 }
             }
@@ -4539,7 +4561,10 @@ mod tests {
             .expect("first page");
 
         assert_eq!(page.rows.len(), OPEN_WORKSHOPS_PAGE_SIZE);
-        assert!(!page.has_more_after, "no older rows exist beyond the last row on the page");
+        assert!(
+            !page.has_more_after,
+            "no older rows exist beyond the last row on the page"
+        );
         assert!(!page.has_more_before, "First page has no newer rows");
     }
 

@@ -25,10 +25,9 @@ use protocol::{
     SPRITE_ATELIER_QUEUED_NOTICE_MESSAGE, SelectCharacterRequest, SessionArtifactKind,
     SessionArtifactRecord, SessionCommand, SessionNoticeCode, SpriteSheetRequest,
     SpriteSheetResult, SpriteSheetSuccess, VotePayload, WorkshopCommandRequest,
-    WorkshopCommandResult, WorkshopCommandSuccess, WorkshopCreateResult,
-    WorkshopCreateSuccess, WorkshopError, WorkshopJoinResult, WorkshopJoinSuccess,
-    WorkshopJudgeBundleRequest, WorkshopJudgeBundleResult,
-    WorkshopJudgeBundleSuccess,
+    WorkshopCommandResult, WorkshopCommandSuccess, WorkshopCreateResult, WorkshopCreateSuccess,
+    WorkshopError, WorkshopJoinResult, WorkshopJoinSuccess, WorkshopJudgeBundleRequest,
+    WorkshopJudgeBundleResult, WorkshopJudgeBundleSuccess,
 };
 use security::{FixedWindowRateLimiter, OriginPolicy};
 use serde_json::json;
@@ -907,7 +906,11 @@ pub(crate) async fn create_workshop_lobby(
         }),
     };
 
-    if let Err(error) = state.store.save_session_with_artifact(&workshop, &artifact).await {
+    if let Err(error) = state
+        .store
+        .save_session_with_artifact(&workshop, &artifact)
+        .await
+    {
         return internal_create_error(format!("failed to persist workshop creation: {error}"));
     }
 
@@ -1465,6 +1468,14 @@ pub(crate) async fn workshop_command(
                 if !is_owned && !is_starter {
                     return bad_command_request("You do not own this character.");
                 }
+                if is_starter
+                    && session.players.values().any(|player| {
+                        player.id != identity.player_id
+                            && player.character_id.as_deref() == Some(character_id)
+                    })
+                {
+                    return bad_command_request("That starter is already taken in this workshop.");
+                }
                 let character = record.profile();
 
                 if let Err(error) =
@@ -1817,6 +1828,7 @@ pub(crate) async fn workshop_command(
                         DomainError::SelfVoteForbidden => {
                             "You cannot vote for your own dragon.".to_string()
                         }
+                        DomainError::VotingClosed => "Voting is already closed.".to_string(),
                         _ => error.to_string(),
                     };
                     return conflict_command_request(&message);
@@ -2478,6 +2490,26 @@ pub(crate) async fn llm_judge(
         return internal_llm_judge_error(format!("failed to touch player identity: {error}"));
     }
 
+    let session = match ensure_session_cached(&state, session_code).await {
+        Ok(true) => {
+            let sessions = state.sessions.lock().await;
+            sessions.get(session_code).cloned()
+        }
+        Ok(false) => None,
+        Err(error) => {
+            return internal_llm_judge_error(format!("failed to load session: {error}"));
+        }
+    };
+    let Some(session) = session else {
+        return bad_llm_judge_request("Workshop not found.");
+    };
+    if session.host_player_id.as_deref() != Some(identity.player_id.as_str()) {
+        return bad_llm_judge_request("Only the host can run judge scoring.");
+    }
+    if session.phase != protocol::Phase::End {
+        return conflict_llm_judge_request("Judge scoring is only available after the game ends.");
+    }
+
     let evaluation = match run_judge_for_session(&state, session_code, &identity.player_id).await {
         Ok(evaluation) => evaluation,
         Err(error) => return internal_llm_judge_error(error),
@@ -2782,10 +2814,9 @@ async fn generate_or_update_character_sprite_sheet(
         );
     }
 
-    let existing_character_created_at = match current_character.as_ref() {
+    let existing_character_record = match current_character.as_ref() {
         Some(character) => match state.store.load_character(&character.id).await {
-            Ok(Some(record)) => Some(record.created_at),
-            Ok(None) => None,
+            Ok(record) => record,
             Err(error) => {
                 return internal_character_sprite_sheet_error(format!(
                     "failed to load character: {error}"
@@ -2794,6 +2825,13 @@ async fn generate_or_update_character_sprite_sheet(
         },
         None => None,
     };
+
+    let existing_character_created_at = existing_character_record
+        .as_ref()
+        .map(|record| record.created_at.clone());
+    let existing_owner_account_id = existing_character_record
+        .as_ref()
+        .and_then(|record| record.owner_account_id.clone());
 
     let description = request.description.trim();
     if description.is_empty() {
@@ -2842,7 +2880,7 @@ async fn generate_or_update_character_sprite_sheet(
                 .clone()
                 .unwrap_or_else(|| timestamp.clone()),
             updated_at: timestamp,
-            owner_account_id: None,
+            owner_account_id: existing_owner_account_id,
         };
         if let Err(error) =
             session.assign_player_character(&identity.player_id, character_record.profile())
@@ -2941,6 +2979,16 @@ fn reject_disallowed_llm_image_origin(
 fn bad_llm_judge_request(message: &str) -> (StatusCode, Json<LlmJudgeResult>) {
     (
         StatusCode::BAD_REQUEST,
+        Json(LlmJudgeResult::Error(WorkshopError {
+            ok: false,
+            error: message.to_string(),
+        })),
+    )
+}
+
+fn conflict_llm_judge_request(message: &str) -> (StatusCode, Json<LlmJudgeResult>) {
+    (
+        StatusCode::CONFLICT,
         Json(LlmJudgeResult::Error(WorkshopError {
             ok: false,
             error: message.to_string(),
@@ -3400,16 +3448,17 @@ pub(crate) async fn delete_workshop(
         return (status, Json(json!({ "error": error }))).into_response();
     }
 
-    let (_, _write_guard, write_lease) = match SessionWriteLease::acquire(&state, &session_code).await {
-        Ok(guard) => guard,
-        Err(error) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": format!("failed to acquire session lease: {error}") })),
-            )
-                .into_response();
-        }
-    };
+    let (_, _write_guard, write_lease) =
+        match SessionWriteLease::acquire(&state, &session_code).await {
+            Ok(guard) => guard,
+            Err(error) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "error": format!("failed to acquire session lease: {error}") })),
+                )
+                    .into_response();
+            }
+        };
     if let Err(error) = write_lease.ensure_active() {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -3423,7 +3472,9 @@ pub(crate) async fn delete_workshop(
         Err(error) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": format!("failed to reload session before delete: {error}") })),
+                Json(
+                    json!({ "error": format!("failed to reload session before delete: {error}") }),
+                ),
             )
                 .into_response();
         }

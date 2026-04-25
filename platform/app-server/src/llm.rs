@@ -16,8 +16,7 @@ use std::{
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
-pub(crate) struct ImageGenerationLease {
-}
+pub(crate) struct ImageGenerationLease {}
 
 // ---------------------------------------------------------------------------
 // Provider pool
@@ -765,11 +764,10 @@ impl LlmClient {
         let system_instruction = build_judge_system_instruction();
         let prompt = build_judge_user_prompt(bundle);
         let mut last_error = String::new();
-        let start_index = self
-            .judge_provider_cursor
-            .fetch_add(1, Ordering::Relaxed);
+        let start_index = self.judge_provider_cursor.fetch_add(1, Ordering::Relaxed);
 
-        for provider_index in provider_attempt_indices(self.config.judge_providers.len(), start_index)
+        for provider_index in
+            provider_attempt_indices(self.config.judge_providers.len(), start_index)
         {
             let provider = &self.config.judge_providers[provider_index];
             info!(
@@ -848,20 +846,15 @@ impl LlmClient {
 
         for attempt in 0..=MAX_RETRIES {
             if attempt > 0 {
-                let backoff_ms =
-                    BASE_DELAY_MS * 2u64.pow(attempt - 1) + rand_jitter_ms(500);
+                let backoff_ms = BASE_DELAY_MS * 2u64.pow(attempt - 1) + rand_jitter_ms(500);
                 warn!(
                     attempt,
-                    backoff_ms,
-                    "image generation rate-limited, retrying after backoff"
+                    backoff_ms, "image generation rate-limited, retrying after backoff"
                 );
                 tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
             }
 
-            match self
-                .try_image_generation(system_instruction, prompt)
-                .await
-            {
+            match self.try_image_generation(system_instruction, prompt).await {
                 Ok(result) => return Ok(result),
                 Err(e) if e.is_rate_limited() && attempt < MAX_RETRIES => {
                     last_error = e;
@@ -882,11 +875,10 @@ impl LlmClient {
         prompt: &str,
     ) -> Result<(String, String), LlmError> {
         let mut last_error = String::new();
-        let start_index = self
-            .image_provider_cursor
-            .fetch_add(1, Ordering::Relaxed);
+        let start_index = self.image_provider_cursor.fetch_add(1, Ordering::Relaxed);
 
-        for provider_index in provider_attempt_indices(self.config.image_providers.len(), start_index)
+        for provider_index in
+            provider_attempt_indices(self.config.image_providers.len(), start_index)
         {
             let provider = &self.config.image_providers[provider_index];
             info!(

@@ -834,7 +834,7 @@ async fn attach_ws_session(
                         "ws attach rejected: session identity does not match authenticated account cookie"
                     );
                     return Err(
-                        "Session identity does not match authenticated account.".to_string(),
+                        "Session identity does not match authenticated account.".to_string()
                     );
                 }
             }

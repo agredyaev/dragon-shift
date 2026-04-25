@@ -931,7 +931,10 @@ mod postgres_tests {
 
     #[tokio::test]
     async fn deleting_postgres_realtime_connections_for_session_retires_all_connections() {
-        let store = setup_store("deleting_postgres_realtime_connections_for_session_retires_all_connections").await;
+        let store = setup_store(
+            "deleting_postgres_realtime_connections_for_session_retires_all_connections",
+        )
+        .await;
 
         store
             .claim_realtime_connection(&crate::RealtimeConnectionRegistration {
@@ -1213,7 +1216,7 @@ mod postgres_tests {
     // Postgres `Before` branch dropped the wrong side of the +1 sentinel
     // and silently lost the row adjacent to the cursor.
 
-    use crate::{OpenWorkshopsPaging, OPEN_WORKSHOPS_PAGE_SIZE};
+    use crate::{OPEN_WORKSHOPS_PAGE_SIZE, OpenWorkshopsPaging};
     use protocol::OpenWorkshopCursor;
 
     /// Build a Lobby session with a single host player and a caller-supplied
@@ -1258,7 +1261,8 @@ mod postgres_tests {
     #[ignore]
     async fn list_open_workshops_postgres_first_page_with_more_than_page_size_rows() {
         let store =
-            setup_store("list_open_workshops_postgres_first_page_with_more_than_page_size_rows").await;
+            setup_store("list_open_workshops_postgres_first_page_with_more_than_page_size_rows")
+                .await;
         pg_seed_lobbies(&store, 75, 1_000).await;
 
         let page = store
@@ -1314,10 +1318,9 @@ mod postgres_tests {
         // the wrong half of the +1 sentinel, losing the row adjacent to the
         // cursor. A round trip (First → After → Before) must return page 1
         // exactly.
-        let store = setup_store(
-            "list_open_workshops_postgres_before_cursor_round_trip_returns_same_page",
-        )
-        .await;
+        let store =
+            setup_store("list_open_workshops_postgres_before_cursor_round_trip_returns_same_page")
+                .await;
         // Seed 151 rows (≥ 3 × page_size + 1) so both After and Before
         // results have strictly-more rows available in their respective
         // directions when probed mid-stream.

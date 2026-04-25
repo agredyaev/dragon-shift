@@ -32,8 +32,13 @@ pub fn hash_password(plaintext: &str) -> Result<String, PasswordHashError> {
     use argon2::{Algorithm, Argon2, Params, Version};
     use password_hash::{PasswordHasher, SaltString, rand_core::OsRng};
 
-    let params = Params::new(ARGON2_MEMORY_KIB, ARGON2_ITERATIONS, ARGON2_PARALLELISM, None)
-        .map_err(|_| PasswordHashError::InvalidParams)?;
+    let params = Params::new(
+        ARGON2_MEMORY_KIB,
+        ARGON2_ITERATIONS,
+        ARGON2_PARALLELISM,
+        None,
+    )
+    .map_err(|_| PasswordHashError::InvalidParams)?;
     let hasher = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
     let salt = SaltString::generate(&mut OsRng);
     hasher

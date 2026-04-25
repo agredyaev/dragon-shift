@@ -120,10 +120,9 @@ impl FromRequestParts<AppState> for AccountSession {
     ) -> Result<Self, Self::Rejection> {
         // `SignedCookieJar` reads the request's Cookie header and validates
         // signatures against the key pulled from AppState via FromRef.
-        let jar =
-            SignedCookieJar::<Key>::from_request_parts(parts, state)
-                .await
-                .map_err(|_: Infallible| AuthRejection::Unauthenticated)?;
+        let jar = SignedCookieJar::<Key>::from_request_parts(parts, state)
+            .await
+            .map_err(|_: Infallible| AuthRejection::Unauthenticated)?;
 
         let Some(cookie) = jar.get(SESSION_COOKIE_NAME) else {
             return Err(AuthRejection::Unauthenticated);
@@ -161,7 +160,10 @@ pub(crate) enum AuthRejection {
     /// Cookie was valid but references a deleted / nonexistent account.
     /// Carries the signing key + production flag so the response can issue a
     /// proper Set-Cookie that clears the stale session.
-    UnknownAccount { key: Key, is_production: bool },
+    UnknownAccount {
+        key: Key,
+        is_production: bool,
+    },
     Internal,
 }
 
@@ -369,10 +371,7 @@ pub(crate) async fn signin(
 ///
 /// Always returns 204 No Content; idempotent regardless of whether a valid
 /// cookie was present.
-pub(crate) async fn logout(
-    State(state): State<AppState>,
-    jar: SignedCookieJar<Key>,
-) -> Response {
+pub(crate) async fn logout(State(state): State<AppState>, jar: SignedCookieJar<Key>) -> Response {
     let jar = jar.remove(build_logout_cookie(state.config.is_production));
     (StatusCode::NO_CONTENT, jar).into_response()
 }

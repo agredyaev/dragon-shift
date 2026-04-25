@@ -10,6 +10,7 @@ use sqlx::PgPool;
 use std::env;
 use std::fs;
 use std::future::Future;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use tokio::net::TcpStream;
@@ -497,19 +498,45 @@ fn run_tool(program: &str, args: &[&str]) -> Result<(), String> {
 }
 
 fn build_web_bundle(config: WebBuildConfig) -> Result<(), String> {
-    if config.out_dir.exists() {
-        fs::remove_dir_all(&config.out_dir).map_err(|error| {
+    let parent_dir = config
+        .out_dir
+        .parent()
+        .ok_or_else(|| {
             format!(
-                "failed to clear app-web output dir {}: {error}",
+                "app-web output dir has no parent: {}",
                 config.out_dir.display()
+            )
+        })?
+        .to_path_buf();
+    let staging_dir = parent_dir.join(format!(
+        ".{}-staging",
+        config
+            .out_dir
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("app-web-dist")
+    ));
+    let backup_dir = parent_dir.join(format!(
+        ".{}-backup",
+        config
+            .out_dir
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("app-web-dist")
+    ));
+    if staging_dir.exists() {
+        fs::remove_dir_all(&staging_dir).map_err(|error| {
+            format!(
+                "failed to clear temporary app-web output dir {}: {error}",
+                staging_dir.display()
             )
         })?;
     }
 
-    fs::create_dir_all(&config.out_dir).map_err(|error| {
+    fs::create_dir_all(&staging_dir).map_err(|error| {
         format!(
-            "failed to create app-web output dir {}: {error}",
-            config.out_dir.display()
+            "failed to create temporary app-web output dir {}: {error}",
+            staging_dir.display()
         )
     })?;
 
@@ -536,7 +563,7 @@ fn build_web_bundle(config: WebBuildConfig) -> Result<(), String> {
         "--out-name".to_string(),
         "app-web".to_string(),
         "--out-dir".to_string(),
-        config.out_dir.to_string_lossy().into_owned(),
+        staging_dir.to_string_lossy().into_owned(),
         wasm_input.to_string_lossy().into_owned(),
     ];
     run_tool_owned("wasm-bindgen", wasm_bindgen_args).map_err(|error| {
@@ -545,7 +572,7 @@ fn build_web_bundle(config: WebBuildConfig) -> Result<(), String> {
         )
     })?;
 
-    let wasm_bg = config.out_dir.join("app-web_bg.wasm");
+    let wasm_bg = staging_dir.join("app-web_bg.wasm");
     let raw_wasm_bytes = fs::metadata(&wasm_input).map(|m| m.len()).unwrap_or(0);
     let bindgen_wasm_bytes = fs::metadata(&wasm_bg).map(|m| m.len()).unwrap_or(0);
     let skip_wasm_opt = env_flag_enabled("XTASK_SKIP_WASM_OPT");
@@ -584,11 +611,11 @@ fn build_web_bundle(config: WebBuildConfig) -> Result<(), String> {
     let opt_saved_pct = saved_percent(bindgen_wasm_bytes, post_opt_bytes);
     let total_saved_pct = saved_percent(raw_wasm_bytes, post_opt_bytes);
 
-    copy_app_web_static_assets(&config.out_dir)?;
-    write_app_web_index_html(&config.out_dir)?;
+    copy_app_web_static_assets(&staging_dir)?;
+    write_app_web_index_html(&staging_dir)?;
 
     // ── WASM bundle size gate ──────────────────────────────────────────
-    let wasm_output = config.out_dir.join("app-web_bg.wasm");
+    let wasm_output = staging_dir.join("app-web_bg.wasm");
     let wasm_size_bytes = fs::metadata(&wasm_output).map(|m| m.len()).unwrap_or(0);
     let wasm_size_kb = wasm_size_bytes / 1024;
     const WASM_SIZE_WARN_KB: u64 = 2048; // 2 MB — warn threshold
@@ -606,8 +633,62 @@ fn build_web_bundle(config: WebBuildConfig) -> Result<(), String> {
         None
     };
 
-    let js_output = config.out_dir.join("app-web.js");
+    let js_output = staging_dir.join("app-web.js");
     let js_size_bytes = fs::metadata(&js_output).map(|m| m.len()).unwrap_or(0);
+
+    if backup_dir.exists() {
+        fs::remove_dir_all(&backup_dir).map_err(|error| {
+            format!(
+                "failed to clear app-web backup dir {}: {error}",
+                backup_dir.display()
+            )
+        })?;
+    }
+
+    fs::create_dir_all(&parent_dir).map_err(|error| {
+        format!(
+            "failed to create app-web output parent dir {}: {error}",
+            parent_dir.display()
+        )
+    })?;
+
+    let had_previous_out_dir = config.out_dir.exists();
+    if had_previous_out_dir {
+        fs::rename(&config.out_dir, &backup_dir).map_err(|error| {
+            format!(
+                "failed to move existing app-web bundle out of the way {} -> {}: {error}",
+                config.out_dir.display(),
+                backup_dir.display()
+            )
+        })?;
+    }
+
+    if let Err(error) = fs::rename(&staging_dir, &config.out_dir) {
+        if had_previous_out_dir {
+            let restore_result = fs::rename(&backup_dir, &config.out_dir);
+            if let Err(restore_error) = restore_result {
+                return Err(format!(
+                    "failed to move built app-web bundle into {}: {error}; also failed to restore previous bundle: {restore_error}",
+                    config.out_dir.display()
+                ));
+            }
+        } else if error.kind() != ErrorKind::NotFound && backup_dir.exists() {
+            let _ = fs::remove_dir_all(&backup_dir);
+        }
+        return Err(format!(
+            "failed to move built app-web bundle into {}: {error}",
+            config.out_dir.display()
+        ));
+    }
+
+    if backup_dir.exists() {
+        fs::remove_dir_all(&backup_dir).map_err(|error| {
+            format!(
+                "failed to remove app-web backup dir {}: {error}",
+                backup_dir.display()
+            )
+        })?;
+    }
 
     let mut result = json!({
         "ok": true,
@@ -967,8 +1048,8 @@ async fn smoke_sprite_load(config: SpriteLoadConfig) -> Result<(), String> {
     // Phase 2: fire all sprite-sheet requests concurrently.
 
     let gen_start = std::time::Instant::now();
-    let sprite_results = futures_util::future::join_all(sessions.iter().enumerate().map(
-        |(index, session)| {
+    let sprite_results =
+        futures_util::future::join_all(sessions.iter().enumerate().map(|(index, session)| {
             let client = client.clone();
             let base_url = config.base_url.clone();
             let description = format!("Smoke test dragon {}", index + 1);
@@ -1017,12 +1098,16 @@ async fn smoke_sprite_load(config: SpriteLoadConfig) -> Result<(), String> {
                             ),
                         }
                     }
-                    Err(req_err) => (index, elapsed_ms, 0, Err(format!("request error: {req_err}"))),
+                    Err(req_err) => (
+                        index,
+                        elapsed_ms,
+                        0,
+                        Err(format!("request error: {req_err}")),
+                    ),
                 }
             }
-        },
-    ))
-    .await;
+        }))
+        .await;
 
     let gen_ms = gen_start.elapsed().as_millis();
 
@@ -1051,7 +1136,10 @@ async fn smoke_sprite_load(config: SpriteLoadConfig) -> Result<(), String> {
     }
 
     success_times.sort();
-    let p50 = success_times.get(success_times.len() / 2).copied().unwrap_or(0);
+    let p50 = success_times
+        .get(success_times.len() / 2)
+        .copied()
+        .unwrap_or(0);
     let p95 = success_times
         .get((success_times.len() as f64 * 0.95) as usize)
         .copied()
@@ -1884,10 +1972,7 @@ async fn sign_in_smoke_client(base_url: &str, name: &str) -> Result<reqwest::Cli
     Ok(client)
 }
 
-async fn create_workshop_lobby(
-    client: &reqwest::Client,
-    base_url: &str,
-)-> Result<String, String> {
+async fn create_workshop_lobby(client: &reqwest::Client, base_url: &str) -> Result<String, String> {
     let response = client
         .post(format!("{base_url}/api/workshops/lobby"))
         .header("Origin", base_url)
