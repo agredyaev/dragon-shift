@@ -1,29 +1,28 @@
 use dioxus::prelude::*;
 
-use crate::flows::{OpenWorkshopsPaging, load_my_characters_flow, load_open_workshops_flow};
-use crate::state::{IdentityState, OperationState, ShellScreen};
+use crate::flows::{
+    OpenWorkshopsPaging, load_open_workshops_flow, submit_create_workshop_flow,
+    submit_delete_workshop_flow,
+};
+use crate::state::{
+    IdentityState, OperationState, PendingFlow, ShellScreen, navigate_to_screen,
+};
 
 #[component]
 pub fn AccountHomeView(identity: Signal<IdentityState>, ops: Signal<OperationState>) -> Element {
     // Account name is surfaced by the app bar's disclosure menu
     // trigger; no need to read it here any more.
     let pending = ops.read().pending_flow.is_some();
+    let delete_pending = ops.read().pending_flow == Some(PendingFlow::DeleteWorkshop);
     let open_workshops = ops.read().open_workshops.clone();
-    let my_characters_empty = ops.read().my_characters.is_empty();
     let next_cursor = ops.read().open_workshops_next_cursor.clone();
     let prev_cursor = ops.read().open_workshops_prev_cursor.clone();
     let has_next = next_cursor.is_some();
     let has_prev = prev_cursor.is_some();
-    // Zero-state: no characters AND no visible open workshops. Tier-1
-    // tradeoff (per §10 step 8): we don't yet distinguish "loading" from
-    // "truly empty" — ListLoadState arrives in Tier 4. Until the initial
-    // `load_my_characters_flow` resolves we keep rendering the 3-card
-    // layout so returning users never see a misleading "create your
-    // first dragon" flash when `state.rs` clears `my_characters` on a
-    // non-reconnect session reset.
-    let mut characters_loaded = use_signal(|| false);
-    let is_first_visit =
-        *characters_loaded.read() && my_characters_empty && open_workshops.is_empty();
+    let show_pager = has_prev || has_next;
+    let pager_prev_cursor = prev_cursor.clone();
+    let pager_next_cursor = next_cursor.clone();
+    let mut pending_delete_workshop_code = use_signal(|| None::<String>);
 
     // Tracks the paging direction of the last user-initiated pager click
     // (or the initial mount). The 5s poll re-uses this instead of
@@ -31,14 +30,11 @@ pub fn AccountHomeView(identity: Signal<IdentityState>, ops: Signal<OperationSta
     // back to page 1 on every tick.
     let mut current_paging = use_signal(|| OpenWorkshopsPaging::First);
 
-    // Load characters + workshops on mount.
+    // Load open workshops on mount.
     let mut loaded = use_signal(|| false);
+    let initial_open_workshops_loaded = loaded.read().clone();
     if !*loaded.read() {
         loaded.set(true);
-        spawn(async move {
-            load_my_characters_flow(identity, ops).await;
-            characters_loaded.set(true);
-        });
         spawn(load_open_workshops_flow(
             identity,
             ops,
@@ -69,124 +65,116 @@ pub fn AccountHomeView(identity: Signal<IdentityState>, ops: Signal<OperationSta
         // bar (see UX_RECOMPOSE_v2 §4.A line 173).
         h1 { class: "sr-only", "Your workshops" }
 
-        if is_first_visit {
-            // Zero-state: single dominant CTA routing straight to
-            // character creation. No secondary tiles while the user has
-            // nothing to pick up.
-            section { class: "panel", "data-testid": "account-home-zero-state",
-                h2 { class: "panel__title", "Create your first dragon" }
+        if let Some(delete_code) = pending_delete_workshop_code.read().clone() {
+            div {
+                class: "modal-backdrop",
+                role: "presentation",
+                onclick: move |_| pending_delete_workshop_code.set(None),
+                div {
+                    class: "modal-card",
+                    role: "dialog",
+                    "aria-modal": "true",
+                    "aria-labelledby": "delete-workshop-modal-title",
+                    "aria-describedby": "delete-workshop-modal-body",
+                    onclick: move |event| event.stop_propagation(),
+                    h2 {
+                        id: "delete-workshop-modal-title",
+                        class: "panel__title modal-card__title",
+                        "Delete Workshop"
+                    }
+                    p {
+                        id: "delete-workshop-modal-body",
+                        class: "panel__body modal-card__body",
+                        "Delete this empty lobby workshop? This action cannot be undone."
+                    }
+                    div { class: "button-row modal-card__actions",
+                        button {
+                            class: "button button--secondary",
+                            disabled: delete_pending,
+                            onclick: move |_| pending_delete_workshop_code.set(None),
+                            "Cancel"
+                        }
+                        button {
+                            class: "button button--danger",
+                            disabled: delete_pending,
+                            onclick: move |_| {
+                                let paging = current_paging.read().clone();
+                                pending_delete_workshop_code.set(None);
+                                spawn(submit_delete_workshop_flow(
+                                    identity,
+                                    ops,
+                                    current_paging,
+                                    delete_code.clone(),
+                                    paging,
+                                ));
+                            },
+                            if delete_pending { "Deleting..." } else { "Delete" }
+                        }
+                    }
+                }
+            }
+        }
+
+        section { class: "grid",
+            // ---- Create Workshop ----
+            article { class: "panel",
+                h2 { class: "panel__title", "Create Workshop" }
                 p { class: "panel__body",
-                    "You'll need a dragon character before you can create or join a workshop."
+                    "Create a lobby now and join it later when you're ready to play."
                 }
-                div { class: "button-row",
-                    button {
-                        class: "button button--primary",
-                        "data-testid": "create-character-button",
-                        disabled: pending,
-                        onclick: move |_| {
-                            identity.with_mut(|id| {
-                                id.screen = ShellScreen::CreateCharacter;
-                            });
-                        },
-                        "Create a dragon"
-                    }
-                }
-            }
-        } else {
-            section { class: "grid",
-                // ---- Create Workshop ----
-                article { class: "panel",
-                    h2 { class: "panel__title", "Create Workshop" }
-                    div { class: "panel__stack",
-                        div { class: "button-row",
-                            button {
-                                class: "button button--primary",
-                                "data-testid": "create-workshop-button",
-                                disabled: pending,
-                                onclick: move |_| {
-                                    identity.with_mut(|id| {
-                                        id.screen = ShellScreen::PickCharacter {
-                                            workshop_code: None,
-                                        };
-                                    });
-                                },
-                                "Create Workshop"
-                            }
-                        }
-                    }
-                }
-
-                // ---- Create Character ----
-                article { class: "panel",
-                    h2 { class: "panel__title", "Create a dragon" }
-                    div { class: "panel__stack",
-                        div { class: "button-row",
-                            button {
-                                class: "button button--secondary",
-                                "data-testid": "create-character-button",
-                                disabled: pending,
-                                onclick: move |_| {
-                                    identity.with_mut(|id| {
-                                        id.screen = ShellScreen::CreateCharacter;
-                                    });
-                                },
-                                "Create a dragon"
-                            }
+                div { class: "panel__stack panel__stack--home-action",
+                    div { class: "button-row button-row--home-action",
+                        button {
+                            class: "button button--primary",
+                            "data-testid": "create-workshop-button",
+                            disabled: pending,
+                            onclick: move |_| {
+                                current_paging.set(OpenWorkshopsPaging::First);
+                                spawn(submit_create_workshop_flow(identity, ops));
+                            },
+                            "Create Workshop"
                         }
                     }
                 }
             }
 
-            section { class: "panel panel--wide", "data-testid": "open-workshops-panel",
-                h2 { class: "panel__title", "Open Workshops" }
-                div { class: "panel__stack",
-                    if open_workshops.is_empty() {
-                        p { class: "meta", "No open workshops at the moment." }
-                    } else {
-                        div { class: "roster",
-                            for workshop in open_workshops.iter() {
-                                {
-                                    let code = workshop.session_code.clone();
-                                    rsx! {
-                                        article { class: "roster__item",
-                                            div {
-                                                p { class: "roster__name", "{workshop.host_name}'s workshop" }
-                                                p { class: "roster__meta",
-                                                    "{workshop.player_count} player(s) \u{2014} Code: {workshop.session_code}"
-                                                }
-                                            }
-                                            button {
-                                                class: "button button--primary button--small",
-                                                "data-testid": "join-workshop-button",
-                                                disabled: pending,
-                                                onclick: move |_| {
-                                                    let c = code.clone();
-                                                    identity.with_mut(|id| {
-                                                        id.screen = ShellScreen::PickCharacter {
-                                                            workshop_code: Some(c),
-                                                        };
-                                                    });
-                                                },
-                                                "Join"
-                                            }
-                                        }
-                                    }
-                                }
-                            }
+            // ---- Create Character ----
+            article { class: "panel",
+                h2 { class: "panel__title", "Create a dragon" }
+                p { class: "panel__body",
+                    "Create your dragon now so you can jump into the game with a ready-to-play companion."
+                }
+                div { class: "panel__stack panel__stack--home-action",
+                    div { class: "button-row button-row--home-action",
+                        button {
+                            class: "button button--secondary",
+                            "data-testid": "create-character-button",
+                            disabled: pending,
+                            onclick: move |_| {
+                                identity.with_mut(|id| {
+                                    ops.with_mut(|o| {
+                                        navigate_to_screen(id, o, ShellScreen::CreateCharacter);
+                                    });
+                                });
+                            },
+                            "Create a dragon"
                         }
                     }
-                    // Prev / Next pager — rendered only when the
-                    // server returned at least one cursor. When both
-                    // are absent the single-page case skips the
-                    // wrapper entirely (M-5).
-                    if has_prev || has_next {
-                        div { class: "button-row",
+                }
+            }
+        }
+
+        section { class: "panel panel--wide", "data-testid": "open-workshops-panel",
+                div { class: "panel__header",
+                    h2 { class: "panel__title", "Open Workshops" }
+                    if show_pager {
+                        div { class: "button-row button-row--workshop-pager",
                             button {
                                 class: "button button--secondary button--small",
                                 "data-testid": "open-workshops-prev-button",
                                 disabled: pending || !has_prev,
                                 onclick: move |_| {
-                                    if let Some(cursor) = prev_cursor.clone() {
+                                    if let Some(cursor) = pager_prev_cursor.clone() {
                                         let paging = OpenWorkshopsPaging::Before(cursor);
                                         current_paging.set(paging.clone());
                                         spawn(load_open_workshops_flow(identity, ops, paging));
@@ -199,7 +187,7 @@ pub fn AccountHomeView(identity: Signal<IdentityState>, ops: Signal<OperationSta
                                 "data-testid": "open-workshops-next-button",
                                 disabled: pending || !has_next,
                                 onclick: move |_| {
-                                    if let Some(cursor) = next_cursor.clone() {
+                                    if let Some(cursor) = pager_next_cursor.clone() {
                                         let paging = OpenWorkshopsPaging::After(cursor);
                                         current_paging.set(paging.clone());
                                         spawn(load_open_workshops_flow(identity, ops, paging));
@@ -210,7 +198,65 @@ pub fn AccountHomeView(identity: Signal<IdentityState>, ops: Signal<OperationSta
                         }
                     }
                 }
-            }
+                div { class: "panel__stack",
+                    if open_workshops.is_empty() && initial_open_workshops_loaded {
+                        p { class: "meta", "No open workshops at the moment." }
+                    } else {
+                        div { class: "roster",
+                            for workshop in open_workshops.iter() {
+                                {
+                                    let code = workshop.session_code.clone();
+                                    let delete_code = workshop.session_code.clone();
+                                    let can_delete = workshop.can_delete;
+                                    rsx! {
+                                        article { class: "roster__item",
+                                            div {
+                                                p { class: "roster__name", "{workshop.host_name}'s workshop" }
+                                                p { class: "roster__meta",
+                                                    "{workshop.player_count} player(s) \u{2014} Code: {workshop.session_code}"
+                                                }
+                                            }
+                                            div { class: "button-row button-row--workshop-actions",
+                                                if can_delete {
+                                                    button {
+                                                        class: "button button--danger button--small",
+                                                        "data-testid": "delete-workshop-button",
+                                                        disabled: pending,
+                                                        onclick: move |_| {
+                                                            pending_delete_workshop_code
+                                                                .set(Some(delete_code.clone()));
+                                                        },
+                                                        if delete_pending { "Deleting..." } else { "Delete" }
+                                                    }
+                                                }
+                                                button {
+                                                    class: "button button--primary button--small",
+                                                    "data-testid": "join-workshop-button",
+                                                    disabled: pending,
+                                                    onclick: move |_| {
+                                                        let c = code.clone();
+                                                        identity.with_mut(|id| {
+                                                            ops.with_mut(|o| {
+                                                                navigate_to_screen(
+                                                                    id,
+                                                                    o,
+                                                                    ShellScreen::PickCharacter {
+                                                                        workshop_code: c,
+                                                                    },
+                                                                );
+                                                            });
+                                                        });
+                                                    },
+                                                    "Join"
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
         }
     }
 }

@@ -3,7 +3,7 @@ use protocol::{ClientGameState, JudgeBundle, SessionCommand};
 
 use crate::flows::submit_workshop_command;
 use crate::helpers::*;
-use crate::state::{IdentityState, OperationState};
+use crate::state::{ConnectionStatus, IdentityState, OperationState};
 
 const PROGRESS_STEPS: i32 = 20;
 
@@ -58,12 +58,24 @@ pub fn Phase2View(
     let handover_tags: Vec<String> = current_dragon(state)
         .map(|d| d.handover_tags.clone())
         .unwrap_or_default();
+    let session_code = state.session.code.clone();
 
     let achievements: Vec<String> = current_player(state)
         .map(|p| p.achievements.clone())
         .unwrap_or_default();
 
     let is_host = current_player(state).map(|p| p.is_host).unwrap_or(false);
+    let connection_status = identity.read().connection_status;
+    let connection_label = match connection_status {
+        ConnectionStatus::Offline => "Offline",
+        ConnectionStatus::Connecting => "Connecting",
+        ConnectionStatus::Connected => "Connected",
+    };
+    let connection_class = match connection_status {
+        ConnectionStatus::Offline => "status-offline",
+        ConnectionStatus::Connecting => "status-connecting",
+        ConnectionStatus::Connected => "status-connected",
+    };
 
     // Phase countdown (§10 step 9).
     let phase_countdown = phase_remaining_seconds(state, now_epoch_seconds()).map(format_mm_ss);
@@ -72,8 +84,16 @@ pub fn Phase2View(
     drop(gs);
 
     rsx! {
+        div { class: "sr-only", "data-testid": "workshop-code-badge", {session_code} }
+        div {
+            class: format!("sr-only {}", connection_class),
+            "data-testid": "connection-badge",
+            {connection_label}
+        }
+        div { class: "sr-only", "data-testid": "controls-panel", if is_host { "visible" } else { "hidden" } }
+
         // ---- Phase 2: 3-column grid layout (same as Phase 1) ----
-        div { class: "phase1-grid",
+        div { class: "phase1-grid", "data-testid": "session-panel",
             // ==== LEFT COLUMN: Dragon + Stats + Handover Notes (2/3 width) ====
             div { class: "phase1-dragon-col",
                 // Dragon info panel

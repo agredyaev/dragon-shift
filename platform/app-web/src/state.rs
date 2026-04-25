@@ -17,7 +17,7 @@ pub enum ShellScreen {
     SignIn,
     AccountHome,
     CreateCharacter,
-    PickCharacter { workshop_code: Option<String> },
+    PickCharacter { workshop_code: String },
     Session,
 }
 
@@ -34,6 +34,7 @@ pub enum PendingFlow {
     Create,
     Join,
     Reconnect,
+    DeleteWorkshop,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,6 +59,16 @@ pub enum SpriteGenerationStage {
 pub struct ShellNotice {
     pub tone: NoticeTone,
     pub message: String,
+    pub scope: NoticeScope,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NoticeScope {
+    SignIn,
+    AccountHome,
+    CreateCharacter,
+    PickCharacter,
+    Session,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -117,6 +128,7 @@ pub fn info_notice(message: &str) -> ShellNotice {
     ShellNotice {
         tone: NoticeTone::Info,
         message: message.to_string(),
+        scope: NoticeScope::Session,
     }
 }
 
@@ -124,6 +136,7 @@ pub fn success_notice(message: &str) -> ShellNotice {
     ShellNotice {
         tone: NoticeTone::Success,
         message: message.to_string(),
+        scope: NoticeScope::Session,
     }
 }
 
@@ -131,7 +144,27 @@ pub fn error_notice(message: &str) -> ShellNotice {
     ShellNotice {
         tone: NoticeTone::Error,
         message: message.to_string(),
+        scope: NoticeScope::Session,
     }
+}
+
+pub fn scoped_notice(scope: NoticeScope, mut notice: ShellNotice) -> ShellNotice {
+    notice.scope = scope;
+    notice
+}
+
+pub fn notice_scope_for_screen(screen: &ShellScreen) -> NoticeScope {
+    match screen {
+        ShellScreen::SignIn => NoticeScope::SignIn,
+        ShellScreen::AccountHome => NoticeScope::AccountHome,
+        ShellScreen::CreateCharacter => NoticeScope::CreateCharacter,
+        ShellScreen::PickCharacter { .. } => NoticeScope::PickCharacter,
+        ShellScreen::Session => NoticeScope::Session,
+    }
+}
+
+fn scope_notice_for_identity(identity: &IdentityState, notice: ShellNotice) -> ShellNotice {
+    scoped_notice(notice_scope_for_screen(&identity.screen), notice)
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -261,8 +294,9 @@ pub fn restore_bootstrap(
                 &mut reconnect_token,
                 snapshot,
             );
-            ops.notice = Some(info_notice(
-                "Restored reconnect session from browser storage.",
+            ops.notice = Some(scoped_notice(
+                NoticeScope::Session,
+                info_notice("Restored reconnect session from browser storage."),
             ));
         }
         (Some(_), None) => {
@@ -293,9 +327,10 @@ pub fn bootstrap_state() -> BootstrapResult {
         Ok(snapshot) => restore_bootstrap(account, snapshot),
         Err(error) => {
             let mut result = restore_bootstrap(account, None);
-            result.ops.notice = Some(error_notice(&format!(
-                "Failed to restore browser session: {error}"
-            )));
+            result.ops.notice = Some(scoped_notice(
+                notice_scope_for_screen(&result.identity.screen),
+                error_notice(&format!("Failed to restore browser session: {error}")),
+            ));
             result
         }
     };
@@ -589,6 +624,7 @@ pub fn apply_join_success(
         PendingFlow::Create => "Workshop created.",
         PendingFlow::Join => "Joined workshop.",
         PendingFlow::Reconnect => "Reconnected to workshop.",
+        PendingFlow::DeleteWorkshop => "Workshop deleted.",
         PendingFlow::SignIn => "Workshop created.",
     };
 
@@ -621,9 +657,12 @@ pub fn apply_join_success(
 
     ops.pending_flow = None;
     ops.pending_judge_bundle = false;
-    ops.notice = Some(success_notice(success_message));
+    ops.notice = Some(scoped_notice(NoticeScope::Session, success_notice(success_message)));
     ops.pending_realtime_notice = match flow {
-        PendingFlow::Reconnect => Some(success_notice(success_message)),
+        PendingFlow::Reconnect => Some(scoped_notice(
+            NoticeScope::Session,
+            success_notice(success_message),
+        )),
         _ => None,
     };
 }
@@ -634,13 +673,14 @@ pub fn apply_request_error(identity: &mut IdentityState, ops: &mut OperationStat
     if should_clear_session_snapshot(&error) {
         clear_session_identity(identity);
     }
-    ops.notice = Some(error_notice(&error));
+    ops.notice = Some(scope_notice_for_identity(identity, error_notice(&error)));
 }
 
 pub fn command_success_message(command: SessionCommand) -> &'static str {
     match command {
         SessionCommand::SelectCharacter => "Dragon profile saved.",
         SessionCommand::StartPhase1 => "Phase 1 started.",
+        SessionCommand::SubmitObservation => "Observation saved.",
         SessionCommand::StartHandover => "Handover started.",
         SessionCommand::SubmitTags => "Handover tags saved.",
         SessionCommand::StartPhase2 => "Phase 2 started.",
@@ -686,7 +726,10 @@ pub fn apply_successful_command(
         ops.sprite_generation_request_pending = false;
         ops.sprite_generation_stage = None;
     }
-    ops.notice = Some(success_notice(command_success_message(command)));
+    ops.notice = Some(scoped_notice(
+        NoticeScope::Session,
+        success_notice(command_success_message(command)),
+    ));
 }
 
 pub fn apply_command_error(identity: &mut IdentityState, ops: &mut OperationState, error: String) {
@@ -694,7 +737,7 @@ pub fn apply_command_error(identity: &mut IdentityState, ops: &mut OperationStat
     if should_clear_session_snapshot(&error) {
         clear_session_identity(identity);
     }
-    ops.notice = Some(error_notice(&error));
+    ops.notice = Some(scope_notice_for_identity(identity, error_notice(&error)));
 }
 
 pub fn apply_judge_bundle_success(
@@ -704,7 +747,10 @@ pub fn apply_judge_bundle_success(
 ) {
     ops.pending_judge_bundle = false;
     *judge_bundle = Some(bundle);
-    ops.notice = Some(success_notice("Workshop archive ready."));
+    ops.notice = Some(scoped_notice(
+        NoticeScope::Session,
+        success_notice("Workshop archive ready."),
+    ));
 }
 
 pub fn apply_judge_bundle_error(
@@ -716,7 +762,7 @@ pub fn apply_judge_bundle_error(
     if should_clear_session_snapshot(&error) {
         clear_session_identity(identity);
     }
-    ops.notice = Some(error_notice(&error));
+    ops.notice = Some(scope_notice_for_identity(identity, error_notice(&error)));
 }
 
 #[allow(dead_code)]
@@ -730,14 +776,14 @@ pub fn apply_realtime_bootstrap_error(
     if should_clear_session_snapshot(&error) {
         clear_session_identity(identity);
     }
-    ops.notice = Some(error_notice(&error));
+    ops.notice = Some(scope_notice_for_identity(identity, error_notice(&error)));
 }
 
 #[allow(dead_code)]
 pub fn apply_realtime_connecting(identity: &mut IdentityState, ops: &mut OperationState) {
     identity.realtime_bootstrap_attempted = true;
     identity.connection_status = ConnectionStatus::Connecting;
-    ops.notice = Some(info_notice("Syncing session…"));
+    ops.notice = Some(scoped_notice(NoticeScope::Session, info_notice("Syncing session…")));
 }
 
 fn should_clear_session_snapshot(error: &str) -> bool {
@@ -756,6 +802,18 @@ pub fn clear_session_identity(identity: &mut IdentityState) {
     identity.session_snapshot = None;
     identity.realtime_bootstrap_attempted = false;
     let _ = clear_browser_session_snapshot();
+}
+
+pub fn navigate_to_screen(identity: &mut IdentityState, ops: &mut OperationState, screen: ShellScreen) {
+    let next_scope = notice_scope_for_screen(&screen);
+    if ops
+        .notice
+        .as_ref()
+        .is_some_and(|notice| notice.scope != next_scope)
+    {
+        ops.notice = None;
+    }
+    identity.screen = screen;
 }
 
 /// Full logout: clears session + account → goes to SignIn.
@@ -804,14 +862,19 @@ pub fn apply_server_ws_message(
                 ops.notice = Some(
                     ops.pending_realtime_notice
                         .take()
-                        .unwrap_or_else(|| info_notice("Session synced.")),
+                        .unwrap_or_else(|| {
+                            scoped_notice(NoticeScope::Session, info_notice("Session synced."))
+                        }),
                 );
             } else if let Some(command) = completed_pending_command {
                 // Phase-transition commands can unmount the source component before
                 // the HTTP task applies its success notice, so confirm them from the
                 // resulting state update as well.
                 ops.pending_command = None;
-                ops.notice = Some(success_notice(command_success_message(command)));
+                ops.notice = Some(scoped_notice(
+                    NoticeScope::Session,
+                    success_notice(command_success_message(command)),
+                ));
             }
         }
         ServerWsMessage::Notice(ProtocolSessionNotice {
@@ -833,6 +896,7 @@ pub fn apply_server_ws_message(
             ops.notice = Some(ShellNotice {
                 tone,
                 message: combined,
+                scope: NoticeScope::Session,
             });
         }
         ServerWsMessage::Error { message } => {
@@ -842,7 +906,7 @@ pub fn apply_server_ws_message(
             if should_clear_session_snapshot(&message) {
                 clear_session_identity(identity);
             }
-            ops.notice = Some(error_notice(&message));
+            ops.notice = Some(scope_notice_for_identity(identity, error_notice(&message)));
         }
         ServerWsMessage::Pong => {
             identity.connection_status = ConnectionStatus::Connected;
@@ -982,10 +1046,10 @@ mod tests {
     }
 
     #[test]
-    fn clear_session_identity_returns_to_account_home_after_host_character_pick() {
+    fn clear_session_identity_returns_to_account_home_after_character_pick() {
         let mut identity = default_identity_state();
         identity.screen = ShellScreen::PickCharacter {
-            workshop_code: None,
+            workshop_code: "123456".to_string(),
         };
 
         clear_session_identity(&mut identity);
@@ -1132,6 +1196,27 @@ mod tests {
     }
 
     #[test]
+    fn submit_observation_success_uses_specific_notice_copy() {
+        let mut identity = default_identity_state();
+        let mut ops = default_operation_state();
+        let mut handover_tags_input = String::new();
+        let mut judge_bundle = None;
+
+        apply_successful_command(
+            &mut identity,
+            &mut ops,
+            &mut handover_tags_input,
+            &mut judge_bundle,
+            SessionCommand::SubmitObservation,
+        );
+
+        assert_eq!(
+            ops.notice.as_ref().map(|n| n.message.as_str()),
+            Some("Observation saved.")
+        );
+    }
+
+    #[test]
     fn apply_judge_bundle_success_stores_bundle_and_clears_pending() {
         let mut ops = default_operation_state();
         ops.pending_judge_bundle = true;
@@ -1258,7 +1343,10 @@ mod tests {
         );
 
         ops.pending_command = Some(SessionCommand::StartPhase1);
-        ops.notice = Some(info_notice("Starting Phase 1…"));
+        ops.notice = Some(scoped_notice(
+            NoticeScope::Session,
+            info_notice("Starting Phase 1…"),
+        ));
 
         let mut next_state = mock_join_success().state;
         next_state.phase = Phase::Phase1;

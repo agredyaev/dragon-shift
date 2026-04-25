@@ -756,6 +756,14 @@ pub struct WorkshopJoinSuccess {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkshopCreateSuccess {
+    pub ok: bool,
+    pub session_code: String,
+    pub host_name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkshopJudgeBundleSuccess {
     pub ok: bool,
@@ -801,6 +809,13 @@ pub enum ServerWsMessage {
 #[allow(clippy::large_enum_variant)]
 pub enum WorkshopJoinResult {
     Success(WorkshopJoinSuccess),
+    Error(WorkshopError),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum WorkshopCreateResult {
+    Success(WorkshopCreateSuccess),
     Error(WorkshopError),
 }
 
@@ -1034,6 +1049,8 @@ pub struct OpenWorkshopSummary {
     pub host_name: String,
     pub player_count: u32,
     pub created_at: String,
+    #[serde(default)]
+    pub can_delete: bool,
 }
 
 /// Keyset cursor over the "open workshops" list. Pairs the RFC3339 `created_at`

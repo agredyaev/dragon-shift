@@ -3,6 +3,7 @@ use protocol::{ClientGameState, SessionCommand};
 
 use crate::flows::{leave_workshop, submit_workshop_command};
 use crate::helpers::{current_player, lobby_player_rows, lobby_ready_summary, lobby_status_copy};
+use crate::state::ConnectionStatus;
 use crate::state::{IdentityState, OperationState};
 
 #[component]
@@ -23,6 +24,17 @@ pub fn LobbyView(
     let ready_label = lobby_ready_summary(state);
     let status_label = lobby_status_copy(state);
     let is_host = current_player(state).map(|p| p.is_host).unwrap_or(false);
+    let connection_status = identity.read().connection_status;
+    let connection_label = match connection_status {
+        ConnectionStatus::Offline => "Offline",
+        ConnectionStatus::Connecting => "Connecting",
+        ConnectionStatus::Connected => "Connected",
+    };
+    let connection_class = match connection_status {
+        ConnectionStatus::Offline => "status-offline",
+        ConnectionStatus::Connecting => "status-connecting",
+        ConnectionStatus::Connected => "status-connected",
+    };
     let commands_disabled = {
         let o = ops.read();
         o.pending_flow.is_some() || o.pending_command.is_some()
@@ -31,7 +43,16 @@ pub fn LobbyView(
     drop(gs);
 
     rsx! {
-        article { class: "panel", "data-testid": "lobby-panel",
+        article { class: "panel", "data-testid": "session-panel",
+            div { class: "sr-only", "data-testid": "workshop-code-badge", {session_code.clone()} }
+            div {
+                class: format!("sr-only {}", connection_class),
+                "data-testid": "connection-badge",
+                {connection_label}
+            }
+            div { class: "sr-only", "data-testid": "controls-panel", if is_host { "visible" } else { "hidden" } }
+
+            article { class: "panel", "data-testid": "lobby-panel",
             h2 { class: "panel__title", "Workshop Lobby" }
             p { class: "panel__body",
                 "Code: "
@@ -91,6 +112,7 @@ pub fn LobbyView(
                         "Leave workshop"
                     }
                 }
+            }
             }
         }
     }

@@ -10,11 +10,12 @@ use crate::api::{AppWebApi, build_command_request, build_judge_bundle_request};
 use crate::helpers::{parse_tags_input, pending_command_label};
 use crate::realtime::bootstrap_realtime;
 use crate::state::{
-    ConnectionStatus, IdentityState, OperationState, PendingFlow, ShellScreen, apply_command_error,
-    apply_join_success, apply_judge_bundle_error, apply_judge_bundle_success,
-    apply_realtime_bootstrap_error, apply_request_error, apply_successful_command,
-    clear_account_identity, clear_session_identity, error_notice, info_notice,
-    persist_browser_account_snapshot, persist_browser_session_snapshot, success_notice,
+    ConnectionStatus, IdentityState, NoticeScope, OperationState, PendingFlow, ShellScreen,
+    apply_command_error, apply_join_success, apply_judge_bundle_error,
+    apply_judge_bundle_success, apply_realtime_bootstrap_error, apply_request_error,
+    apply_successful_command, clear_account_identity, clear_session_identity, error_notice,
+    info_notice, navigate_to_screen, persist_browser_account_snapshot,
+    persist_browser_session_snapshot, scoped_notice, success_notice,
 };
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -39,8 +40,9 @@ pub async fn submit_reconnect_flow(
 
     if session_code.is_empty() || reconnect_token.is_empty() {
         ops.with_mut(|o| {
-            o.notice = Some(error_notice(
-                "Session code and reconnect token are required for reconnect.",
+            o.notice = Some(scoped_notice(
+                NoticeScope::Session,
+                error_notice("Session code and reconnect token are required for reconnect."),
             ))
         });
         return;
@@ -51,7 +53,7 @@ pub async fn submit_reconnect_flow(
     });
     ops.with_mut(|o| {
         o.pending_flow = Some(PendingFlow::Reconnect);
-        o.notice = Some(info_notice("Reconnecting…"));
+        o.notice = Some(scoped_notice(NoticeScope::Session, info_notice("Reconnecting…")));
     });
 
     let api = AppWebApi::new(base_url);
@@ -84,9 +86,12 @@ pub async fn submit_reconnect_flow(
                 && let Err(error) = persist_browser_session_snapshot(&snapshot)
             {
                 ops.with_mut(|o| {
-                    o.notice = Some(error_notice(&format!(
-                        "Reconnected, but session persistence failed: {error}"
-                    )))
+                    o.notice = Some(scoped_notice(
+                        NoticeScope::Session,
+                        error_notice(&format!(
+                            "Reconnected, but session persistence failed: {error}"
+                        )),
+                    ))
                 });
             }
             if let Err(error) = bootstrap_realtime(identity, game_state, ops, judge_bundle) {
@@ -122,8 +127,9 @@ pub async fn submit_workshop_command(
 
     let Some(snapshot) = snapshot else {
         ops.with_mut(|o| {
-            o.notice = Some(error_notice(
-                "Connect to a workshop before sending commands.",
+            o.notice = Some(scoped_notice(
+                NoticeScope::Session,
+                error_notice("Connect to a workshop before sending commands."),
             ))
         });
         return;
@@ -131,7 +137,10 @@ pub async fn submit_workshop_command(
 
     ops.with_mut(|o| {
         o.pending_command = Some(command);
-        o.notice = Some(info_notice(pending_command_label(command)));
+        o.notice = Some(scoped_notice(
+            NoticeScope::Session,
+            info_notice(pending_command_label(command)),
+        ));
     });
 
     let api = AppWebApi::new(base_url);
@@ -162,7 +171,7 @@ pub async fn submit_workshop_command(
 
 pub async fn submit_handover_tags_command(
     identity: Signal<IdentityState>,
-    mut ops: Signal<OperationState>,
+    ops: Signal<OperationState>,
     handover_tags_input: Signal<String>,
     judge_bundle: Signal<Option<JudgeBundle>>,
 ) {
@@ -196,8 +205,9 @@ pub async fn submit_judge_bundle_request(
 
     let Some(snapshot) = snapshot else {
         ops.with_mut(|o| {
-            o.notice = Some(error_notice(
-                "Connect to a workshop before building the archive.",
+            o.notice = Some(scoped_notice(
+                NoticeScope::Session,
+                error_notice("Connect to a workshop before building the archive."),
             ))
         });
         return;
@@ -205,7 +215,10 @@ pub async fn submit_judge_bundle_request(
 
     ops.with_mut(|o| {
         o.pending_judge_bundle = true;
-        o.notice = Some(info_notice("Building workshop archive…"));
+        o.notice = Some(scoped_notice(
+            NoticeScope::Session,
+            info_notice("Building workshop archive…"),
+        ));
     });
 
     let api = AppWebApi::new(base_url);
@@ -246,13 +259,18 @@ pub async fn submit_signin_flow(
     let base_url = { identity.read().api_base_url.clone() };
 
     if name.trim().is_empty() || password.is_empty() {
-        ops.with_mut(|o| o.notice = Some(error_notice("Name and password are required.")));
+        ops.with_mut(|o| {
+            o.notice = Some(scoped_notice(
+                NoticeScope::SignIn,
+                error_notice("Name and password are required."),
+            ))
+        });
         return;
     }
 
     ops.with_mut(|o| {
         o.pending_flow = Some(PendingFlow::SignIn);
-        o.notice = Some(info_notice("Signing in…"));
+        o.notice = Some(scoped_notice(NoticeScope::SignIn, info_notice("Signing in…")));
     });
 
     let api = AppWebApi::new(base_url);
@@ -265,14 +283,19 @@ pub async fn submit_signin_flow(
         Ok(response) => {
             if let Err(error) = persist_browser_account_snapshot(&response.account) {
                 ops.with_mut(|o| {
-                    o.notice = Some(error_notice(&format!(
-                        "Signed in, but local persistence failed: {error}"
-                    )));
+                    o.notice = Some(scoped_notice(
+                        NoticeScope::AccountHome,
+                        error_notice(&format!(
+                            "Signed in, but local persistence failed: {error}"
+                        )),
+                    ));
                 });
             }
             identity.with_mut(|id| {
-                id.account = Some(response.account);
-                id.screen = ShellScreen::AccountHome;
+                ops.with_mut(|o| {
+                    id.account = Some(response.account);
+                    navigate_to_screen(id, o, ShellScreen::AccountHome);
+                });
             });
             ops.with_mut(|o| {
                 o.pending_flow = None;
@@ -281,7 +304,7 @@ pub async fn submit_signin_flow(
                 } else {
                     "Signed in."
                 };
-                o.notice = Some(success_notice(msg));
+                o.notice = Some(scoped_notice(NoticeScope::AccountHome, success_notice(msg)));
             });
         }
         Err(error) => {
@@ -291,7 +314,7 @@ pub async fn submit_signin_flow(
             let message = crate::components::sign_in::map_signin_error(&error);
             ops.with_mut(|o| {
                 o.pending_flow = None;
-                o.notice = Some(error_notice(&message));
+                o.notice = Some(scoped_notice(NoticeScope::SignIn, error_notice(&message)));
             });
         }
     }
@@ -317,41 +340,39 @@ pub async fn submit_logout_flow(
     });
 }
 
-/// Create a workshop with default config. The server gets the host name from
-/// the signed cookie. On success, applies join + bootstraps realtime.
+/// Create an empty workshop lobby. The creator remains on AccountHome and must
+/// explicitly join later from the open-workshops list.
 pub async fn submit_create_workshop_flow(
     mut identity: Signal<IdentityState>,
-    mut game_state: Signal<Option<ClientGameState>>,
     mut ops: Signal<OperationState>,
-    mut reconnect_session_code: Signal<String>,
-    mut reconnect_token: Signal<String>,
-    mut judge_bundle: Signal<Option<JudgeBundle>>,
-    character_id: Option<String>,
 ) {
     let base_url = { identity.read().api_base_url.clone() };
 
-    identity.with_mut(|id| {
-        id.connection_status = ConnectionStatus::Connecting;
-    });
     ops.with_mut(|o| {
         o.pending_flow = Some(PendingFlow::Create);
-        o.notice = Some(info_notice("Creating workshop…"));
+        o.notice = Some(scoped_notice(
+            NoticeScope::AccountHome,
+            info_notice("Creating workshop…"),
+        ));
     });
 
     let api = AppWebApi::new(base_url);
-    match api.create_workshop(String::new(), character_id).await {
+    match api.create_workshop_lobby().await {
         Ok(success) => {
-            apply_join_and_bootstrap(
-                &mut identity,
-                &mut game_state,
-                &mut ops,
-                &mut reconnect_session_code,
-                &mut reconnect_token,
-                &mut judge_bundle,
-                success,
-                PendingFlow::Create,
-                "Workshop created, but session persistence failed",
-            );
+            identity.with_mut(|id| {
+                ops.with_mut(|o| {
+                    id.connection_status = ConnectionStatus::Offline;
+                    navigate_to_screen(id, o, ShellScreen::AccountHome);
+                });
+            });
+            ops.with_mut(|o| {
+                o.pending_flow = None;
+                o.notice = Some(scoped_notice(
+                    NoticeScope::AccountHome,
+                    success_notice(&format!("Workshop {} created.", success.session_code)),
+                ));
+            });
+            load_open_workshops_flow(identity, ops, OpenWorkshopsPaging::First).await;
         }
         Err(error) => {
             identity.with_mut(|id| {
@@ -382,7 +403,7 @@ pub async fn submit_join_with_character_flow(
     });
     ops.with_mut(|o| {
         o.pending_flow = Some(PendingFlow::Join);
-        o.notice = Some(info_notice("Joining workshop…"));
+        o.notice = Some(scoped_notice(NoticeScope::PickCharacter, info_notice("Joining workshop…")));
     });
 
     let api = AppWebApi::new(base_url);
@@ -434,7 +455,10 @@ pub async fn load_my_characters_flow(
         }
         Err(error) => {
             ops.with_mut(|o| {
-                o.notice = Some(error_notice(&format!("Failed to load characters: {error}")));
+                o.notice = Some(scoped_notice(
+                    NoticeScope::AccountHome,
+                    error_notice(&format!("Failed to load characters: {error}")),
+                ));
             });
         }
     }
@@ -451,10 +475,9 @@ pub enum OpenWorkshopsPaging {
 }
 
 /// Load open workshops into `ops.open_workshops` and refresh the paging
-/// cursors on the operation state. The 5-second poll always calls this
-/// with `OpenWorkshopsPaging::First` so the user keeps seeing the
-/// freshest lobbies at the top; only the Prev/Next buttons on
-/// AccountHome use the `After` / `Before` variants.
+/// cursors on the operation state. AccountHome reuses the caller-provided
+/// paging direction for both explicit pager clicks and its 5-second poll so
+/// the current page is preserved until the user changes it.
 pub async fn load_open_workshops_flow(
     identity: Signal<IdentityState>,
     mut ops: Signal<OperationState>,
@@ -472,9 +495,30 @@ pub async fn load_open_workshops_flow(
         }
         Err(error) => {
             ops.with_mut(|o| {
-                o.notice = Some(error_notice(&format!("Failed to load workshops: {error}")));
+                o.notice = Some(scoped_notice(
+                    NoticeScope::AccountHome,
+                    error_notice(&format!("Failed to load workshops: {error}")),
+                ));
             });
         }
+    }
+}
+
+pub async fn refresh_open_workshops_after_delete(
+    identity: Signal<IdentityState>,
+    ops: Signal<OperationState>,
+    paging: OpenWorkshopsPaging,
+) -> OpenWorkshopsPaging {
+    load_open_workshops_flow(identity, ops, paging.clone()).await;
+    let should_fallback = {
+        let current = ops.read();
+        !matches!(paging, OpenWorkshopsPaging::First) && current.open_workshops.is_empty()
+    };
+    if should_fallback {
+        load_open_workshops_flow(identity, ops, OpenWorkshopsPaging::First).await;
+        OpenWorkshopsPaging::First
+    } else {
+        paging
     }
 }
 
@@ -484,6 +528,9 @@ pub async fn load_eligible_characters_flow(
     mut ops: Signal<OperationState>,
     workshop_code: String,
 ) {
+    ops.with_mut(|o| {
+        o.eligible_characters.clear();
+    });
     let base_url = { identity.read().api_base_url.clone() };
     let api = AppWebApi::new(base_url);
     match api.eligible_characters(&workshop_code).await {
@@ -494,9 +541,10 @@ pub async fn load_eligible_characters_flow(
         }
         Err(error) => {
             ops.with_mut(|o| {
-                o.notice = Some(error_notice(&format!(
-                    "Failed to load eligible characters: {error}"
-                )));
+                o.notice = Some(scoped_notice(
+                    NoticeScope::PickCharacter,
+                    error_notice(&format!("Failed to load eligible characters: {error}")),
+                ));
             });
         }
     }
@@ -518,13 +566,21 @@ pub async fn submit_create_character_flow(
     let base_url = { identity.read().api_base_url.clone() };
 
     if description.trim().is_empty() {
-        ops.with_mut(|o| o.notice = Some(error_notice("Enter a character description.")));
+        ops.with_mut(|o| {
+            o.notice = Some(scoped_notice(
+                NoticeScope::CreateCharacter,
+                error_notice("Enter a character description."),
+            ))
+        });
         return;
     }
 
     ops.with_mut(|o| {
         o.pending_flow = Some(PendingFlow::Create);
-        o.notice = Some(info_notice("Creating character…"));
+        o.notice = Some(scoped_notice(
+            NoticeScope::CreateCharacter,
+            info_notice("Creating character…"),
+        ));
     });
 
     let api = AppWebApi::new(base_url);
@@ -535,17 +591,22 @@ pub async fn submit_create_character_flow(
     match api.create_character(&request).await {
         Ok(_profile) => {
             identity.with_mut(|id| {
-                id.screen = ShellScreen::AccountHome;
+                ops.with_mut(|o| {
+                    navigate_to_screen(id, o, ShellScreen::AccountHome);
+                });
             });
             ops.with_mut(|o| {
                 o.pending_flow = None;
-                o.notice = Some(success_notice("Character created."));
+                o.notice = Some(scoped_notice(
+                    NoticeScope::AccountHome,
+                    success_notice("Character created."),
+                ));
             });
         }
         Err(error) => {
             ops.with_mut(|o| {
                 o.pending_flow = None;
-                o.notice = Some(error_notice(&error));
+                o.notice = Some(scoped_notice(NoticeScope::CreateCharacter, error_notice(&error)));
             });
         }
     }
@@ -565,14 +626,58 @@ pub async fn submit_delete_character_flow(
         Ok(()) => {
             ops.with_mut(|o| {
                 o.my_characters.retain(|c| c.id != character_id);
-                o.notice = Some(success_notice("Character deleted."));
+                o.notice = Some(scoped_notice(
+                    NoticeScope::AccountHome,
+                    success_notice("Character deleted."),
+                ));
             });
         }
         Err(error) => {
             ops.with_mut(|o| {
-                o.notice = Some(error_notice(&format!(
-                    "Failed to delete character: {error}"
-                )));
+                o.notice = Some(scoped_notice(
+                    NoticeScope::AccountHome,
+                    error_notice(&format!("Failed to delete character: {error}")),
+                ));
+            });
+        }
+    }
+}
+
+pub async fn submit_delete_workshop_flow(
+    identity: Signal<IdentityState>,
+    mut ops: Signal<OperationState>,
+    mut current_paging: Signal<OpenWorkshopsPaging>,
+    session_code: String,
+    paging: OpenWorkshopsPaging,
+) {
+    let base_url = { identity.read().api_base_url.clone() };
+    ops.with_mut(|o| {
+        o.pending_flow = Some(PendingFlow::DeleteWorkshop);
+        o.notice = Some(scoped_notice(
+            NoticeScope::AccountHome,
+            info_notice("Deleting workshop…"),
+        ));
+    });
+    let api = AppWebApi::new(base_url);
+    match api.delete_workshop(&session_code).await {
+        Ok(()) => {
+            ops.with_mut(|o| {
+                o.pending_flow = None;
+                o.notice = Some(scoped_notice(
+                    NoticeScope::AccountHome,
+                    success_notice(&format!("Workshop {} deleted.", session_code)),
+                ));
+            });
+            let next_paging = refresh_open_workshops_after_delete(identity, ops, paging).await;
+            current_paging.set(next_paging);
+        }
+        Err(error) => {
+            ops.with_mut(|o| {
+                o.pending_flow = None;
+                o.notice = Some(scoped_notice(
+                    NoticeScope::AccountHome,
+                    error_notice(&format!("Failed to delete workshop: {error}")),
+                ));
             });
         }
     }
@@ -623,9 +728,10 @@ fn apply_join_and_bootstrap(
         && let Err(error) = persist_browser_session_snapshot(&snapshot)
     {
         ops.with_mut(|o| {
-            o.notice = Some(error_notice(&format!(
-                "{persistence_error_prefix}: {error}"
-            )));
+            o.notice = Some(scoped_notice(
+                NoticeScope::Session,
+                error_notice(&format!("{persistence_error_prefix}: {error}")),
+            ));
         });
     }
     if let Err(error) = bootstrap_realtime(*identity, *game_state, *ops, *judge_bundle) {
@@ -644,7 +750,8 @@ mod tests {
         ConnectionStatus, ShellScreen, default_identity_state, default_operation_state,
     };
     use protocol::{
-        ClientGameState, CoordinatorType, Phase, Player, SessionMeta, WorkshopJoinResult,
+        ClientGameState, CoordinatorType, ListOpenWorkshopsResponse, OpenWorkshopCursor,
+        OpenWorkshopSummary, Phase, Player, SessionMeta, WorkshopJoinResult,
         WorkshopJoinSuccess, create_default_session_settings,
     };
     use std::collections::BTreeMap;
@@ -722,6 +829,79 @@ mod tests {
         (format!("http://{address}"), handle)
     }
 
+    fn read_http_request(stream: &mut std::net::TcpStream) -> String {
+        let mut buffer = [0_u8; 8192];
+        let bytes_read = stream.read(&mut buffer).expect("read http request");
+        String::from_utf8_lossy(&buffer[..bytes_read]).into_owned()
+    }
+
+    fn json_response(body: &str) -> String {
+        format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        )
+    }
+
+    fn spawn_delete_workshop_server() -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind delete test server");
+        let address = listener.local_addr().expect("read delete test server address");
+
+        let handle = thread::spawn(move || {
+            let (mut delete_stream, _) = listener.accept().expect("accept delete request");
+            let delete_request = read_http_request(&mut delete_stream);
+            assert!(
+                delete_request.starts_with("DELETE /api/workshops/654321 HTTP/1.1"),
+                "unexpected delete request: {delete_request}"
+            );
+            delete_stream
+                .write_all(b"HTTP/1.1 204 No Content\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                .expect("write delete response");
+
+            let (mut stale_page_stream, _) = listener.accept().expect("accept stale page request");
+            let stale_page_request = read_http_request(&mut stale_page_stream);
+            assert!(
+                stale_page_request.starts_with(
+                    "GET /api/workshops/open?after_created_at=2026-01-02T00%3A00%3A00Z&after_session_code=654321 HTTP/1.1"
+                ),
+                "unexpected stale page request: {stale_page_request}"
+            );
+            let empty_page = serde_json::to_string(&ListOpenWorkshopsResponse {
+                workshops: Vec::new(),
+                next_cursor: None,
+                prev_cursor: None,
+            })
+            .expect("encode empty page");
+            stale_page_stream
+                .write_all(json_response(&empty_page).as_bytes())
+                .expect("write stale page response");
+
+            let (mut first_page_stream, _) = listener.accept().expect("accept first page request");
+            let first_page_request = read_http_request(&mut first_page_stream);
+            assert!(
+                first_page_request.starts_with("GET /api/workshops/open HTTP/1.1"),
+                "unexpected first page request: {first_page_request}"
+            );
+            let refreshed_page = serde_json::to_string(&ListOpenWorkshopsResponse {
+                workshops: vec![OpenWorkshopSummary {
+                    session_code: "123456".to_string(),
+                    host_name: "Alice".to_string(),
+                    player_count: 0,
+                    created_at: "2026-01-01T00:00:00Z".to_string(),
+                    can_delete: true,
+                }],
+                next_cursor: None,
+                prev_cursor: None,
+            })
+            .expect("encode refreshed page");
+            first_page_stream
+                .write_all(json_response(&refreshed_page).as_bytes())
+                .expect("write refreshed page response");
+        });
+
+        (format!("http://{address}"), handle)
+    }
+
     #[test]
     fn reconnect_success_bootstraps_realtime() {
         let (base_url, server) = spawn_join_success_server(mock_join_success());
@@ -788,15 +968,55 @@ mod tests {
     }
 
     #[test]
-    fn create_workshop_flow_accepts_optional_character_id() {
-        let _f: fn(
-            Signal<IdentityState>,
-            Signal<Option<ClientGameState>>,
-            Signal<OperationState>,
-            Signal<String>,
-            Signal<String>,
-            Signal<Option<JudgeBundle>>,
-            Option<String>,
-        ) -> _ = submit_create_workshop_flow;
+    fn create_workshop_flow_stays_account_scoped() {
+        let _f: fn(Signal<IdentityState>, Signal<OperationState>) -> _ =
+            submit_create_workshop_flow;
+    }
+
+    #[test]
+    fn delete_workshop_flow_falls_back_to_first_page_after_empty_non_first_reload() {
+        let (base_url, server) = spawn_delete_workshop_server();
+
+        let mut dom = VirtualDom::new(|| rsx! { div {} });
+        dom.rebuild_in_place();
+
+        dom.in_scope(ScopeId::ROOT, || {
+            let runtime = tokio::runtime::Runtime::new().expect("create tokio runtime");
+
+            let mut initial_identity = default_identity_state();
+            initial_identity.api_base_url = base_url;
+
+            let identity = Signal::new(initial_identity);
+            let ops = Signal::new(default_operation_state());
+            let current_paging = Signal::new(OpenWorkshopsPaging::After(OpenWorkshopCursor {
+                created_at: "2026-01-02T00:00:00Z".to_string(),
+                session_code: "654321".to_string(),
+            }));
+
+            runtime.block_on(submit_delete_workshop_flow(
+                identity,
+                ops,
+                current_paging,
+                "654321".to_string(),
+                OpenWorkshopsPaging::After(OpenWorkshopCursor {
+                    created_at: "2026-01-02T00:00:00Z".to_string(),
+                    session_code: "654321".to_string(),
+                }),
+            ));
+
+            server.join().expect("join delete workshop server thread");
+
+            assert_eq!(ops.read().pending_flow, None);
+            assert_eq!(ops.read().open_workshops.len(), 1);
+            assert_eq!(ops.read().open_workshops[0].session_code, "123456");
+            assert_eq!(*current_paging.read(), OpenWorkshopsPaging::First);
+            assert_eq!(
+                ops.read()
+                    .notice
+                    .as_ref()
+                    .map(|notice| notice.message.as_str()),
+                Some("Workshop 654321 deleted.")
+            );
+        });
     }
 }

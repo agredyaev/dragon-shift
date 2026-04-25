@@ -27,7 +27,7 @@ pub fn SignInView(identity: Signal<IdentityState>, ops: Signal<OperationState>) 
     let pending = ops.read().pending_flow.is_some();
 
     rsx! {
-        article { class: "panel", "data-testid": "signin-panel",
+        article { class: "panel panel--hero-tint", "data-testid": "signin-panel",
             h1 { class: "panel__title", "Sign in" }
             p { class: "panel__body", "Sign in or create a new account" }
             div { class: "panel__stack",

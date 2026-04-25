@@ -22,7 +22,9 @@ use components::sign_in::SignInView;
 use helpers::poke_icon_url;
 use protocol::Phase;
 use realtime::bootstrap_realtime;
-use state::{ShellScreen, apply_realtime_bootstrap_error, bootstrap_state};
+use state::{
+    NoticeScope, ShellScreen, apply_realtime_bootstrap_error, bootstrap_state,
+};
 
 #[cfg(target_arch = "wasm32")]
 fn main() {
@@ -127,6 +129,8 @@ fn App() -> Element {
         } else {
             "shell shell--night"
         }
+    } else if is_create_character_screen {
+        "shell shell--pre-session shell--create-character"
     } else if pre_session_screen.is_some() {
         "shell shell--pre-session"
     } else {
@@ -164,8 +168,20 @@ fn App() -> Element {
                 }
             }
             section { class: container_class,
+                if is_lobby || is_phase1 || is_handover || is_phase2 || is_voting || is_judge || is_end {
+                    NoticeBar {
+                        ops,
+                        scope: NoticeScope::Session,
+                    }
+                } else {
+                    match pre_session_screen.as_ref() {
+                        Some(ShellScreen::AccountHome) => rsx! { NoticeBar { ops, scope: NoticeScope::AccountHome } },
+                        Some(ShellScreen::CreateCharacter) => rsx! { NoticeBar { ops, scope: NoticeScope::CreateCharacter } },
+                        Some(ShellScreen::PickCharacter { .. }) => rsx! { NoticeBar { ops, scope: NoticeScope::PickCharacter } },
+                        _ => rsx! { NoticeBar { ops, scope: NoticeScope::SignIn } },
+                    }
+                }
                 if is_lobby {
-                    NoticeBar { ops }
                     LobbyView {
                         identity,
                         game_state,
@@ -174,7 +190,6 @@ fn App() -> Element {
                         judge_bundle,
                     }
                 } else if is_phase1 {
-                    NoticeBar { ops }
                     Phase1View {
                         identity,
                         game_state,
@@ -183,7 +198,6 @@ fn App() -> Element {
                         judge_bundle,
                     }
                 } else if is_handover {
-                    NoticeBar { ops }
                     HandoverView {
                         identity,
                         game_state,
@@ -192,7 +206,6 @@ fn App() -> Element {
                         judge_bundle,
                     }
                 } else if is_phase2 {
-                    NoticeBar { ops }
                     Phase2View {
                         identity,
                         game_state,
@@ -201,7 +214,6 @@ fn App() -> Element {
                         judge_bundle,
                     }
                 } else if is_voting {
-                    NoticeBar { ops }
                     EndView {
                         identity,
                         game_state,
@@ -210,7 +222,6 @@ fn App() -> Element {
                         judge_bundle,
                     }
                 } else if is_judge {
-                    NoticeBar { ops }
                     EndView {
                         identity,
                         game_state,
@@ -219,7 +230,6 @@ fn App() -> Element {
                         judge_bundle,
                     }
                 } else if is_end {
-                    NoticeBar { ops }
                     EndView {
                         identity,
                         game_state,
@@ -229,7 +239,6 @@ fn App() -> Element {
                     }
                 } else {
                     // ---- Pre-session screens (SignIn / AccountHome / etc.) ----
-                    NoticeBar { ops }
                     match pre_session_screen.as_ref() {
                         Some(ShellScreen::AccountHome) => rsx! {
                             AccountHomeView {

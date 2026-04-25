@@ -1,6 +1,6 @@
 use chrono::{DateTime, Utc};
 use domain::WorkshopSession;
-use protocol::{CharacterProfile, SessionArtifactRecord, SpriteSet};
+use protocol::{CharacterProfile, OpenWorkshopCursor, SessionArtifactRecord, SpriteSet};
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
@@ -126,6 +126,8 @@ pub struct OpenWorkshopRecord {
     pub host_name: String,
     pub player_count: u32,
     pub created_at: String,
+    pub owner_account_id: Option<String>,
+    pub has_non_owner_players: bool,
 }
 
 /// Paging direction for `SessionStore::list_open_workshops`. Cursors reuse
@@ -154,7 +156,7 @@ pub struct OpenWorkshopsPage {
 
 /// Page size for the "open workshops" list. Also the internal fetch is
 /// `PAGE_SIZE + 1` to let the impl compute `has_more_after` / `has_more_before`.
-pub const OPEN_WORKSHOPS_PAGE_SIZE: usize = 50;
+pub const OPEN_WORKSHOPS_PAGE_SIZE: usize = 4;
 
 /// Row in the `accounts` table (migration 0007). Never carries plaintext
 /// password; only the argon2id PHC hash produced by `security::hash_password`.
@@ -261,6 +263,17 @@ impl SessionUpdateNotification {
         }
     }
 
+    pub fn workshop_deleted(session_code: &str) -> Self {
+        Self {
+            kind: "workshop_deleted".to_string(),
+            session_code: session_code.to_string(),
+            updated_at: None,
+            payload_fingerprint: None,
+            connection_id: None,
+            replica_id: None,
+        }
+    }
+
     pub fn to_payload(&self) -> Result<String, PersistenceError> {
         let mut payload = serde_json::Map::new();
         payload.insert(
@@ -336,21 +349,43 @@ fn active_realtime_connection_cutoff() -> DateTime<Utc> {
 }
 
 /// Map a `WorkshopSession` to the summary record returned by
-/// `list_open_workshops`. Returns `None` when the session has no resolvable
-/// host (missing `host_player_id` or the host isn't in the player map) —
-/// such sessions are unrenderable on AccountHome and should be skipped.
+/// `list_open_workshops`. Empty lobbies are allowed before the reserved
+/// creator explicitly joins, so the summary falls back to the reserved host
+/// name when no concrete host player exists yet.
 fn open_workshop_summary_from_session(session: &WorkshopSession) -> Option<OpenWorkshopRecord> {
     let host_name = session
         .host_player_id
         .as_ref()
         .and_then(|id| session.players.get(id))
-        .map(|player| player.name.clone())?;
+        .map(|player| player.name.clone())
+        .or_else(|| session.reserved_host_name().map(str::to_string))?;
+    let owner_account_id = session
+        .owner_account_id()
+        .or_else(|| session.reserved_host_account_id());
+    let has_non_owner_players = session
+        .players
+        .values()
+        .any(|player| player.account_id.as_deref() != owner_account_id);
     Some(OpenWorkshopRecord {
         session_code: session.code.0.clone(),
         host_name,
         player_count: session.players.len() as u32,
         created_at: session.created_at.to_rfc3339(),
+        owner_account_id: owner_account_id.map(str::to_string),
+        has_non_owner_players,
     })
+}
+
+fn is_older_open_workshop_cursor(created_at: &str, session_code: &str, cursor: &OpenWorkshopCursor) -> bool {
+    created_at < cursor.created_at.as_str()
+        || (created_at == cursor.created_at.as_str()
+            && session_code > cursor.session_code.as_str())
+}
+
+fn is_newer_open_workshop_cursor(created_at: &str, session_code: &str, cursor: &OpenWorkshopCursor) -> bool {
+    created_at > cursor.created_at.as_str()
+        || (created_at == cursor.created_at.as_str()
+            && session_code < cursor.session_code.as_str())
 }
 
 pub trait SessionStore: Send + Sync {
@@ -567,6 +602,24 @@ pub trait SessionStore: Send + Sync {
         character_id: &str,
         owner_account_id: &str,
     ) -> Pin<Box<dyn Future<Output = Result<bool, PersistenceError>> + Send + '_>>;
+
+    fn delete_lobby_workshop_by_owner(
+        &self,
+        session_code: &str,
+        owner_account_id: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, PersistenceError>> + Send + '_>>;
+
+    fn delete_realtime_connections_for_session(
+        &self,
+        session_code: &str,
+    ) -> Pin<
+        Box<
+            dyn Future<
+                    Output = Result<Vec<RealtimeConnectionRegistration>, PersistenceError>,
+                > + Send
+                + '_,
+        >,
+    >;
 
     /// List sessions currently in `Phase::Lobby` for AccountHome's "open
     /// workshops" list. Ordered DESC by `created_at` with `session_code ASC`
@@ -1871,6 +1924,128 @@ impl SessionStore for PostgresSessionStore {
         })
     }
 
+    fn delete_lobby_workshop_by_owner(
+        &self,
+        session_code: &str,
+        owner_account_id: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, PersistenceError>> + Send + '_>> {
+        let session_code = session_code.to_string();
+        let owner = owner_account_id.to_string();
+        Box::pin(async move {
+            let mut tx = self.pool.begin().await?;
+            let row = sqlx::query(
+                "
+                    SELECT session_id, payload
+                    FROM workshop_sessions
+                    WHERE session_code = $1
+                    FOR UPDATE
+                ",
+            )
+            .bind(&session_code)
+            .fetch_optional(&mut *tx)
+            .await?;
+
+            let Some(row) = row else {
+                tx.rollback().await?;
+                return Ok(false);
+            };
+
+            use sqlx::Row;
+            let session_id: String = row.get("session_id");
+            let payload: sqlx::types::Json<serde_json::Value> = row.get("payload");
+            let session: WorkshopSession = match serde_json::from_value(payload.0) {
+                Ok(value) => value,
+                Err(error) => {
+                    tracing::warn!(%error, %session_code, "malformed workshop payload during delete");
+                    tx.rollback().await?;
+                    return Ok(false);
+                }
+            };
+
+            let session_owner = session
+                .owner_account_id()
+                .or_else(|| session.reserved_host_account_id());
+            let can_delete = session.phase == protocol::Phase::Lobby
+                && session.players.is_empty()
+                && session_owner == Some(owner.as_str());
+            if !can_delete {
+                tx.rollback().await?;
+                return Ok(false);
+            }
+
+            sqlx::query("DELETE FROM player_identities WHERE session_id = $1")
+                .bind(&session_id)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query("DELETE FROM session_artifacts WHERE session_id = $1")
+                .bind(&session_id)
+                .execute(&mut *tx)
+                .await?;
+            let result = sqlx::query("DELETE FROM workshop_sessions WHERE session_id = $1")
+                .bind(&session_id)
+                .execute(&mut *tx)
+                .await?;
+            tx.commit().await?;
+            Ok(result.rows_affected() > 0)
+        })
+    }
+
+    fn delete_realtime_connections_for_session(
+        &self,
+        session_code: &str,
+    ) -> Pin<
+        Box<
+            dyn Future<
+                    Output = Result<Vec<RealtimeConnectionRegistration>, PersistenceError>,
+                > + Send
+                + '_,
+        >,
+    > {
+        let session_code = session_code.to_string();
+        Box::pin(async move {
+            use sqlx::Row;
+
+            let mut tx = self.pool.begin().await?;
+            let realtime_connections = sqlx::query(
+                "
+                    DELETE FROM realtime_connections
+                    WHERE session_code = $1
+                    RETURNING session_code, player_id, connection_id, replica_id
+                ",
+            )
+            .bind(&session_code)
+            .fetch_all(&mut *tx)
+            .await?
+            .into_iter()
+            .map(|row| RealtimeConnectionRegistration {
+                session_code: row.get("session_code"),
+                player_id: row.get("player_id"),
+                connection_id: row.get("connection_id"),
+                replica_id: row.get("replica_id"),
+            })
+            .collect::<Vec<_>>();
+
+            for registration in &realtime_connections {
+                sqlx::query(
+                    "
+                        INSERT INTO retired_realtime_connections (connection_id, replica_id, retired_at)
+                        VALUES ($1, $2, NOW())
+                        ON CONFLICT (connection_id) DO UPDATE SET
+                            replica_id = EXCLUDED.replica_id,
+                            retired_at = EXCLUDED.retired_at
+                    ",
+                )
+                .bind(&registration.connection_id)
+                .bind(&registration.replica_id)
+                .execute(&mut *tx)
+                .await?;
+            }
+
+            tx.commit().await?;
+            Ok(realtime_connections)
+        })
+    }
+
     fn list_open_workshops(
         &self,
         paging: OpenWorkshopsPaging,
@@ -1912,14 +2087,17 @@ impl SessionStore for PostgresSessionStore {
                     (rows, false)
                 }
                 OpenWorkshopsPaging::After(cursor) => {
-                    // Strictly older than cursor: tuple (created_at, code) < (ts, code).
-                    // Postgres lex-compares TEXT tuples natively.
+                    // Strictly older than the DESC/ASC sort key:
+                    // `(created_at DESC, session_code ASC)`.
                     let rows = sqlx::query(
                         "
                             SELECT payload
                             FROM workshop_sessions
                             WHERE payload->>'phase' = 'lobby'
-                              AND (payload->>'created_at', session_code) < ($1, $2)
+                              AND (
+                                    payload->>'created_at' < $1
+                                 OR (payload->>'created_at' = $1 AND session_code > $2)
+                              )
                             ORDER BY payload->>'created_at' DESC, session_code ASC
                             LIMIT $3
                         ",
@@ -1932,7 +2110,7 @@ impl SessionStore for PostgresSessionStore {
                     (rows, false)
                 }
                 OpenWorkshopsPaging::Before(cursor) => {
-                    // Strictly newer than cursor: tuple > (ts, code). We
+                    // Strictly newer than the DESC/ASC sort key. We
                     // query in the opposite order to grab the rows closest
                     // to the cursor, then reverse so the final page is in
                     // the canonical DESC form.
@@ -1941,7 +2119,10 @@ impl SessionStore for PostgresSessionStore {
                             SELECT payload
                             FROM workshop_sessions
                             WHERE payload->>'phase' = 'lobby'
-                              AND (payload->>'created_at', session_code) > ($1, $2)
+                              AND (
+                                    payload->>'created_at' > $1
+                                 OR (payload->>'created_at' = $1 AND session_code < $2)
+                              )
                             ORDER BY payload->>'created_at' ASC, session_code DESC
                             LIMIT $3
                         ",
@@ -2004,7 +2185,7 @@ impl SessionStore for PostgresSessionStore {
                         // After the reverse above, rows sit in DESC order:
                         // index 0 is the NEWEST (farthest from the cursor)
                         // and the last index is the row flush against the
-                        // cursor. To keep the 50 rows adjacent to the cursor
+                        // cursor. To keep the page-size rows adjacent to the cursor
                         // — matching the in-memory `skip(total - take)`
                         // semantics — we drop the extra from the FRONT, not
                         // the back. A `truncate(PAGE_SIZE)` here would
@@ -2973,6 +3154,100 @@ impl SessionStore for InMemorySessionStore {
         })
     }
 
+    fn delete_lobby_workshop_by_owner(
+        &self,
+        session_code: &str,
+        owner_account_id: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, PersistenceError>> + Send + '_>> {
+        let session_code = session_code.to_string();
+        let owner = owner_account_id.to_string();
+        Box::pin(async move {
+            let mut sessions_by_code = self
+                .sessions_by_code
+                .write()
+                .map_err(|_| PersistenceError::LockPoisoned)?;
+            let Some(session) = sessions_by_code.get(&session_code) else {
+                return Ok(false);
+            };
+            let session_owner = session
+                .owner_account_id()
+                .or_else(|| session.reserved_host_account_id());
+            let can_delete = session.phase == protocol::Phase::Lobby
+                && session.players.is_empty()
+                && session_owner == Some(owner.as_str());
+            if !can_delete {
+                return Ok(false);
+            }
+
+            let session_id = session.id.to_string();
+            sessions_by_code.remove(&session_code);
+            drop(sessions_by_code);
+
+            self.sessions_by_id
+                .write()
+                .map_err(|_| PersistenceError::LockPoisoned)?
+                .remove(&session_id);
+            self.artifacts_by_session_id
+                .write()
+                .map_err(|_| PersistenceError::LockPoisoned)?
+                .remove(&session_id);
+            self.identities_by_token
+                .write()
+                .map_err(|_| PersistenceError::LockPoisoned)?
+                .retain(|_, identity| identity.session_id != session_id);
+            Ok(true)
+        })
+    }
+
+    fn delete_realtime_connections_for_session(
+        &self,
+        session_code: &str,
+    ) -> Pin<
+        Box<
+            dyn Future<
+                    Output = Result<Vec<RealtimeConnectionRegistration>, PersistenceError>,
+                > + Send
+                + '_,
+        >,
+    > {
+        let session_code = session_code.to_string();
+        Box::pin(async move {
+            let mut connections_by_id = self
+                .realtime_connections_by_id
+                .write()
+                .map_err(|_| PersistenceError::LockPoisoned)?;
+            let mut by_session_player = self
+                .realtime_connection_by_session_player
+                .write()
+                .map_err(|_| PersistenceError::LockPoisoned)?;
+            let mut retired_connections = self
+                .retired_realtime_connections
+                .write()
+                .map_err(|_| PersistenceError::LockPoisoned)?;
+
+            let connection_ids = connections_by_id
+                .iter()
+                .filter(|(_, (registration, _))| registration.session_code == session_code)
+                .map(|(connection_id, _)| connection_id.clone())
+                .collect::<Vec<_>>();
+
+            let mut registrations = Vec::with_capacity(connection_ids.len());
+            for connection_id in connection_ids {
+                if let Some((registration, _)) = connections_by_id.remove(&connection_id) {
+                    by_session_player.remove(&(
+                        registration.session_code.clone(),
+                        registration.player_id.clone(),
+                    ));
+                    retired_connections
+                        .insert(registration.connection_id.clone(), registration.replica_id.clone());
+                    registrations.push(registration);
+                }
+            }
+
+            Ok(registrations)
+        })
+    }
+
     fn list_open_workshops(
         &self,
         paging: OpenWorkshopsPaging,
@@ -3007,21 +3282,27 @@ impl SessionStore for InMemorySessionStore {
                 OpenWorkshopsPaging::After(cursor) => summaries
                     .into_iter()
                     .filter(|row| {
-                        (row.created_at.as_str(), row.session_code.as_str())
-                            < (cursor.created_at.as_str(), cursor.session_code.as_str())
+                        is_older_open_workshop_cursor(
+                            row.created_at.as_str(),
+                            row.session_code.as_str(),
+                            cursor,
+                        )
                     })
                     .collect(),
                 OpenWorkshopsPaging::Before(cursor) => summaries
                     .into_iter()
                     .filter(|row| {
-                        (row.created_at.as_str(), row.session_code.as_str())
-                            > (cursor.created_at.as_str(), cursor.session_code.as_str())
+                        is_newer_open_workshop_cursor(
+                            row.created_at.as_str(),
+                            row.session_code.as_str(),
+                            cursor,
+                        )
                     })
                     .collect(),
             };
 
-            // For Before we need the 50 rows *immediately* newer than the
-            // cursor. The filtered slice is still DESC, so those 50 are the
+            // For Before we need the page-size rows *immediately* newer than the
+            // cursor. The filtered slice is still DESC, so those rows are the
             // tail. Symmetrically: fetch `PAGE_SIZE + 1` on the relevant
             // side, then truncate to `PAGE_SIZE`, and compute has_more_*.
             let page = match &paging {
@@ -3750,6 +4031,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn deleting_in_memory_realtime_connections_for_session_retires_all_connections() {
+        let store = InMemorySessionStore::new();
+
+        store
+            .claim_realtime_connection(&RealtimeConnectionRegistration {
+                session_code: "123456".to_string(),
+                player_id: "player-1".to_string(),
+                connection_id: "conn-1".to_string(),
+                replica_id: "replica-a".to_string(),
+            })
+            .await
+            .expect("claim first realtime connection");
+        store
+            .claim_realtime_connection(&RealtimeConnectionRegistration {
+                session_code: "123456".to_string(),
+                player_id: "player-2".to_string(),
+                connection_id: "conn-2".to_string(),
+                replica_id: "replica-b".to_string(),
+            })
+            .await
+            .expect("claim second realtime connection");
+
+        let deleted = store
+            .delete_realtime_connections_for_session("123456")
+            .await
+            .expect("delete session realtime connections");
+
+        assert_eq!(deleted.len(), 2);
+        assert!(
+            store
+                .list_realtime_connections("123456")
+                .await
+                .expect("list cleared realtime connections")
+                .is_empty()
+        );
+        assert!(
+            store
+                .take_retired_realtime_connection("conn-1", "replica-a")
+                .await
+                .expect("take retired first connection")
+                .is_some()
+        );
+        assert!(
+            store
+                .take_retired_realtime_connection("conn-2", "replica-b")
+                .await
+                .expect("take retired second connection")
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
     async fn in_memory_realtime_claim_reusing_same_connection_clears_stale_reverse_mapping() {
         let store = InMemorySessionStore::new();
 
@@ -4014,7 +4347,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_open_workshops_first_page_returns_50_newest_desc() {
+    async fn list_open_workshops_first_page_returns_page_size_newest_desc() {
         let store = InMemorySessionStore::new();
         seed_lobbies(&store, 120, 1_000).await;
 
@@ -4068,7 +4401,7 @@ mod tests {
             assert!(pair[0].created_at > pair[1].created_at);
         }
 
-        // Now page 3 should return the last 20 rows.
+        // Page 3 should still return a full page while older rows remain.
         let cursor3 = {
             let last = page2.rows.last().unwrap();
             OpenWorkshopCursor {
@@ -4080,8 +4413,8 @@ mod tests {
             .list_open_workshops(OpenWorkshopsPaging::After(cursor3))
             .await
             .expect("page 3");
-        assert_eq!(page3.rows.len(), 20);
-        assert!(!page3.has_more_after);
+        assert_eq!(page3.rows.len(), OPEN_WORKSHOPS_PAGE_SIZE);
+        assert!(page3.has_more_after);
         assert!(page3.has_more_before);
     }
 
@@ -4150,7 +4483,51 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_open_workshops_first_page_with_exactly_50_rows_has_no_more_after() {
+    async fn list_open_workshops_after_cursor_keeps_equal_timestamp_older_code_side() {
+        let store = InMemorySessionStore::new();
+        for code in ["AAAAAA", "BBBBBB", "CCCCCC"] {
+            store
+                .save_session(&lobby_session_at(code, 2_000))
+                .await
+                .expect("save tied lobby");
+        }
+
+        let page = store
+            .list_open_workshops(OpenWorkshopsPaging::After(OpenWorkshopCursor {
+                created_at: "1970-01-01T00:33:20+00:00".to_string(),
+                session_code: "BBBBBB".to_string(),
+            }))
+            .await
+            .expect("after page");
+
+        assert_eq!(page.rows.len(), 1);
+        assert_eq!(page.rows[0].session_code, "CCCCCC");
+    }
+
+    #[tokio::test]
+    async fn list_open_workshops_before_cursor_keeps_equal_timestamp_newer_code_side() {
+        let store = InMemorySessionStore::new();
+        for code in ["AAAAAA", "BBBBBB", "CCCCCC"] {
+            store
+                .save_session(&lobby_session_at(code, 2_000))
+                .await
+                .expect("save tied lobby");
+        }
+
+        let page = store
+            .list_open_workshops(OpenWorkshopsPaging::Before(OpenWorkshopCursor {
+                created_at: "1970-01-01T00:33:20+00:00".to_string(),
+                session_code: "BBBBBB".to_string(),
+            }))
+            .await
+            .expect("before page");
+
+        assert_eq!(page.rows.len(), 1);
+        assert_eq!(page.rows[0].session_code, "AAAAAA");
+    }
+
+    #[tokio::test]
+    async fn list_open_workshops_first_page_with_exactly_page_size_rows_has_no_more_after() {
         // Boundary: no `+1` sentinel row beyond the page size. The page must
         // fill exactly and both has_more_* flags must be false.
         let store = InMemorySessionStore::new();
@@ -4162,14 +4539,14 @@ mod tests {
             .expect("first page");
 
         assert_eq!(page.rows.len(), OPEN_WORKSHOPS_PAGE_SIZE);
-        assert!(!page.has_more_after, "no older rows exist beyond the 50th");
+        assert!(!page.has_more_after, "no older rows exist beyond the last row on the page");
         assert!(!page.has_more_before, "First page has no newer rows");
     }
 
     #[tokio::test]
-    async fn list_open_workshops_first_page_with_exactly_51_rows_returns_50_and_signals_more() {
+    async fn list_open_workshops_first_page_with_exactly_page_size_plus_one_rows_signals_more() {
         // Boundary: exactly one extra sentinel. First page must truncate to
-        // 50 and flag more_after; a subsequent After(last) must yield the
+        // page size and flag more_after; a subsequent After(last) must yield the
         // lone remaining row with more_after = false.
         let store = InMemorySessionStore::new();
         seed_lobbies(&store, OPEN_WORKSHOPS_PAGE_SIZE + 1, 1_000).await;

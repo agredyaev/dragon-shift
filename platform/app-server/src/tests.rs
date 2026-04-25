@@ -27,7 +27,7 @@ use protocol::{
     ClientWsMessage, CoordinatorType, DragonStats, JoinWorkshopRequest, LlmProviderKind,
     NoticeLevel, ServerWsMessage, SessionArtifactKind, SessionArtifactRecord, SessionCommand,
     SessionEnvelope, SpriteSheetResult, WorkshopCommandRequest, WorkshopCommandResult,
-    WorkshopJoinResult, WorkshopJudgeBundleResult,
+    WorkshopCreateResult, WorkshopJoinResult, WorkshopJudgeBundleResult,
 };
 use security::{DEFAULT_RUST_SESSION_CODE_PREFIX, OriginPolicyOptions, create_origin_policy};
 use sqlx::PgPool;
@@ -758,6 +758,28 @@ impl SessionStore for FaultyStore {
     ) -> Pin<Box<dyn Future<Output = Result<bool, PersistenceError>> + Send + '_>> {
         self.inner
             .delete_character_by_owner(character_id, owner_account_id)
+    }
+
+    fn delete_lobby_workshop_by_owner(
+        &self,
+        session_code: &str,
+        owner_account_id: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, PersistenceError>> + Send + '_>> {
+        self.inner
+            .delete_lobby_workshop_by_owner(session_code, owner_account_id)
+    }
+
+    fn delete_realtime_connections_for_session(
+        &self,
+        session_code: &str,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Vec<RealtimeConnectionRegistration>, PersistenceError>>
+                + Send
+                + '_,
+        >,
+    > {
+        self.inner.delete_realtime_connections_for_session(session_code)
     }
 
     fn list_open_workshops(
@@ -2502,6 +2524,66 @@ async fn realtime_replaced_notification_clears_local_registration_without_persis
 }
 
 #[tokio::test]
+async fn workshop_deleted_notification_closes_local_session_connections() {
+    let state = test_state();
+    let timestamp = Utc::now();
+    let mut session = WorkshopSession::new(
+        Uuid::new_v4(),
+        SessionCode("123456".into()),
+        timestamp,
+        protocol::WorkshopCreateConfig::default(),
+    );
+    session.add_player(session_player_with_state(
+        "player-1", "Alice", timestamp, true, true,
+    ));
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(session.code.0.clone(), session.clone());
+
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+    state
+        .realtime
+        .lock()
+        .await
+        .attach(&session.code.0, "player-1", "conn-1");
+    state
+        .realtime_senders
+        .lock()
+        .await
+        .insert("conn-1".to_string(), sender);
+
+    handle_session_update_notification(
+        &state,
+        &SessionUpdateNotification::workshop_deleted(&session.code.0),
+    )
+    .await;
+
+    let error_message = receiver.try_recv().expect("deleted workshop error sent");
+    assert!(matches!(
+        error_message,
+        crate::ws::WsOutbound::Message(ServerWsMessage::Error { ref message })
+            if message == "Workshop not found."
+    ));
+    let close_message = receiver.try_recv().expect("deleted workshop close sent");
+    assert!(matches!(close_message, crate::ws::WsOutbound::Close));
+    assert!(
+        state
+            .realtime
+            .lock()
+            .await
+            .session_registrations(&session.code.0)
+            .is_empty(),
+        "deleted workshop should clear local session registrations"
+    );
+    assert!(
+        !state.sessions.lock().await.contains_key(&session.code.0),
+        "deleted workshop notification should evict cached session"
+    );
+}
+
+#[tokio::test]
 async fn clearing_local_realtime_before_close_prevents_false_disconnect_fallback() {
     let state = test_state();
     let timestamp = Utc::now();
@@ -3337,6 +3419,240 @@ async fn create_workshop_endpoint_returns_join_success() {
         }
         WorkshopJoinResult::Error(error) => panic!("expected success, got error: {}", error.error),
     }
+}
+
+#[tokio::test]
+async fn create_workshop_lobby_endpoint_creates_empty_reserved_lobby() {
+    let state = test_state();
+    let app = build_app(state.clone());
+    let cookie = test_auth_cookie(&app, "Alice").await;
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops/lobby")
+                .header("content-type", "application/json")
+                .header(axum::http::header::COOKIE, &cookie)
+                .body(Body::from(create_workshop_body("Alice")))
+                .expect("build create lobby request"),
+        )
+        .await
+        .expect("call create workshop lobby");
+
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read create lobby body");
+    let result: WorkshopCreateResult =
+        serde_json::from_slice(&body).expect("parse create lobby result");
+    let success = match result {
+        WorkshopCreateResult::Success(success) => success,
+        WorkshopCreateResult::Error(error) => {
+            panic!("expected create lobby success, got error: {}", error.error)
+        }
+    };
+
+    let session = state
+        .store
+        .load_session_by_code(&success.session_code)
+        .await
+        .expect("load created lobby")
+        .expect("created lobby exists");
+    assert!(session.players.is_empty());
+    assert_eq!(session.host_player_id, None);
+    assert_eq!(session.reserved_host_name(), Some("Alice"));
+    assert!(session.reserved_host_account_id().is_some());
+}
+
+#[tokio::test]
+async fn create_workshop_lobby_appears_in_open_workshops_with_zero_players() {
+    let state = test_state();
+    let app = build_app(state.clone());
+    let cookie = test_auth_cookie(&app, "Alice").await;
+
+    let create_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops/lobby")
+                .header("content-type", "application/json")
+                .header(axum::http::header::COOKIE, &cookie)
+                .body(Body::from(create_workshop_body("Alice")))
+                .expect("build create lobby request"),
+        )
+        .await
+        .expect("call create workshop lobby");
+    let create_body = to_bytes(create_response.into_body(), usize::MAX)
+        .await
+        .expect("read create lobby body");
+    let create_result: WorkshopCreateResult =
+        serde_json::from_slice(&create_body).expect("parse create lobby result");
+    let session_code = match create_result {
+        WorkshopCreateResult::Success(success) => success.session_code,
+        WorkshopCreateResult::Error(error) => {
+            panic!("expected create lobby success, got error: {}", error.error)
+        }
+    };
+
+    let (status, value) = get_open_workshops_json(&app, &cookie, "").await;
+    assert_eq!(status, StatusCode::OK);
+    let workshops = value["workshops"].as_array().expect("workshops array");
+    let created = workshops
+        .iter()
+        .find(|row| row["sessionCode"].as_str() == Some(session_code.as_str()))
+        .expect("created lobby appears in open workshops");
+    assert_eq!(created["hostName"].as_str(), Some("Alice"));
+    assert_eq!(created["playerCount"].as_u64(), Some(0));
+    assert_eq!(created["canDelete"].as_bool(), Some(true));
+}
+
+#[tokio::test]
+async fn open_workshops_marks_only_own_reserved_lobby_as_deletable() {
+    let state = test_state();
+    let app = build_app(state.clone());
+    let alice_cookie = test_auth_cookie(&app, "Alice").await;
+    let bob_cookie = test_auth_cookie(&app, "Bob").await;
+
+    let alice_create = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops/lobby")
+                .header("content-type", "application/json")
+                .header(axum::http::header::COOKIE, &alice_cookie)
+                .body(Body::from(create_workshop_body("Alice")))
+                .expect("build Alice create lobby request"),
+        )
+        .await
+        .expect("call Alice create workshop lobby");
+    let alice_body = to_bytes(alice_create.into_body(), usize::MAX)
+        .await
+        .expect("read Alice create body");
+    let alice_result: WorkshopCreateResult =
+        serde_json::from_slice(&alice_body).expect("parse Alice create result");
+    let alice_code = match alice_result {
+        WorkshopCreateResult::Success(success) => success.session_code,
+        WorkshopCreateResult::Error(error) => panic!("expected success, got {}", error.error),
+    };
+
+    let bob_create = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops/lobby")
+                .header("content-type", "application/json")
+                .header(axum::http::header::COOKIE, &bob_cookie)
+                .body(Body::from(create_workshop_body("Bob")))
+                .expect("build Bob create lobby request"),
+        )
+        .await
+        .expect("call Bob create workshop lobby");
+    let bob_body = to_bytes(bob_create.into_body(), usize::MAX)
+        .await
+        .expect("read Bob create body");
+    let bob_result: WorkshopCreateResult =
+        serde_json::from_slice(&bob_body).expect("parse Bob create result");
+    let bob_code = match bob_result {
+        WorkshopCreateResult::Success(success) => success.session_code,
+        WorkshopCreateResult::Error(error) => panic!("expected success, got {}", error.error),
+    };
+
+    let (status, alice_view) = get_open_workshops_json(&app, &alice_cookie, "").await;
+    assert_eq!(status, StatusCode::OK);
+    let alice_rows = alice_view["workshops"].as_array().expect("Alice rows");
+    assert_eq!(
+        alice_rows
+            .iter()
+            .find(|row| row["sessionCode"].as_str() == Some(alice_code.as_str()))
+            .and_then(|row| row["canDelete"].as_bool()),
+        Some(true)
+    );
+    assert_eq!(
+        alice_rows
+            .iter()
+            .find(|row| row["sessionCode"].as_str() == Some(bob_code.as_str()))
+            .and_then(|row| row["canDelete"].as_bool()),
+        Some(false)
+    );
+}
+
+#[tokio::test]
+async fn open_workshops_marks_legacy_reserved_lobby_as_deletable_for_owner() {
+    let state = test_state();
+    let app = build_app(state.clone());
+    let cookie = test_auth_cookie(&app, "Alice").await;
+    let account_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/accounts/me")
+                .header(axum::http::header::COOKIE, &cookie)
+                .body(Body::empty())
+                .expect("build accounts/me request"),
+        )
+        .await
+        .expect("accounts/me response");
+    assert_eq!(account_response.status(), StatusCode::OK);
+    let account_body = to_bytes(account_response.into_body(), 64 * 1024)
+        .await
+        .expect("read accounts/me body");
+    let account_value: serde_json::Value =
+        serde_json::from_slice(&account_body).expect("accounts/me json");
+    let account_id = account_value["id"].as_str().expect("account id").to_string();
+
+    let mut session = WorkshopSession::new(
+        Uuid::new_v4(),
+        SessionCode("654321".to_string()),
+        Utc::now(),
+        protocol::WorkshopCreateConfig::default(),
+    );
+    session.reserve_host(account_id, "Alice");
+    session.owner_account_id = None;
+    state.store.save_session(&session).await.expect("save legacy lobby");
+
+    let (status, view) = get_open_workshops_json(&app, &cookie, "").await;
+    assert_eq!(status, StatusCode::OK);
+    let rows = view["workshops"].as_array().expect("rows");
+    assert_eq!(
+        rows.iter()
+            .find(|row| row["sessionCode"].as_str() == Some("654321"))
+            .and_then(|row| row["canDelete"].as_bool()),
+        Some(true)
+    );
+}
+
+#[tokio::test]
+async fn list_open_workshops_same_timestamp_orders_by_session_code_and_pages_without_gaps() {
+    let state = test_state();
+    let shared_created_at = chrono::DateTime::<Utc>::from_timestamp(2_000, 0).expect("valid timestamp");
+    for code in ["200003", "200001", "200002"] {
+        let mut session = WorkshopSession::new(
+            Uuid::new_v4(),
+            SessionCode(code.to_string()),
+            shared_created_at,
+            protocol::WorkshopCreateConfig::default(),
+        );
+        session.reserve_host(format!("acct-{code}"), format!("Host-{code}"));
+        state.store.save_session(&session).await.expect("save tied lobby");
+    }
+    let app = build_app(state);
+    let cookie = signin_and_get_cookie(&app, "knight", "Alice", "correcthorse").await;
+
+    let (status, value) = get_open_workshops_json(&app, &cookie, "").await;
+    assert_eq!(status, StatusCode::OK);
+    let workshops = value["workshops"].as_array().expect("workshops array");
+    let tied_codes: Vec<&str> = workshops
+        .iter()
+        .filter(|row| row["createdAt"].as_str() == Some("1970-01-01T00:33:20+00:00"))
+        .map(|row| row["sessionCode"].as_str().expect("session code"))
+        .collect();
+    assert_eq!(tied_codes, vec!["200001", "200002", "200003"]);
 }
 
 #[tokio::test]
@@ -10494,6 +10810,22 @@ fn to_client_game_state_includes_dragons_and_voting_details() {
             .is_some_and(|voting| voting.current_player_vote_dragon_id.as_deref()
                 == Some(voted_dragon_id.as_str()))
     );
+
+    let current_players_original_dragon = client_state
+        .dragons
+        .get("dragon-p1")
+        .expect("current player's original dragon");
+    let other_players_original_dragon = client_state
+        .dragons
+        .get("dragon-p2")
+        .expect("other player's original dragon");
+    assert_eq!(
+        current_players_original_dragon.original_owner_id.as_deref(),
+        Some("p1")
+    );
+    assert_eq!(current_players_original_dragon.current_owner_id, None);
+    assert_eq!(other_players_original_dragon.original_owner_id, None);
+    assert_eq!(other_players_original_dragon.current_owner_id, None);
 }
 
 #[test]
@@ -11468,7 +11800,7 @@ async fn list_open_workshops_first_page_returns_next_cursor_when_more_rows() {
 
     let (status, value) = get_open_workshops_json(&app, &cookie, "").await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(value["workshops"].as_array().unwrap().len(), 50);
+    assert_eq!(value["workshops"].as_array().unwrap().len(), 4);
     assert!(value["nextCursor"].is_object(), "expected nextCursor");
     assert!(
         value.get("prevCursor").map(|v| v.is_null()).unwrap_or(true),
@@ -11495,16 +11827,15 @@ async fn list_open_workshops_forward_paging_returns_older_rows() {
     let (status, page2) = get_open_workshops_json(&app, &cookie, &query).await;
     assert_eq!(status, StatusCode::OK);
     let workshops = page2["workshops"].as_array().unwrap();
-    // Seeded 75 rows; first page consumed 50, so page 2 returns the
-    // remaining 25.
-    assert_eq!(workshops.len(), 25);
+    // Seeded 75 rows; first page consumed 4, so page 2 returns the next 4.
+    assert_eq!(workshops.len(), 4);
     // Every row must be strictly older than the cursor.
     for row in workshops {
         let created = row["createdAt"].as_str().unwrap();
         assert!(created < ts.as_str(), "row {created} older than {ts}");
     }
-    // No further forward pages exist; prev cursor points back to page 1.
-    assert!(page2.get("nextCursor").map(|v| v.is_null()).unwrap_or(true));
+    // With a page size of 4 and 75 rows total, more older pages still exist.
+    assert!(page2["nextCursor"].is_object());
     assert!(page2["prevCursor"].is_object());
 }
 
@@ -11531,8 +11862,8 @@ async fn list_open_workshops_backward_paging_returns_newer_rows() {
     let back_query = format!("before_created_at={prev_ts_encoded}&before_session_code={prev_code}");
     let (status, back_page) = get_open_workshops_json(&app, &cookie, &back_query).await;
     assert_eq!(status, StatusCode::OK);
-    // Prev from page 2's first row returns page 1's 50 rows.
-    assert_eq!(back_page["workshops"].as_array().unwrap().len(), 50);
+    // Prev from page 2's first row returns page 1's 4 rows.
+    assert_eq!(back_page["workshops"].as_array().unwrap().len(), 4);
     // Every returned row is strictly newer than the cursor.
     for row in back_page["workshops"].as_array().unwrap() {
         let created = row["createdAt"].as_str().unwrap();
@@ -11838,6 +12169,372 @@ async fn create_character_rejects_too_long_description() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+async fn delete_workshop_deletes_owned_reserved_lobby() {
+    let state = test_state();
+    let app = build_app(state.clone());
+    let cookie = test_auth_cookie(&app, "Alice").await;
+
+    let create_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops/lobby")
+                .header("content-type", "application/json")
+                .header(axum::http::header::COOKIE, &cookie)
+                .body(Body::from(create_workshop_body("Alice")))
+                .expect("build create lobby request"),
+        )
+        .await
+        .expect("call create workshop lobby");
+    assert_eq!(create_response.status(), StatusCode::CREATED);
+    let create_body = to_bytes(create_response.into_body(), usize::MAX)
+        .await
+        .expect("read create lobby body");
+    let create_result: WorkshopCreateResult =
+        serde_json::from_slice(&create_body).expect("parse create lobby result");
+    let session_code = match create_result {
+        WorkshopCreateResult::Success(success) => success.session_code,
+        WorkshopCreateResult::Error(error) => panic!("expected success, got {}", error.error),
+    };
+
+    let delete_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/api/workshops/{session_code}"))
+                .header(axum::http::header::COOKIE, &cookie)
+                .body(Body::empty())
+                .expect("build delete workshop request"),
+        )
+        .await
+        .expect("delete workshop response");
+    assert_eq!(delete_response.status(), StatusCode::NO_CONTENT);
+    assert!(
+        state
+            .store
+            .load_session_by_code(&session_code)
+            .await
+            .expect("load deleted session")
+            .is_none(),
+        "deleted lobby should be removed from the store"
+    );
+}
+
+#[tokio::test]
+async fn delete_workshop_rejects_wrong_owner() {
+    let state = test_state();
+    let app = build_app(state.clone());
+    let alice_cookie = test_auth_cookie(&app, "Alice").await;
+    let bob_cookie = test_auth_cookie(&app, "Bob").await;
+
+    let create_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops/lobby")
+                .header("content-type", "application/json")
+                .header(axum::http::header::COOKIE, &alice_cookie)
+                .body(Body::from(create_workshop_body("Alice")))
+                .expect("build create lobby request"),
+        )
+        .await
+        .expect("call create workshop lobby");
+    let create_body = to_bytes(create_response.into_body(), usize::MAX)
+        .await
+        .expect("read create lobby body");
+    let create_result: WorkshopCreateResult =
+        serde_json::from_slice(&create_body).expect("parse create lobby result");
+    let session_code = match create_result {
+        WorkshopCreateResult::Success(success) => success.session_code,
+        WorkshopCreateResult::Error(error) => panic!("expected success, got {}", error.error),
+    };
+
+    let delete_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/api/workshops/{session_code}"))
+                .header(axum::http::header::COOKIE, &bob_cookie)
+                .body(Body::empty())
+                .expect("build delete workshop request"),
+        )
+        .await
+        .expect("delete workshop response");
+    assert_eq!(delete_response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn delete_workshop_allows_legacy_reserved_lobby_owned_by_requester() {
+    let state = test_state();
+    let app = build_app(state.clone());
+    let cookie = test_auth_cookie(&app, "Alice").await;
+    let account_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/accounts/me")
+                .header(axum::http::header::COOKIE, &cookie)
+                .body(Body::empty())
+                .expect("build accounts/me request"),
+        )
+        .await
+        .expect("accounts/me response");
+    assert_eq!(account_response.status(), StatusCode::OK);
+    let account_body = to_bytes(account_response.into_body(), 64 * 1024)
+        .await
+        .expect("read accounts/me body");
+    let account_value: serde_json::Value =
+        serde_json::from_slice(&account_body).expect("accounts/me json");
+    let account_id = account_value["id"].as_str().expect("account id").to_string();
+
+    let mut session = WorkshopSession::new(
+        Uuid::new_v4(),
+        SessionCode("654322".to_string()),
+        Utc::now(),
+        protocol::WorkshopCreateConfig::default(),
+    );
+    session.reserve_host(account_id, "Alice");
+    session.owner_account_id = None;
+    state.store.save_session(&session).await.expect("save legacy lobby");
+
+    let delete_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/api/workshops/654322")
+                .header(axum::http::header::COOKIE, &cookie)
+                .body(Body::empty())
+                .expect("build delete workshop request"),
+        )
+        .await
+        .expect("delete workshop response");
+    assert_eq!(delete_response.status(), StatusCode::NO_CONTENT);
+    assert!(
+        state
+            .store
+            .load_session_by_code("654322")
+            .await
+            .expect("load deleted session")
+            .is_none(),
+        "deleted legacy lobby should be removed from the store"
+    );
+}
+
+#[tokio::test]
+async fn delete_workshop_rejects_non_lobby_session() {
+    let state = test_state();
+    let app = build_app(state.clone());
+    let cookie = test_auth_cookie(&app, "Alice").await;
+
+    let create_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops/lobby")
+                .header("content-type", "application/json")
+                .header(axum::http::header::COOKIE, &cookie)
+                .body(Body::from(create_workshop_body("Alice")))
+                .expect("build create lobby request"),
+        )
+        .await
+        .expect("call create workshop lobby");
+    let create_body = to_bytes(create_response.into_body(), usize::MAX)
+        .await
+        .expect("read create lobby body");
+    let create_result: WorkshopCreateResult =
+        serde_json::from_slice(&create_body).expect("parse create lobby result");
+    let session_code = match create_result {
+        WorkshopCreateResult::Success(success) => success.session_code,
+        WorkshopCreateResult::Error(error) => panic!("expected success, got {}", error.error),
+    };
+
+    let mut session = state
+        .store
+        .load_session_by_code(&session_code)
+        .await
+        .expect("load created session")
+        .expect("session exists");
+    session.phase = protocol::Phase::Phase1;
+    state.store.save_session(&session).await.expect("save phase1 session");
+
+    let delete_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/api/workshops/{session_code}"))
+                .header(axum::http::header::COOKIE, &cookie)
+                .body(Body::empty())
+                .expect("build delete workshop request"),
+        )
+        .await
+        .expect("delete workshop response");
+    assert_eq!(delete_response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn delete_workshop_rejects_owner_after_owner_joins_lobby() {
+    let state = test_state();
+    let app = build_app(state.clone());
+    let cookie = test_auth_cookie(&app, "Alice").await;
+
+    let create_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops/lobby")
+                .header("content-type", "application/json")
+                .header(axum::http::header::COOKIE, &cookie)
+                .body(Body::from(create_workshop_body("Alice")))
+                .expect("build create lobby request"),
+        )
+        .await
+        .expect("call create workshop lobby");
+    let create_body = to_bytes(create_response.into_body(), usize::MAX)
+        .await
+        .expect("read create lobby body");
+    let create_result: WorkshopCreateResult =
+        serde_json::from_slice(&create_body).expect("parse create lobby result");
+    let session_code = match create_result {
+        WorkshopCreateResult::Success(success) => success.session_code,
+        WorkshopCreateResult::Error(error) => panic!("expected success, got {}", error.error),
+    };
+
+    let join_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops/join")
+                .header("content-type", "application/json")
+                .header(axum::http::header::COOKIE, &cookie)
+                .body(Body::from(
+                    serde_json::json!({
+                        "sessionCode": session_code,
+                        "characterId": null,
+                        "reconnectToken": null
+                    })
+                    .to_string(),
+                ))
+                .expect("build join request"),
+        )
+        .await
+        .expect("join workshop response");
+    assert_eq!(join_response.status(), StatusCode::OK);
+
+    let (status, value) = get_open_workshops_json(&app, &cookie, "").await;
+    assert_eq!(status, StatusCode::OK);
+    let created = value["workshops"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["sessionCode"].as_str() == Some(session_code.as_str()))
+        .expect("joined lobby appears in open workshops");
+    assert_eq!(created["canDelete"].as_bool(), Some(false));
+
+    let delete_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/api/workshops/{session_code}"))
+                .header("origin", "http://localhost:5173")
+                .header(axum::http::header::COOKIE, &cookie)
+                .body(Body::empty())
+                .expect("build delete workshop request"),
+        )
+        .await
+        .expect("delete workshop response");
+    assert_eq!(delete_response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn delete_workshop_rejects_when_another_player_has_joined_lobby() {
+    let state = test_state();
+    let app = build_app(state.clone());
+    let alice_cookie = test_auth_cookie(&app, "Alice").await;
+    let bob_cookie = test_auth_cookie(&app, "Bob").await;
+
+    let create_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops/lobby")
+                .header("content-type", "application/json")
+                .header(axum::http::header::COOKIE, &alice_cookie)
+                .body(Body::from(create_workshop_body("Alice")))
+                .expect("build create lobby request"),
+        )
+        .await
+        .expect("call create workshop lobby");
+    let create_body = to_bytes(create_response.into_body(), usize::MAX)
+        .await
+        .expect("read create lobby body");
+    let create_result: WorkshopCreateResult =
+        serde_json::from_slice(&create_body).expect("parse create lobby result");
+    let session_code = match create_result {
+        WorkshopCreateResult::Success(success) => success.session_code,
+        WorkshopCreateResult::Error(error) => panic!("expected success, got {}", error.error),
+    };
+
+    let join_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops/join")
+                .header("content-type", "application/json")
+                .header(axum::http::header::COOKIE, &bob_cookie)
+                .body(Body::from(
+                    serde_json::json!({
+                        "sessionCode": session_code,
+                        "characterId": null,
+                        "reconnectToken": null
+                    })
+                    .to_string(),
+                ))
+                .expect("build Bob join request"),
+        )
+        .await
+        .expect("Bob join workshop response");
+    assert_eq!(join_response.status(), StatusCode::OK);
+
+    let (status, value) = get_open_workshops_json(&app, &alice_cookie, "").await;
+    assert_eq!(status, StatusCode::OK);
+    let created = value["workshops"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["sessionCode"].as_str() == Some(session_code.as_str()))
+        .expect("joined lobby appears in open workshops");
+    assert_eq!(created["canDelete"].as_bool(), Some(false));
+
+    let delete_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/api/workshops/{session_code}"))
+                .header("origin", "http://localhost:5173")
+                .header(axum::http::header::COOKIE, &alice_cookie)
+                .body(Body::empty())
+                .expect("build delete workshop request"),
+        )
+        .await
+        .expect("delete workshop response");
+    assert_eq!(delete_response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
 async fn delete_character_rejects_wrong_owner() {
     let state = test_state();
     let app = build_app(state);
@@ -11963,15 +12660,38 @@ async fn create_test_workshop(app: &Router, cookie: &str) -> String {
     }
 }
 
+async fn create_test_workshop_lobby(app: &Router, cookie: &str) -> String {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops/lobby")
+                .header("content-type", "application/json")
+                .header(axum::http::header::COOKIE, cookie)
+                .body(Body::from(create_workshop_body("Test")))
+                .expect("build create workshop lobby request"),
+        )
+        .await
+        .expect("create workshop lobby response");
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let bytes = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    let result: WorkshopCreateResult = serde_json::from_slice(&bytes).expect("parse result");
+    match result {
+        WorkshopCreateResult::Success(s) => s.session_code,
+        WorkshopCreateResult::Error(e) => panic!("expected success: {}", e.error),
+    }
+}
+
 #[tokio::test]
-async fn join_workshop_same_account_returns_409() {
+async fn creator_can_join_own_create_only_workshop() {
     let app = build_app(test_state());
     let cookie = test_auth_cookie(&app, "Alice").await;
 
-    // Alice creates a workshop (she is now a player).
-    let session_code = create_test_workshop(&app, &cookie).await;
+    let session_code = create_test_workshop_lobby(&app, &cookie).await;
 
-    // Alice tries to join the same workshop again → 409.
     let response = app
         .oneshot(
             Request::builder()
@@ -11988,21 +12708,100 @@ async fn join_workshop_same_account_returns_409() {
         .await
         .expect("join response");
 
-    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert_eq!(response.status(), StatusCode::OK);
     let bytes = to_bytes(response.into_body(), usize::MAX)
         .await
         .expect("read body");
     let result: WorkshopJoinResult = serde_json::from_slice(&bytes).expect("parse result");
     match result {
-        WorkshopJoinResult::Error(e) => {
-            assert!(
-                e.error.contains("already joined"),
-                "expected 'already joined' in error, got: {}",
-                e.error
-            );
+        WorkshopJoinResult::Success(success) => {
+            let player = success
+                .state
+                .players
+                .get(&success.player_id)
+                .expect("creator player in state");
+            assert!(player.is_host);
         }
-        WorkshopJoinResult::Success(_) => panic!("expected 409 conflict"),
+        WorkshopJoinResult::Error(e) => panic!("expected success, got: {}", e.error),
     }
+}
+
+#[tokio::test]
+async fn creator_claims_host_after_guest_joins_reserved_lobby() {
+    let app = build_app(test_state());
+    let alice_cookie = test_auth_cookie(&app, "Alice").await;
+    let bob_cookie = test_auth_cookie(&app, "Bob").await;
+
+    let session_code = create_test_workshop_lobby(&app, &alice_cookie).await;
+
+    let guest_join_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops/join")
+                .header("content-type", "application/json")
+                .header(axum::http::header::COOKIE, &bob_cookie)
+                .body(Body::from(format!(
+                    r#"{{"sessionCode":"{}","name":"Bob"}}"#,
+                    session_code
+                )))
+                .expect("build guest join request"),
+        )
+        .await
+        .expect("guest join response");
+    assert_eq!(guest_join_response.status(), StatusCode::OK);
+    let guest_bytes = to_bytes(guest_join_response.into_body(), usize::MAX)
+        .await
+        .expect("read guest join body");
+    let guest_result: WorkshopJoinResult =
+        serde_json::from_slice(&guest_bytes).expect("parse guest join result");
+    let guest_success = match guest_result {
+        WorkshopJoinResult::Success(success) => success,
+        WorkshopJoinResult::Error(error) => {
+            panic!("expected guest join success, got error: {}", error.error)
+        }
+    };
+    let guest_player = guest_success
+        .state
+        .players
+        .get(&guest_success.player_id)
+        .expect("guest player in state");
+    assert!(!guest_player.is_host);
+
+    let creator_join_response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops/join")
+                .header("content-type", "application/json")
+                .header(axum::http::header::COOKIE, &alice_cookie)
+                .body(Body::from(format!(
+                    r#"{{"sessionCode":"{}","name":"Alice"}}"#,
+                    session_code
+                )))
+                .expect("build creator join request"),
+        )
+        .await
+        .expect("creator join response");
+    assert_eq!(creator_join_response.status(), StatusCode::OK);
+    let creator_bytes = to_bytes(creator_join_response.into_body(), usize::MAX)
+        .await
+        .expect("read creator join body");
+    let creator_result: WorkshopJoinResult =
+        serde_json::from_slice(&creator_bytes).expect("parse creator join result");
+    let creator_success = match creator_result {
+        WorkshopJoinResult::Success(success) => success,
+        WorkshopJoinResult::Error(error) => {
+            panic!("expected creator join success, got error: {}", error.error)
+        }
+    };
+    let creator_player = creator_success
+        .state
+        .players
+        .get(&creator_success.player_id)
+        .expect("creator player in state");
+    assert!(creator_player.is_host);
 }
 
 #[tokio::test]

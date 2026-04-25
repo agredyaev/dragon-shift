@@ -3,8 +3,9 @@ use protocol::{
     CharacterSpritePreviewResponse, ClientSessionSnapshot, CreateCharacterRequest,
     CreateWorkshopRequest, EligibleCharactersResponse, JoinWorkshopRequest, JudgeBundle,
     ListOpenWorkshopsResponse, MyCharactersResponse, SessionCommand, SessionEnvelope,
-    WorkshopCommandRequest, WorkshopCommandResult, WorkshopJoinResult, WorkshopJoinSuccess,
-    WorkshopJudgeBundleRequest, WorkshopJudgeBundleResult,
+    WorkshopCommandRequest, WorkshopCommandResult, WorkshopCreateResult,
+    WorkshopCreateSuccess, WorkshopJoinResult, WorkshopJoinSuccess, WorkshopJudgeBundleRequest,
+    WorkshopJudgeBundleResult,
 };
 
 use serde::de::DeserializeOwned;
@@ -44,15 +45,26 @@ fn percent_encode_component(raw: &str) -> String {
 #[derive(Clone)]
 pub struct AppWebApi {
     pub base_url: String,
+    #[cfg(not(target_arch = "wasm32"))]
+    client: reqwest::Client,
 }
 
 impl AppWebApi {
     pub fn new(base_url: impl Into<String>) -> Self {
+        #[cfg(not(target_arch = "wasm32"))]
+        let client = reqwest::Client::builder()
+            .cookie_store(true)
+            .build()
+            .expect("build reqwest client with cookie store");
+
         Self {
             base_url: normalize_api_base_url(&base_url.into()),
+            #[cfg(not(target_arch = "wasm32"))]
+            client,
         }
     }
 
+    #[allow(dead_code)]
     pub async fn create_workshop(
         &self,
         name: String,
@@ -69,6 +81,24 @@ impl AppWebApi {
             )
             .await?,
         )
+    }
+
+    pub async fn create_workshop_lobby(&self) -> Result<WorkshopCreateSuccess, String> {
+        let payload: WorkshopCreateResult = self
+            .post_json(
+                "/api/workshops/lobby",
+                &CreateWorkshopRequest {
+                    name: None,
+                    config: None,
+                    character_id: None,
+                },
+            )
+            .await?;
+
+        match payload {
+            WorkshopCreateResult::Success(success) => Ok(success),
+            WorkshopCreateResult::Error(error) => Err(error.error),
+        }
     }
 
     pub async fn join_workshop(
@@ -151,6 +181,11 @@ impl AppWebApi {
 
     pub async fn delete_character(&self, character_id: &str) -> Result<(), String> {
         self.delete_empty(&format!("/api/characters/{character_id}"))
+            .await
+    }
+
+    pub async fn delete_workshop(&self, session_code: &str) -> Result<(), String> {
+        self.delete_empty(&format!("/api/workshops/{session_code}"))
             .await
     }
 
@@ -337,7 +372,8 @@ impl AppWebApi {
         Req: serde::Serialize,
         Res: DeserializeOwned,
     {
-        let response = reqwest::Client::new()
+        let response = self
+            .client
             .post(format!("{}{}", self.base_url, path))
             .json(body)
             .send()
@@ -355,7 +391,8 @@ impl AppWebApi {
     where
         Req: serde::Serialize,
     {
-        let response = reqwest::Client::new()
+        let response = self
+            .client
             .post(format!("{}{}", self.base_url, path))
             .json(body)
             .send()
@@ -376,7 +413,8 @@ impl AppWebApi {
     where
         Res: DeserializeOwned,
     {
-        let response = reqwest::Client::new()
+        let response = self
+            .client
             .get(format!("{}{}", self.base_url, path))
             .send()
             .await
@@ -390,7 +428,8 @@ impl AppWebApi {
 
     #[cfg(not(target_arch = "wasm32"))]
     async fn delete_empty(&self, path: &str) -> Result<(), String> {
-        let response = reqwest::Client::new()
+        let response = self
+            .client
             .delete(format!("{}{}", self.base_url, path))
             .send()
             .await

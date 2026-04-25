@@ -508,6 +508,35 @@ pub(crate) async fn close_local_connection(state: &AppState, connection_id: &str
     }
 }
 
+pub(crate) async fn close_local_workshop_connections(
+    state: &AppState,
+    session_code: &str,
+    error_message: Option<&str>,
+) {
+    let registrations = state
+        .realtime
+        .lock()
+        .await
+        .session_registrations(session_code);
+    for registration in registrations {
+        clear_local_realtime_connection(state, &registration.connection_id).await;
+        if let Some(message) = error_message {
+            if let Some(sender) = state
+                .realtime_senders
+                .lock()
+                .await
+                .get(&registration.connection_id)
+                .cloned()
+            {
+                let _ = sender.send(WsOutbound::Message(ServerWsMessage::Error {
+                    message: message.to_string(),
+                }));
+            }
+        }
+        close_local_connection(state, &registration.connection_id).await;
+    }
+}
+
 pub(crate) async fn broadcast_session_state(
     state: &AppState,
     session_code: &str,

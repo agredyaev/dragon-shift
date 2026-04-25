@@ -6,7 +6,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use crate::flows::submit_logout_flow;
-use crate::state::{IdentityState, OperationState, ShellScreen};
+use crate::state::{IdentityState, OperationState, ShellScreen, navigate_to_screen};
 
 /// Disclosure-menu ids used by keyboard handlers to restore focus after
 /// opening/closing the menu. Kept as constants so the trigger and the
@@ -241,9 +241,11 @@ pub fn AppBar(identity: Signal<IdentityState>, ops: Signal<OperationState>) -> E
                         return;
                     }
                     identity.with_mut(|id| {
-                        if id.account.is_some() {
-                            id.screen = ShellScreen::AccountHome;
-                        }
+                        ops.with_mut(|o| {
+                            if id.account.is_some() {
+                                navigate_to_screen(id, o, ShellScreen::AccountHome);
+                            }
+                        });
                     });
                 },
                 "DRAGON SHIFT"
@@ -337,7 +339,9 @@ pub fn AppBar(identity: Signal<IdentityState>, ops: Signal<OperationState>) -> E
                                 onclick: move |_| {
                                     open.set(false);
                                     identity.with_mut(|id| {
-                                        id.screen = ShellScreen::CreateCharacter;
+                                        ops.with_mut(|o| {
+                                            navigate_to_screen(id, o, ShellScreen::CreateCharacter);
+                                        });
                                     });
                                 },
                                 onkeydown: move |event| {

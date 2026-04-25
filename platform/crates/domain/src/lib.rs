@@ -187,6 +187,12 @@ pub struct WorkshopSession {
     pub config: WorkshopCreateConfig,
     pub phase_started_at: DateTime<Utc>,
     pub warned_for_current_phase: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_account_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reserved_host_account_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reserved_host_name: Option<String>,
     pub host_player_id: Option<String>,
     pub players: BTreeMap<String, SessionPlayer>,
     pub dragons: BTreeMap<String, SessionDragon>,
@@ -243,6 +249,9 @@ impl WorkshopSession {
             config,
             phase_started_at: created_at,
             warned_for_current_phase: false,
+            owner_account_id: None,
+            reserved_host_account_id: None,
+            reserved_host_name: None,
             host_player_id: None,
             players: BTreeMap::new(),
             dragons: BTreeMap::new(),
@@ -263,12 +272,74 @@ impl WorkshopSession {
 
     pub fn add_player(&mut self, player: SessionPlayer) {
         let player_id = player.id.clone();
-        if self.host_player_id.is_none() {
+        self.players.insert(player_id.clone(), player);
+
+        let should_assign_reserved_host = self
+            .reserved_host_account_id
+            .as_deref()
+            .zip(self.players.get(&player_id).and_then(|p| p.account_id.as_deref()))
+            .is_some_and(|(reserved, actual)| reserved == actual);
+        if should_assign_reserved_host {
+            self.assign_reserved_host_to_player(&player_id);
+        } else if self.host_player_id.is_none() && self.reserved_host_account_id.is_none() {
             self.host_player_id = Some(player_id.clone());
         }
-        self.players.insert(player_id, player);
+
         self.ensure_host_assigned(false);
         self.touch();
+    }
+
+    pub fn reserve_host(&mut self, account_id: impl Into<String>, name: impl Into<String>) {
+        let account_id = account_id.into();
+        self.owner_account_id = Some(account_id.clone());
+        self.reserved_host_account_id = Some(account_id);
+        self.reserved_host_name = Some(name.into());
+        if let Some(host_player_id) = self.host_player_id.clone() {
+            let should_clear = self
+                .players
+                .get(&host_player_id)
+                .and_then(|player| player.account_id.as_deref())
+                .zip(self.reserved_host_account_id.as_deref())
+                .is_some_and(|(actual, reserved)| actual == reserved);
+            if should_clear {
+                self.assign_reserved_host_to_player(&host_player_id);
+            } else {
+                self.reconcile_host_flags(self.host_player_id.clone());
+            }
+        }
+        self.touch();
+    }
+
+    pub fn reserved_host_name(&self) -> Option<&str> {
+        self.reserved_host_name.as_deref()
+    }
+
+    pub fn reserved_host_account_id(&self) -> Option<&str> {
+        self.reserved_host_account_id.as_deref()
+    }
+
+    pub fn owner_account_id(&self) -> Option<&str> {
+        self.owner_account_id.as_deref()
+    }
+
+    pub fn assign_reserved_host_to_player(&mut self, player_id: &str) -> bool {
+        let Some(reserved_account_id) = self.reserved_host_account_id.as_deref() else {
+            return false;
+        };
+        let matches_reserved = self
+            .players
+            .get(player_id)
+            .and_then(|player| player.account_id.as_deref())
+            .is_some_and(|account_id| account_id == reserved_account_id);
+        if !matches_reserved {
+            return false;
+        }
+
+        self.host_player_id = Some(player_id.to_string());
+        self.reserved_host_account_id = None;
+        self.reserved_host_name = None;
+        self.reconcile_host_flags(self.host_player_id.clone());
+        true
     }
 
     pub fn assign_player_character(
@@ -1158,6 +1229,46 @@ impl WorkshopSession {
     }
 
     pub fn ensure_host_assigned(&mut self, prefer_connected: bool) -> Option<String> {
+        if self.reserved_host_account_id.is_some() {
+            if let Some(current_host_id) = self.host_player_id.clone() {
+                let current_matches_reserved = self
+                    .players
+                    .get(&current_host_id)
+                    .and_then(|player| player.account_id.as_deref())
+                    .zip(self.reserved_host_account_id.as_deref())
+                    .is_some_and(|(actual, reserved)| actual == reserved);
+                if current_matches_reserved {
+                    self.assign_reserved_host_to_player(&current_host_id);
+                    return Some(current_host_id);
+                } else {
+                    self.host_player_id = None;
+                    self.reconcile_host_flags(None);
+                }
+            }
+
+            let reserved_host_id = self.players.iter().find_map(|(player_id, player)| {
+                player
+                    .account_id
+                    .as_deref()
+                    .zip(self.reserved_host_account_id.as_deref())
+                    .and_then(|(actual, reserved)| {
+                        if actual == reserved && (!prefer_connected || player.is_connected) {
+                            Some(player_id.clone())
+                        } else {
+                            None
+                        }
+                    })
+            });
+            if let Some(player_id) = reserved_host_id {
+                self.assign_reserved_host_to_player(&player_id);
+                return Some(player_id);
+            }
+
+            self.host_player_id = None;
+            self.reconcile_host_flags(None);
+            return None;
+        }
+
         if let Some(current_host_id) = self.host_player_id.clone()
             && let Some(current_host) = self.players.get(&current_host_id)
             && (!prefer_connected || current_host.is_connected)
@@ -4574,6 +4685,35 @@ mod tests {
         assert_eq!(s.host_player_id.as_deref(), Some("p1"));
         assert!(s.players.get("p1").unwrap().is_host);
         assert!(!s.players.get("p2").unwrap().is_host);
+    }
+
+    #[test]
+    fn reserved_host_blocks_guest_from_becoming_host_until_creator_joins() {
+        let mut s = WorkshopSession::new(
+            Uuid::new_v4(),
+            SessionCode("120001".into()),
+            ts(1),
+            config(),
+        );
+        s.reserve_host("acct-alice", "Alice");
+
+        let mut guest = player("p2", true, 20);
+        guest.account_id = Some("acct-bob".to_string());
+        s.add_player(guest);
+
+        assert_eq!(s.host_player_id, None);
+        assert!(!s.players.get("p2").unwrap().is_host);
+        assert_eq!(s.reserved_host_name(), Some("Alice"));
+
+        let mut creator = player("p1", true, 10);
+        creator.account_id = Some("acct-alice".to_string());
+        s.add_player(creator);
+
+        assert_eq!(s.host_player_id.as_deref(), Some("p1"));
+        assert!(s.players.get("p1").unwrap().is_host);
+        assert!(!s.players.get("p2").unwrap().is_host);
+        assert_eq!(s.owner_account_id(), Some("acct-alice"));
+        assert_eq!(s.reserved_host_account_id(), None);
     }
 
     #[test]

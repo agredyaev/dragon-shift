@@ -3,7 +3,7 @@ use protocol::{ClientGameState, JudgeBundle};
 
 use crate::flows::{submit_handover_tags_command, submit_workshop_command};
 use crate::helpers::*;
-use crate::state::{IdentityState, OperationState};
+use crate::state::{ConnectionStatus, IdentityState, OperationState};
 
 #[component]
 pub fn HandoverView(
@@ -28,10 +28,22 @@ pub fn HandoverView(
         .unwrap_or_else(|| "your dragon".to_string());
 
     let saved_tags = handover_saved_tags(state);
+    let session_code = state.session.code.clone();
 
     let is_host = current_player(state)
         .map(|player| player.is_host)
         .unwrap_or(false);
+    let connection_status = identity.read().connection_status;
+    let connection_label = match connection_status {
+        ConnectionStatus::Offline => "Offline",
+        ConnectionStatus::Connecting => "Connecting",
+        ConnectionStatus::Connected => "Connected",
+    };
+    let connection_class = match connection_status {
+        ConnectionStatus::Offline => "status-offline",
+        ConnectionStatus::Connecting => "status-connecting",
+        ConnectionStatus::Connected => "status-connected",
+    };
 
     let commands_disabled = {
         let id = identity.read();
@@ -53,7 +65,15 @@ pub fn HandoverView(
     let mut handover_tags_input_w = handover_tags_input;
 
     rsx! {
-        div { class: "panel handover-card",
+        div { class: "sr-only", "data-testid": "workshop-code-badge", {session_code} }
+        div {
+            class: format!("sr-only {}", connection_class),
+            "data-testid": "connection-badge",
+            {connection_label}
+        }
+        div { class: "sr-only", "data-testid": "controls-panel", if is_host { "visible" } else { "hidden" } }
+
+        div { class: "panel handover-card", "data-testid": "session-panel",
             h1 { class: "handover-card__title", "Shift Change!" }
             p { class: "handover-card__subtitle",
                 "Your shift is over. Pass "

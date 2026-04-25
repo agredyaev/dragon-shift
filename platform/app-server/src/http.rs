@@ -25,8 +25,9 @@ use protocol::{
     SPRITE_ATELIER_QUEUED_NOTICE_MESSAGE, SelectCharacterRequest, SessionArtifactKind,
     SessionArtifactRecord, SessionCommand, SessionNoticeCode, SpriteSheetRequest,
     SpriteSheetResult, SpriteSheetSuccess, VotePayload, WorkshopCommandRequest,
-    WorkshopCommandResult, WorkshopCommandSuccess, WorkshopError, WorkshopJoinResult,
-    WorkshopJoinSuccess, WorkshopJudgeBundleRequest, WorkshopJudgeBundleResult,
+    WorkshopCommandResult, WorkshopCommandSuccess, WorkshopCreateResult,
+    WorkshopCreateSuccess, WorkshopError, WorkshopJoinResult, WorkshopJoinSuccess,
+    WorkshopJudgeBundleRequest, WorkshopJudgeBundleResult,
     WorkshopJudgeBundleSuccess,
 };
 use security::{FixedWindowRateLimiter, OriginPolicy};
@@ -46,7 +47,9 @@ use crate::cache::{SessionWriteLease, ensure_session_cached, reload_cached_sessi
 use crate::helpers::{
     build_judge_bundle, parse_player_action, phase_step, random_prefixed_id, to_client_game_state,
 };
-use crate::ws::{broadcast_session_state, send_player_notice_with_code};
+use crate::ws::{
+    broadcast_session_state, close_local_workshop_connections, send_player_notice_with_code,
+};
 
 enum ImageJobAdmissionError {
     TimedOut,
@@ -779,6 +782,7 @@ pub(crate) async fn create_workshop(
         timestamp,
         session_config,
     );
+    workshop.owner_account_id = Some(session.account.id.clone());
     let host_player = SessionPlayer {
         id: player_id.clone(),
         name: normalized_name.clone(),
@@ -851,6 +855,75 @@ pub(crate) async fn create_workshop(
     (
         StatusCode::CREATED,
         Json(WorkshopJoinResult::Success(response)),
+    )
+}
+
+pub(crate) async fn create_workshop_lobby(
+    State(state): State<AppState>,
+    session: AccountSession,
+    connect_info: MaybeConnectInfo,
+    headers: HeaderMap,
+    Json(payload): Json<CreateWorkshopRequest>,
+) -> (StatusCode, Json<WorkshopCreateResult>) {
+    if let Some((status, payload)) = reject_disallowed_origin(&headers, &state.config.origin_policy)
+    {
+        return (status, map_join_error_to_create(payload));
+    }
+    let client_key = client_key(&state, connect_info, &headers);
+    if let Some((status, payload)) = reject_rate_limited(&state.create_limiter, &client_key).await {
+        return (status, map_join_error_to_create(payload));
+    }
+
+    let session_config = payload.config.unwrap_or_default();
+    let normalized_name = session.account.name.clone();
+    let timestamp = Utc::now();
+    let session_code = allocate_session_code(&state).await;
+    let mut workshop = WorkshopSession::new(
+        Uuid::new_v4(),
+        SessionCode(session_code.clone()),
+        timestamp,
+        session_config,
+    );
+    workshop.reserve_host(session.account.id.clone(), normalized_name.clone());
+
+    let artifact = SessionArtifactRecord {
+        id: random_prefixed_id("artifact"),
+        session_id: workshop.id.to_string(),
+        phase: protocol::Phase::Lobby,
+        step: 0,
+        kind: SessionArtifactKind::SessionCreated,
+        player_id: None,
+        created_at: timestamp.to_rfc3339(),
+        payload: json!({
+            "sessionCode": session_code,
+            "hostName": normalized_name,
+            "accountId": session.account.id,
+            "createdWithoutJoin": true,
+            "phase0Minutes": workshop.config.phase0_minutes,
+            "phase1Minutes": workshop.config.phase1_minutes,
+            "phase2Minutes": workshop.config.phase2_minutes,
+            "imageModelConfigured": state.config.llm_pool.is_image_configured(),
+            "judgeModelConfigured": state.config.llm_pool.is_judge_configured(),
+        }),
+    };
+
+    if let Err(error) = state.store.save_session_with_artifact(&workshop, &artifact).await {
+        return internal_create_error(format!("failed to persist workshop creation: {error}"));
+    }
+
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(workshop.code.0.clone(), workshop.clone());
+
+    (
+        StatusCode::CREATED,
+        Json(WorkshopCreateResult::Success(WorkshopCreateSuccess {
+            ok: true,
+            session_code: workshop.code.0,
+            host_name: normalized_name,
+        })),
     )
 }
 
@@ -1135,6 +1208,7 @@ pub(crate) async fn join_workshop(
         let timestamp = Utc::now();
         let player_id = random_prefixed_id("player");
         let reconnect_token = random_prefixed_id("reconnect");
+        let is_reserved_host = session.reserved_host_account_id() == Some(account.id.as_str());
         let player = SessionPlayer {
             id: player_id.clone(),
             name: normalized_name.clone(),
@@ -1143,7 +1217,7 @@ pub(crate) async fn join_workshop(
                 .as_ref()
                 .map(|character| character.id.clone()),
             selected_character: selected_character.clone(),
-            is_host: false,
+            is_host: is_reserved_host,
             is_connected: true,
             is_ready: selected_character.is_some(),
             score: 0,
@@ -1152,6 +1226,9 @@ pub(crate) async fn join_workshop(
             joined_at: timestamp,
         };
         session.add_player(player.clone());
+        if is_reserved_host {
+            session.assign_reserved_host_to_player(&player_id);
+        }
         (session_before, session.clone(), player_id, reconnect_token)
     };
 
@@ -2099,6 +2176,27 @@ fn internal_join_error(message: String) -> (StatusCode, Json<WorkshopJoinResult>
             error: message,
         })),
     )
+}
+
+fn internal_create_error(message: String) -> (StatusCode, Json<WorkshopCreateResult>) {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(WorkshopCreateResult::Error(WorkshopError {
+            ok: false,
+            error: message,
+        })),
+    )
+}
+
+fn map_join_error_to_create(payload: Json<WorkshopJoinResult>) -> Json<WorkshopCreateResult> {
+    let Json(payload) = payload;
+    Json(match payload {
+        WorkshopJoinResult::Error(error) => WorkshopCreateResult::Error(error),
+        WorkshopJoinResult::Success(_) => WorkshopCreateResult::Error(WorkshopError {
+            ok: false,
+            error: "unexpected join success payload".to_string(),
+        }),
+    })
 }
 
 fn bad_judge_bundle_request(message: &str) -> (StatusCode, Json<WorkshopJudgeBundleResult>) {
@@ -3286,6 +3384,98 @@ pub(crate) async fn delete_character(
     }
 }
 
+/// `DELETE /api/workshops/:code` — delete an owned lobby workshop.
+pub(crate) async fn delete_workshop(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    session: AccountSession,
+    Path(session_code): Path<String>,
+) -> Response {
+    if let Some((status, payload)) = reject_disallowed_origin(&headers, &state.config.origin_policy)
+    {
+        let error = match payload.0 {
+            WorkshopJoinResult::Success(_) => "Origin is not allowed.".to_string(),
+            WorkshopJoinResult::Error(error) => error.error,
+        };
+        return (status, Json(json!({ "error": error }))).into_response();
+    }
+
+    let (_, _write_guard, write_lease) = match SessionWriteLease::acquire(&state, &session_code).await {
+        Ok(guard) => guard,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": format!("failed to acquire session lease: {error}") })),
+            )
+                .into_response();
+        }
+    };
+    if let Err(error) = write_lease.ensure_active() {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("lost session lease before delete: {error}") })),
+        )
+            .into_response();
+    }
+
+    match reload_cached_session(&state, &session_code).await {
+        Ok(_) => {}
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": format!("failed to reload session before delete: {error}") })),
+            )
+                .into_response();
+        }
+    }
+    if let Err(error) = write_lease.ensure_active() {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("lost session lease before delete persist: {error}") })),
+        )
+            .into_response();
+    }
+
+    match state
+        .store
+        .delete_lobby_workshop_by_owner(&session_code, &session.account.id)
+        .await
+    {
+        Ok(true) => {
+            state.sessions.lock().await.remove(&session_code);
+            match state
+                .store
+                .delete_realtime_connections_for_session(&session_code)
+                .await
+            {
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(%error, %session_code, "failed to delete realtime connections after workshop delete");
+                }
+            }
+            close_local_workshop_connections(&state, &session_code, Some("Workshop not found.")).await;
+            let notification = persistence::SessionUpdateNotification::workshop_deleted(&session_code);
+            if let Err(error) = state.store.publish_session_notification(&notification).await {
+                tracing::warn!(%error, %session_code, "failed to publish delete notification");
+            }
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Ok(false) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "Workshop not found, already started, not empty, or not owned by your account." })),
+        )
+            .into_response(),
+        Err(error) => {
+            tracing::error!(%error, %session_code, "delete_lobby_workshop_by_owner failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "internal error" })),
+            )
+                .into_response()
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Open workshops list (C2-b)
 // ---------------------------------------------------------------------------
@@ -3310,7 +3500,7 @@ pub(crate) struct OpenWorkshopsQuery {
 ///   `?before_created_at=<rfc3339>&before_session_code=<code>` (Prev).
 pub(crate) async fn list_open_workshops(
     State(state): State<AppState>,
-    _session: AccountSession,
+    session: AccountSession,
     Query(query): Query<OpenWorkshopsQuery>,
 ) -> Response {
     // `serde_urlencoded` turns `?after_created_at=&after_session_code=` into
@@ -3433,6 +3623,8 @@ pub(crate) async fn list_open_workshops(
             host_name: r.host_name,
             player_count: r.player_count,
             created_at: r.created_at,
+            can_delete: r.player_count == 0
+                && r.owner_account_id.as_deref() == Some(session.account.id.as_str()),
         })
         .collect();
     (

@@ -89,9 +89,6 @@ pub fn screen_title(screen: &ShellScreen) -> &'static str {
         ShellScreen::SignIn => "Sign in to Dragon Shift",
         ShellScreen::AccountHome => "Your account",
         ShellScreen::CreateCharacter => "Create a character",
-        ShellScreen::PickCharacter {
-            workshop_code: None,
-        } => "Pick your host character",
         ShellScreen::PickCharacter { .. } => "Pick a character",
         ShellScreen::Session => "Your Dragon Shift session is live",
     }
@@ -1420,10 +1417,7 @@ pub mod tests {
             ShellScreen::AccountHome,
             ShellScreen::CreateCharacter,
             ShellScreen::PickCharacter {
-                workshop_code: None,
-            },
-            ShellScreen::PickCharacter {
-                workshop_code: Some("ABC123".to_string()),
+                workshop_code: "ABC123".to_string(),
             },
             ShellScreen::Session,
         ] {
@@ -1468,19 +1462,13 @@ pub mod tests {
     }
 
     /// Regression guard for UX_RECOMPOSE_v2 §4.A / §10.3: PickCharacter
-    /// must use the "Pick your dragon" / "Pick a host dragon" h1 copy.
-    /// A grep-level check so refactors that accidentally revert the
-    /// copy (e.g. back to "Pick Character") fail loudly.
+    /// must keep the join-focused "Pick your dragon" h1 copy.
     #[test]
     fn pick_character_h1_copy_is_stable() {
         let src = include_str!("components/pick_character.rs");
         assert!(
             src.contains("\"Pick your dragon\""),
             "expected PickCharacter default h1 copy \"Pick your dragon\""
-        );
-        assert!(
-            src.contains("\"Pick a host dragon\""),
-            "expected PickCharacter host-variant h1 copy \"Pick a host dragon\""
         );
     }
 
@@ -1649,6 +1637,37 @@ pub mod tests {
             rows.iter()
                 .any(|row| row.dragon_name.starts_with("Dragon #") && row.is_selected)
         );
+    }
+
+    #[test]
+    fn voting_helpers_keep_self_vote_block_when_other_owners_are_hidden() {
+        let mut state = mock_voting_state();
+        state
+            .dragons
+            .get_mut("dragon-1")
+            .expect("dragon-1")
+            .current_owner_id = Some("player-2".to_string());
+        state
+            .dragons
+            .get_mut("dragon-2")
+            .expect("dragon-2")
+            .original_owner_id = None;
+        state
+            .dragons
+            .get_mut("dragon-2")
+            .expect("dragon-2")
+            .current_owner_id = None;
+
+        let rows = voting_option_rows(&state);
+
+        assert!(rows
+            .iter()
+            .find(|row| row.real_dragon_name == "Comet")
+            .is_some_and(|row| row.is_current_players_dragon));
+        assert!(rows
+            .iter()
+            .find(|row| row.real_dragon_name == "Nova")
+            .is_some_and(|row| !row.is_current_players_dragon));
     }
 
     #[test]

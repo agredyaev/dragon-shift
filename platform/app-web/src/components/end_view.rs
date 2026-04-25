@@ -3,7 +3,7 @@ use protocol::{ClientGameState, JudgeBundle, SessionCommand};
 
 use crate::flows::{leave_workshop, submit_workshop_command};
 use crate::helpers::*;
-use crate::state::{IdentityState, OperationState};
+use crate::state::{ConnectionStatus, IdentityState, OperationState};
 
 use super::archive_panel::ArchivePanel;
 
@@ -35,6 +35,7 @@ pub fn EndView(
     let reveal_enabled = voting_reveal_ready(state);
     let results_revealed = voting_results_revealed(state);
     let voting_progress = voting_progress_label(state);
+    let session_code = state.session.code.clone();
     let header_title = if is_end_screen {
         "Game over"
     } else {
@@ -46,6 +47,17 @@ pub fn EndView(
     let commands_disabled = {
         let o = ops.read();
         o.pending_flow.is_some() || o.pending_command.is_some()
+    };
+    let connection_status = identity.read().connection_status;
+    let connection_label = match connection_status {
+        ConnectionStatus::Offline => "Offline",
+        ConnectionStatus::Connecting => "Connecting",
+        ConnectionStatus::Connected => "Connected",
+    };
+    let connection_class = match connection_status {
+        ConnectionStatus::Offline => "status-offline",
+        ConnectionStatus::Connecting => "status-connecting",
+        ConnectionStatus::Connected => "status-connected",
     };
 
     drop(gs);
@@ -68,6 +80,13 @@ pub fn EndView(
     // Game Over overlay — shown on End phase until dismissed
     if is_end_screen && !game_over_rows.is_empty() && *show_game_over.read() {
         return rsx! {
+            div { class: "sr-only", "data-testid": "workshop-code-badge", {session_code.clone()} }
+            div {
+                class: format!("sr-only {}", connection_class),
+                "data-testid": "connection-badge",
+                {connection_label}
+            }
+            div { class: "sr-only", "data-testid": "controls-panel", if is_host { "visible" } else { "hidden" } }
             div { class: "game-over", "data-testid": "game-over-overlay",
                 h1 { class: "game-over__title", "Game Over!" }
                 p { class: "game-over__subtitle", "High Scores" }
@@ -133,6 +152,14 @@ pub fn EndView(
     }
 
     rsx! {
+        div { class: "sr-only", "data-testid": "workshop-code-badge", {session_code} }
+        div {
+            class: format!("sr-only {}", connection_class),
+            "data-testid": "connection-badge",
+            {connection_label}
+        }
+        div { class: "sr-only", "data-testid": "controls-panel", if is_host { "visible" } else { "hidden" } }
+        div { "data-testid": "session-panel",
         article { class: "roster__item roster__item--phase",
             div {
                 p { class: "roster__name", {header_title} }
@@ -375,6 +402,7 @@ pub fn EndView(
         // ---- Workshop archive (End phase only) ----
         if is_end_screen {
             ArchivePanel { game_state, judge_bundle }
+        }
         }
     }
 }

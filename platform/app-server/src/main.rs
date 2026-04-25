@@ -17,7 +17,7 @@ use persistence::SessionUpdateNotification;
 use tracing::info;
 use ws::{
     advance_game_ticks, broadcast_session_state, clear_local_realtime_connection,
-    close_local_connection, emit_phase_warning_notices,
+    close_local_connection, close_local_workshop_connections, emit_phase_warning_notices,
 };
 
 pub(crate) fn parse_session_update_notification(
@@ -83,6 +83,16 @@ pub(crate) async fn handle_session_update_notification(
             clear_local_realtime_connection(state, connection_id).await;
             close_local_connection(state, connection_id).await;
         }
+        return;
+    }
+
+    if notification.kind == "workshop_deleted" {
+        state
+            .sessions
+            .lock()
+            .await
+            .remove(&notification.session_code);
+        close_local_workshop_connections(state, &notification.session_code, Some("Workshop not found.")).await;
         return;
     }
 

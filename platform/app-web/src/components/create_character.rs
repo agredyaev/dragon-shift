@@ -3,8 +3,8 @@ use protocol::{CharacterSpritePreviewRequest, CreateCharacterRequest, SpriteSet}
 
 use crate::api::AppWebApi;
 use crate::state::{
-    IdentityState, OperationState, PendingFlow, ShellScreen, error_notice, info_notice,
-    success_notice,
+    IdentityState, NoticeScope, OperationState, PendingFlow, ShellScreen, error_notice,
+    info_notice, navigate_to_screen, scoped_notice, success_notice,
 };
 
 const EMOTION_LABELS: [&str; 4] = ["Neutral", "Happy", "Angry", "Sleepy"];
@@ -136,7 +136,10 @@ pub fn CreateCharacterView(
             saving.set(true);
             ops.with_mut(|o| {
                 o.pending_flow = Some(PendingFlow::Create);
-                o.notice = Some(info_notice("Creating character…"));
+                o.notice = Some(scoped_notice(
+                    NoticeScope::CreateCharacter,
+                    info_notice("Creating character…"),
+                ));
             });
             spawn(async move {
                 let api = AppWebApi::new(base_url);
@@ -147,17 +150,25 @@ pub fn CreateCharacterView(
                 match api.create_character(&request).await {
                     Ok(_profile) => {
                         identity.with_mut(|id| {
-                            id.screen = ShellScreen::AccountHome;
+                            ops.with_mut(|o| {
+                                navigate_to_screen(id, o, ShellScreen::AccountHome);
+                            });
                         });
                         ops.with_mut(|o| {
                             o.pending_flow = None;
-                            o.notice = Some(success_notice("Character created."));
+                            o.notice = Some(scoped_notice(
+                                NoticeScope::AccountHome,
+                                success_notice("Character created."),
+                            ));
                         });
                     }
                     Err(error) => {
                         ops.with_mut(|o| {
                             o.pending_flow = None;
-                            o.notice = Some(error_notice(&error));
+                            o.notice = Some(scoped_notice(
+                                NoticeScope::CreateCharacter,
+                                error_notice(&error),
+                            ));
                         });
                     }
                 }
@@ -194,7 +205,7 @@ pub fn CreateCharacterView(
     let generate_button_class = if has_sprites {
         "button button--secondary phase0-action-button"
     } else {
-        "button button--primary button--cta phase0-action-button"
+        "button button--primary phase0-action-button"
     };
 
     rsx! {
@@ -259,17 +270,6 @@ pub fn CreateCharacterView(
                 }
             }
 
-            button {
-                class: "{generate_button_class}",
-                "data-testid": "generate-sprites-button",
-                disabled: generation_in_flight
-                    || saving_now
-                    || description_empty
-                    || pending,
-                onclick: generate_onclick,
-                {generate_button_label}
-            }
-
             if has_sprites {
                 h2 { class: "panel__title phase0-card__section-title", "Review your pet" }
                 div { class: "sprite-grid",
@@ -297,20 +297,19 @@ pub fn CreateCharacterView(
                 }
             }
 
-            div { class: "button-row",
+            div { class: "button-row phase0-card__actions",
                 button {
-                    class: "button button--secondary",
-                    "data-testid": "back-to-account-button",
-                    disabled: generation_in_flight || saving_now,
-                    onclick: move |_| {
-                        identity.clone().with_mut(|id| {
-                            id.screen = ShellScreen::AccountHome;
-                        });
-                    },
-                    "Back"
+                    class: "{generate_button_class}",
+                    "data-testid": "generate-sprites-button",
+                    disabled: generation_in_flight
+                        || saving_now
+                        || description_empty
+                        || pending,
+                    onclick: generate_onclick,
+                    {generate_button_label}
                 }
                 button {
-                    class: "button button--primary button--cta phase0-action-button",
+                    class: "button button--primary phase0-action-button",
                     "data-testid": "save-character-button",
                     disabled: !has_sprites
                         || saving_now
@@ -319,6 +318,22 @@ pub fn CreateCharacterView(
                         || pending,
                     onclick: save_onclick,
                     if saving_now { "Saving..." } else { "Save Character" }
+                }
+            }
+
+            div { class: "button-row phase0-card__back-row",
+                button {
+                    class: "button button--secondary",
+                    "data-testid": "back-to-account-button",
+                    disabled: generation_in_flight || saving_now,
+                    onclick: move |_| {
+                        identity.clone().with_mut(|id| {
+                            ops.with_mut(|o| {
+                                navigate_to_screen(id, o, ShellScreen::AccountHome);
+                            });
+                        });
+                    },
+                    "Back"
                 }
             }
         }
