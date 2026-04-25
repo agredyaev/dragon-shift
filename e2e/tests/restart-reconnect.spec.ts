@@ -3,13 +3,14 @@ import { existsSync, readFileSync } from 'node:fs'
 import { expect, test, type APIRequestContext } from '@playwright/test'
 
 import {
-  createWorkshop,
-  generateDragonSprites,
+  cloneSignedInSession,
+  createCharacter,
+  createWorkshopAndJoinAsHost,
   joinWorkshop,
   newPlayerContext,
-  openCharacterCreation,
-  readReconnectToken,
-  saveDragonProfile,
+  readSessionSnapshot,
+  saveHandoverTags,
+  signInAccount,
   voteForVisibleDragon,
   waitForNotice,
 } from './gameplay-helpers'
@@ -76,22 +77,19 @@ async function waitForReady(request: APIRequestContext, baseUrl: string) {
 test.describe('browser restart reconnect proof', () => {
   test.skip(!process.env.E2E_MANAGED_SERVER_STATE_PATH, 'managed local restart harness only')
 
-  test('restart -> reconnect -> continued realtime correctness end-to-end', async ({ browser, request }) => {
+  test('restart -> storage bootstrap reconnect -> continued realtime correctness end-to-end', async ({ browser, request }) => {
     const host = await newPlayerContext(browser)
     const guest = await newPlayerContext(browser)
     const reconnect = await newPlayerContext(browser)
 
     try {
-      const workshopCode = await createWorkshop(host.page, 'Alice')
+      await signInAccount(host.page, 'Alice')
+      await createCharacter(host.page, 'A lantern-scaled dragon with ember whiskers.')
+      await signInAccount(guest.page, 'Bob')
+      await createCharacter(guest.page, 'A mint dragon with ribbon fins and calm eyes.')
+
+      const workshopCode = await createWorkshopAndJoinAsHost(host.page, 'Alice')
       await joinWorkshop(guest.page, workshopCode, 'Bob')
-
-      await openCharacterCreation(host.page, guest.page)
-
-      await generateDragonSprites(host.page)
-      await generateDragonSprites(guest.page)
-
-      await saveDragonProfile(host.page, 'A lantern-scaled dragon with ember whiskers.')
-      await saveDragonProfile(guest.page, 'A mint dragon with ribbon fins and calm eyes.')
 
       await host.page.getByTestId('start-phase1-button').click()
       await waitForNotice(host.page, 'Phase 1 started.')
@@ -100,15 +98,13 @@ test.describe('browser restart reconnect proof', () => {
 
       await host.page.getByTestId('start-handover-button').click()
       await waitForNotice(host.page, 'Handover started.')
-      await expect(host.page.locator('body')).toContainText('Handover')
-      await expect(guest.page.locator('body')).toContainText('Handover')
+      await expect(host.page.locator('body')).toContainText('Shift Change!')
+      await expect(guest.page.locator('body')).toContainText('Shift Change!')
 
-      await host.page.getByTestId('handover-tags-input').fill('calm,dusk,berries')
-      await host.page.getByTestId('save-handover-tags-button').click()
-      await waitForNotice(host.page, 'Handover tags saved.')
-      await expect(host.page.locator('body')).toContainText('3 / 3 handover rules saved')
+      await saveHandoverTags(host.page, 'calm,dusk,berries')
+      await expect(host.page.locator('body')).toContainText('berries')
 
-      const reconnectToken = await readReconnectToken(host.page)
+      const snapshot = await readSessionSnapshot(host.page)
       const beforeRestart = readManagedState()
 
       process.kill(beforeRestart.managerPid, 'SIGHUP')
@@ -121,39 +117,31 @@ test.describe('browser restart reconnect proof', () => {
 
       await expect(host.page.getByTestId('connection-badge')).toContainText('Offline')
 
-      await reconnect.page.goto('/')
-      await reconnect.page.getByTestId('reconnect-session-code-input').fill(workshopCode)
-      await reconnect.page.getByTestId('reconnect-token-input').fill(reconnectToken)
-      await reconnect.page.getByTestId('reconnect-button').click()
+      await cloneSignedInSession(host.page, reconnect.context, reconnect.page, snapshot)
 
       await expect(reconnect.page.getByTestId('connection-badge')).toContainText('Connected')
-      await waitForNotice(reconnect.page, 'Reconnected to workshop.')
-      await expect(reconnect.page.locator('body')).toContainText('Handover')
-      await expect(reconnect.page.locator('body')).toContainText('3 / 3 handover rules saved')
+      await waitForNotice(reconnect.page, 'Session synced.')
+      await expect(reconnect.page.locator('body')).toContainText('Shift Change!')
       await expect(reconnect.page.locator('body')).toContainText('berries')
 
       await expect(guest.page.getByTestId('connection-badge')).toContainText('Offline')
       await guest.page.reload()
       await waitForNotice(guest.page, 'Session synced.')
       await expect(guest.page.getByTestId('connection-badge')).toContainText('Connected')
-      await expect(guest.page.locator('body')).toContainText('Handover')
+      await expect(guest.page.locator('body')).toContainText('Shift Change!')
 
-      await guest.page.getByTestId('handover-tags-input').fill('music,night,playful')
-      await guest.page.getByTestId('save-handover-tags-button').click()
-      await waitForNotice(guest.page, 'Handover tags saved.')
-      await expect(reconnect.page.locator('body')).toContainText('Handover')
+      await saveHandoverTags(guest.page, 'music,night,playful')
+      await expect(reconnect.page.locator('body')).toContainText('Shift Change!')
 
       await reconnect.page.getByTestId('start-phase2-button').click()
       await waitForNotice(reconnect.page, 'Phase 2 started.')
-      await expect(reconnect.page.locator('body')).toContainText('Care round')
-      await expect(guest.page.locator('body')).toContainText('Care round')
+      await expect(reconnect.page.locator('body')).toContainText('Phase 2: New Shift')
+      await expect(guest.page.locator('body')).toContainText('Phase 2: New Shift')
 
       await reconnect.page.getByTestId('end-game-button').click()
       await waitForNotice(reconnect.page, 'Scoring opened.')
-      await expect(reconnect.page.locator('body')).toContainText('Scoring')
-      await expect(guest.page.locator('body')).toContainText('Scoring')
-      await expect(reconnect.page.locator('.voting-grid')).toBeVisible()
-      await expect(guest.page.locator('.voting-grid')).toBeVisible()
+      await expect(reconnect.page.locator('body')).toContainText('Vote for the most creative dragon design')
+      await expect(guest.page.locator('body')).toContainText('Vote for the most creative dragon design')
 
       await expect(reconnect.page.locator('body')).toContainText('0 / 2 votes submitted')
 

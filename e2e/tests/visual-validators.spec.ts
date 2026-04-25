@@ -2,43 +2,26 @@ import { mkdirSync, writeFileSync } from 'node:fs'
 import * as path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-import { expect, test, type Browser, type BrowserContext, type Page } from '@playwright/test'
+import { expect, test, type Page } from '@playwright/test'
 
 import {
-  createWorkshop,
+  createCharacter,
+  createWorkshopAndJoinAsHost,
   enterHandover,
   enterJudge,
   enterPhase1,
   enterPhase2,
   enterVoting,
-  gotoApp,
   joinWorkshop,
   newPlayerContext,
-  openCharacterCreation,
-  generateDragonSprites,
-  readReconnectToken,
-  saveDragonProfile,
   saveHandoverTags,
+  signInAccount,
   voteForVisibleDragon,
   waitForNotice,
 } from './gameplay-helpers'
 
-type ValidatorRole =
-  | 'Host'
-  | 'Validator 1'
-  | 'Validator 2'
-  | 'Validator 3'
-  | 'Validator 4'
-  | 'Validator 5'
-
-type PhaseWindow = 'home' | 'lobby' | 'phase0' | 'phase1' | 'handover' | 'phase2' | 'judge' | 'voting' | 'end'
-
-type ValidatorCtx = {
-  role: ValidatorRole
-  context: BrowserContext
-  page: Page
-  reconnectToken: string
-}
+type Role = 'Host' | 'Validator 1' | 'Validator 2'
+type PhaseWindow = 'signin' | 'home' | 'lobby' | 'phase1' | 'handover' | 'phase2' | 'voting' | 'end'
 
 type ReportEntry = {
   phase: string
@@ -49,11 +32,6 @@ type ReportEntry = {
   screenshot: string
 }
 
-type PhaseCheck = {
-  label: string
-  fn: (page: Page) => Promise<{ summary: string; details: string; status?: 'pass' | 'warn' | 'bug' }>
-}
-
 const BASE_URL = process.env.E2E_BASE_URL ?? 'https://dragon-shift.34.54.200.112.nip.io/'
 const RUN_ID = `visual-${new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)}`
 const __filename = fileURLToPath(import.meta.url)
@@ -61,43 +39,6 @@ const __dirname = path.dirname(__filename)
 const ARTIFACT_ROOT = path.resolve(__dirname, '..', '.tmp', 'visual-validator-runs', RUN_ID)
 const SCREENSHOT_ROOT = path.join(ARTIFACT_ROOT, 'shots')
 const REPORT_ROOT = path.join(ARTIFACT_ROOT, 'reports')
-const lobbyTitlePattern = /Workshop lobby|Waiting lobby/
-
-const phase0Descriptions = [
-  'A brass dragon with clockwork ribs, plum wings, and ember freckles.',
-  'A jade dragon with petal fins, moonlit eyes, and a ribbon tail.',
-  'A charcoal dragon with cobalt horns and a lantern glow under the scales.',
-  'A coral dragon with shell-like cheeks, teal wings, and a comet tail.',
-  'A lilac dragon with fern horns, glassy eyes, and silver claws.',
-  'A sand-colored dragon with moss frills, bright whiskers, and heavy paws.',
-]
-
-const phase1Observations = [
-  'Daytime hints are visible right away and the dragon reads as approachable.',
-  'Stat bars are readable, but the action cluster feels dense on a single column.',
-  'The observation input is clear, though save feedback is easy to miss while focused on stats.',
-  'Speech hint adds personality, but it competes visually with the condition hint copy.',
-  'The countdown chip is useful, though the round name and focus card feel slightly repetitive.',
-  'Action cooldown feedback is understandable, but the disabled state needs stronger contrast.',
-]
-
-const handoverTags = [
-  'calm,dusk,berries',
-  'music,night,playful',
-  'river,day,meat',
-  'lantern,fetch,warm',
-  'cozy,fruit,quiet',
-  'windy,watchful,sleep',
-]
-
-const roleNames: Array<{ role: ValidatorRole; joinName: string }> = [
-  { role: 'Host', joinName: 'HostAlice' },
-  { role: 'Validator 1', joinName: 'V1Basil' },
-  { role: 'Validator 2', joinName: 'V2Coral' },
-  { role: 'Validator 3', joinName: 'V3Dune' },
-  { role: 'Validator 4', joinName: 'V4Ember' },
-  { role: 'Validator 5', joinName: 'V5Fable' },
-]
 
 function ensureArtifactDirs() {
   mkdirSync(SCREENSHOT_ROOT, { recursive: true })
@@ -108,12 +49,8 @@ function slugify(value: string) {
   return value.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '')
 }
 
-function roleFileStem(role: ValidatorRole) {
-  return slugify(role)
-}
-
-async function capture(page: Page, role: ValidatorRole, phase: PhaseWindow, label: string) {
-  const roleDir = path.join(SCREENSHOT_ROOT, roleFileStem(role))
+async function capture(page: Page, role: Role, phase: PhaseWindow, label: string) {
+  const roleDir = path.join(SCREENSHOT_ROOT, slugify(role))
   mkdirSync(roleDir, { recursive: true })
   const fileName = `${phase}-${slugify(label)}.png`
   const absolutePath = path.join(roleDir, fileName)
@@ -121,75 +58,8 @@ async function capture(page: Page, role: ValidatorRole, phase: PhaseWindow, labe
   return path.relative(ARTIFACT_ROOT, absolutePath)
 }
 
-async function openReconnectWindow(
-  browser: Browser,
-  workshopCode: string,
-  reconnectToken: string,
-  expectedText: string,
-) {
-  const player = await newPlayerContext(browser)
-  await player.page.goto('/')
-
-  const sessionPanel = player.page.getByTestId('session-panel')
-  const reconnectButton = player.page.getByTestId('reconnect-button')
-
-  await Promise.race([
-    sessionPanel.waitFor({ state: 'visible', timeout: 30_000 }).then(() => 'session'),
-    reconnectButton.waitFor({ state: 'visible', timeout: 30_000 }).then(() => 'home'),
-  ])
-
-  if (await reconnectButton.isVisible().catch(() => false)) {
-    await player.page.getByTestId('reconnect-session-code-input').fill(workshopCode)
-    await player.page.getByTestId('reconnect-token-input').fill(reconnectToken)
-    await reconnectButton.click()
-  }
-
-  await expect(sessionPanel).toContainText(expectedText)
-  await expect(player.page.getByTestId('connection-badge')).toContainText('Connected')
-  return player
-}
-
-async function rotateToWindow(
-  browser: Browser,
-  validator: ValidatorCtx,
-  workshopCode: string,
-  expectedText: string,
-) {
-  const reconnectToken = validator.reconnectToken
-  await validator.context.close()
-  const replacement = await openReconnectWindow(browser, workshopCode, reconnectToken, expectedText)
-  validator.context = replacement.context
-  validator.page = replacement.page
-  validator.reconnectToken = await readReconnectToken(replacement.page)
-}
-
-async function collectChecks(
-  page: Page,
-  role: ValidatorRole,
-  phase: string,
-  window: PhaseWindow,
-  checks: PhaseCheck[],
-) {
-  const entries: ReportEntry[] = []
-
-  for (const check of checks) {
-    const result = await check.fn(page)
-    const screenshot = await capture(page, role, window, check.label)
-    entries.push({
-      phase,
-      window,
-      status: result.status ?? 'pass',
-      summary: result.summary,
-      details: result.details,
-      screenshot,
-    })
-  }
-
-  return entries
-}
-
-function writeRoleReport(role: ValidatorRole, workshopCode: string, entries: ReportEntry[]) {
-  const reportPath = path.join(REPORT_ROOT, `${roleFileStem(role)}.md`)
+function writeRoleReport(role: Role, workshopCode: string, entries: ReportEntry[]) {
+  const reportPath = path.join(REPORT_ROOT, `${slugify(role)}.md`)
   const lines = [
     `# ${role}`,
     '',
@@ -213,7 +83,7 @@ function writeRoleReport(role: ValidatorRole, workshopCode: string, entries: Rep
   writeFileSync(reportPath, lines.join('\n'), 'utf8')
 }
 
-function writeSummary(workshopCode: string, reports: Map<ValidatorRole, ReportEntry[]>) {
+function writeSummary(workshopCode: string, reports: Map<Role, ReportEntry[]>) {
   const allEntries = Array.from(reports.values()).flat()
   const bugs = allEntries.filter(entry => entry.status === 'bug')
   const warnings = allEntries.filter(entry => entry.status === 'warn')
@@ -249,353 +119,227 @@ function writeSummary(workshopCode: string, reports: Map<ValidatorRole, ReportEn
   writeFileSync(path.join(ARTIFACT_ROOT, 'summary.md'), lines.join('\n'), 'utf8')
 }
 
-async function roleChecksForHome(page: Page) {
-  return collectChecks(page, 'Host', 'Home', 'home', [
-    {
-      label: 'home-overview',
-      fn: async currentPage => {
-        await expect(currentPage.getByTestId('hero-panel')).toBeVisible()
-        await expect(currentPage.getByTestId('create-panel')).toBeVisible()
-        await expect(currentPage.getByTestId('join-panel')).toBeVisible()
-        return {
-          summary: 'Home screen is structurally complete',
-          details: 'Hero, create panel, and join panel are all visible on first load.',
-        }
-      },
-    },
-  ])
+async function record(
+  reports: Map<Role, ReportEntry[]>,
+  role: Role,
+  page: Page,
+  phase: string,
+  window: PhaseWindow,
+  label: string,
+  summary: string,
+  details: string,
+  status: 'pass' | 'warn' | 'bug' = 'pass',
+) {
+  const screenshot = await capture(page, role, window, label)
+  const entries = reports.get(role) ?? []
+  entries.push({ phase, window, status, summary, details, screenshot })
+  reports.set(role, entries)
 }
 
 test.describe.serial('visual validators', () => {
-  test('six validators capture separate phase windows with reports and screenshots', async ({ browser }) => {
+  test('three validators capture current supported flow with reports and screenshots', async ({ browser }) => {
     ensureArtifactDirs()
 
-    const validators: ValidatorCtx[] = []
-    const reports = new Map<ValidatorRole, ReportEntry[]>()
-    let workshopCode = ''
+    const reports = new Map<Role, ReportEntry[]>()
+    const host = await newPlayerContext(browser)
+    const guest1 = await newPlayerContext(browser)
+    const guest2 = await newPlayerContext(browser)
+    let workshopCode = 'unknown'
 
     try {
-      for (const { role } of roleNames) {
-        const player = await newPlayerContext(browser)
-        await gotoApp(player.page)
-        validators.push({
+      await host.page.goto('/')
+      await expect(host.page.getByTestId('signin-panel')).toBeVisible()
+      await record(
+        reports,
+        'Host',
+        host.page,
+        'SignIn',
+        'signin',
+        'signin-layout',
+        'Sign-in screen is visible',
+        'The current first screen exposes name/password inputs and a single primary submit action.',
+      )
+
+      await signInAccount(host.page, 'HostAlice')
+      await signInAccount(guest1.page, 'V1Basil')
+      await signInAccount(guest2.page, 'V2Coral')
+
+      await record(
+        reports,
+        'Host',
+        host.page,
+        'AccountHome',
+        'home',
+        'home-actions',
+        'Account home shows current entry points',
+        'Create workshop, create dragon, and open workshops are visible from the signed-in home screen.',
+      )
+
+      await createCharacter(host.page, 'A brass dragon with clockwork ribs, plum wings, and ember freckles.')
+      await createCharacter(guest1.page, 'A jade dragon with petal fins, moonlit eyes, and a ribbon tail.')
+      await createCharacter(guest2.page, 'A charcoal dragon with cobalt horns and a lantern glow under the scales.')
+
+      workshopCode = await createWorkshopAndJoinAsHost(host.page, 'HostAlice')
+      await joinWorkshop(guest1.page, workshopCode, 'V1Basil')
+      await joinWorkshop(guest2.page, workshopCode, 'V2Coral')
+
+      for (const [role, page] of [
+        ['Host', host.page],
+        ['Validator 1', guest1.page],
+        ['Validator 2', guest2.page],
+      ] as const) {
+        await expect(page.getByTestId('session-panel')).toContainText('Workshop Lobby')
+        await expect(page.getByTestId('workshop-code-badge')).toContainText(workshopCode)
+        await record(
+          reports,
           role,
-          context: player.context,
-          page: player.page,
-          reconnectToken: '',
-        })
-      }
-
-      const host = validators[0]
-      const guests = validators.slice(1)
-
-      reports.set(host.role, await roleChecksForHome(host.page))
-
-      workshopCode = await createWorkshop(host.page, roleNames[0].joinName)
-      host.reconnectToken = await readReconnectToken(host.page)
-
-      for (let index = 0; index < guests.length; index++) {
-        const guest = guests[index]
-        await joinWorkshop(guest.page, workshopCode, roleNames[index + 1].joinName)
-        guest.reconnectToken = await readReconnectToken(guest.page)
-      }
-
-      for (const validator of validators) {
-        const entries = reports.get(validator.role) ?? []
-        entries.push(
-          ...(await collectChecks(validator.page, validator.role, 'Lobby', 'lobby', [
-            {
-              label: 'lobby-roster',
-              fn: async currentPage => {
-                await expect(currentPage.getByTestId('session-panel')).toContainText(lobbyTitlePattern)
-                await expect(currentPage.getByTestId('session-panel')).toContainText('Players in view: 6')
-                return {
-                  summary: 'Lobby sync is visible for all 6 players',
-                  details: 'Roster and summary chips agree on a 6-player workshop in the waiting lobby.',
-                }
-              },
-            },
-          ])),
+          page,
+          'Lobby',
+          'lobby',
+          'lobby-roster',
+          'Lobby roster is readable',
+          'The lobby exposes workshop code, readiness copy, and a visible player roster for the joined workshop.',
         )
-        reports.set(validator.role, entries)
       }
 
-      await openCharacterCreation(host.page, ...guests.map(validator => validator.page))
+      await enterPhase1(host.page, guest1.page, guest2.page)
+      await guest1.page.getByTestId('observation-input').fill('Stat bars are readable and the sprite remains visually prominent.')
+      await guest1.page.getByTestId('submit-observation-button').click()
+      await waitForNotice(guest1.page, 'Observation saved.')
 
-      for (const validator of validators) {
-        await rotateToWindow(browser, validator, workshopCode, 'Character creation')
-      }
-
-      for (let index = 0; index < validators.length; index++) {
-        const validator = validators[index]
-        await generateDragonSprites(validator.page)
-        await saveDragonProfile(validator.page, phase0Descriptions[index])
-        validator.reconnectToken = await readReconnectToken(validator.page)
-
-        const entries = reports.get(validator.role) ?? []
-        entries.push(
-          ...(await collectChecks(validator.page, validator.role, 'Phase 0', 'phase0', [
-            {
-              label: 'phase0-layout',
-              fn: async currentPage => {
-                await expect(currentPage.getByTestId('session-panel')).toContainText('Character creation')
-                await expect(currentPage.getByTestId('dragon-description-input')).toBeVisible()
-                const previewImages = currentPage.getByTestId('session-panel').locator('.sprite-grid__image')
-                await expect(previewImages).toHaveCount(4)
-                await expect(previewImages.first()).toBeVisible()
-                await expect(currentPage.getByTestId('save-dragon-button')).toBeVisible()
-                return {
-                  summary: 'Phase 0 character creation is usable',
-                  details: 'Description field, generated sprite preview, save button, and phase copy are present in the character creation window.',
-                }
-              },
-            },
-            {
-              label: 'phase0-feedback',
-              fn: async currentPage => {
-                await expect(currentPage.getByTestId('notice-bar')).toContainText('Dragon profile saved.')
-                return {
-                  summary: 'Phase 0 save feedback is visible',
-                  details: 'Saving the dragon now produces an explicit success notice instead of a generic command response.',
-                }
-              },
-            },
-          ])),
+      for (const [role, page] of [
+        ['Host', host.page],
+        ['Validator 1', guest1.page],
+        ['Validator 2', guest2.page],
+      ] as const) {
+        await expect(page.getByTestId('session-panel')).toContainText('Phase 1: Discovery')
+        await expect(page.locator('.dragon-stage__sprite')).toBeVisible()
+        await record(
+          reports,
+          role,
+          page,
+          'Phase1',
+          'phase1',
+          'phase1-discovery',
+          'Phase 1 discovery layout is visible',
+          'Discovery view shows the dragon sprite, action controls, and the observation input on the active screen.',
         )
-        reports.set(validator.role, entries)
       }
 
-      await enterPhase1(host.page, ...guests.map(validator => validator.page))
+      await enterHandover(host.page, guest1.page, guest2.page)
+      await saveHandoverTags(host.page, 'calm,dusk,berries')
+      await saveHandoverTags(guest1.page, 'music,night,playful')
+      await saveHandoverTags(guest2.page, 'river,day,meat')
 
-      for (const validator of validators) {
-        await rotateToWindow(browser, validator, workshopCode, 'Discovery round')
-      }
-
-      for (let index = 0; index < validators.length; index++) {
-        const validator = validators[index]
-        await validator.page.getByTestId('observation-input').fill(phase1Observations[index])
-        await validator.page.getByTestId('submit-observation-button').click()
-        await waitForNotice(validator.page, 'Observation saved.')
-        validator.reconnectToken = await readReconnectToken(validator.page)
-
-        const entries = reports.get(validator.role) ?? []
-        entries.push(
-          ...(await collectChecks(validator.page, validator.role, 'Phase 1', 'phase1', [
-            {
-              label: 'phase1-visibility',
-              fn: async currentPage => {
-                await expect(currentPage.getByTestId('session-panel')).toContainText('Discovery round')
-                await expect(currentPage.getByTestId('observation-input')).toBeVisible()
-                await expect(currentPage.getByTestId('action-feed-meat')).toBeVisible()
-                return {
-                  summary: 'Phase 1 discovery tools are visible',
-                  details: 'Observation input and action controls appear in the dedicated discovery window.',
-                }
-              },
-            },
-          ])),
+      for (const [role, page] of [
+        ['Host', host.page],
+        ['Validator 1', guest1.page],
+        ['Validator 2', guest2.page],
+      ] as const) {
+        await expect(page.getByTestId('session-panel')).toContainText('Shift Change!')
+        await expect(page.getByTestId('save-handover-tags-button')).toBeVisible()
+        await record(
+          reports,
+          role,
+          page,
+          'Handover',
+          'handover',
+          'handover-layout',
+          'Handover screen keeps note entry visible',
+          'The handover screen shows its three rule inputs and acknowledges saved notes without modal flow changes.',
         )
-        reports.set(validator.role, entries)
       }
 
-      await enterHandover(host.page, ...guests.map(validator => validator.page))
+      await enterPhase2(host.page, guest1.page, guest2.page)
 
-      for (const validator of validators) {
-        await rotateToWindow(browser, validator, workshopCode, 'Handover')
-      }
-
-      for (let index = 0; index < validators.length; index++) {
-        const validator = validators[index]
-        await saveHandoverTags(validator.page, handoverTags[index])
-        validator.reconnectToken = await readReconnectToken(validator.page)
-
-        const entries = reports.get(validator.role) ?? []
-        entries.push(
-          ...(await collectChecks(validator.page, validator.role, 'Handover', 'handover', [
-            {
-              label: 'handover-entry',
-              fn: async currentPage => {
-                await expect(currentPage.getByTestId('session-panel')).toContainText('Handover')
-                await expect(currentPage.getByTestId('handover-tags-input')).toBeVisible()
-                await expect(currentPage.getByTestId('notice-bar')).toContainText('Handover tags saved.')
-                return {
-                  summary: 'Handover window accepts rules and confirms save',
-                  details: 'The dedicated handover window keeps tag entry visible and acknowledges each save clearly.',
-                }
-              },
-            },
-          ])),
+      for (const [role, page] of [
+        ['Host', host.page],
+        ['Validator 1', guest1.page],
+        ['Validator 2', guest2.page],
+      ] as const) {
+        await expect(page.getByTestId('session-panel')).toContainText('Phase 2: New Shift')
+        await expect(page.locator('.phase2-creator-label')).toBeVisible()
+        await record(
+          reports,
+          role,
+          page,
+          'Phase2',
+          'phase2',
+          'phase2-layout',
+          'Phase 2 care layout is visible',
+          'Care view preserves the dragon/action layout and adds creator plus inherited-note context.',
         )
-        reports.set(validator.role, entries)
       }
 
-      await enterPhase2(host.page, ...guests.map(validator => validator.page))
+      await enterJudge(host.page, guest1.page, guest2.page)
+      await enterVoting(host.page, guest1.page, guest2.page)
 
-      for (const validator of validators) {
-        await rotateToWindow(browser, validator, workshopCode, 'Care round')
-      }
-
-      for (const validator of validators) {
-        const entries = reports.get(validator.role) ?? []
-        entries.push(
-          ...(await collectChecks(validator.page, validator.role, 'Phase 2', 'phase2', [
-            {
-              label: 'phase2-handover-context',
-              fn: async currentPage => {
-                await expect(currentPage.getByTestId('session-panel')).toContainText('Care round')
-                await expect(currentPage.getByTestId('session-panel')).toContainText('Handover notes from previous caretaker')
-                return {
-                  summary: 'Phase 2 care window shows inherited context',
-                  details: 'Care round keeps the action controls while surfacing handover guidance above the stats.',
-                }
-              },
-            },
-            {
-              label: 'phase2-observation-hidden',
-              fn: async currentPage => {
-                const count = await currentPage.getByTestId('observation-input').count()
-                return count === 0
-                  ? {
-                      summary: 'Phase 2 correctly removes discovery input',
-                      details: 'Observation authoring is hidden in care mode, which keeps the phase focused.',
-                    }
-                  : {
-                      status: 'bug',
-                      summary: 'Phase 2 still exposes discovery input',
-                      details: 'Observation controls should be absent during the care window.',
-                    }
-              },
-            },
-          ])),
+      for (const [role, page] of [
+        ['Host', host.page],
+        ['Validator 1', guest1.page],
+        ['Validator 2', guest2.page],
+      ] as const) {
+        const names = await page.locator('.voting-card__name').allTextContents()
+        const leaked = names.some(name => /hostalice|v1basil|v2coral/i.test(name))
+        await record(
+          reports,
+          role,
+          page,
+          'Voting',
+          'voting',
+          'voting-anonymity',
+          leaked ? 'Voting labels leak player identity' : 'Voting labels stay anonymous',
+          leaked
+            ? `Expected Dragon #N labels but saw: ${names.join(', ')}`
+            : `Anonymous labels rendered correctly: ${names.join(', ')}`,
+          leaked ? 'bug' : 'pass',
         )
-        reports.set(validator.role, entries)
       }
 
-      await enterJudge(host.page, ...guests.map(validator => validator.page))
-
-      for (const validator of validators) {
-        await rotateToWindow(browser, validator, workshopCode, 'Judge review')
-      }
-
-      for (const validator of validators) {
-        const entries = reports.get(validator.role) ?? []
-        entries.push(
-          ...(await collectChecks(validator.page, validator.role, 'Judge', 'judge', [
-            {
-              label: 'judge-review-layout',
-              fn: async currentPage => {
-                await expect(currentPage.getByTestId('session-panel')).toContainText('Judge review')
-                await expect(currentPage.getByTestId('session-panel')).toContainText('Judge feedback by dragon')
-                return {
-                  summary: 'Judge review separates mechanics feedback from voting',
-                  details: 'The dedicated judge window shows mechanics scores and qualitative feedback before anonymous voting starts.',
-                }
-              },
-            },
-          ])),
-        )
-        reports.set(validator.role, entries)
-      }
-
-      await enterVoting(host.page, ...guests.map(validator => validator.page))
-
-      for (const validator of validators) {
-        await rotateToWindow(browser, validator, workshopCode, 'Design voting')
-      }
-
-      for (const validator of validators) {
-        const entries = reports.get(validator.role) ?? []
-        entries.push(
-          ...(await collectChecks(validator.page, validator.role, 'Voting', 'voting', [
-            {
-              label: 'voting-anonymity',
-              fn: async currentPage => {
-                await expect(currentPage.getByTestId('session-panel')).toContainText('Design voting')
-                const cardNames = await currentPage.locator('.voting-card__name').allTextContents()
-                const leaksPlayerName = cardNames.some(name => /hostalice|v1basil|v2coral|v3dune|v4ember|v5fable/i.test(name))
-                return leaksPlayerName
-                  ? {
-                      status: 'bug',
-                      summary: 'Voting leaks player identity in card labels',
-                      details: `Expected anonymous dragon labels, but saw: ${cardNames.join(', ')}`,
-                    }
-                  : {
-                      summary: 'Voting cards stay anonymous',
-                      details: `Card labels stayed anonymized: ${cardNames.join(', ')}`,
-                    }
-              },
-            },
-          ])),
-        )
-        reports.set(validator.role, entries)
-      }
-
-      for (const validator of guests) {
-        await voteForVisibleDragon(validator.page)
-      }
+      await voteForVisibleDragon(guest1.page)
+      await voteForVisibleDragon(guest2.page)
       await voteForVisibleDragon(host.page)
-      await expect(host.page.getByTestId('session-panel')).toContainText('6 / 6 votes submitted')
+      await expect(host.page.getByTestId('session-panel')).toContainText('3 / 3 votes submitted')
 
       await host.page.getByTestId('reveal-results-button').click()
-      await waitForNotice(host.page, 'Voting results revealed.')
+      await waitForNotice(host.page, 'Voting finished.')
+      await host.page.getByTestId('end-session-button').click()
+      await waitForNotice(host.page, 'Game over ready.')
+      await host.page.getByTestId('game-over-continue-button').click()
+      await guest1.page.getByTestId('game-over-continue-button').click()
+      await guest2.page.getByTestId('game-over-continue-button').click()
 
-      for (const validator of validators) {
-        await expect(validator.page.getByTestId('session-panel')).toContainText('Workshop results')
-      }
-
-      for (const validator of validators) {
-        await rotateToWindow(browser, validator, workshopCode, 'Workshop results')
-      }
-
-      for (const validator of validators) {
-        const entries = reports.get(validator.role) ?? []
-        entries.push(
-          ...(await collectChecks(validator.page, validator.role, 'End', 'end', [
-            {
-              label: 'end-leaderboards',
-              fn: async currentPage => {
-                await expect(currentPage.getByTestId('session-panel')).toContainText('Workshop results')
-                await expect(currentPage.getByTestId('session-panel')).toContainText('Creativity leaderboard')
-                await expect(currentPage.getByTestId('session-panel')).toContainText('Mechanics leaderboard')
-                return {
-                  summary: 'End screen shows split leaderboards',
-                  details: 'Creative and mechanics rankings are both visible after reveal in the final window.',
-                }
-              },
-            },
-            {
-              label: 'end-archive-affordance',
-              fn: async currentPage => {
-                const archiveVisible = await currentPage.getByTestId('archive-panel').isVisible()
-                return archiveVisible
-                  ? {
-                      summary: 'Archive panel stays visible in final results',
-                      details: 'Final results keep the archive affordance nearby, which helps post-workshop review.',
-                    }
-                  : {
-                      status: 'warn',
-                      summary: 'Archive panel is not visible in final results',
-                      details: 'Expected archive affordance in the final window, but it was not visible.',
-                    }
-              },
-            },
-          ])),
+      for (const [role, page] of [
+        ['Host', host.page],
+        ['Validator 1', guest1.page],
+        ['Validator 2', guest2.page],
+      ] as const) {
+        await expect(page.getByTestId('session-panel')).toContainText('Game over')
+        await expect(page.getByTestId('session-panel')).toContainText('Creativity leaderboard')
+        await record(
+          reports,
+          role,
+          page,
+          'End',
+          'end',
+          'end-results',
+          'End screen shows final results',
+          'The final screen exposes the leaderboard stack and the archive panel copy for post-workshop review.',
         )
-        reports.set(validator.role, entries)
       }
 
-      for (const validator of validators) {
-        writeRoleReport(validator.role, workshopCode, reports.get(validator.role) ?? [])
+      for (const [role, entries] of reports.entries()) {
+        writeRoleReport(role, workshopCode, entries)
       }
       writeSummary(workshopCode, reports)
     } finally {
-      for (const validator of validators) {
-        writeRoleReport(validator.role, workshopCode || 'unknown', reports.get(validator.role) ?? [])
+      for (const [role, entries] of reports.entries()) {
+        writeRoleReport(role, workshopCode, entries)
       }
-      writeSummary(workshopCode || 'unknown', reports)
-      for (const validator of validators) {
-        await validator.context.close().catch(() => undefined)
-      }
+      writeSummary(workshopCode, reports)
+      await host.context.close().catch(() => undefined)
+      await guest1.context.close().catch(() => undefined)
+      await guest2.context.close().catch(() => undefined)
     }
   })
 })

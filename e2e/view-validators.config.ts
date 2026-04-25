@@ -2,13 +2,13 @@ import { defineConfig } from '@playwright/test'
 
 import { projectProfiles } from './project-profiles'
 
-const baseURL = process.env.E2E_BASE_URL ?? 'http://127.0.0.1:4100'
+const baseURL = process.env.E2E_BASE_URL ?? 'https://dragon-shift.34.54.200.112.nip.io'
 
 export default defineConfig({
   testDir: './tests',
   testMatch: 'view-validators.spec.ts',
   outputDir: './.tmp/test-results-view-validators',
-  timeout: 900_000,
+  timeout: 240_000,
   expect: {
     timeout: 30_000,
   },
