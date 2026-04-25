@@ -16,7 +16,6 @@ pub fn HandoverView(
     let rule1 = use_signal(String::new);
     let rule2 = use_signal(String::new);
     let rule3 = use_signal(String::new);
-    let sprite_recommendation = use_signal(String::new);
 
     let gs = game_state.read();
     let Some(state) = gs.as_ref() else {
@@ -54,14 +53,24 @@ pub fn HandoverView(
     let rule1_val = rule1.read().clone();
     let rule2_val = rule2.read().clone();
     let rule3_val = rule3.read().clone();
-    let sprite_rec_val = sprite_recommendation.read().clone();
+    let valid_rule_count = [rule1_val.trim(), rule2_val.trim(), rule3_val.trim()]
+        .into_iter()
+        .filter(|value| !value.is_empty())
+        .count();
+    let parsed_rule_count = parse_tags_input(&format!(
+        "{}, {}, {}",
+        rule1_val.trim(),
+        rule2_val.trim(),
+        rule3_val.trim()
+    ))
+    .len();
+    let save_disabled = commands_disabled || valid_rule_count != 3 || parsed_rule_count != 3;
 
     drop(gs);
 
     let mut rule1_w = rule1;
     let mut rule2_w = rule2;
     let mut rule3_w = rule3;
-    let mut sprite_rec_w = sprite_recommendation;
     let mut handover_tags_input_w = handover_tags_input;
 
     rsx! {
@@ -121,24 +130,12 @@ pub fn HandoverView(
                 }
             }
 
-            // Dragon sprite recommendation
-            div { class: "handover-input-group", style: "margin-top:16px;",
-                p { class: "handover-input-label", "Dragon Sprite Notes" }
-                input {
-                    class: "input",
-                    "data-testid": "handover-sprite-recommendation",
-                    value: sprite_rec_val,
-                    placeholder: "Describe how the dragon should look for the next caretaker\u{2026}",
-                    oninput: move |event| sprite_rec_w.set(event.value()),
-                }
-            }
-
             // Save Notes button
             div { class: "button-row", style: "margin-top:20px;",
                 button {
                     class: "button button--secondary",
                     "data-testid": "save-handover-tags-button",
-                    disabled: commands_disabled,
+                    disabled: save_disabled,
                     onclick: move |_| {
                         // Combine rules into comma-separated string for existing flow
                         let r1 = rule1.read().trim().to_string();

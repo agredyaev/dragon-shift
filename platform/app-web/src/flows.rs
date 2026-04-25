@@ -11,11 +11,11 @@ use crate::helpers::{parse_tags_input, pending_command_label};
 use crate::realtime::bootstrap_realtime;
 use crate::state::{
     ConnectionStatus, IdentityState, NoticeScope, OperationState, PendingFlow, ShellScreen,
-    apply_command_error, apply_join_success, apply_judge_bundle_error,
-    apply_judge_bundle_success, apply_realtime_bootstrap_error, apply_request_error,
-    apply_successful_command, clear_account_identity, clear_session_identity, error_notice,
-    info_notice, navigate_to_screen, persist_browser_account_snapshot,
-    persist_browser_session_snapshot, scoped_notice, success_notice,
+    apply_command_error, apply_join_success, apply_judge_bundle_error, apply_judge_bundle_success,
+    apply_realtime_bootstrap_error, apply_request_error, apply_successful_command,
+    clear_account_identity, clear_session_identity, error_notice, info_notice, navigate_to_screen,
+    persist_browser_account_snapshot, persist_browser_session_snapshot, scoped_notice,
+    success_notice,
 };
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -53,7 +53,10 @@ pub async fn submit_reconnect_flow(
     });
     ops.with_mut(|o| {
         o.pending_flow = Some(PendingFlow::Reconnect);
-        o.notice = Some(scoped_notice(NoticeScope::Session, info_notice("Reconnecting…")));
+        o.notice = Some(scoped_notice(
+            NoticeScope::Session,
+            info_notice("Reconnecting…"),
+        ));
     });
 
     let api = AppWebApi::new(base_url);
@@ -270,7 +273,10 @@ pub async fn submit_signin_flow(
 
     ops.with_mut(|o| {
         o.pending_flow = Some(PendingFlow::SignIn);
-        o.notice = Some(scoped_notice(NoticeScope::SignIn, info_notice("Signing in…")));
+        o.notice = Some(scoped_notice(
+            NoticeScope::SignIn,
+            info_notice("Signing in…"),
+        ));
     });
 
     let api = AppWebApi::new(base_url);
@@ -285,9 +291,7 @@ pub async fn submit_signin_flow(
                 ops.with_mut(|o| {
                     o.notice = Some(scoped_notice(
                         NoticeScope::AccountHome,
-                        error_notice(&format!(
-                            "Signed in, but local persistence failed: {error}"
-                        )),
+                        error_notice(&format!("Signed in, but local persistence failed: {error}")),
                     ));
                 });
             }
@@ -403,7 +407,10 @@ pub async fn submit_join_with_character_flow(
     });
     ops.with_mut(|o| {
         o.pending_flow = Some(PendingFlow::Join);
-        o.notice = Some(scoped_notice(NoticeScope::PickCharacter, info_notice("Joining workshop…")));
+        o.notice = Some(scoped_notice(
+            NoticeScope::PickCharacter,
+            info_notice("Joining workshop…"),
+        ));
     });
 
     let api = AppWebApi::new(base_url);
@@ -606,7 +613,10 @@ pub async fn submit_create_character_flow(
         Err(error) => {
             ops.with_mut(|o| {
                 o.pending_flow = None;
-                o.notice = Some(scoped_notice(NoticeScope::CreateCharacter, error_notice(&error)));
+                o.notice = Some(scoped_notice(
+                    NoticeScope::CreateCharacter,
+                    error_notice(&error),
+                ));
             });
         }
     }
@@ -751,8 +761,8 @@ mod tests {
     };
     use protocol::{
         ClientGameState, CoordinatorType, ListOpenWorkshopsResponse, OpenWorkshopCursor,
-        OpenWorkshopSummary, Phase, Player, SessionMeta, WorkshopJoinResult,
-        WorkshopJoinSuccess, create_default_session_settings,
+        OpenWorkshopSummary, Phase, Player, SessionMeta, WorkshopJoinResult, WorkshopJoinSuccess,
+        create_default_session_settings,
     };
     use std::collections::BTreeMap;
     use std::io::{Read, Write};
@@ -845,7 +855,9 @@ mod tests {
 
     fn spawn_delete_workshop_server() -> (String, thread::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind delete test server");
-        let address = listener.local_addr().expect("read delete test server address");
+        let address = listener
+            .local_addr()
+            .expect("read delete test server address");
 
         let handle = thread::spawn(move || {
             let (mut delete_stream, _) = listener.accept().expect("accept delete request");
@@ -855,7 +867,9 @@ mod tests {
                 "unexpected delete request: {delete_request}"
             );
             delete_stream
-                .write_all(b"HTTP/1.1 204 No Content\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                .write_all(
+                    b"HTTP/1.1 204 No Content\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                )
                 .expect("write delete response");
 
             let (mut stale_page_stream, _) = listener.accept().expect("accept stale page request");

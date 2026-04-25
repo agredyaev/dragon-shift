@@ -4,9 +4,7 @@ use crate::flows::{
     OpenWorkshopsPaging, load_open_workshops_flow, submit_create_workshop_flow,
     submit_delete_workshop_flow,
 };
-use crate::state::{
-    IdentityState, OperationState, PendingFlow, ShellScreen, navigate_to_screen,
-};
+use crate::state::{IdentityState, OperationState, PendingFlow, ShellScreen, navigate_to_screen};
 
 #[component]
 pub fn AccountHomeView(identity: Signal<IdentityState>, ops: Signal<OperationState>) -> Element {

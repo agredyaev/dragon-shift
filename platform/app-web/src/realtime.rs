@@ -130,7 +130,8 @@ pub fn bootstrap_realtime(
     let mut close_identity = identity;
     let mut close_ops = ops;
     let onclose = Closure::wrap(Box::new(move |_event: web_sys::Event| {
-        let should_announce_close = close_identity.read().connection_status != ConnectionStatus::Offline;
+        let should_announce_close =
+            close_identity.read().connection_status != ConnectionStatus::Offline;
         close_identity.with_mut(|id| {
             id.connection_status = ConnectionStatus::Offline;
         });

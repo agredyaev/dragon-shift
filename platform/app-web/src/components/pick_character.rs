@@ -1,8 +1,6 @@
 use dioxus::prelude::*;
 
-use crate::flows::{
-    load_eligible_characters_flow, submit_join_with_character_flow,
-};
+use crate::flows::{load_eligible_characters_flow, submit_join_with_character_flow};
 use crate::state::{IdentityState, OperationState, ShellScreen, navigate_to_screen};
 use protocol::{ClientGameState, JudgeBundle};
 

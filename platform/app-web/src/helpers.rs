@@ -1660,14 +1660,16 @@ pub mod tests {
 
         let rows = voting_option_rows(&state);
 
-        assert!(rows
-            .iter()
-            .find(|row| row.real_dragon_name == "Comet")
-            .is_some_and(|row| row.is_current_players_dragon));
-        assert!(rows
-            .iter()
-            .find(|row| row.real_dragon_name == "Nova")
-            .is_some_and(|row| !row.is_current_players_dragon));
+        assert!(
+            rows.iter()
+                .find(|row| row.real_dragon_name == "Comet")
+                .is_some_and(|row| row.is_current_players_dragon)
+        );
+        assert!(
+            rows.iter()
+                .find(|row| row.real_dragon_name == "Nova")
+                .is_some_and(|row| !row.is_current_players_dragon)
+        );
     }
 
     #[test]

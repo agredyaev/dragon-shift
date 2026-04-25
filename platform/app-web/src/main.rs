@@ -22,9 +22,7 @@ use components::sign_in::SignInView;
 use helpers::poke_icon_url;
 use protocol::Phase;
 use realtime::bootstrap_realtime;
-use state::{
-    NoticeScope, ShellScreen, apply_realtime_bootstrap_error, bootstrap_state,
-};
+use state::{NoticeScope, ShellScreen, apply_realtime_bootstrap_error, bootstrap_state};
 
 #[cfg(target_arch = "wasm32")]
 fn main() {

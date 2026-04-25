@@ -3,9 +3,8 @@ use protocol::{
     CharacterSpritePreviewResponse, ClientSessionSnapshot, CreateCharacterRequest,
     CreateWorkshopRequest, EligibleCharactersResponse, JoinWorkshopRequest, JudgeBundle,
     ListOpenWorkshopsResponse, MyCharactersResponse, SessionCommand, SessionEnvelope,
-    WorkshopCommandRequest, WorkshopCommandResult, WorkshopCreateResult,
-    WorkshopCreateSuccess, WorkshopJoinResult, WorkshopJoinSuccess, WorkshopJudgeBundleRequest,
-    WorkshopJudgeBundleResult,
+    WorkshopCommandRequest, WorkshopCommandResult, WorkshopCreateResult, WorkshopCreateSuccess,
+    WorkshopJoinResult, WorkshopJoinSuccess, WorkshopJudgeBundleRequest, WorkshopJudgeBundleResult,
 };
 
 use serde::de::DeserializeOwned;

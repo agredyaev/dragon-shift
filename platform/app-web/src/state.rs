@@ -657,7 +657,10 @@ pub fn apply_join_success(
 
     ops.pending_flow = None;
     ops.pending_judge_bundle = false;
-    ops.notice = Some(scoped_notice(NoticeScope::Session, success_notice(success_message)));
+    ops.notice = Some(scoped_notice(
+        NoticeScope::Session,
+        success_notice(success_message),
+    ));
     ops.pending_realtime_notice = match flow {
         PendingFlow::Reconnect => Some(scoped_notice(
             NoticeScope::Session,
@@ -783,7 +786,10 @@ pub fn apply_realtime_bootstrap_error(
 pub fn apply_realtime_connecting(identity: &mut IdentityState, ops: &mut OperationState) {
     identity.realtime_bootstrap_attempted = true;
     identity.connection_status = ConnectionStatus::Connecting;
-    ops.notice = Some(scoped_notice(NoticeScope::Session, info_notice("Syncing session…")));
+    ops.notice = Some(scoped_notice(
+        NoticeScope::Session,
+        info_notice("Syncing session…"),
+    ));
 }
 
 fn should_clear_session_snapshot(error: &str) -> bool {
@@ -804,7 +810,11 @@ pub fn clear_session_identity(identity: &mut IdentityState) {
     let _ = clear_browser_session_snapshot();
 }
 
-pub fn navigate_to_screen(identity: &mut IdentityState, ops: &mut OperationState, screen: ShellScreen) {
+pub fn navigate_to_screen(
+    identity: &mut IdentityState,
+    ops: &mut OperationState,
+    screen: ShellScreen,
+) {
     let next_scope = notice_scope_for_screen(&screen);
     if ops
         .notice
@@ -859,13 +869,9 @@ pub fn apply_server_ws_message(
             }
             if first_attach {
                 ops.pending_command = None;
-                ops.notice = Some(
-                    ops.pending_realtime_notice
-                        .take()
-                        .unwrap_or_else(|| {
-                            scoped_notice(NoticeScope::Session, info_notice("Session synced."))
-                        }),
-                );
+                ops.notice = Some(ops.pending_realtime_notice.take().unwrap_or_else(|| {
+                    scoped_notice(NoticeScope::Session, info_notice("Session synced."))
+                }));
             } else if let Some(command) = completed_pending_command {
                 // Phase-transition commands can unmount the source component before
                 // the HTTP task applies its success notice, so confirm them from the
