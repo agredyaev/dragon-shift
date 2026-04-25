@@ -87,6 +87,10 @@ spec:
               value: {{ .Values.app.createRateLimitMax | quote }}
             - name: JOIN_RATE_LIMIT_MAX
               value: {{ .Values.app.joinRateLimitMax | quote }}
+            - name: SIGNUP_RATE_LIMIT_MAX
+              value: {{ .Values.app.signupRateLimitMax | quote }}
+            - name: LOGIN_RATE_LIMIT_MAX
+              value: {{ .Values.app.loginRateLimitMax | quote }}
             - name: COMMAND_RATE_LIMIT_MAX
               value: {{ .Values.app.commandRateLimitMax | quote }}
             - name: WEBSOCKET_RATE_LIMIT_MAX
