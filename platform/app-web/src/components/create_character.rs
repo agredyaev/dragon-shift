@@ -9,6 +9,8 @@ use crate::state::{
 
 const EMOTION_LABELS: [&str; 4] = ["Neutral", "Happy", "Angry", "Sleepy"];
 const GENERATION_PROGRESS_SEGMENTS: usize = 16;
+// Initial generation plus exactly one regeneration.
+const MAX_SPRITE_GENERATIONS: u8 = 2;
 
 #[derive(Clone, PartialEq, Eq)]
 enum GenerationStatus {
@@ -68,6 +70,7 @@ pub fn CreateCharacterView(
     // after a successful generation, so Save cannot submit a description
     // that doesn't match the sprites.
     let last_generated_for: Signal<Option<String>> = use_signal(|| None);
+    let generation_count = use_signal(|| 0_u8);
     let generation_status = use_signal(|| GenerationStatus::Idle);
     let saving = use_signal(|| false);
 
@@ -76,6 +79,8 @@ pub fn CreateCharacterView(
     let status_snapshot = generation_status.read().clone();
     let generation_in_flight = status_snapshot.is_generating();
     let has_sprites = generated_sprites.read().is_some();
+    let generations_used = *generation_count.read();
+    let can_generate = generations_used < MAX_SPRITE_GENERATIONS;
     let saving_now = *saving.read();
     let pending = ops.read().pending_flow.is_some();
 
@@ -83,9 +88,13 @@ pub fn CreateCharacterView(
         let mut dragon_description = dragon_description;
         let mut generated_sprites = generated_sprites;
         let mut last_generated_for = last_generated_for;
+        let mut generation_count = generation_count;
         let mut generation_status = generation_status;
         move |_| {
             if generation_status.read().is_generating() {
+                return;
+            }
+            if *generation_count.read() >= MAX_SPRITE_GENERATIONS {
                 return;
             }
             let desc = dragon_description.read().trim().to_string();
@@ -103,6 +112,9 @@ pub fn CreateCharacterView(
                     Ok(response) => {
                         generated_sprites.set(Some(response.sprites));
                         last_generated_for.set(Some(desc));
+                        generation_count.with_mut(|count| {
+                            *count = count.saturating_add(1);
+                        });
                         generation_status.set(GenerationStatus::Idle);
                     }
                     Err(error) => {
@@ -187,6 +199,8 @@ pub fn CreateCharacterView(
 
     let generate_button_label = if generation_in_flight {
         "Drawing..."
+    } else if !can_generate {
+        "Regeneration used"
     } else if has_sprites {
         "Regenerate"
     } else if status_snapshot.is_error() {
@@ -196,9 +210,10 @@ pub fn CreateCharacterView(
     };
 
     // Button state machine (§10 step 7 / §4.F):
-    //   textarea empty            -> Generate disabled,   Save disabled
-    //   text entered, no sprites  -> Generate primary,    Save disabled (ghost)
-    //   sprites exist             -> Save primary,        Regenerate ghost, Generate hidden
+    //   textarea empty              -> Generate disabled,   Save disabled
+    //   text entered, no sprites    -> Generate primary,    Save disabled
+    //   sprites exist, budget left  -> Save primary,        Regenerate secondary
+    //   sprites exist, budget spent -> Save primary,        Regenerate disabled
     // The Generate/Regenerate affordance lives on the same button because
     // the existing component shape pairs it with `GenerationStatus`; we
     // just swap the visual class between primary and ghost (secondary).
@@ -225,7 +240,7 @@ pub fn CreateCharacterView(
                 rows: 4,
                 maxlength: 512,
                 value: "{desc_value}",
-                disabled: generation_in_flight || saving_now,
+                disabled: generation_in_flight || saving_now || (has_sprites && !can_generate),
                 oninput: move |event| {
                     let new_value = event.value();
                     let mut desc = dragon_description;
@@ -304,7 +319,8 @@ pub fn CreateCharacterView(
                     disabled: generation_in_flight
                         || saving_now
                         || description_empty
-                        || pending,
+                        || pending
+                        || !can_generate,
                     onclick: generate_onclick,
                     {generate_button_label}
                 }

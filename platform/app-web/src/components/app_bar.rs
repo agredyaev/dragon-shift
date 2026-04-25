@@ -5,8 +5,9 @@ use std::cell::RefCell;
 #[cfg(target_arch = "wasm32")]
 use std::rc::Rc;
 
-use crate::flows::submit_logout_flow;
-use crate::state::{IdentityState, OperationState, ShellScreen, navigate_to_screen};
+use crate::flows::{load_my_characters_flow, submit_delete_character_flow, submit_logout_flow};
+use crate::state::{IdentityState, OperationState, PendingFlow, ShellScreen, navigate_to_screen};
+use protocol::SpriteSet;
 
 /// Disclosure-menu ids used by keyboard handlers to restore focus after
 /// opening/closing the menu. Kept as constants so the trigger and the
@@ -18,6 +19,8 @@ const MENU_ITEM_ID_PREFIX: &str = "app-bar-menu-item-";
 /// outside-click handler uses it to decide whether a pointerdown
 /// originated inside the disclosure (trigger + menu) or outside.
 const WRAP_ID: &str = "app-bar-menu-wrap";
+
+const CHARACTER_SPRITE_LABELS: [&str; 4] = ["Neutral", "Happy", "Angry", "Sleepy"];
 
 /// Count of menu items in the account disclosure. Keep in sync with
 /// the rendered list in `AppBar`. Shared with `handle_menu_item_key`
@@ -57,6 +60,15 @@ fn wrap_contains(node: &web_sys::Node) -> bool {
 
 fn menu_item_id(index: usize) -> String {
     format!("{MENU_ITEM_ID_PREFIX}{index}")
+}
+
+fn sprite_for_index(sprites: &SpriteSet, index: usize) -> &str {
+    match index {
+        0 => &sprites.neutral,
+        1 => &sprites.happy,
+        2 => &sprites.angry,
+        _ => &sprites.sleepy,
+    }
 }
 
 /// Install a document-level `pointerdown` listener that closes the
@@ -171,6 +183,8 @@ pub fn AppBar(identity: Signal<IdentityState>, ops: Signal<OperationState>) -> E
     // Local disclosure state. Lives in the component so the menu closes
     // automatically when `AppBar` unmounts (e.g. on sign-out).
     let mut open = use_signal(|| false);
+    let mut manage_dragons_open = use_signal(|| false);
+    let mut pending_delete_character = use_signal(|| None::<(String, usize)>);
 
     // Snapshot read: account is the only bit we need from identity.
     let (account_name, is_signed_in, current_screen) = {
@@ -186,6 +200,9 @@ pub fn AppBar(identity: Signal<IdentityState>, ops: Signal<OperationState>) -> E
     // another pending flow is in-flight. Mirrors the prior
     // account_home.rs contract (`disabled: ops.read().pending_flow.is_some()`).
     let flow_pending = ops.read().pending_flow.is_some();
+    let delete_character_pending = ops.read().pending_flow == Some(PendingFlow::DeleteCharacter);
+    let my_characters = ops.read().my_characters.clone();
+    let my_characters_limit = ops.read().my_characters_limit;
 
     // Disabled-state snapshot for each menu item, in render order.
     // Used by `handle_menu_item_key` to skip over disabled items when
@@ -229,6 +246,155 @@ pub fn AppBar(identity: Signal<IdentityState>, ops: Signal<OperationState>) -> E
     }
 
     rsx! {
+        if *manage_dragons_open.read() {
+            div {
+                class: "modal-backdrop",
+                role: "presentation",
+                onclick: move |_| manage_dragons_open.set(false),
+                div {
+                    class: "modal-card modal-card--characters",
+                    role: "dialog",
+                    "aria-modal": "true",
+                    "aria-labelledby": "manage-dragons-modal-title",
+                    "aria-describedby": "manage-dragons-modal-body",
+                    onclick: move |event| event.stop_propagation(),
+                    div { class: "panel__header",
+                        h2 {
+                            id: "manage-dragons-modal-title",
+                            class: "panel__title modal-card__title",
+                            "Your Dragons"
+                        }
+                        span { class: "badge", "{my_characters.len()} / {my_characters_limit}" }
+                    }
+                    p {
+                        id: "manage-dragons-modal-body",
+                        class: "panel__body modal-card__body",
+                        "Create a dragon or delete an existing one from your account."
+                    }
+                    div { class: "button-row button-row--home-action modal-card__primary-action",
+                        button {
+                            class: "button button--secondary",
+                            "data-testid": "create-character-button",
+                            disabled: flow_pending,
+                            onclick: move |_| {
+                                manage_dragons_open.set(false);
+                                identity.with_mut(|id| {
+                                    ops.with_mut(|o| {
+                                        navigate_to_screen(id, o, ShellScreen::CreateCharacter);
+                                    });
+                                });
+                            },
+                            "Create a dragon"
+                        }
+                    }
+                    div { class: "panel__stack",
+                        if my_characters.is_empty() {
+                            p { class: "meta", "No dragons yet. Create one to use it in workshops." }
+                        } else {
+                            div { class: "roster roster--modal",
+                                for (character_index, character) in my_characters.iter().enumerate() {
+                                    {
+                                        let character_id = character.id.clone();
+                                        let character_number = character_index + 1;
+                                        rsx! {
+                                            article { class: "roster__item pick-character-row",
+                                                div { class: "pick-character-row__body",
+                                                    div {
+                                                        class: "pick-character-row__sprites",
+                                                        "aria-label": "Dragon {character_number} sprites",
+                                                        for (sprite_index, label) in CHARACTER_SPRITE_LABELS.iter().enumerate() {
+                                                            div { class: "pick-character-row__sprite-frame",
+                                                                img {
+                                                                    class: "pick-character-row__sprite",
+                                                                    src: "data:image/png;base64,{sprite_for_index(&character.sprites, sprite_index)}",
+                                                                    alt: "Dragon {character_number}: {label} sprite",
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                    div { class: "pick-character-row__copy",
+                                                        p { class: "roster__name", "Dragon {character_number}" }
+                                                        p { class: "roster__meta", "Ready for workshops" }
+                                                    }
+                                                }
+                                                button {
+                                                    class: "button button--danger button--small",
+                                                    "data-testid": "delete-character-button",
+                                                    disabled: flow_pending,
+                                                    onclick: move |_| {
+                                                        pending_delete_character.set(Some((
+                                                            character_id.clone(),
+                                                            character_number,
+                                                        )));
+                                                    },
+                                                    if delete_character_pending { "Deleting..." } else { "Delete" }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    div { class: "button-row modal-card__actions",
+                        button {
+                            class: "button button--primary",
+                            onclick: move |_| manage_dragons_open.set(false),
+                            "Close"
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some((delete_character_id, delete_character_number)) = pending_delete_character.read().clone() {
+            div {
+                class: "modal-backdrop",
+                role: "presentation",
+                onclick: move |_| pending_delete_character.set(None),
+                div {
+                    class: "modal-card",
+                    role: "dialog",
+                    "aria-modal": "true",
+                    "aria-labelledby": "delete-character-modal-title",
+                    "aria-describedby": "delete-character-modal-body",
+                    onclick: move |event| event.stop_propagation(),
+                    h2 {
+                        id: "delete-character-modal-title",
+                        class: "panel__title modal-card__title",
+                        "Delete Dragon"
+                    }
+                    p {
+                        id: "delete-character-modal-body",
+                        class: "panel__body modal-card__body",
+                        "Delete Dragon {delete_character_number}? This pet will no longer be available for new workshops."
+                    }
+                    div { class: "button-row modal-card__actions",
+                        button {
+                            class: "button button--secondary",
+                            disabled: delete_character_pending,
+                            onclick: move |_| pending_delete_character.set(None),
+                            "Cancel"
+                        }
+                        button {
+                            class: "button button--danger",
+                            "data-testid": "confirm-delete-character-button",
+                            disabled: delete_character_pending,
+                            onclick: move |_| {
+                                pending_delete_character.set(None);
+                                spawn(submit_delete_character_flow(
+                                    identity,
+                                    ops,
+                                    delete_character_id.clone(),
+                                ));
+                            },
+                            if delete_character_pending { "Deleting..." } else { "Delete" }
+                        }
+                    }
+                }
+            }
+        }
+
         header { class: "app-bar", role: "banner",
             // --- Left: wordmark ---
             button {
@@ -327,7 +493,7 @@ pub fn AppBar(identity: Signal<IdentityState>, ops: Signal<OperationState>) -> E
                         class: "app-bar__menu",
                         role: "menu",
                         hidden: !*open.read(),
-                        // Item 0: Create dragon
+                        // Item 0: Manage dragons
                         li { role: "none",
                             button {
                                 id: "{menu_item_id(0)}",
@@ -338,16 +504,13 @@ pub fn AppBar(identity: Signal<IdentityState>, ops: Signal<OperationState>) -> E
                                 tabindex: "-1",
                                 onclick: move |_| {
                                     open.set(false);
-                                    identity.with_mut(|id| {
-                                        ops.with_mut(|o| {
-                                            navigate_to_screen(id, o, ShellScreen::CreateCharacter);
-                                        });
-                                    });
+                                    manage_dragons_open.set(true);
+                                    spawn(load_my_characters_flow(identity, ops));
                                 },
                                 onkeydown: move |event| {
                                     handle_menu_item_key(event, 0, open, menu_disabled);
                                 },
-                                "Create a dragon"
+                                "Your dragons"
                             }
                         }
                         // Item 1: Logout

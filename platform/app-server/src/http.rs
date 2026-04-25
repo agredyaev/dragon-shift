@@ -72,11 +72,20 @@ async fn wait_for_image_job_turn(
 
 /// Outcome returned by [`acquire_image_job_permit`] when admission to the
 /// image-job queue fails. Callers map each variant to their own
-/// response/fallback contract (workshop notices, HTTP error body, or
-/// session-less preview fallback).
+/// response/fallback contract (workshop notices or HTTP error body).
 enum ImageQueueAdmissionOutcome {
     TimedOut,
     Unavailable,
+}
+
+const SPRITE_PREVIEW_BUSY_ERROR: &str = "Sprite API is busy. Please try again in a few minutes.";
+
+fn sprite_preview_busy_response() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({ "error": SPRITE_PREVIEW_BUSY_ERROR })),
+    )
+        .into_response()
 }
 
 /// Consolidate the `try_acquire_owned → NoPermits→wait_for_image_job_turn
@@ -3318,36 +3327,21 @@ pub(crate) async fn generate_character_sprite_preview(
 
     // Reuse the same image-job queue semaphore used by the workshop-scoped
     // sprite-sheet producer so preview requests do not starve it. We do not
-    // send session notices (no session exists); on timeout or LLM failure
-    // we fall back to the default companion sprite set so the UI can proceed.
+    // send session notices (no session exists); on timeout or LLM failure,
+    // return a retryable busy error instead of showing a fake companion.
     let _queue_permit = match acquire_image_job_permit(&state, || async {}).await {
         Ok(permit) => permit,
         Err(ImageQueueAdmissionOutcome::TimedOut) => {
-            return (
-                StatusCode::OK,
-                Json(CharacterSpritePreviewResponse {
-                    sprites: (*state.fallback_companion_sprites).clone(),
-                }),
-            )
-                .into_response();
+            return sprite_preview_busy_response();
         }
         Err(ImageQueueAdmissionOutcome::Unavailable) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": "image generation queue is unavailable" })),
-            )
-                .into_response();
+            tracing::warn!(
+                account_id = %session.account.id,
+                "character sprite preview queue unavailable"
+            );
+            return sprite_preview_busy_response();
         }
     };
-
-    // Note: we intentionally do NOT extract the subsequent
-    // `generate_sprite_sheet_with_lease → on Err, fallback` block into a
-    // shared helper. The workshop sprite-sheet path at
-    // `generate_sprite_sheet_with_queue` must also send a Warning-level
-    // session notice on fallback (via `sprite_sheet_fallback_with_notice`),
-    // while this session-less preview path just returns the fallback
-    // sprites. Factoring would either re-introduce the notice contract or
-    // leave two near-identical wrappers, so each site stays inlined.
 
     let lease = state.llm_client.acquire_image_generation_lease();
     let sprites = match state
@@ -3360,9 +3354,9 @@ pub(crate) async fn generate_character_sprite_preview(
             tracing::warn!(
                 account_id = %session.account.id,
                 %error,
-                "character sprite preview generation failed, using fallback companion"
+                "character sprite preview generation failed"
             );
-            (*state.fallback_companion_sprites).clone()
+            return sprite_preview_busy_response();
         }
     };
 

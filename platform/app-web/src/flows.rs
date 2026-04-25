@@ -444,9 +444,6 @@ pub async fn submit_join_with_character_flow(
     }
 }
 
-/// Load the player's characters into `ops.my_characters`.
-// Retained without a current consumer; no plan2 item schedules reuse. Remove if still unused after plan2 reintroduces per-account character management UI.
-#[allow(dead_code)]
 pub async fn load_my_characters_flow(
     identity: Signal<IdentityState>,
     mut ops: Signal<OperationState>,
@@ -622,19 +619,24 @@ pub async fn submit_create_character_flow(
     }
 }
 
-/// Delete a character and refresh the character list.
-// Retained without a current consumer; no plan2 item schedules reuse. Remove if still unused after plan2 reintroduces per-account character management UI.
-#[allow(dead_code)]
 pub async fn submit_delete_character_flow(
     identity: Signal<IdentityState>,
     mut ops: Signal<OperationState>,
     character_id: String,
 ) {
     let base_url = { identity.read().api_base_url.clone() };
+    ops.with_mut(|o| {
+        o.pending_flow = Some(PendingFlow::DeleteCharacter);
+        o.notice = Some(scoped_notice(
+            NoticeScope::AccountHome,
+            info_notice("Deleting character…"),
+        ));
+    });
     let api = AppWebApi::new(base_url);
     match api.delete_character(&character_id).await {
         Ok(()) => {
             ops.with_mut(|o| {
+                o.pending_flow = None;
                 o.my_characters.retain(|c| c.id != character_id);
                 o.notice = Some(scoped_notice(
                     NoticeScope::AccountHome,
@@ -644,6 +646,7 @@ pub async fn submit_delete_character_flow(
         }
         Err(error) => {
             ops.with_mut(|o| {
+                o.pending_flow = None;
                 o.notice = Some(scoped_notice(
                     NoticeScope::AccountHome,
                     error_notice(&format!("Failed to delete character: {error}")),
