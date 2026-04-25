@@ -2,13 +2,19 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-BASE_URL="${E2E_BASE_URL:-http://127.0.0.1:32000}"
+BASE_URL="${E2E_BASE_URL:-}"
 BASE_URL="${BASE_URL%/}"
+ALLOW_PORT_FORWARD_FALLBACK="${ALLOW_PORT_FORWARD_FALLBACK:-0}"
 PORT_FORWARD_LOG="${PORT_FORWARD_LOG:-${ROOT_DIR}/e2e/.tmp/port-forward.log}"
 PORT_FORWARD_NAMESPACE="${PORT_FORWARD_NAMESPACE:-default}"
 PORT_FORWARD_SERVICE="${PORT_FORWARD_SERVICE:-dragon-shift-dragon-shift}"
 PORT_FORWARD_REMOTE_PORT="${PORT_FORWARD_REMOTE_PORT:-3000}"
 PORT_FORWARD_PID=""
+
+if [[ -z "${BASE_URL}" ]]; then
+  printf 'E2E_BASE_URL must be set.\n' >&2
+  exit 1
+fi
 
 BASE_URL_NO_SCHEME="${BASE_URL#*://}"
 BASE_PATH=""
@@ -92,6 +98,11 @@ if is_live "${BASE_URL}"; then
   exit 0
 fi
 
+if [[ "${ALLOW_PORT_FORWARD_FALLBACK}" != "1" ]]; then
+  printf 'Base URL %s is not live. Refusing to fall back to kubectl port-forward unless ALLOW_PORT_FORWARD_FALLBACK=1 is set.\n' "${BASE_URL}" >&2
+  exit 1
+fi
+
 trap cleanup EXIT
 mkdir -p "$(dirname "${PORT_FORWARD_LOG}")"
 kubectl port-forward -n "${PORT_FORWARD_NAMESPACE}" "svc/${PORT_FORWARD_SERVICE}" "${FORWARDED_PORT}:${PORT_FORWARD_REMOTE_PORT}" >"${PORT_FORWARD_LOG}" 2>&1 &
@@ -102,5 +113,6 @@ if ! wait_for_live; then
   exit 1
 fi
 
+printf 'Base URL %s is not live. Running Playwright against port-forward target %s\n' "${BASE_URL}" "${FORWARDED_BASE_URL}"
 ensure_origin_allowed "${FORWARDED_BASE_URL}"
 run_playwright "${FORWARDED_BASE_URL}" "$@"

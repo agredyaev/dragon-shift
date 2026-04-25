@@ -1,4 +1,4 @@
-import { expect, test, type Browser, type BrowserContext, type Page } from '@playwright/test'
+import { expect, test, type Browser, type BrowserContext, type Page, type Response } from '@playwright/test'
 
 import { getProjectContextOptions } from '../project-profiles'
 
@@ -122,23 +122,32 @@ export async function createWorkshopAndJoinAsHost(page: Page, hostName: string) 
   return workshopCode
 }
 
-async function completeWorkshopJoin(page: Page, workshopCode: string) {
-  const eligibleCharactersResponse = page.waitForResponse(response =>
+function waitForEligibleCharactersResponse(page: Page, workshopCode: string): Promise<Response> {
+  return page.waitForResponse(response =>
     response.url().includes(`/api/workshops/${workshopCode}/eligible-characters`)
     && response.request().method() === 'GET'
     && response.ok(),
   )
+}
 
+async function completeWorkshopJoin(
+  page: Page,
+  workshopCode: string,
+  eligibleCharactersResponse: Promise<Response>,
+) {
   await expect(page.getByTestId('pick-character-panel')).toBeVisible()
-  await eligibleCharactersResponse
+  const eligibleResponse = await eligibleCharactersResponse
+  const eligiblePayload = await eligibleResponse.json() as { characters?: unknown[] }
+  const hasOwnedCharacters = (eligiblePayload.characters?.length ?? 0) > 0
 
   const joinResponse = page.waitForResponse(response =>
     response.url().includes('/api/workshops/join')
     && response.request().method() === 'POST',
   )
 
-  const selectCharacterButton = page.getByTestId('select-character-button').first()
-  if (await selectCharacterButton.count()) {
+  if (hasOwnedCharacters) {
+    const selectCharacterButton = page.getByTestId('select-character-button').first()
+    await expect(selectCharacterButton).toBeVisible()
     await selectCharacterButton.click()
   } else {
     await page.getByTestId('use-starter-button').click()
@@ -158,15 +167,17 @@ export async function joinWorkshop(page: Page, workshopCode: string, playerName:
   await signInAccount(page, playerName)
   const row = page.locator('.roster__item').filter({ hasText: workshopCode }).first()
   await expect(row).toBeVisible({ timeout: 15_000 })
+  const eligibleCharactersResponse = waitForEligibleCharactersResponse(page, workshopCode)
   await row.getByTestId('join-workshop-button').click()
-  await completeWorkshopJoin(page, workshopCode)
+  await completeWorkshopJoin(page, workshopCode, eligibleCharactersResponse)
 }
 
 export async function hostJoinOwnWorkshop(page: Page, workshopCode: string) {
   const row = page.locator('.roster__item').filter({ hasText: workshopCode }).first()
   await expect(row).toBeVisible({ timeout: 15_000 })
+  const eligibleCharactersResponse = waitForEligibleCharactersResponse(page, workshopCode)
   await row.getByTestId('join-workshop-button').click()
-  await completeWorkshopJoin(page, workshopCode)
+  await completeWorkshopJoin(page, workshopCode, eligibleCharactersResponse)
 }
 
 export async function createCharacter(page: Page, description: string) {
