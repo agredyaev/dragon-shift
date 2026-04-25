@@ -4,6 +4,7 @@ import {
   advanceWorkshopToVoting,
   cloneSignedInSession,
   createCharacter,
+  createWorkshop,
   createWorkshopAndJoinAsHost,
   dismissGameOverOverlay,
   enterHandover,
@@ -12,6 +13,7 @@ import {
   enterPhase2,
   enterVoting,
   expectToStayOnHome,
+  hostJoinOwnWorkshop,
   joinWorkshop,
   newPlayerContext,
   readSessionSnapshot,
@@ -240,6 +242,36 @@ test.describe('dragon shift deployed gameplay', () => {
       await expect(guest.page.getByTestId('session-panel')).toContainText(lobbyTitlePattern)
     } finally {
       await safeClose(host.context, guest.context)
+    }
+  })
+
+  test('account home only shows delete for an owned empty workshop before join', async ({ browser }) => {
+    const host = await newPlayerContext(browser)
+
+    try {
+      const workshopCode = await createWorkshop(host.page, 'Alice')
+      const row = host.page.locator('.roster__item').filter({ hasText: workshopCode }).first()
+
+      await expect(row).toContainText('0 player(s)')
+      await expect(row.getByTestId('delete-workshop-button')).toBeVisible()
+      await expect(row.getByTestId('join-workshop-button')).toBeVisible()
+
+      const refreshedOpenWorkshops = host.page.waitForResponse(response =>
+        response.url().includes('/api/workshops/open')
+        && response.request().method() === 'GET'
+        && response.ok(),
+      )
+
+      await hostJoinOwnWorkshop(host.page, workshopCode)
+      await host.page.getByTestId('leave-workshop-button').click()
+      await refreshedOpenWorkshops
+      await expect(host.page.getByTestId('open-workshops-panel')).toBeVisible()
+
+      const joinedRow = host.page.locator('.roster__item').filter({ hasText: workshopCode }).first()
+      await expect(joinedRow).toContainText('1 player(s)')
+      await expect(joinedRow.getByTestId('delete-workshop-button')).toHaveCount(0)
+    } finally {
+      await safeClose(host.context)
     }
   })
 
