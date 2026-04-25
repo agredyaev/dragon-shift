@@ -16,6 +16,7 @@ ingress:
   enabled: false
 
 app:
+  nodeEnv: development
   port: 3000
   allowedOrigins: "http://localhost:4100,http://127.0.0.1:4100"
   viteAppUrl: http://127.0.0.1:4100

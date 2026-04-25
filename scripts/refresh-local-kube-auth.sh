@@ -13,6 +13,21 @@ RELEASE_NAME="dragon-shift"
 IMAGE_NAME="dragon-shift-rust:kind-local"
 ADC_SECRET_NAME="dragon-shift-gcp-adc"
 SESSION_COOKIE_SECRET_NAME="dragon-shift-session-cookie-key"
+
+HOST_ARCH="$(uname -m)"
+case "$HOST_ARCH" in
+  arm64|aarch64)
+    APP_SERVER_TARGET_TRIPLE="aarch64-unknown-linux-gnu"
+    ;;
+  x86_64|amd64)
+    APP_SERVER_TARGET_TRIPLE="x86_64-unknown-linux-gnu"
+    ;;
+  *)
+    printf 'Unsupported host architecture: %s\n' "$HOST_ARCH" >&2
+    exit 1
+    ;;
+esac
+
 need_cmd() {
   if ! command -v "$1" >/dev/null 2>&1; then
     printf 'Missing required command: %s\n' "$1" >&2
@@ -41,11 +56,18 @@ fi
 printf 'Building web assets...\n'
 cargo run --manifest-path "$PLATFORM_DIR/Cargo.toml" -p xtask -- build-web
 
-printf 'Building Linux arm64 app-server...\n'
-cargo zigbuild --manifest-path "$PLATFORM_DIR/Cargo.toml" -p app-server --release --target aarch64-unknown-linux-gnu
+printf 'Building Linux %s app-server...\n' "$APP_SERVER_TARGET_TRIPLE"
+cargo zigbuild --manifest-path "$PLATFORM_DIR/Cargo.toml" -p app-server --release --target "$APP_SERVER_TARGET_TRIPLE"
 
 printf 'Building local Docker image...\n'
-docker build -f "$ROOT_DIR/Dockerfile.local" -t "$IMAGE_NAME" "$ROOT_DIR"
+docker build \
+  --build-arg "APP_SERVER_TARGET_TRIPLE=$APP_SERVER_TARGET_TRIPLE" \
+  -f "$ROOT_DIR/Dockerfile.local" \
+  -t "$IMAGE_NAME" \
+  "$ROOT_DIR"
+
+printf 'Ensuring namespace exists...\n'
+kubectl --context "$KUBE_CONTEXT" create namespace "$NAMESPACE" --dry-run=client -o yaml | kubectl --context "$KUBE_CONTEXT" apply -f -
 
 printf 'Refreshing ADC secret...\n'
 kubectl --context "$KUBE_CONTEXT" -n "$NAMESPACE" create secret generic "$ADC_SECRET_NAME" \

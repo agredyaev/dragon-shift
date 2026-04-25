@@ -10,7 +10,7 @@ Use the local `kind` workflow for a full rebuild and deploy:
 
 What it does:
 - builds the web bundle with `xtask build-web`
-- builds `app-server` for Linux arm64
+- builds `app-server` for the local host's Linux target (`aarch64` or `x86_64`)
 - builds `dragon-shift-rust:kind-local`
 - loads the image into `kind-dragon-shift-local`
 - upgrades the Helm release in namespace `dragon-shift`
@@ -49,8 +49,10 @@ TEST_DATABASE_URL=postgres://postgres:postgres@127.0.0.1:5432/dragon_shift_test 
 Run deployed-browser tests against the local `kind` deployment:
 
 ```bash
-E2E_BASE_URL=http://127.0.0.1:4100 npm run test:deployed
+E2E_BASE_URL=http://127.0.0.1:4100 npm run test:deployed:local
 ```
+
+`npm run test:deployed` stays fail-closed for real deployed-edge checks. `npm run test:deployed:local` opts into the localhost port-forward fallback for local `kind` workflows.
 
 ## Notes
 

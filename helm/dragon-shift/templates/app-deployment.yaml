@@ -68,7 +68,7 @@ spec:
               protocol: TCP
           env:
             - name: NODE_ENV
-              value: production
+              value: {{ .Values.app.nodeEnv | quote }}
             - name: RUST_LOG
               value: {{ .Values.app.rustLog | quote }}
             - name: APP_SERVER_BIND_ADDR

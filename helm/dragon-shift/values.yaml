@@ -32,6 +32,7 @@ ingress:
     secretName: ""
 
 app:
+  nodeEnv: production
   port: 3000
   allowedOrigins: https://dragon-shift.example.com
   viteAppUrl: https://dragon-shift.example.com
