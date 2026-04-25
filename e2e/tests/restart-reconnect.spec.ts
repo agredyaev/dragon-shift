@@ -93,8 +93,8 @@ test.describe('browser restart reconnect proof', () => {
 
       await host.page.getByTestId('start-phase1-button').click()
       await waitForNotice(host.page, 'Phase 1 started.')
-      await expect(host.page.locator('body')).toContainText('Discovery round')
-      await expect(guest.page.locator('body')).toContainText('Discovery round')
+      await expect(host.page.getByTestId('session-panel')).toContainText('Phase 1: Discovery')
+      await expect(guest.page.getByTestId('session-panel')).toContainText('Phase 1: Discovery')
 
       await host.page.getByTestId('start-handover-button').click()
       await waitForNotice(host.page, 'Handover started.')

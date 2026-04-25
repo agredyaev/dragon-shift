@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { spawn } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
+import { randomBytes } from 'node:crypto'
 
 const currentDir = dirname(fileURLToPath(import.meta.url))
 const workspaceRoot = resolve(currentDir, '..')
@@ -21,6 +22,7 @@ if (!databaseUrl) {
 let child = null
 let restarting = false
 let shuttingDown = false
+const sessionCookieKey = process.env.SESSION_COOKIE_KEY ?? randomBytes(64).toString('base64')
 
 function ensureParentDir(filePath) {
   mkdirSync(dirname(filePath), { recursive: true })
@@ -49,6 +51,7 @@ function spawnServer() {
       VITE_APP_URL: baseUrl,
       NODE_ENV: 'development',
       DATABASE_URL: databaseUrl,
+      SESSION_COOKIE_KEY: sessionCookieKey,
     },
     stdio: 'inherit',
   })

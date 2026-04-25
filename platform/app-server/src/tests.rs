@@ -4674,6 +4674,12 @@ async fn workshop_command_rejects_duplicate_starter_selection_in_lobby() {
             panic!("expected host join success, got error: {}", error.error)
         }
     };
+    let host_starter_id = host_join_success
+        .state
+        .players
+        .get(&host_join_success.player_id)
+        .and_then(|player| player.character_id.clone())
+        .expect("host should lease a starter on join");
 
     let guest_join_response = app
         .clone()
@@ -4704,30 +4710,6 @@ async fn workshop_command_rejects_duplicate_starter_selection_in_lobby() {
         }
     };
 
-    let host_select_response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/api/workshops/command")
-                .header("content-type", "application/json")
-                .body(Body::from(format!(
-                    r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"selectCharacter","payload":{{"characterId":"{}"}}}}"#,
-                    session_code, host_join_success.reconnect_token, starter.id
-                )))
-                .expect("build host select request"),
-        )
-        .await
-        .expect("call host selectCharacter");
-    if host_select_response.status() != StatusCode::OK {
-        let body = to_bytes(host_select_response.into_body(), usize::MAX)
-            .await
-            .expect("read host select body");
-        let result: WorkshopCommandResult =
-            serde_json::from_slice(&body).expect("parse host select result");
-        panic!("unexpected host select result: {:?}", result);
-    }
-
     let guest_select_response = app
         .oneshot(
             Request::builder()
@@ -4736,7 +4718,7 @@ async fn workshop_command_rejects_duplicate_starter_selection_in_lobby() {
                 .header("content-type", "application/json")
                 .body(Body::from(format!(
                     r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"selectCharacter","payload":{{"characterId":"{}"}}}}"#,
-                    session_code, guest_join_success.reconnect_token, starter.id
+                    session_code, guest_join_success.reconnect_token, host_starter_id
                 )))
                 .expect("build guest select request"),
         )
