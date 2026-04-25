@@ -1,8 +1,9 @@
 #![allow(clippy::too_many_arguments)]
 
 use protocol::{
-    ClientGameState, ClientSessionSnapshot, CoordinatorType, JudgeBundle, NoticeLevel, Phase,
-    ServerWsMessage, SessionCommand, SessionNotice as ProtocolSessionNotice, WorkshopJoinSuccess,
+    AccountProfile, CharacterProfile, ClientGameState, ClientSessionSnapshot, CoordinatorType,
+    JudgeBundle, NoticeLevel, OpenWorkshopCursor, OpenWorkshopSummary, Phase, ServerWsMessage,
+    SessionCommand, SessionNotice as ProtocolSessionNotice, SessionNoticeCode, WorkshopJoinSuccess,
 };
 
 use crate::api::build_client_session_snapshot;
@@ -13,7 +14,10 @@ use crate::api::build_client_session_snapshot;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ShellScreen {
-    Home,
+    SignIn,
+    AccountHome,
+    CreateCharacter,
+    PickCharacter { workshop_code: String },
     Session,
 }
 
@@ -26,9 +30,11 @@ pub enum ConnectionStatus {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PendingFlow {
+    SignIn,
     Create,
     Join,
     Reconnect,
+    DeleteWorkshop,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,10 +45,30 @@ pub enum NoticeTone {
     Error,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum SpriteGenerationStage {
+    Preparing,
+    Queued,
+    Drawing,
+    Fallback,
+    Completed,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShellNotice {
     pub tone: NoticeTone,
     pub message: String,
+    pub scope: NoticeScope,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NoticeScope {
+    SignIn,
+    AccountHome,
+    CreateCharacter,
+    PickCharacter,
+    Session,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -62,6 +88,7 @@ pub struct IdentityState {
     pub screen: ShellScreen,
     pub connection_status: ConnectionStatus,
     pub coordinator: CoordinatorType,
+    pub account: Option<AccountProfile>,
     pub identity: Option<SessionIdentity>,
     pub session_snapshot: Option<ClientSessionSnapshot>,
     pub api_base_url: String,
@@ -74,6 +101,17 @@ pub struct OperationState {
     pub pending_flow: Option<PendingFlow>,
     pub pending_command: Option<SessionCommand>,
     pub pending_judge_bundle: bool,
+    pub sprite_generation_request_pending: bool,
+    pub sprite_generation_stage: Option<SpriteGenerationStage>,
+    pub selected_character_id: Option<String>,
+    pub my_characters: Vec<CharacterProfile>,
+    pub my_characters_limit: u8,
+    pub open_workshops: Vec<OpenWorkshopSummary>,
+    /// Cursor to use for the "Next" (older) pager button; `None` disables it.
+    pub open_workshops_next_cursor: Option<OpenWorkshopCursor>,
+    /// Cursor to use for the "Prev" (newer) pager button; `None` disables it.
+    pub open_workshops_prev_cursor: Option<OpenWorkshopCursor>,
+    pub eligible_characters: Vec<CharacterProfile>,
     pub notice: Option<ShellNotice>,
     /// Notice to show on the first realtime attach instead of the default
     /// "Session synced." message.  Set by `apply_join_success` for
@@ -90,6 +128,7 @@ pub fn info_notice(message: &str) -> ShellNotice {
     ShellNotice {
         tone: NoticeTone::Info,
         message: message.to_string(),
+        scope: NoticeScope::Session,
     }
 }
 
@@ -97,6 +136,7 @@ pub fn success_notice(message: &str) -> ShellNotice {
     ShellNotice {
         tone: NoticeTone::Success,
         message: message.to_string(),
+        scope: NoticeScope::Session,
     }
 }
 
@@ -104,16 +144,48 @@ pub fn error_notice(message: &str) -> ShellNotice {
     ShellNotice {
         tone: NoticeTone::Error,
         message: message.to_string(),
+        scope: NoticeScope::Session,
     }
 }
 
-#[allow(dead_code)]
+pub fn scoped_notice(scope: NoticeScope, mut notice: ShellNotice) -> ShellNotice {
+    notice.scope = scope;
+    notice
+}
+
+pub fn notice_scope_for_screen(screen: &ShellScreen) -> NoticeScope {
+    match screen {
+        ShellScreen::SignIn => NoticeScope::SignIn,
+        ShellScreen::AccountHome => NoticeScope::AccountHome,
+        ShellScreen::CreateCharacter => NoticeScope::CreateCharacter,
+        ShellScreen::PickCharacter { .. } => NoticeScope::PickCharacter,
+        ShellScreen::Session => NoticeScope::Session,
+    }
+}
+
+fn scope_notice_for_identity(identity: &IdentityState, notice: ShellNotice) -> ShellNotice {
+    scoped_notice(notice_scope_for_screen(&identity.screen), notice)
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
 fn map_notice_tone(level: NoticeLevel) -> NoticeTone {
     match level {
         NoticeLevel::Info => NoticeTone::Info,
         NoticeLevel::Success => NoticeTone::Success,
         NoticeLevel::Warning => NoticeTone::Warning,
         NoticeLevel::Error => NoticeTone::Error,
+    }
+}
+
+fn sprite_generation_stage_from_notice(
+    code: Option<SessionNoticeCode>,
+) -> Option<SpriteGenerationStage> {
+    match code {
+        Some(SessionNoticeCode::SpriteAtelierAccepted) => Some(SpriteGenerationStage::Preparing),
+        Some(SessionNoticeCode::SpriteAtelierQueued) => Some(SpriteGenerationStage::Queued),
+        Some(SessionNoticeCode::SpriteAtelierDrawing) => Some(SpriteGenerationStage::Drawing),
+        Some(SessionNoticeCode::SpriteAtelierFallback) => Some(SpriteGenerationStage::Fallback),
+        _ => None,
     }
 }
 
@@ -143,9 +215,10 @@ fn browser_default_api_base_url() -> Option<String> {
 
 pub fn default_identity_state() -> IdentityState {
     IdentityState {
-        screen: ShellScreen::Home,
+        screen: ShellScreen::SignIn,
         connection_status: ConnectionStatus::Offline,
         coordinator: CoordinatorType::Rust,
+        account: None,
         identity: None,
         session_snapshot: None,
         api_base_url: default_api_base_url(),
@@ -158,6 +231,15 @@ pub fn default_operation_state() -> OperationState {
         pending_flow: None,
         pending_command: None,
         pending_judge_bundle: false,
+        sprite_generation_request_pending: false,
+        sprite_generation_stage: None,
+        selected_character_id: None,
+        my_characters: Vec::new(),
+        my_characters_limit: 5,
+        open_workshops: Vec::new(),
+        open_workshops_next_cursor: None,
+        open_workshops_prev_cursor: None,
+        eligible_characters: Vec::new(),
         notice: None,
         pending_realtime_notice: None,
     }
@@ -165,7 +247,6 @@ pub fn default_operation_state() -> OperationState {
 
 pub fn hydrate_from_snapshot(
     identity: &mut IdentityState,
-    join_session_code: &mut String,
     reconnect_session_code: &mut String,
     reconnect_token: &mut String,
     snapshot: &ClientSessionSnapshot,
@@ -179,7 +260,6 @@ pub fn hydrate_from_snapshot(
         reconnect_token: snapshot.reconnect_token.clone(),
     });
     identity.session_snapshot = Some(snapshot.clone());
-    *join_session_code = snapshot.session_code.clone();
     *reconnect_session_code = snapshot.session_code.clone();
     *reconnect_token = snapshot.reconnect_token.clone();
 }
@@ -188,9 +268,6 @@ pub fn hydrate_from_snapshot(
 pub struct BootstrapResult {
     pub identity: IdentityState,
     pub game_state: Option<ClientGameState>,
-    pub create_name: String,
-    pub join_session_code: String,
-    pub join_name: String,
     pub reconnect_session_code: String,
     pub reconnect_token: String,
     pub handover_tags_input: String,
@@ -198,35 +275,42 @@ pub struct BootstrapResult {
     pub judge_bundle: Option<JudgeBundle>,
 }
 
-pub fn restore_bootstrap(snapshot: Option<ClientSessionSnapshot>) -> BootstrapResult {
+pub fn restore_bootstrap(
+    account: Option<AccountProfile>,
+    snapshot: Option<ClientSessionSnapshot>,
+) -> BootstrapResult {
     let mut identity = default_identity_state();
-    let create_name = String::new();
-    let mut join_session_code = String::new();
-    let join_name = String::new();
     let mut reconnect_session_code = String::new();
     let mut reconnect_token = String::new();
     let handover_tags_input = String::new();
     let mut ops = default_operation_state();
 
-    if let Some(snapshot) = snapshot {
-        hydrate_from_snapshot(
-            &mut identity,
-            &mut join_session_code,
-            &mut reconnect_session_code,
-            &mut reconnect_token,
-            &snapshot,
-        );
-        ops.notice = Some(info_notice(
-            "Restored reconnect session from browser storage.",
-        ));
+    match (&account, &snapshot) {
+        (Some(_), Some(snapshot)) => {
+            identity.account = account;
+            hydrate_from_snapshot(
+                &mut identity,
+                &mut reconnect_session_code,
+                &mut reconnect_token,
+                snapshot,
+            );
+            ops.notice = Some(scoped_notice(
+                NoticeScope::Session,
+                info_notice("Restored reconnect session from browser storage."),
+            ));
+        }
+        (Some(_), None) => {
+            identity.account = account;
+            identity.screen = ShellScreen::AccountHome;
+        }
+        _ => {
+            // No account snapshot → SignIn (the default)
+        }
     }
 
     BootstrapResult {
         identity,
         game_state: None,
-        create_name,
-        join_session_code,
-        join_name,
         reconnect_session_code,
         reconnect_token,
         handover_tags_input,
@@ -236,13 +320,17 @@ pub fn restore_bootstrap(snapshot: Option<ClientSessionSnapshot>) -> BootstrapRe
 }
 
 pub fn bootstrap_state() -> BootstrapResult {
-    let mut result = match load_browser_session_snapshot() {
-        Ok(snapshot) => restore_bootstrap(snapshot),
+    let account = load_browser_account_snapshot().ok().flatten();
+    let session = load_browser_session_snapshot();
+
+    let mut result = match session {
+        Ok(snapshot) => restore_bootstrap(account, snapshot),
         Err(error) => {
-            let mut result = restore_bootstrap(None);
-            result.ops.notice = Some(error_notice(&format!(
-                "Failed to restore browser session: {error}"
-            )));
+            let mut result = restore_bootstrap(account, None);
+            result.ops.notice = Some(scoped_notice(
+                notice_scope_for_screen(&result.identity.screen),
+                error_notice(&format!("Failed to restore browser session: {error}")),
+            ));
             result
         }
     };
@@ -434,6 +522,90 @@ pub fn persist_browser_api_base_url(api_base_url: &str) -> Result<(), String> {
 }
 
 // ---------------------------------------------------------------------------
+// Account snapshot persistence (localStorage)
+// ---------------------------------------------------------------------------
+
+#[allow(dead_code)]
+pub const ACCOUNT_SNAPSHOT_STORAGE_KEY: &str = "dragon-switch/platform/account-snapshot";
+
+#[allow(dead_code)]
+pub fn encode_account_snapshot(profile: &AccountProfile) -> Result<String, String> {
+    serde_json::to_string(profile)
+        .map_err(|error| format!("failed to encode account snapshot: {error}"))
+}
+
+#[allow(dead_code)]
+pub fn decode_account_snapshot(value: &str) -> Result<AccountProfile, String> {
+    serde_json::from_str(value)
+        .map_err(|error| format!("failed to decode account snapshot: {error}"))
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn load_browser_account_snapshot() -> Result<Option<AccountProfile>, String> {
+    let Some(window) = web_sys::window() else {
+        return Err("window is unavailable".to_string());
+    };
+    let storage = window
+        .local_storage()
+        .map_err(|_| "failed to access browser storage".to_string())?
+        .ok_or_else(|| "browser storage is unavailable".to_string())?;
+
+    let Some(encoded) = storage
+        .get_item(ACCOUNT_SNAPSHOT_STORAGE_KEY)
+        .map_err(|_| "failed to read browser storage".to_string())?
+    else {
+        return Ok(None);
+    };
+
+    decode_account_snapshot(&encoded).map(Some)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn load_browser_account_snapshot() -> Result<Option<AccountProfile>, String> {
+    Ok(None)
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn persist_browser_account_snapshot(profile: &AccountProfile) -> Result<(), String> {
+    let Some(window) = web_sys::window() else {
+        return Err("window is unavailable".to_string());
+    };
+    let storage = window
+        .local_storage()
+        .map_err(|_| "failed to access browser storage".to_string())?
+        .ok_or_else(|| "browser storage is unavailable".to_string())?;
+    let encoded = encode_account_snapshot(profile)?;
+    storage
+        .set_item(ACCOUNT_SNAPSHOT_STORAGE_KEY, &encoded)
+        .map_err(|_| "failed to persist account snapshot".to_string())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn persist_browser_account_snapshot(profile: &AccountProfile) -> Result<(), String> {
+    let _ = profile;
+    Ok(())
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn clear_browser_account_snapshot() -> Result<(), String> {
+    let Some(window) = web_sys::window() else {
+        return Err("window is unavailable".to_string());
+    };
+    let storage = window
+        .local_storage()
+        .map_err(|_| "failed to access browser storage".to_string())?
+        .ok_or_else(|| "browser storage is unavailable".to_string())?;
+    storage
+        .remove_item(ACCOUNT_SNAPSHOT_STORAGE_KEY)
+        .map_err(|_| "failed to clear account snapshot".to_string())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn clear_browser_account_snapshot() -> Result<(), String> {
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Mutation functions
 // ---------------------------------------------------------------------------
 
@@ -441,7 +613,6 @@ pub fn apply_join_success(
     identity: &mut IdentityState,
     game_state: &mut Option<ClientGameState>,
     ops: &mut OperationState,
-    join_session_code: &mut String,
     reconnect_session_code: &mut String,
     reconnect_token: &mut String,
     judge_bundle: &mut Option<JudgeBundle>,
@@ -453,6 +624,8 @@ pub fn apply_join_success(
         PendingFlow::Create => "Workshop created.",
         PendingFlow::Join => "Joined workshop.",
         PendingFlow::Reconnect => "Reconnected to workshop.",
+        PendingFlow::DeleteWorkshop => "Workshop deleted.",
+        PendingFlow::SignIn => "Workshop created.",
     };
 
     identity.screen = ShellScreen::Session;
@@ -468,15 +641,31 @@ pub fn apply_join_success(
     *game_state = Some(success.state);
     *judge_bundle = None;
 
-    *join_session_code = snapshot.session_code.clone();
+    ops.selected_character_id = game_state.as_ref().and_then(|state| {
+        state
+            .current_player_id
+            .as_ref()
+            .and_then(|player_id| state.players.get(player_id))
+            .and_then(|player| player.character_id.clone())
+    });
+    if flow != PendingFlow::Reconnect {
+        ops.my_characters.clear();
+    }
+
     *reconnect_session_code = snapshot.session_code.clone();
     *reconnect_token = snapshot.reconnect_token.clone();
 
     ops.pending_flow = None;
     ops.pending_judge_bundle = false;
-    ops.notice = Some(success_notice(success_message));
+    ops.notice = Some(scoped_notice(
+        NoticeScope::Session,
+        success_notice(success_message),
+    ));
     ops.pending_realtime_notice = match flow {
-        PendingFlow::Reconnect => Some(success_notice(success_message)),
+        PendingFlow::Reconnect => Some(scoped_notice(
+            NoticeScope::Session,
+            success_notice(success_message),
+        )),
         _ => None,
     };
 }
@@ -487,14 +676,14 @@ pub fn apply_request_error(identity: &mut IdentityState, ops: &mut OperationStat
     if should_clear_session_snapshot(&error) {
         clear_session_identity(identity);
     }
-    ops.notice = Some(error_notice(&error));
+    ops.notice = Some(scope_notice_for_identity(identity, error_notice(&error)));
 }
 
 pub fn command_success_message(command: SessionCommand) -> &'static str {
     match command {
-        SessionCommand::StartPhase0 => "Character creation opened.",
-        SessionCommand::UpdatePlayerPet => "Dragon profile saved.",
+        SessionCommand::SelectCharacter => "Dragon profile saved.",
         SessionCommand::StartPhase1 => "Phase 1 started.",
+        SessionCommand::SubmitObservation => "Observation saved.",
         SessionCommand::StartHandover => "Handover started.",
         SessionCommand::SubmitTags => "Handover tags saved.",
         SessionCommand::StartPhase2 => "Phase 2 started.",
@@ -510,8 +699,7 @@ pub fn command_success_message(command: SessionCommand) -> &'static str {
 fn command_completed_by_phase_update(command: SessionCommand, phase: Phase) -> bool {
     matches!(
         (command, phase),
-        (SessionCommand::StartPhase0, Phase::Phase0)
-            | (SessionCommand::StartPhase1, Phase::Phase1)
+        (SessionCommand::StartPhase1, Phase::Phase1)
             | (SessionCommand::StartHandover, Phase::Handover)
             | (SessionCommand::StartPhase2, Phase::Phase2)
             | (SessionCommand::EndGame, Phase::Voting)
@@ -537,7 +725,14 @@ pub fn apply_successful_command(
     if command == SessionCommand::ResetGame {
         *judge_bundle = None;
     }
-    ops.notice = Some(success_notice(command_success_message(command)));
+    if command == SessionCommand::SelectCharacter {
+        ops.sprite_generation_request_pending = false;
+        ops.sprite_generation_stage = None;
+    }
+    ops.notice = Some(scoped_notice(
+        NoticeScope::Session,
+        success_notice(command_success_message(command)),
+    ));
 }
 
 pub fn apply_command_error(identity: &mut IdentityState, ops: &mut OperationState, error: String) {
@@ -545,7 +740,7 @@ pub fn apply_command_error(identity: &mut IdentityState, ops: &mut OperationStat
     if should_clear_session_snapshot(&error) {
         clear_session_identity(identity);
     }
-    ops.notice = Some(error_notice(&error));
+    ops.notice = Some(scope_notice_for_identity(identity, error_notice(&error)));
 }
 
 pub fn apply_judge_bundle_success(
@@ -555,7 +750,10 @@ pub fn apply_judge_bundle_success(
 ) {
     ops.pending_judge_bundle = false;
     *judge_bundle = Some(bundle);
-    ops.notice = Some(success_notice("Workshop archive ready."));
+    ops.notice = Some(scoped_notice(
+        NoticeScope::Session,
+        success_notice("Workshop archive ready."),
+    ));
 }
 
 pub fn apply_judge_bundle_error(
@@ -567,7 +765,7 @@ pub fn apply_judge_bundle_error(
     if should_clear_session_snapshot(&error) {
         clear_session_identity(identity);
     }
-    ops.notice = Some(error_notice(&error));
+    ops.notice = Some(scope_notice_for_identity(identity, error_notice(&error)));
 }
 
 #[allow(dead_code)]
@@ -581,14 +779,17 @@ pub fn apply_realtime_bootstrap_error(
     if should_clear_session_snapshot(&error) {
         clear_session_identity(identity);
     }
-    ops.notice = Some(error_notice(&error));
+    ops.notice = Some(scope_notice_for_identity(identity, error_notice(&error)));
 }
 
 #[allow(dead_code)]
 pub fn apply_realtime_connecting(identity: &mut IdentityState, ops: &mut OperationState) {
     identity.realtime_bootstrap_attempted = true;
     identity.connection_status = ConnectionStatus::Connecting;
-    ops.notice = Some(info_notice("Syncing session…"));
+    ops.notice = Some(scoped_notice(
+        NoticeScope::Session,
+        info_notice("Syncing session…"),
+    ));
 }
 
 fn should_clear_session_snapshot(error: &str) -> bool {
@@ -601,12 +802,36 @@ fn should_clear_session_snapshot(error: &str) -> bool {
 }
 
 pub fn clear_session_identity(identity: &mut IdentityState) {
-    identity.screen = ShellScreen::Home;
+    identity.screen = ShellScreen::AccountHome;
     identity.connection_status = ConnectionStatus::Offline;
     identity.identity = None;
     identity.session_snapshot = None;
     identity.realtime_bootstrap_attempted = false;
     let _ = clear_browser_session_snapshot();
+}
+
+pub fn navigate_to_screen(
+    identity: &mut IdentityState,
+    ops: &mut OperationState,
+    screen: ShellScreen,
+) {
+    let next_scope = notice_scope_for_screen(&screen);
+    if ops
+        .notice
+        .as_ref()
+        .is_some_and(|notice| notice.scope != next_scope)
+    {
+        ops.notice = None;
+    }
+    identity.screen = screen;
+}
+
+/// Full logout: clears session + account → goes to SignIn.
+pub fn clear_account_identity(identity: &mut IdentityState) {
+    clear_session_identity(identity);
+    identity.screen = ShellScreen::SignIn;
+    identity.account = None;
+    let _ = clear_browser_account_snapshot();
 }
 
 #[allow(dead_code)]
@@ -627,30 +852,47 @@ pub fn apply_server_ws_message(
             identity.screen = ShellScreen::Session;
             *game_state = Some(client_state);
             identity.connection_status = ConnectionStatus::Connected;
+            ops.selected_character_id = game_state.as_ref().and_then(|state| {
+                state
+                    .current_player_id
+                    .as_ref()
+                    .and_then(|player_id| state.players.get(player_id))
+                    .and_then(|player| player.character_id.clone())
+            });
+            if phase != Phase::Lobby {
+                ops.sprite_generation_request_pending = false;
+                ops.sprite_generation_stage = None;
+            }
             if phase != Phase::End {
                 *judge_bundle = None;
                 ops.pending_judge_bundle = false;
             }
             if first_attach {
                 ops.pending_command = None;
-                ops.notice = Some(
-                    ops.pending_realtime_notice
-                        .take()
-                        .unwrap_or_else(|| info_notice("Session synced.")),
-                );
+                ops.notice = Some(ops.pending_realtime_notice.take().unwrap_or_else(|| {
+                    scoped_notice(NoticeScope::Session, info_notice("Session synced."))
+                }));
             } else if let Some(command) = completed_pending_command {
                 // Phase-transition commands can unmount the source component before
                 // the HTTP task applies its success notice, so confirm them from the
                 // resulting state update as well.
                 ops.pending_command = None;
-                ops.notice = Some(success_notice(command_success_message(command)));
+                ops.notice = Some(scoped_notice(
+                    NoticeScope::Session,
+                    success_notice(command_success_message(command)),
+                ));
             }
         }
         ServerWsMessage::Notice(ProtocolSessionNotice {
             level,
             title,
             message,
+            code,
         }) => {
+            if let Some(stage) = sprite_generation_stage_from_notice(code) {
+                ops.sprite_generation_request_pending = false;
+                ops.sprite_generation_stage = Some(stage);
+            }
             let combined = if title.trim().is_empty() {
                 message
             } else {
@@ -660,14 +902,17 @@ pub fn apply_server_ws_message(
             ops.notice = Some(ShellNotice {
                 tone,
                 message: combined,
+                scope: NoticeScope::Session,
             });
         }
         ServerWsMessage::Error { message } => {
             identity.connection_status = ConnectionStatus::Offline;
+            ops.sprite_generation_request_pending = false;
+            ops.sprite_generation_stage = None;
             if should_clear_session_snapshot(&message) {
                 clear_session_identity(identity);
             }
-            ops.notice = Some(error_notice(&message));
+            ops.notice = Some(scope_notice_for_identity(identity, error_notice(&message)));
         }
         ServerWsMessage::Pong => {
             identity.connection_status = ConnectionStatus::Connected;
@@ -683,8 +928,8 @@ pub fn apply_server_ws_message(
 mod tests {
     use super::*;
     use protocol::{
-        create_default_session_settings, ClientGameState, CoordinatorType, Phase, Player,
-        SessionMeta, WorkshopJoinSuccess,
+        ClientGameState, CoordinatorType, Phase, Player, SessionMeta, SessionNoticeCode,
+        WorkshopJoinSuccess, create_default_session_settings,
     };
     use std::collections::BTreeMap;
 
@@ -701,8 +946,10 @@ mod tests {
                 achievements: Vec::new(),
                 is_ready: false,
                 is_connected: true,
+                character_id: None,
                 pet_description: Some("Alice's workshop dragon".to_string()),
                 custom_sprites: None,
+                remaining_sprite_regenerations: 1,
             },
         );
 
@@ -733,18 +980,24 @@ mod tests {
     }
 
     #[test]
-    fn default_identity_boots_home_screen_with_rust_coordinator() {
+    fn default_identity_boots_signin_screen_with_rust_coordinator() {
         let identity = default_identity_state();
 
-        assert_eq!(identity.screen, ShellScreen::Home);
+        assert_eq!(identity.screen, ShellScreen::SignIn);
         assert_eq!(identity.connection_status, ConnectionStatus::Offline);
         assert_eq!(identity.coordinator, CoordinatorType::Rust);
+        assert_eq!(identity.account, None);
         assert_eq!(identity.identity, None);
         assert_eq!(identity.api_base_url, "");
     }
 
     #[test]
     fn restore_bootstrap_rehydrates_reconnect_fields_from_snapshot() {
+        let account = AccountProfile {
+            id: "acct-9".to_string(),
+            hero: "hero-9".to_string(),
+            name: "TestUser".to_string(),
+        };
         let snapshot = ClientSessionSnapshot {
             session_code: "654321".to_string(),
             reconnect_token: "reconnect-9".to_string(),
@@ -752,10 +1005,11 @@ mod tests {
             coordinator_type: CoordinatorType::Rust,
         };
 
-        let result = restore_bootstrap(Some(snapshot.clone()));
+        let result = restore_bootstrap(Some(account.clone()), Some(snapshot.clone()));
 
         assert_eq!(result.identity.screen, ShellScreen::Session);
         assert_eq!(result.identity.connection_status, ConnectionStatus::Offline);
+        assert_eq!(result.identity.account, Some(account));
         assert_eq!(
             result
                 .identity
@@ -771,6 +1025,44 @@ mod tests {
             result.ops.notice.as_ref().map(|n| n.message.as_str()),
             Some("Restored reconnect session from browser storage.")
         );
+    }
+
+    #[test]
+    fn restore_bootstrap_with_account_only_goes_to_account_home() {
+        let account = AccountProfile {
+            id: "acct-1".to_string(),
+            hero: "hero-1".to_string(),
+            name: "Alice".to_string(),
+        };
+
+        let result = restore_bootstrap(Some(account.clone()), None);
+
+        assert_eq!(result.identity.screen, ShellScreen::AccountHome);
+        assert_eq!(result.identity.account, Some(account));
+        assert_eq!(result.identity.identity, None);
+        assert_eq!(result.identity.session_snapshot, None);
+    }
+
+    #[test]
+    fn restore_bootstrap_without_account_goes_to_signin() {
+        let result = restore_bootstrap(None, None);
+
+        assert_eq!(result.identity.screen, ShellScreen::SignIn);
+        assert_eq!(result.identity.account, None);
+    }
+
+    #[test]
+    fn clear_session_identity_returns_to_account_home_after_character_pick() {
+        let mut identity = default_identity_state();
+        identity.screen = ShellScreen::PickCharacter {
+            workshop_code: "123456".to_string(),
+        };
+
+        clear_session_identity(&mut identity);
+
+        assert_eq!(identity.screen, ShellScreen::AccountHome);
+        assert_eq!(identity.identity, None);
+        assert_eq!(identity.session_snapshot, None);
     }
 
     #[test]
@@ -793,7 +1085,6 @@ mod tests {
         let mut identity = default_identity_state();
         let mut game_state = None;
         let mut ops = default_operation_state();
-        let mut join_session_code = String::new();
         let mut reconnect_session_code = String::new();
         let mut reconnect_token = String::new();
         let mut judge_bundle = None;
@@ -802,7 +1093,6 @@ mod tests {
             &mut identity,
             &mut game_state,
             &mut ops,
-            &mut join_session_code,
             &mut reconnect_session_code,
             &mut reconnect_token,
             &mut judge_bundle,
@@ -826,7 +1116,7 @@ mod tests {
                 coordinator_type: CoordinatorType::Rust,
             })
         );
-        assert_eq!(join_session_code, "123456");
+        assert_eq!(reconnect_session_code, "123456");
         assert_eq!(reconnect_token, "reconnect-1");
         assert_eq!(
             ops.notice.as_ref().map(|n| n.message.as_str()),
@@ -839,7 +1129,6 @@ mod tests {
         let mut identity = default_identity_state();
         let mut game_state = None;
         let mut ops = default_operation_state();
-        let mut join_session_code = String::new();
         let mut reconnect_session_code = String::new();
         let mut reconnect_token = String::new();
         let mut handover_tags_input = String::new();
@@ -849,7 +1138,6 @@ mod tests {
             &mut identity,
             &mut game_state,
             &mut ops,
-            &mut join_session_code,
             &mut reconnect_session_code,
             &mut reconnect_token,
             &mut judge_bundle,
@@ -880,7 +1168,6 @@ mod tests {
         let mut identity = default_identity_state();
         let mut game_state = None;
         let mut ops = default_operation_state();
-        let mut join_session_code = String::new();
         let mut reconnect_session_code = String::new();
         let mut reconnect_token = String::new();
         let mut handover_tags_input = "one, two".to_string();
@@ -890,7 +1177,6 @@ mod tests {
             &mut identity,
             &mut game_state,
             &mut ops,
-            &mut join_session_code,
             &mut reconnect_session_code,
             &mut reconnect_token,
             &mut judge_bundle,
@@ -912,6 +1198,27 @@ mod tests {
         assert_eq!(
             ops.notice.as_ref().map(|n| n.message.as_str()),
             Some("Handover tags saved.")
+        );
+    }
+
+    #[test]
+    fn submit_observation_success_uses_specific_notice_copy() {
+        let mut identity = default_identity_state();
+        let mut ops = default_operation_state();
+        let mut handover_tags_input = String::new();
+        let mut judge_bundle = None;
+
+        apply_successful_command(
+            &mut identity,
+            &mut ops,
+            &mut handover_tags_input,
+            &mut judge_bundle,
+            SessionCommand::SubmitObservation,
+        );
+
+        assert_eq!(
+            ops.notice.as_ref().map(|n| n.message.as_str()),
+            Some("Observation saved.")
         );
     }
 
@@ -957,7 +1264,7 @@ mod tests {
             "Session identity is invalid or expired.".to_string(),
         );
 
-        assert_eq!(identity.screen, ShellScreen::Home);
+        assert_eq!(identity.screen, ShellScreen::AccountHome);
         assert_eq!(identity.identity, None);
         assert_eq!(identity.session_snapshot, None);
         assert!(!identity.realtime_bootstrap_attempted);
@@ -988,7 +1295,6 @@ mod tests {
         let mut identity = default_identity_state();
         let mut game_state = None;
         let mut ops = default_operation_state();
-        let mut join_session_code = String::new();
         let mut reconnect_session_code = String::new();
         let mut reconnect_token = String::new();
         let mut judge_bundle = None;
@@ -997,7 +1303,6 @@ mod tests {
             &mut identity,
             &mut game_state,
             &mut ops,
-            &mut join_session_code,
             &mut reconnect_session_code,
             &mut reconnect_token,
             &mut judge_bundle,
@@ -1024,11 +1329,10 @@ mod tests {
     }
 
     #[test]
-    fn server_ws_phase_update_confirms_pending_transition_command() {
+    fn server_ws_phase_update_confirms_pending_start_phase1_command() {
         let mut identity = default_identity_state();
         let mut game_state = None;
         let mut ops = default_operation_state();
-        let mut join_session_code = String::new();
         let mut reconnect_session_code = String::new();
         let mut reconnect_token = String::new();
         let mut judge_bundle = None;
@@ -1037,7 +1341,6 @@ mod tests {
             &mut identity,
             &mut game_state,
             &mut ops,
-            &mut join_session_code,
             &mut reconnect_session_code,
             &mut reconnect_token,
             &mut judge_bundle,
@@ -1045,11 +1348,14 @@ mod tests {
             PendingFlow::Join,
         );
 
-        ops.pending_command = Some(SessionCommand::StartPhase0);
-        ops.notice = Some(info_notice("Opening character creation…"));
+        ops.pending_command = Some(SessionCommand::StartPhase1);
+        ops.notice = Some(scoped_notice(
+            NoticeScope::Session,
+            info_notice("Starting Phase 1…"),
+        ));
 
         let mut next_state = mock_join_success().state;
-        next_state.phase = Phase::Phase0;
+        next_state.phase = Phase::Phase1;
 
         apply_server_ws_message(
             &mut identity,
@@ -1063,11 +1369,11 @@ mod tests {
         assert_eq!(ops.pending_command, None);
         assert_eq!(
             ops.notice.as_ref().map(|n| n.message.as_str()),
-            Some("Character creation opened.")
+            Some("Phase 1 started.")
         );
         assert_eq!(
             game_state.as_ref().map(|state| state.phase),
-            Some(Phase::Phase0)
+            Some(Phase::Phase1)
         );
     }
 
@@ -1076,7 +1382,6 @@ mod tests {
         let mut identity = default_identity_state();
         let mut game_state = None;
         let mut ops = default_operation_state();
-        let mut join_session_code = String::new();
         let mut reconnect_session_code = String::new();
         let mut reconnect_token = String::new();
         let mut judge_bundle = None;
@@ -1085,7 +1390,6 @@ mod tests {
             &mut identity,
             &mut game_state,
             &mut ops,
-            &mut join_session_code,
             &mut reconnect_session_code,
             &mut reconnect_token,
             &mut judge_bundle,
@@ -1147,6 +1451,7 @@ mod tests {
                 level: NoticeLevel::Success,
                 title: "Saved".to_string(),
                 message: "Workshop updated".to_string(),
+                code: None,
             }),
         );
 
@@ -1158,5 +1463,159 @@ mod tests {
             ops.notice.as_ref().map(|n| n.tone),
             Some(NoticeTone::Success)
         );
+    }
+
+    #[test]
+    fn server_ws_notice_sets_sprite_generation_stage_from_notice_code() {
+        let mut identity = default_identity_state();
+        let mut game_state = None;
+        let mut ops = default_operation_state();
+        let mut judge_bundle = None;
+
+        apply_server_ws_message(
+            &mut identity,
+            &mut game_state,
+            &mut ops,
+            &mut judge_bundle,
+            ServerWsMessage::Notice(ProtocolSessionNotice {
+                level: NoticeLevel::Info,
+                title: "Sprite Atelier".to_string(),
+                message: "Queued".to_string(),
+                code: Some(SessionNoticeCode::SpriteAtelierAccepted),
+            }),
+        );
+        assert_eq!(
+            ops.sprite_generation_stage,
+            Some(SpriteGenerationStage::Preparing)
+        );
+
+        apply_server_ws_message(
+            &mut identity,
+            &mut game_state,
+            &mut ops,
+            &mut judge_bundle,
+            ServerWsMessage::Notice(ProtocolSessionNotice {
+                level: NoticeLevel::Info,
+                title: "Sprite Atelier".to_string(),
+                message: "Queued".to_string(),
+                code: Some(SessionNoticeCode::SpriteAtelierQueued),
+            }),
+        );
+        assert_eq!(
+            ops.sprite_generation_stage,
+            Some(SpriteGenerationStage::Queued)
+        );
+
+        apply_server_ws_message(
+            &mut identity,
+            &mut game_state,
+            &mut ops,
+            &mut judge_bundle,
+            ServerWsMessage::Notice(ProtocolSessionNotice {
+                level: NoticeLevel::Info,
+                title: "Sprite Atelier".to_string(),
+                message: "Drawing".to_string(),
+                code: Some(SessionNoticeCode::SpriteAtelierDrawing),
+            }),
+        );
+        assert_eq!(
+            ops.sprite_generation_stage,
+            Some(SpriteGenerationStage::Drawing)
+        );
+
+        apply_server_ws_message(
+            &mut identity,
+            &mut game_state,
+            &mut ops,
+            &mut judge_bundle,
+            ServerWsMessage::Notice(ProtocolSessionNotice {
+                level: NoticeLevel::Warning,
+                title: "Sprite Atelier".to_string(),
+                message: "Fallback".to_string(),
+                code: Some(SessionNoticeCode::SpriteAtelierFallback),
+            }),
+        );
+        assert_eq!(
+            ops.sprite_generation_stage,
+            Some(SpriteGenerationStage::Fallback)
+        );
+    }
+
+    #[test]
+    fn server_ws_uncoded_sprite_notice_does_not_change_generation_stage() {
+        let mut identity = default_identity_state();
+        let mut game_state = None;
+        let mut ops = default_operation_state();
+        let mut judge_bundle = None;
+
+        apply_server_ws_message(
+            &mut identity,
+            &mut game_state,
+            &mut ops,
+            &mut judge_bundle,
+            ServerWsMessage::Notice(ProtocolSessionNotice {
+                level: NoticeLevel::Info,
+                title: "Sprite Atelier".to_string(),
+                message: "Queued".to_string(),
+                code: None,
+            }),
+        );
+
+        assert_eq!(ops.sprite_generation_stage, None);
+    }
+
+    #[test]
+    fn state_update_keeps_terminal_sprite_generation_stage_visible_in_lobby() {
+        let mut identity = default_identity_state();
+        let mut game_state = None;
+        let mut ops = default_operation_state();
+        let mut judge_bundle = None;
+        let mut lobby_state = mock_join_success().state;
+        lobby_state.phase = Phase::Lobby;
+        lobby_state
+            .players
+            .get_mut("player-1")
+            .expect("player-1")
+            .custom_sprites = Some(protocol::SpriteSet {
+            neutral: "n".into(),
+            happy: "h".into(),
+            angry: "a".into(),
+            sleepy: "s".into(),
+        });
+        ops.sprite_generation_stage = Some(SpriteGenerationStage::Completed);
+
+        apply_server_ws_message(
+            &mut identity,
+            &mut game_state,
+            &mut ops,
+            &mut judge_bundle,
+            ServerWsMessage::StateUpdate(lobby_state),
+        );
+
+        assert_eq!(
+            ops.sprite_generation_stage,
+            Some(SpriteGenerationStage::Completed)
+        );
+    }
+
+    #[test]
+    fn update_player_pet_success_clears_sprite_generation_stage() {
+        let mut identity = default_identity_state();
+        let mut ops = default_operation_state();
+        let mut handover_tags_input = String::new();
+        let mut judge_bundle = None;
+        ops.sprite_generation_request_pending = true;
+        ops.sprite_generation_stage = Some(SpriteGenerationStage::Completed);
+
+        apply_successful_command(
+            &mut identity,
+            &mut ops,
+            &mut handover_tags_input,
+            &mut judge_bundle,
+            SessionCommand::SelectCharacter,
+        );
+
+        assert!(!ops.sprite_generation_request_pending);
+        assert_eq!(ops.sprite_generation_stage, None);
     }
 }

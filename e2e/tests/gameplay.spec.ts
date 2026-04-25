@@ -2,7 +2,10 @@ import { expect, test, type WebSocketRoute } from '@playwright/test'
 
 import {
   advanceWorkshopToVoting,
+  cloneSignedInSession,
+  createCharacter,
   createWorkshop,
+  createWorkshopAndJoinAsHost,
   dismissGameOverOverlay,
   enterHandover,
   enterJudge,
@@ -10,14 +13,12 @@ import {
   enterPhase2,
   enterVoting,
   expectToStayOnHome,
-  generateDragonSprites,
-  gotoApp,
+  hostJoinOwnWorkshop,
   joinWorkshop,
   newPlayerContext,
-  openCharacterCreation,
-  readReconnectToken,
   readSessionSnapshot,
   saveHandoverTags,
+  signInAccount,
   voteForVisibleDragon,
   waitForNotice,
 } from './gameplay-helpers'
@@ -26,39 +27,16 @@ async function safeClose(...contexts: Array<{ close: () => Promise<void> }>) {
   await Promise.allSettled(contexts.map(context => context.close()))
 }
 
-const lobbyTitlePattern = /Workshop lobby|Waiting lobby/
-
-async function expectPhaseDragonSprite(page: Parameters<typeof gotoApp>[0]) {
-  const stageSprite = page.locator('.dragon-stage__sprite')
-  await expect(stageSprite).toBeVisible()
-  const spriteSource = await stageSprite.getAttribute('src')
-  expect(spriteSource).toMatch(/^data:image\/png;base64,/
-  )
-  await expect(page.locator('.dragon-stage .meta').filter({ hasText: 'Mood:' })).toHaveCount(0)
-}
-
-async function expectVotingSpriteImages(page: Parameters<typeof gotoApp>[0], expectedCount: number) {
-  const spriteImages = page.locator('.voting-card__sprite-img')
-  await expect(spriteImages).toHaveCount(expectedCount)
-
-  for (let index = 0; index < expectedCount; index++) {
-    const spriteImage = spriteImages.nth(index)
-    await expect(spriteImage).toBeVisible()
-    const spriteSource = await spriteImage.getAttribute('src')
-    expect(spriteSource).toMatch(/^data:image\/png;base64,/
-    )
-  }
-
-  await expect(page.locator('.voting-card__sprite .sprite-body')).toHaveCount(0)
-}
+const lobbyTitlePattern = /Workshop Lobby|Waiting lobby/
 
 test.describe('dragon shift deployed gameplay', () => {
   test('host and guest can advance through the visible workshop flow', async ({ browser }) => {
+    test.setTimeout(180_000)
     const host = await newPlayerContext(browser)
     const guest = await newPlayerContext(browser)
 
     try {
-      const workshopCode = await createWorkshop(host.page, 'Alice')
+      const workshopCode = await createWorkshopAndJoinAsHost(host.page, 'Alice')
       await joinWorkshop(guest.page, workshopCode, 'Bob')
 
       await expect(host.page.getByTestId('session-panel')).toContainText(lobbyTitlePattern)
@@ -75,24 +53,21 @@ test.describe('dragon shift deployed gameplay', () => {
       await expect(guest.page.getByTestId('session-panel')).toContainText('2 / 2 votes submitted')
 
       await host.page.getByTestId('reveal-results-button').click()
-      await waitForNotice(host.page, 'Voting results revealed.')
+      await waitForNotice(host.page, 'Voting finished.')
+
+      await host.page.getByTestId('end-session-button').click()
+      await waitForNotice(host.page, 'Game over ready.')
       await dismissGameOverOverlay(host.page, guest.page)
-      await expect(host.page.getByTestId('session-panel')).toContainText('Workshop results')
+
+      await expect(host.page.getByTestId('session-panel')).toContainText('Game over')
       await expect(host.page.getByTestId('session-panel')).toContainText('Creativity leaderboard')
-      await expect(host.page.getByTestId('session-panel')).toContainText('Mechanics leaderboard')
-      await expect(guest.page.getByTestId('session-panel')).toContainText('Workshop results')
+      await expect(guest.page.getByTestId('session-panel')).toContainText('Game over')
       await expect(guest.page.getByTestId('session-panel')).toContainText('Creativity leaderboard')
 
       await expect(host.page.getByTestId('archive-panel')).toContainText('Build the workshop archive')
-      await host.page.getByTestId('build-archive-button').click()
-      await waitForNotice(host.page, 'Workshop archive ready.')
-      await expect(host.page.getByTestId('archive-panel')).toContainText('Artifacts:')
-      await expect(host.page.getByTestId('archive-panel')).toContainText('Captured final standings')
-      await expect(host.page.getByTestId('archive-panel')).toContainText('Captured dragons')
       await expect(guest.page.getByTestId('archive-panel')).toContainText('Build the workshop archive')
-      await expect(guest.page.getByTestId('build-archive-button')).toHaveCount(0)
 
-      await host.page.getByTestId('reset-workshop-button').click()
+      await host.page.getByTestId('reset-game-button').click()
       await waitForNotice(host.page, 'Workshop reset.')
       await expect(host.page.getByTestId('session-panel')).toContainText(lobbyTitlePattern)
       await expect(guest.page.getByTestId('session-panel')).toContainText(lobbyTitlePattern)
@@ -101,33 +76,27 @@ test.describe('dragon shift deployed gameplay', () => {
     }
   })
 
-  test('phase 0 sprite drafts remain visible through later phases without explicit save', async ({ browser }) => {
+  test('standalone character creation feeds the later workshop flow', async ({ browser }) => {
+    test.setTimeout(180_000)
     const host = await newPlayerContext(browser)
     const guest = await newPlayerContext(browser)
 
     try {
-      const workshopCode = await createWorkshop(host.page, 'Alice')
+      await signInAccount(host.page, 'Alice')
+      await createCharacter(host.page, 'A confident coral dragon with striped wings and lantern eyes.')
+      await signInAccount(guest.page, 'Bob')
+      await createCharacter(guest.page, 'A moss-green dragon with wide fins and a comet tail.')
+
+      const workshopCode = await createWorkshopAndJoinAsHost(host.page, 'Alice')
       await joinWorkshop(guest.page, workshopCode, 'Bob')
 
-      await openCharacterCreation(host.page, guest.page)
-
-      await host.page
-        .getByTestId('dragon-description-input')
-        .fill('A confident coral dragon with striped wings and lantern eyes.')
-      await guest.page
-        .getByTestId('dragon-description-input')
-        .fill('A moss-green dragon with wide fins and a comet tail.')
-
-      await generateDragonSprites(host.page)
-      await generateDragonSprites(guest.page)
-
-      await expect(host.page.getByTestId('save-dragon-button')).toBeVisible()
-      await expect(guest.page.getByTestId('save-dragon-button')).toBeVisible()
+      await expect(host.page.locator('.dragon-stage__sprite')).toHaveCount(0)
+      await expect(guest.page.locator('.dragon-stage__sprite')).toHaveCount(0)
 
       await enterPhase1(host.page, guest.page)
 
-      await expectPhaseDragonSprite(host.page)
-      await expectPhaseDragonSprite(guest.page)
+      await expect(host.page.locator('.dragon-stage__sprite')).toBeVisible()
+      await expect(guest.page.locator('.dragon-stage__sprite')).toBeVisible()
 
       await enterHandover(host.page, guest.page)
       await saveHandoverTags(host.page, 'calm,dusk,berries')
@@ -135,53 +104,45 @@ test.describe('dragon shift deployed gameplay', () => {
 
       await enterPhase2(host.page, guest.page)
 
-      await expectPhaseDragonSprite(host.page)
-      await expectPhaseDragonSprite(guest.page)
+      await expect(host.page.locator('.dragon-stage__sprite')).toBeVisible()
+      await expect(guest.page.locator('.dragon-stage__sprite')).toBeVisible()
 
       await enterJudge(host.page, guest.page)
       await enterVoting(host.page, guest.page)
 
-      await expectVotingSpriteImages(host.page, 2)
-      await expectVotingSpriteImages(guest.page, 2)
+      const hostVotingSprites = host.page.locator('.voting-card__sprite-img')
+      const guestVotingSprites = guest.page.locator('.voting-card__sprite-img')
+      await expect(hostVotingSprites).toHaveCount(8)
+      await expect(guestVotingSprites).toHaveCount(8)
     } finally {
       await safeClose(host.context, guest.context)
     }
   })
 
-  test('reconnect flow re-attaches an existing browser session', async ({ browser }) => {
+  test('fresh context can restore the workshop from browser storage bootstrap', async ({ browser }) => {
     const original = await newPlayerContext(browser)
     const reconnect = await newPlayerContext(browser)
     const guest = await newPlayerContext(browser)
     const lateJoiner = await newPlayerContext(browser)
-    let originalClosed = false
 
     try {
-      const workshopCode = await createWorkshop(original.page, 'Alice')
+      const workshopCode = await createWorkshopAndJoinAsHost(original.page, 'Alice')
       await joinWorkshop(guest.page, workshopCode, 'Bob')
 
-      const reconnectToken = await readReconnectToken(original.page)
-
-      await original.context.close()
-      originalClosed = true
-
-      await gotoApp(reconnect.page)
-      await reconnect.page.getByTestId('reconnect-session-code-input').fill(workshopCode)
-      await reconnect.page.getByTestId('reconnect-token-input').fill(reconnectToken)
-      await reconnect.page.getByTestId('reconnect-button').click()
+      const snapshot = await readSessionSnapshot(original.page)
+      await cloneSignedInSession(original.page, reconnect.context, reconnect.page, snapshot)
 
       await expect(reconnect.page.getByTestId('session-panel')).toContainText(lobbyTitlePattern)
       await expect(reconnect.page.getByTestId('connection-badge')).toContainText('Connected')
       await expect(reconnect.page.getByTestId('workshop-code-badge')).toContainText(workshopCode)
+      await waitForNotice(reconnect.page, 'Session synced.')
 
       await joinWorkshop(lateJoiner.page, workshopCode, 'Carol')
 
-      await expect(reconnect.page.getByTestId('session-panel')).toContainText('Players in view: 3')
-      await expect(guest.page.getByTestId('session-panel')).toContainText('Players in view: 3')
+      await expect(reconnect.page.getByTestId('session-panel')).toContainText('Carol')
+      await expect(guest.page.getByTestId('session-panel')).toContainText('Carol')
     } finally {
-      if (!originalClosed) {
-        await safeClose(original.context)
-      }
-      await safeClose(reconnect.context, guest.context, lateJoiner.context)
+      await safeClose(original.context, reconnect.context, guest.context, lateJoiner.context)
     }
   })
 
@@ -191,7 +152,7 @@ test.describe('dragon shift deployed gameplay', () => {
     const lateJoiner = await newPlayerContext(browser)
 
     try {
-      const workshopCode = await createWorkshop(host.page, 'Alice')
+      const workshopCode = await createWorkshopAndJoinAsHost(host.page, 'Alice')
       await joinWorkshop(guest.page, workshopCode, 'Bob')
 
       await expect(host.page.getByTestId('session-panel')).toContainText(lobbyTitlePattern)
@@ -207,21 +168,58 @@ test.describe('dragon shift deployed gameplay', () => {
 
       await joinWorkshop(lateJoiner.page, workshopCode, 'Carol')
 
-      await expect(host.page.getByTestId('session-panel')).toContainText('Players in view: 3')
+      await expect(host.page.getByTestId('session-panel')).toContainText('Carol')
       await expect(host.page.getByTestId('connection-badge')).toContainText('Connected')
     } finally {
       await safeClose(host.context, guest.context, lateJoiner.context)
     }
   })
 
-  test('invalid join shows a visible error and stays on the home flow', async ({ browser }) => {
+  test('stale open-workshop entry shows a visible error and stays on the home flow', async ({ browser }) => {
     const guest = await newPlayerContext(browser)
 
     try {
-      await gotoApp(guest.page)
-      await guest.page.getByTestId('join-session-code-input').fill('999999')
-      await guest.page.getByTestId('join-name-input').fill('Bob')
-      await guest.page.getByTestId('join-workshop-button').click()
+      await guest.page.route('**/api/workshops/open', async route => {
+        await route.fulfill({
+          status: 200,
+          contentType: 'application/json',
+          body: JSON.stringify({
+            workshops: [{
+              sessionCode: '999999',
+              hostName: 'MissingHost',
+              playerCount: 1,
+              createdAt: '2026-04-24T00:00:00Z',
+            }],
+            nextCursor: null,
+            prevCursor: null,
+          }),
+        })
+      })
+      await guest.page.route('**/api/workshops/999999/eligible-characters', async route => {
+        await route.fulfill({
+          status: 200,
+          contentType: 'application/json',
+          body: JSON.stringify({ characters: [] }),
+        })
+      })
+      await guest.page.route('**/api/workshops/join', async route => {
+        await route.fulfill({
+          status: 404,
+          contentType: 'application/json',
+          body: JSON.stringify({ ok: false, error: 'Workshop not found.' }),
+        })
+      })
+
+      await guest.page.goto('/')
+      await guest.page.getByTestId('signin-name-input').fill('Bob')
+      await guest.page.getByTestId('signin-password-input').fill('password-1234')
+      await guest.page.getByTestId('signin-submit-button').click()
+      await expect(guest.page.getByTestId('open-workshops-panel')).toBeVisible()
+
+      const row = guest.page.locator('.roster__item').filter({ hasText: '999999' }).first()
+      await row.getByTestId('join-workshop-button').click()
+      await expect(guest.page.getByTestId('pick-character-panel')).toBeVisible()
+      await guest.page.getByTestId('use-starter-button').click()
 
       await waitForNotice(guest.page, 'Workshop not found.')
       await expectToStayOnHome(guest.page)
@@ -230,35 +228,16 @@ test.describe('dragon shift deployed gameplay', () => {
     }
   })
 
-  test('invalid reconnect shows a visible error and stays on the home flow', async ({ browser }) => {
-    const host = await newPlayerContext(browser)
-    const reconnect = await newPlayerContext(browser)
-
-    try {
-      const workshopCode = await createWorkshop(host.page, 'Alice')
-
-      await gotoApp(reconnect.page)
-      await reconnect.page.getByTestId('reconnect-session-code-input').fill(workshopCode)
-      await reconnect.page.getByTestId('reconnect-token-input').fill('invalid-token')
-      await reconnect.page.getByTestId('reconnect-button').click()
-
-      await waitForNotice(reconnect.page, 'Session identity is invalid or expired.')
-      await expectToStayOnHome(reconnect.page)
-    } finally {
-      await safeClose(host.context, reconnect.context)
-    }
-  })
-
   test('guest does not see host-only controls in the lobby', async ({ browser }) => {
     const host = await newPlayerContext(browser)
     const guest = await newPlayerContext(browser)
 
     try {
-      const workshopCode = await createWorkshop(host.page, 'Alice')
+      const workshopCode = await createWorkshopAndJoinAsHost(host.page, 'Alice')
       await joinWorkshop(guest.page, workshopCode, 'Bob')
 
-      await expect(guest.page.getByTestId('controls-panel')).toHaveCount(0)
-      await expect(guest.page.getByTestId('start-phase0-button')).toHaveCount(0)
+      await expect(guest.page.getByTestId('controls-panel')).toContainText('hidden')
+      await expect(guest.page.getByTestId('start-phase1-button')).toHaveCount(0)
       await expect(host.page.getByTestId('session-panel')).toContainText(lobbyTitlePattern)
       await expect(guest.page.getByTestId('session-panel')).toContainText(lobbyTitlePattern)
     } finally {
@@ -266,27 +245,87 @@ test.describe('dragon shift deployed gameplay', () => {
     }
   })
 
+  test('account home only shows delete for an owned empty workshop before join', async ({ browser }) => {
+    const host = await newPlayerContext(browser)
+
+    try {
+      const workshopCode = await createWorkshop(host.page, 'Alice')
+      const row = host.page.locator('.roster__item').filter({ hasText: workshopCode }).first()
+
+      await expect(row).toContainText('0 player(s)')
+      await expect(row.getByTestId('delete-workshop-button')).toBeVisible()
+      await expect(row.getByTestId('join-workshop-button')).toBeVisible()
+
+      const refreshedOpenWorkshops = host.page.waitForResponse(response =>
+        response.url().includes('/api/workshops/open')
+        && response.request().method() === 'GET'
+        && response.ok(),
+      )
+
+      await hostJoinOwnWorkshop(host.page, workshopCode)
+      await host.page.getByTestId('leave-workshop-button').click()
+      await refreshedOpenWorkshops
+      await expect(host.page.getByTestId('open-workshops-panel')).toBeVisible()
+
+      const joinedRow = host.page.locator('.roster__item').filter({ hasText: workshopCode }).first()
+      await expect(joinedRow).toContainText('1 player(s)')
+      await expect(joinedRow.getByTestId('delete-workshop-button')).toHaveCount(0)
+    } finally {
+      await safeClose(host.context)
+    }
+  })
+
   test('join network failure shows degraded-path feedback', async ({ browser }) => {
     const guest = await newPlayerContext(browser)
 
     try {
+      await guest.page.route('**/api/workshops/open', async route => {
+        await route.fulfill({
+          status: 200,
+          contentType: 'application/json',
+          body: JSON.stringify({
+            workshops: [{
+              sessionCode: '123456',
+              hostName: 'Alice',
+              playerCount: 1,
+              createdAt: '2026-04-24T00:00:00Z',
+            }],
+            nextCursor: null,
+            prevCursor: null,
+          }),
+        })
+      })
+      await guest.page.route('**/api/workshops/123456/eligible-characters', async route => {
+        await route.fulfill({
+          status: 200,
+          contentType: 'application/json',
+          body: JSON.stringify({ characters: [] }),
+        })
+      })
       await guest.page.route('**/api/workshops/join', async route => {
         await route.abort('failed')
       })
 
-      await gotoApp(guest.page)
-      await guest.page.getByTestId('join-session-code-input').fill('123456')
-      await guest.page.getByTestId('join-name-input').fill('Bob')
-      await guest.page.getByTestId('join-workshop-button').click()
+      await guest.page.goto('/')
+      await guest.page.getByTestId('signin-name-input').fill('Bob')
+      await guest.page.getByTestId('signin-password-input').fill('password-1234')
+      await guest.page.getByTestId('signin-submit-button').click()
+      await expect(guest.page.getByTestId('open-workshops-panel')).toBeVisible()
+
+      const row = guest.page.locator('.roster__item').filter({ hasText: '123456' }).first()
+      await row.getByTestId('join-workshop-button').click()
+      await expect(guest.page.getByTestId('pick-character-panel')).toBeVisible()
+      await guest.page.getByTestId('use-starter-button').click()
 
       await waitForNotice(guest.page, 'failed to reach backend:')
-      await expectToStayOnHome(guest.page)
+      await expect(guest.page.getByTestId('pick-character-panel')).toBeVisible()
+      await expect(guest.page.getByTestId('open-workshops-panel')).toHaveCount(0)
     } finally {
       await safeClose(guest.context)
     }
   })
 
-  test('disconnected session can resync after using the session sync control', async ({ browser }) => {
+  test('disconnected session can resync after page reload', async ({ browser }) => {
     const host = await newPlayerContext(browser)
     const guest = await newPlayerContext(browser)
     const lateJoiner = await newPlayerContext(browser)
@@ -302,7 +341,7 @@ test.describe('dragon shift deployed gameplay', () => {
         resolveHostRealtimeSocket = null
       })
 
-      const workshopCode = await createWorkshop(host.page, 'Alice')
+      const workshopCode = await createWorkshopAndJoinAsHost(host.page, 'Alice')
       await joinWorkshop(guest.page, workshopCode, 'Bob')
 
       const realtimeSocket = await hostRealtimeSocket
@@ -310,41 +349,13 @@ test.describe('dragon shift deployed gameplay', () => {
       await expect(host.page.getByTestId('connection-badge')).toContainText('Offline')
 
       await joinWorkshop(lateJoiner.page, workshopCode, 'Carol')
-      await expect(host.page.getByTestId('session-panel')).toContainText('Players in view: 2')
+      await expect(host.page.getByTestId('session-panel')).not.toContainText('Carol')
 
-      await host.page.getByTestId('sync-session-button').click()
+      await host.page.reload()
       await waitForNotice(host.page, 'Session synced.')
-
-      await expect(host.page.getByTestId('session-panel')).toContainText('Players in view: 3')
+      await expect(host.page.getByTestId('session-panel')).toContainText('Carol')
     } finally {
       await safeClose(host.context, guest.context, lateJoiner.context)
-    }
-  })
-
-  test('archive build failure shows degraded-path feedback', async ({ browser }) => {
-    const host = await newPlayerContext(browser)
-    const guest = await newPlayerContext(browser)
-
-    try {
-      const workshopCode = await createWorkshop(host.page, 'Alice')
-      await joinWorkshop(guest.page, workshopCode, 'Bob')
-
-      await advanceWorkshopToVoting(host.page, guest.page)
-      await voteForVisibleDragon(host.page)
-      await voteForVisibleDragon(guest.page)
-      await host.page.getByTestId('reveal-results-button').click()
-      await waitForNotice(host.page, 'Voting results revealed.')
-      await dismissGameOverOverlay(host.page, guest.page)
-
-      await host.page.route('**/api/workshops/judge-bundle', async route => {
-        await route.abort('failed')
-      })
-
-      await host.page.getByTestId('build-archive-button').click()
-      await waitForNotice(host.page, 'failed to reach backend:')
-      await expect(host.page.getByTestId('archive-panel')).toContainText('Build the workshop archive')
-    } finally {
-      await safeClose(host.context, guest.context)
     }
   })
 })

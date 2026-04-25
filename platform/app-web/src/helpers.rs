@@ -83,13 +83,18 @@ pub struct JudgeBundleDragonRow {
 // Pure view-model functions
 // ---------------------------------------------------------------------------
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn screen_title(screen: &ShellScreen) -> &'static str {
     match screen {
-        ShellScreen::Home => "Raise a dragon, hand it off, and jump back into your workshop",
+        ShellScreen::SignIn => "Sign in to Dragon Shift",
+        ShellScreen::AccountHome => "Your account",
+        ShellScreen::CreateCharacter => "Create a character",
+        ShellScreen::PickCharacter { .. } => "Pick a character",
         ShellScreen::Session => "Your Dragon Shift session is live",
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn connection_status_label(status: &ConnectionStatus) -> &'static str {
     match status {
         ConnectionStatus::Offline => "Offline",
@@ -98,6 +103,7 @@ pub fn connection_status_label(status: &ConnectionStatus) -> &'static str {
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn connection_status_class(status: &ConnectionStatus) -> &'static str {
     match status {
         ConnectionStatus::Offline => "status-offline",
@@ -117,8 +123,7 @@ pub fn notice_class(tone: NoticeTone) -> &'static str {
 
 pub fn pending_command_label(command: SessionCommand) -> &'static str {
     match command {
-        SessionCommand::StartPhase0 => "Opening character creation…",
-        SessionCommand::UpdatePlayerPet => "Saving dragon profile…",
+        SessionCommand::SelectCharacter => "Saving selected character…",
         SessionCommand::StartPhase1 => "Starting Phase 1…",
         SessionCommand::StartHandover => "Starting handover…",
         SessionCommand::SubmitTags => "Saving handover tags…",
@@ -141,6 +146,7 @@ pub fn parse_tags_input(input: &str) -> Vec<String> {
         .collect()
 }
 
+#[allow(dead_code)]
 pub fn active_player_name(state: &ClientGameState) -> Option<String> {
     let player_id = state.current_player_id.as_ref()?;
     state
@@ -149,10 +155,11 @@ pub fn active_player_name(state: &ClientGameState) -> Option<String> {
         .map(|player| player.name.clone())
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn phase_screen_title(phase: Phase) -> &'static str {
     match phase {
         Phase::Lobby => "Waiting lobby",
-        Phase::Phase0 => "Character creation",
+        Phase::Phase0 => "Character setup (legacy)",
         Phase::Phase1 => "Discovery round",
         Phase::Handover => "Handover",
         Phase::Phase2 => "Care round",
@@ -162,12 +169,11 @@ pub fn phase_screen_title(phase: Phase) -> &'static str {
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn phase_screen_body(phase: Phase) -> &'static str {
     match phase {
-        Phase::Lobby => "Wait for the host to gather the group and open character creation.",
-        Phase::Phase0 => {
-            "Describe your dragon, generate sprites, and save your character before discovery begins."
-        }
+        Phase::Lobby => "Wait for the host to gather the group and start Phase 1.",
+        Phase::Phase0 => "Legacy character creation phase (no longer used in the new flow).",
         Phase::Phase1 => {
             "Observe your dragon, capture what stands out, and get ready for the handover."
         }
@@ -189,6 +195,7 @@ pub fn phase_screen_body(phase: Phase) -> &'static str {
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn phase_duration_seconds(state: &ClientGameState) -> Option<i32> {
     state
         .session
@@ -199,6 +206,7 @@ pub fn phase_duration_seconds(state: &ClientGameState) -> Option<i32> {
         .filter(|seconds| *seconds > 0)
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn phase_remaining_seconds(state: &ClientGameState, now_epoch_seconds: i64) -> Option<i32> {
     let duration_seconds = phase_duration_seconds(state)?;
     let phase_started_at = parse_rfc3339_epoch_seconds(&state.session.phase_started_at)?;
@@ -206,6 +214,34 @@ pub fn phase_remaining_seconds(state: &ClientGameState, now_epoch_seconds: i64) 
     Some((duration_seconds - elapsed).max(0))
 }
 
+/// Current wall-clock time in epoch seconds. Used as the `now` input to
+/// [`phase_remaining_seconds`] from rsx render paths. Returns 0 on
+/// non-wasm targets (tests / server renders) — the helper treats the
+/// elapsed clamp at 0, so a stale timestamp simply renders the full
+/// phase duration instead of a negative countdown.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn now_epoch_seconds() -> i64 {
+    #[cfg(target_arch = "wasm32")]
+    {
+        (js_sys::Date::now() / 1000.0) as i64
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        0
+    }
+}
+
+/// Format a non-negative seconds value as `MM:SS` for phase countdown
+/// display.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn format_mm_ss(total_seconds: i32) -> String {
+    let total = total_seconds.max(0);
+    let mins = total / 60;
+    let secs = total % 60;
+    format!("{mins:02}:{secs:02}")
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
 fn parse_rfc3339_epoch_seconds(value: &str) -> Option<i64> {
     let trimmed = value.trim();
     let normalized = trimmed
@@ -218,6 +254,7 @@ fn parse_rfc3339_epoch_seconds(value: &str) -> Option<i64> {
     Some(seconds_from_civil(year, month, day)? + i64::from(hour * 3600 + minute * 60 + second))
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn parse_date(value: &str) -> Option<(i32, u32, u32)> {
     let mut parts = value.split('-');
     Some((
@@ -227,6 +264,7 @@ fn parse_date(value: &str) -> Option<(i32, u32, u32)> {
     ))
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn parse_time(value: &str) -> Option<(u32, u32, u32)> {
     let main = value.split_once('.').map(|(head, _)| head).unwrap_or(value);
     let mut parts = main.split(':');
@@ -237,6 +275,7 @@ fn parse_time(value: &str) -> Option<(u32, u32, u32)> {
     ))
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn seconds_from_civil(year: i32, month: u32, day: u32) -> Option<i64> {
     if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
         return None;
@@ -252,6 +291,7 @@ fn seconds_from_civil(year: i32, month: u32, day: u32) -> Option<i64> {
     Some((era * 146097 + doe - 719468) * 86_400)
 }
 
+#[allow(dead_code)]
 pub fn format_remaining_duration(total_seconds: i32) -> String {
     let minutes = total_seconds / 60;
     let seconds = total_seconds % 60;
@@ -346,6 +386,7 @@ pub fn achievement_def(id: &str) -> Option<(&'static str, &'static str, &'static
         .map(|(_, name, desc, icon)| (*name, *desc, *icon))
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn dragon_action_label(action: DragonAction) -> &'static str {
     match action {
         DragonAction::Feed => "Feed",
@@ -434,12 +475,14 @@ pub fn lobby_status_copy(state: &ClientGameState) -> String {
 // Phase 1 helpers
 // ---------------------------------------------------------------------------
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn phase1_focus_title(state: &ClientGameState) -> String {
     current_dragon(state)
         .map(|dragon| format!("Meet {}", dragon.name))
         .unwrap_or_else(|| "Awaiting assigned dragon".to_string())
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn phase1_focus_body(state: &ClientGameState) -> String {
     let Some(dragon) = current_dragon(state) else {
         return "Phase 1 will unlock once the session assigns you a dragon to observe.".to_string();
@@ -459,6 +502,7 @@ pub fn phase1_focus_body(state: &ClientGameState) -> String {
     format!("{speech} {condition}")
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn phase1_observation_summary(state: &ClientGameState) -> String {
     let Some(dragon) = current_dragon(state) else {
         return "No discovery notes saved yet.".to_string();
@@ -476,6 +520,7 @@ pub fn phase1_observation_summary(state: &ClientGameState) -> String {
 // Handover helpers
 // ---------------------------------------------------------------------------
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn handover_focus_title(state: &ClientGameState) -> String {
     current_dragon(state)
         .map(|dragon| format!("Handover for {}", dragon.name))
@@ -488,11 +533,13 @@ pub fn handover_saved_tags(state: &ClientGameState) -> Vec<String> {
         .unwrap_or_default()
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn handover_saved_summary(state: &ClientGameState) -> String {
     let saved_count = handover_saved_tags(state).len();
     format!("{saved_count} / 3 handover rules saved")
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn handover_status_copy(state: &ClientGameState) -> String {
     let saved_count = handover_saved_tags(state).len();
     match saved_count {
@@ -509,6 +556,7 @@ pub fn handover_status_copy(state: &ClientGameState) -> String {
 // Phase 2 helpers
 // ---------------------------------------------------------------------------
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn phase2_focus_title(state: &ClientGameState) -> String {
     current_dragon(state)
         .map(|dragon| format!("Phase 2 care for {}", dragon.name))
@@ -526,6 +574,7 @@ pub fn phase2_creator_label(state: &ClientGameState) -> String {
     )
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn phase2_handover_summary(state: &ClientGameState) -> String {
     let Some(dragon) = current_dragon(state) else {
         return "No handover notes yet.".to_string();
@@ -544,6 +593,7 @@ pub fn phase2_handover_summary(state: &ClientGameState) -> String {
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn phase2_care_copy(state: &ClientGameState) -> String {
     let Some(dragon) = current_dragon(state) else {
         return "Phase 2 will begin once a dragon is assigned.".to_string();
@@ -583,8 +633,16 @@ pub fn voting_status_copy(state: &ClientGameState) -> String {
             "Vote submitted. {} of {} eligible votes are in; the host can finish voting at any time.",
             voting.submitted_count, voting.eligible_count
         )
+    } else if voting.submitted_count > 0 {
+        format!(
+            "{} of {} eligible votes are in. You can still vote before the host finishes voting.",
+            voting.submitted_count, voting.eligible_count
+        )
+    } else if voting.eligible_count == 0 {
+        "No anonymous design vote is needed for this workshop. The host can open the final results when ready."
+            .to_string()
     } else {
-        "Choose the most creative dragon design that is not currently assigned to you.".to_string()
+        "Choose the most creative dragon design that you did not create.".to_string()
     }
 }
 
@@ -592,7 +650,7 @@ pub fn voting_reveal_ready(state: &ClientGameState) -> bool {
     state
         .voting
         .as_ref()
-        .map(|voting| voting.eligible_count >= 0)
+        .map(|voting| voting.eligible_count > 0 && voting.submitted_count > 0)
         .unwrap_or(false)
 }
 
@@ -608,8 +666,7 @@ fn has_judge_scores(state: &ClientGameState) -> bool {
 }
 
 pub fn voting_option_rows(state: &ClientGameState) -> Vec<VotingOptionRow> {
-    let current_player_dragon_id =
-        current_player(state).and_then(|player| player.current_dragon_id.as_deref());
+    let current_player_id = state.current_player_id.as_deref();
     let current_vote_dragon_id = state
         .voting
         .as_ref()
@@ -630,7 +687,7 @@ pub fn voting_option_rows(state: &ClientGameState) -> Vec<VotingOptionRow> {
             dragon_name: format!("Dragon #{}", index + 1),
             real_dragon_name: dragon.name.clone(),
             is_selected: current_vote_dragon_id == Some(dragon.id.as_str()),
-            is_current_players_dragon: current_player_dragon_id == Some(dragon.id.as_str()),
+            is_current_players_dragon: dragon.original_owner_id.as_deref() == current_player_id,
             color_primary: dragon.visuals.color_p.clone(),
             color_secondary: dragon.visuals.color_s.clone(),
             color_accent: dragon.visuals.color_a.clone(),
@@ -960,8 +1017,8 @@ pub fn judge_bundle_dragon_rows(bundle: &JudgeBundle) -> Vec<JudgeBundleDragonRo
 pub mod tests {
     use super::*;
     use protocol::{
-        create_default_session_settings, ClientDragon, ClientGameState, CoordinatorType,
-        DragonAction, DragonEmotion, Phase, Player, SessionMeta, WorkshopJoinSuccess,
+        ClientDragon, ClientGameState, CoordinatorType, DragonAction, DragonEmotion, Phase, Player,
+        SessionMeta, WorkshopJoinSuccess, create_default_session_settings,
     };
     use std::collections::BTreeMap;
 
@@ -978,8 +1035,10 @@ pub mod tests {
                 achievements: Vec::new(),
                 is_ready: false,
                 is_connected: true,
+                character_id: None,
                 pet_description: Some("Alice's workshop dragon".to_string()),
                 custom_sprites: None,
+                remaining_sprite_regenerations: 1,
             },
         );
 
@@ -1086,8 +1145,10 @@ pub mod tests {
                 achievements: Vec::new(),
                 is_ready: true,
                 is_connected: true,
+                character_id: None,
                 pet_description: Some("Bob's workshop dragon".to_string()),
                 custom_sprites: None,
+                remaining_sprite_regenerations: 1,
             },
         );
         state.dragons.insert(
@@ -1232,10 +1293,8 @@ pub mod tests {
                         happiness: 77,
                     },
                     actual_active_time: protocol::ActiveTime::Day,
-                    actual_day_food: protocol::FoodType::Meat,
-                    actual_night_food: protocol::FoodType::Fruit,
-                    actual_day_play: protocol::PlayType::Fetch,
-                    actual_night_play: protocol::PlayType::Puzzle,
+                    actual_favorite_food: protocol::FoodType::Meat,
+                    actual_favorite_play: protocol::PlayType::Fetch,
                     actual_sleep_rate: 2,
                     handover_chain: protocol::JudgeHandoverChain {
                         creator_instructions: "Start with music".to_string(),
@@ -1275,10 +1334,8 @@ pub mod tests {
                         happiness: 81,
                     },
                     actual_active_time: protocol::ActiveTime::Night,
-                    actual_day_food: protocol::FoodType::Fish,
-                    actual_night_food: protocol::FoodType::Meat,
-                    actual_day_play: protocol::PlayType::Music,
-                    actual_night_play: protocol::PlayType::Fetch,
+                    actual_favorite_food: protocol::FoodType::Fish,
+                    actual_favorite_play: protocol::PlayType::Music,
                     actual_sleep_rate: 1,
                     handover_chain: protocol::JudgeHandoverChain {
                         creator_instructions: "Feed at dusk".to_string(),
@@ -1304,8 +1361,8 @@ pub mod tests {
     #[test]
     fn shell_labels_match_bootstrap_state() {
         assert_eq!(
-            screen_title(&ShellScreen::Home),
-            "Raise a dragon, hand it off, and jump back into your workshop"
+            screen_title(&ShellScreen::SignIn),
+            "Sign in to Dragon Shift"
         );
         assert_eq!(
             connection_status_label(&ConnectionStatus::Offline),
@@ -1344,12 +1401,96 @@ pub mod tests {
     }
 
     #[test]
+    fn format_mm_ss_covers_boundary_cases() {
+        assert_eq!(format_mm_ss(0), "00:00");
+        assert_eq!(format_mm_ss(-5), "00:00");
+        assert_eq!(format_mm_ss(9), "00:09");
+        assert_eq!(format_mm_ss(61), "01:01");
+        assert_eq!(format_mm_ss(3600), "60:00");
+    }
+
+    #[test]
+    fn no_screen_title_contains_legacy_brand() {
+        use crate::state::ShellScreen;
+        for screen in [
+            ShellScreen::SignIn,
+            ShellScreen::AccountHome,
+            ShellScreen::CreateCharacter,
+            ShellScreen::PickCharacter {
+                workshop_code: "ABC123".to_string(),
+            },
+            ShellScreen::Session,
+        ] {
+            let title = screen_title(&screen);
+            assert!(
+                !title.contains("Switch"),
+                "legacy brand leaked in {:?}: {}",
+                screen,
+                title
+            );
+        }
+    }
+
+    /// Regression guard for UX_RECOMPOSE_v2 §10.3 step 15: after the
+    /// app-bar migration, pre-session screens must no longer render a
+    /// duplicate wordmark heading. The wordmark now lives only in the
+    /// app bar, so `hero__title` with the "Dragon Shift" brand text
+    /// must not appear in any screen component source.
+    #[test]
+    fn pre_session_screens_do_not_render_hero_title_wordmark() {
+        let screens: &[(&str, &str)] = &[
+            (
+                "account_home.rs",
+                include_str!("components/account_home.rs"),
+            ),
+            ("sign_in.rs", include_str!("components/sign_in.rs")),
+            (
+                "pick_character.rs",
+                include_str!("components/pick_character.rs"),
+            ),
+        ];
+        for (name, source) in screens {
+            assert!(
+                !source.contains("hero__title"),
+                "{name} still renders a hero__title heading — wordmark must live in AppBar only"
+            );
+            assert!(
+                !source.contains("\"Dragon Shift\""),
+                "{name} still renders the \"Dragon Shift\" literal — moved to AppBar"
+            );
+        }
+    }
+
+    /// Regression guard for UX_RECOMPOSE_v2 §4.A / §10.3: PickCharacter
+    /// must keep the join-focused "Pick your dragon" h1 copy.
+    #[test]
+    fn pick_character_h1_copy_is_stable() {
+        let src = include_str!("components/pick_character.rs");
+        assert!(
+            src.contains("\"Pick your dragon\""),
+            "expected PickCharacter default h1 copy \"Pick your dragon\""
+        );
+    }
+
+    #[test]
+    fn voting_helpers_block_original_creator_dragon_after_handover() {
+        let state = mock_voting_state();
+        let rows = voting_option_rows(&state);
+
+        assert!(
+            rows.iter()
+                .find(|row| row.real_dragon_name == "Comet")
+                .is_some_and(|row| row.is_current_players_dragon)
+        );
+    }
+
+    #[test]
     fn phase_screen_copy_matches_lobby_and_voting_states() {
         assert_eq!(phase_screen_title(Phase::Lobby), "Waiting lobby");
         assert_eq!(phase_screen_title(Phase::Voting), "Design voting");
         assert_eq!(
             phase_screen_body(Phase::Lobby),
-            "Wait for the host to gather the group and open character creation."
+            "Wait for the host to gather the group and start Phase 1."
         );
     }
 
@@ -1367,8 +1508,10 @@ pub mod tests {
                 achievements: Vec::new(),
                 is_ready: true,
                 is_connected: false,
+                character_id: None,
                 pet_description: Some("Bob's workshop dragon".to_string()),
                 custom_sprites: None,
+                remaining_sprite_regenerations: 1,
             },
         );
 
@@ -1490,9 +1633,61 @@ pub mod tests {
         assert!(rows
             .iter()
             .any(|row| row.dragon_name.starts_with("Dragon #") && row.is_current_players_dragon));
-        assert!(rows
-            .iter()
-            .any(|row| row.dragon_name.starts_with("Dragon #") && row.is_selected));
+        assert!(
+            rows.iter()
+                .any(|row| row.dragon_name.starts_with("Dragon #") && row.is_selected)
+        );
+    }
+
+    #[test]
+    fn voting_helpers_keep_self_vote_block_when_other_owners_are_hidden() {
+        let mut state = mock_voting_state();
+        state
+            .dragons
+            .get_mut("dragon-1")
+            .expect("dragon-1")
+            .current_owner_id = Some("player-2".to_string());
+        state
+            .dragons
+            .get_mut("dragon-2")
+            .expect("dragon-2")
+            .original_owner_id = None;
+        state
+            .dragons
+            .get_mut("dragon-2")
+            .expect("dragon-2")
+            .current_owner_id = None;
+
+        let rows = voting_option_rows(&state);
+
+        assert!(
+            rows.iter()
+                .find(|row| row.real_dragon_name == "Comet")
+                .is_some_and(|row| row.is_current_players_dragon)
+        );
+        assert!(
+            rows.iter()
+                .find(|row| row.real_dragon_name == "Nova")
+                .is_some_and(|row| !row.is_current_players_dragon)
+        );
+    }
+
+    #[test]
+    fn voting_helpers_prompt_unsubmitted_voter_after_partial_progress() {
+        let mut state = mock_voting_state();
+        state.voting = Some(protocol::ClientVotingState {
+            eligible_count: 2,
+            submitted_count: 1,
+            current_player_vote_dragon_id: None,
+            results_revealed: false,
+            results: None,
+        });
+
+        assert_eq!(
+            voting_status_copy(&state),
+            "1 of 2 eligible votes are in. You can still vote before the host finishes voting."
+        );
+        assert!(voting_reveal_ready(&state));
     }
 
     #[test]
@@ -1607,8 +1802,10 @@ pub mod tests {
                     achievements: vec![format!("badge_{i}")],
                     is_ready: i % 2 == 0,
                     is_connected: i % 3 != 0,
+                    character_id: None,
                     pet_description: Some(format!("Dragon description {i}")),
                     custom_sprites: None,
+                    remaining_sprite_regenerations: 1,
                 },
             );
             state.dragons.insert(
@@ -1685,10 +1882,8 @@ pub mod tests {
                     happiness: 50,
                 },
                 actual_active_time: protocol::ActiveTime::Day,
-                actual_day_food: protocol::FoodType::Meat,
-                actual_night_food: protocol::FoodType::Fruit,
-                actual_day_play: protocol::PlayType::Fetch,
-                actual_night_play: protocol::PlayType::Puzzle,
+                actual_favorite_food: protocol::FoodType::Meat,
+                actual_favorite_play: protocol::PlayType::Fetch,
                 actual_sleep_rate: 2,
                 handover_chain: protocol::JudgeHandoverChain {
                     creator_instructions: format!("Instructions {i}"),

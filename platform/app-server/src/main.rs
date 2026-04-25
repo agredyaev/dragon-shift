@@ -1,4 +1,5 @@
 mod app;
+mod auth;
 mod cache;
 mod helpers;
 mod http;
@@ -9,12 +10,12 @@ mod ws;
 
 use std::sync::Arc;
 
-use app::{AppState, build_app, build_session_store, load_config};
+use app::{AppState, build_app, build_session_store, load_config, load_fallback_companion_sprites};
 use persistence::SessionUpdateNotification;
 use tracing::info;
 use ws::{
     advance_game_ticks, broadcast_session_state, clear_local_realtime_connection,
-    close_local_connection, emit_phase_warning_notices,
+    close_local_connection, close_local_workshop_connections, emit_phase_warning_notices,
 };
 
 pub(crate) fn parse_session_update_notification(
@@ -80,6 +81,21 @@ pub(crate) async fn handle_session_update_notification(
             clear_local_realtime_connection(state, connection_id).await;
             close_local_connection(state, connection_id).await;
         }
+        return;
+    }
+
+    if notification.kind == "workshop_deleted" {
+        state
+            .sessions
+            .lock()
+            .await
+            .remove(&notification.session_code);
+        close_local_workshop_connections(
+            state,
+            &notification.session_code,
+            Some("Workshop not found."),
+        )
+        .await;
         return;
     }
 
@@ -193,8 +209,11 @@ async fn main() {
         .await
         .expect("build session store");
     store.init().await.expect("init session store");
+    let fallback_companion_sprites = load_fallback_companion_sprites(&store)
+        .await
+        .expect("load fallback companion sprites");
 
-    let state = AppState::new(config.clone(), store);
+    let state = AppState::new(config.clone(), store, fallback_companion_sprites);
 
     if let Some(database_url) = state.config.database_url.as_deref() {
         let listener_state = state.clone();

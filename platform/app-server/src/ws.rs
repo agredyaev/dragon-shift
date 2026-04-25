@@ -8,7 +8,7 @@ use chrono::Utc;
 use persistence::{RealtimeConnectionRegistration, SessionUpdateNotification};
 use protocol::{
     ClientWsMessage, NoticeLevel, ServerWsMessage, SessionArtifactKind, SessionArtifactRecord,
-    SessionEnvelope,
+    SessionEnvelope, SessionNoticeCode,
 };
 use serde_json::json;
 #[cfg(test)]
@@ -18,6 +18,7 @@ use tokio::task::JoinHandle;
 use tracing::info;
 
 use crate::app::AppState;
+use crate::auth::SESSION_COOKIE_NAME;
 use crate::cache::{SessionWriteLease, ensure_session_cached, reload_cached_session};
 use crate::helpers::{phase_label, phase_step, random_prefixed_id, to_client_game_state};
 use crate::http::{
@@ -93,6 +94,7 @@ async fn broadcast_notice(
         level,
         title: title.to_string(),
         message: message.to_string(),
+        code: None,
     });
 
     let failed_connection_ids = {
@@ -100,6 +102,56 @@ async fn broadcast_notice(
         registrations
             .into_iter()
             .filter(|registration| registration.replica_id == state.replica_id)
+            .filter_map(|registration| {
+                senders.get(&registration.connection_id).and_then(|sender| {
+                    sender
+                        .send(WsOutbound::Message(notice.clone()))
+                        .err()
+                        .map(|_| registration.connection_id)
+                })
+            })
+            .collect::<Vec<_>>()
+    };
+
+    if !failed_connection_ids.is_empty() {
+        let mut senders = state.realtime_senders.lock().await;
+        for connection_id in failed_connection_ids {
+            senders.remove(&connection_id);
+        }
+    }
+}
+
+pub(crate) async fn send_player_notice_with_code(
+    state: &AppState,
+    session_code: &str,
+    player_id: &str,
+    level: protocol::NoticeLevel,
+    title: &str,
+    message: &str,
+    code: Option<SessionNoticeCode>,
+) {
+    let registrations = match state.store.list_realtime_connections(session_code).await {
+        Ok(registrations) => registrations,
+        Err(_) => return,
+    };
+    if registrations.is_empty() {
+        return;
+    }
+
+    let notice = ServerWsMessage::Notice(protocol::SessionNotice {
+        level,
+        title: title.to_string(),
+        message: message.to_string(),
+        code,
+    });
+
+    let failed_connection_ids = {
+        let senders = state.realtime_senders.lock().await;
+        registrations
+            .into_iter()
+            .filter(|registration| {
+                registration.replica_id == state.replica_id && registration.player_id == player_id
+            })
             .filter_map(|registration| {
                 senders.get(&registration.connection_id).and_then(|sender| {
                     sender
@@ -140,11 +192,48 @@ pub(crate) async fn workshop_ws(
             .into_response();
     }
 
-    ws.on_upgrade(move |socket| handle_workshop_ws(state, socket, client_key))
+    // Soft cookie check: if a session cookie is present in the upgrade
+    // request, verify it is not tampered. Reject tampered cookies but allow
+    // upgrade when no cookie is present (the client will auth via
+    // reconnect_token after the WebSocket is established).
+    //
+    // Also extract the authenticated account id from the signed cookie (if
+    // any) so the post-upgrade attach path can assert `session.player
+    // .account_id == cookie.account_id` for account-owned sessions. The
+    // signed cookie value is the account id (see `build_session_cookie`), so
+    // no store lookup is required here — equality of the signed value is
+    // sufficient to bind the WS to the cookie holder.
+    let cookie_account_id: Option<String> = {
+        use axum_extra::extract::cookie::SignedCookieJar;
+        let jar = SignedCookieJar::<axum_extra::extract::cookie::Key>::from_headers(
+            &headers,
+            state.config.cookie_key.clone(),
+        );
+        // Only check if the raw Cookie header actually contains our cookie
+        // name — avoids rejecting requests that carry no cookie at all.
+        let raw_cookies = headers
+            .get(axum::http::header::COOKIE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        if raw_cookies.contains(SESSION_COOKIE_NAME) && jar.get(SESSION_COOKIE_NAME).is_none() {
+            return (StatusCode::UNAUTHORIZED, "Invalid session cookie.").into_response();
+        }
+        jar.get(SESSION_COOKIE_NAME).and_then(|cookie| {
+            let value = cookie.value().to_string();
+            if value.is_empty() { None } else { Some(value) }
+        })
+    };
+
+    ws.on_upgrade(move |socket| handle_workshop_ws(state, socket, client_key, cookie_account_id))
         .into_response()
 }
 
-async fn handle_workshop_ws(state: AppState, mut socket: WebSocket, client_key: String) {
+async fn handle_workshop_ws(
+    state: AppState,
+    mut socket: WebSocket,
+    client_key: String,
+    cookie_account_id: Option<String>,
+) {
     let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel();
     let mut attached_connection_id: Option<String> = None;
 
@@ -238,7 +327,7 @@ async fn handle_workshop_ws(state: AppState, mut socket: WebSocket, client_key: 
                             if is_new_connection {
                                 register_ws_sender(&state, &connection_id, outbound_tx.clone()).await;
                             }
-                            match attach_ws_session(&state, &mut socket, &envelope, &connection_id, is_new_connection).await {
+                            match attach_ws_session(&state, &mut socket, &envelope, &connection_id, is_new_connection, cookie_account_id.as_deref()).await {
                                 Ok(outcome) => {
                                       if outcome.state_changed {
                                           broadcast_session_state(&state, &outcome.session_code, Some(connection_id.as_str())).await;
@@ -255,6 +344,14 @@ async fn handle_workshop_ws(state: AppState, mut socket: WebSocket, client_key: 
                                     {
                                         break;
                                     }
+                                    // Attach failures are terminal for this socket:
+                                    // credentials, identity, lease, and account-cookie
+                                    // binding errors all require a fresh upgrade to
+                                    // recover. Close instead of leaving the client in
+                                    // a retry loop on a half-open connection (mirrors
+                                    // the retired-connection path above).
+                                    let _ = outbound_tx.send(WsOutbound::Close);
+                                    continue;
                                 }
                             }
                         }
@@ -408,6 +505,35 @@ pub(crate) async fn close_local_connection(state: &AppState, connection_id: &str
         .cloned()
     {
         let _ = sender.send(WsOutbound::Close);
+    }
+}
+
+pub(crate) async fn close_local_workshop_connections(
+    state: &AppState,
+    session_code: &str,
+    error_message: Option<&str>,
+) {
+    let registrations = state
+        .realtime
+        .lock()
+        .await
+        .session_registrations(session_code);
+    for registration in registrations {
+        clear_local_realtime_connection(state, &registration.connection_id).await;
+        if let Some(message) = error_message {
+            if let Some(sender) = state
+                .realtime_senders
+                .lock()
+                .await
+                .get(&registration.connection_id)
+                .cloned()
+            {
+                let _ = sender.send(WsOutbound::Message(ServerWsMessage::Error {
+                    message: message.to_string(),
+                }));
+            }
+        }
+        close_local_connection(state, &registration.connection_id).await;
     }
 }
 
@@ -630,6 +756,7 @@ async fn attach_ws_session(
     envelope: &SessionEnvelope,
     connection_id: &str,
     is_new_connection: bool,
+    cookie_account_id: Option<&str>,
 ) -> Result<WsAttachOutcome, String> {
     let session_code = envelope.session_code.trim();
     let reconnect_token = envelope.reconnect_token.trim();
@@ -675,6 +802,43 @@ async fn attach_ws_session(
         let session = sessions
             .get_mut(session_code)
             .ok_or_else(|| "Workshop not found.".to_string())?;
+        // Bind the WS identity to the authenticated account cookie. If the
+        // session player is account-owned (post-session-4 signed-in flow),
+        // the upgrade request's signed `ds_session` cookie must carry that
+        // same account id. Legacy anonymous players (`account_id: None`,
+        // e.g. seeded test fixtures) skip the check so we don't regress
+        // cookie-less flows. Mismatches fail closed — the client should
+        // sign in with the correct account and reconnect.
+        {
+            let player = session
+                .players
+                .get(&identity.player_id)
+                .ok_or_else(|| "Session identity is invalid or expired.".to_string())?;
+            if let Some(expected_account_id) = player.account_id.as_deref() {
+                let matches = cookie_account_id
+                    .map(|observed| observed == expected_account_id)
+                    .unwrap_or(false);
+                if !matches {
+                    // Correlate without leaking signed cookie bytes: log the
+                    // expected account id and whether a cookie was present
+                    // (but never its value).
+                    let observed_repr = match cookie_account_id {
+                        Some(_) => "mismatch",
+                        None => "none",
+                    };
+                    tracing::warn!(
+                        session_code = %session_code,
+                        player_id = %identity.player_id,
+                        expected_account_id = %expected_account_id,
+                        observed_account = observed_repr,
+                        "ws attach rejected: session identity does not match authenticated account cookie"
+                    );
+                    return Err(
+                        "Session identity does not match authenticated account.".to_string()
+                    );
+                }
+            }
+        }
         let was_connected = session
             .players
             .get(&identity.player_id)
@@ -937,10 +1101,24 @@ pub(crate) async fn advance_game_ticks(state: &AppState) {
     };
 
     for session_code in session_codes {
-        {
+        let session_snapshot = {
             let mut sessions = state.sessions.lock().await;
             if let Some(session) = sessions.get_mut(&session_code) {
                 session.advance_tick();
+                Some(session.clone())
+            } else {
+                None
+            }
+        };
+
+        // Persist tick-decayed state periodically so that command-handler reloads
+        // (reload_cached_session) pick up recent stats. Throttled to every 5 ticks
+        // to reduce write pressure on Postgres (was OOM-killed at 1 write/sec).
+        if let Some(snapshot) = &session_snapshot {
+            if snapshot.time % 5 == 0 {
+                if let Err(error) = state.store.save_session(snapshot).await {
+                    info!(session_code = %session_code, error = %error, "failed to persist tick state");
+                }
             }
         }
 

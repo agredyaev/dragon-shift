@@ -14,3 +14,4 @@ protocol.workspace = true
 serde_json.workspace = true
 uuid.workspace = true
 tokio = { workspace = true, features = ["rt"] }
+tracing.workspace = true

@@ -157,6 +157,18 @@ variable "websocket_rate_limit_max" {
   default     = 500
 }
 
+variable "sprite_queue_timeout_seconds" {
+  description = "Seconds a sprite/image request may wait in the backend queue before timing out."
+  type        = number
+  default     = 1200
+}
+
+variable "image_job_max_concurrency" {
+  description = "Maximum number of queued image jobs admitted concurrently by the backend runtime."
+  type        = number
+  default     = 2
+}
+
 variable "cloud_armor_rate_limit_count" {
   description = "Cloud Armor rate limit count per interval."
   type        = number
@@ -185,6 +197,12 @@ variable "database_url_secret_id" {
   description = "Secret Manager secret ID that stores the runtime DATABASE_URL."
   type        = string
   default     = "dragon-shift-production-database-url"
+}
+
+variable "session_cookie_key_secret_id" {
+  description = "Secret Manager secret ID that stores the runtime SESSION_COOKIE_KEY (base64-encoded, >=64 decoded bytes). Generate once per environment with `openssl rand -base64 64` and store under the latest version of this secret before the first production apply."
+  type        = string
+  default     = "dragon-shift-production-session-cookie-key"
 }
 
 variable "enable_uptime_checks" {

@@ -4,6 +4,7 @@
 - `APP_SERVER_BIND_ADDR` - Axum bind address
 - `VITE_APP_URL` - public app URL used for same-origin bootstrap
 - `DATABASE_URL` - Postgres connection string; required in production
+- `SESSION_COOKIE_KEY` - base64-encoded random bytes (>=64 decoded bytes) used to sign/encrypt session cookies; required in production (the server fails fast on startup when `NODE_ENV=production` and this is unset). Generate with `openssl rand -base64 64`.
 - `ALLOWED_ORIGINS` - comma-separated origin allowlist
 - `RUST_SESSION_CODE_PREFIX` - optional single-digit workshop code prefix
 - `TRUST_X_FORWARDED_FOR` - trust forwarded client IPs only behind a trusted edge
@@ -11,6 +12,8 @@
 - `JOIN_RATE_LIMIT_MAX` - join and reconnect rate limit
 - `COMMAND_RATE_LIMIT_MAX` - workshop command rate limit
 - `WEBSOCKET_RATE_LIMIT_MAX` - websocket upgrade and message rate limit
+- `SPRITE_QUEUE_TIMEOUT_SECONDS` - how long sprite/image jobs may wait for backend image capacity before timing out
+- `IMAGE_JOB_MAX_CONCURRENCY` - how many queued image jobs the backend may admit concurrently
 - `RECONNECT_TOKEN_TTL_SECONDS` - reconnect token inactivity TTL
 - `DATABASE_POOL_SIZE` - Postgres connection pool size
 - `LLM_JUDGE_PROVIDERS` - JSON array of judge provider pool entries
@@ -24,6 +27,8 @@
 - `image.digest` - immutable image digest
 - `app.allowedOrigins` - runtime origin allowlist
 - `app.viteAppUrl` - runtime base URL
+- `app.spriteQueueTimeoutSeconds` - backend queue wait timeout for sprite/image jobs before timeout handling
+- `app.imageJobMaxConcurrency` - concurrent queued image job admission limit for the backend runtime
 - `app.googleCloudProject` - runtime GCP project for server-side Vertex AI calls; required when any `vertex_ai` provider is configured
 - `app.googleCloudLocation` - runtime GCP region/location for Vertex AI model routing; required when any `vertex_ai` provider is configured
 - `app.judgeProviders` - ordered provider pool for the judge LLM; each entry has `type` (`vertex_ai` or `api_key`), `model`, and optional `apiKeySecretName`/`apiKeySecretKey`
@@ -34,9 +39,11 @@
 - `serviceAccount.annotations` - Kubernetes service account annotations including `iam.gke.io/gcp-service-account`
 - `database.url` - inline database URL
 - `database.existingSecretName` - Kubernetes secret name for `DATABASE_URL`
+- `sessionCookieKey.existingSecretName` - Kubernetes secret name holding the `SESSION_COOKIE_KEY` value; required in production
+- `sessionCookieKey.existingSecretKey` - Kubernetes secret key, default `SESSION_COOKIE_KEY`
 
 ## Notes
-- LLM provider pools are configured as ordered arrays in Helm values (`judgeProviders` / `imageProviders`). Failover happens left-to-right on 429 or provider failure.
+- LLM provider pools are configured as ordered arrays in Helm values (`judgeProviders` / `imageProviders`). The runtime starts each request from a round-robin provider index and then fails over left-to-right on 429 or provider failure.
 - `vertex_ai` providers in the current runtime use the in-cluster Google metadata server with Workload Identity and require no API key secret.
 - `api_key` providers read their key from a Kubernetes Secret referenced by `apiKeySecretName` / `apiKeySecretKey` in the provider entry.
 - GKE Workload Identity additionally requires the corresponding Google IAM binding for the Kubernetes service account principal.
@@ -60,6 +67,8 @@
 - `image_repository` - deployed image repository
 - `image_digest` - deployed image digest
 - `image_tag` - deployed image tag
+- `database_url_secret_id` - Secret Manager secret ID for the runtime `DATABASE_URL` (default `dragon-shift-production-database-url`)
+- `session_cookie_key_secret_id` - Secret Manager secret ID for the runtime `SESSION_COOKIE_KEY` (default `dragon-shift-production-session-cookie-key`); operators must create this secret and populate its first version with `openssl rand -base64 64` output **before** the first production apply
 - `database_pool_size` - runtime `DATABASE_POOL_SIZE` override for production
 - `app_cpu_request` - optional production app pod CPU request override
 - `app_cpu_limit` - optional production app pod CPU limit override
@@ -100,8 +109,10 @@
 - `TF_JOIN_RATE_LIMIT_MAX` - optional repository variable overriding the join/reconnect rate limit
 - `TF_COMMAND_RATE_LIMIT_MAX` - optional repository variable overriding the workshop command rate limit
 - `TF_WEBSOCKET_RATE_LIMIT_MAX` - optional repository variable overriding the websocket rate limit
+- `TF_SPRITE_QUEUE_TIMEOUT_SECONDS` - optional positive repository variable overriding how long sprite/image jobs may wait in the backend queue before timeout handling
+- `TF_IMAGE_JOB_MAX_CONCURRENCY` - optional positive repository variable overriding how many queued image jobs the backend admits concurrently
 - `GCP_WORKLOAD_IDENTITY_PROVIDER` - repository secret for the Google Workload Identity Provider resource name
 - `GCP_SERVICE_ACCOUNT_EMAIL` - repository secret for the GitHub Actions Terraform service account email
 - `TF_PRODUCTION_DB_PASSWORD` - repository secret for the Cloud SQL application password
 - `TF_GEMINI_API_KEY` - optional primary repository secret required only when `TF_LLM_PROVIDER_TYPE=api_key`
-- `TF_GEMINI_API_KEY_1` ... `TF_GEMINI_API_KEY_5` - optional additional repository secrets for multi-key `api_key` deployments
+- `TF_GEMINI_API_KEY_1` ... `TF_GEMINI_API_KEY_15` - optional additional repository secrets for multi-key `api_key` deployments; deploy automation compacts the non-empty numbered secrets into a dense provider list, so numbering gaps are ignored and duplicate keys are not deduplicated

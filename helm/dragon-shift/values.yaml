@@ -32,6 +32,7 @@ ingress:
     secretName: ""
 
 app:
+  nodeEnv: production
   port: 3000
   allowedOrigins: https://dragon-shift.example.com
   viteAppUrl: https://dragon-shift.example.com
@@ -42,8 +43,12 @@ app:
   databasePoolSize: 10
   createRateLimitMax: 20
   joinRateLimitMax: 40
+  signupRateLimitMax: 5
+  loginRateLimitMax: 10
   commandRateLimitMax: 120
   socketRateLimitMax: 300
+  spriteQueueTimeoutSeconds: 1200
+  imageJobMaxConcurrency: 2
   googleCloudProject: ""
   googleCloudLocation: ""
   # Provider pool arrays — ordered by preference; failover happens left-to-right.
@@ -65,6 +70,14 @@ database:
   url: ""
   existingSecretName: ""
   existingSecretKey: DATABASE_URL
+
+sessionCookieKey:
+  # Base64-encoded random bytes (>=64 decoded bytes) used by the app to sign
+  # and encrypt session cookies. Required in production; without it the app
+  # fails fast on startup (`SESSION_COOKIE_KEY is required when NODE_ENV=production`).
+  # Generate once per environment with: `openssl rand -base64 64`
+  existingSecretName: ""
+  existingSecretKey: SESSION_COOKIE_KEY
 
 postgresql:
   # Bundled Postgres is the local/dev default. For cloud production, prefer an

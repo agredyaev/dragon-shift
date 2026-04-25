@@ -58,6 +58,8 @@ The default GitHub Actions Terraform roles now include `roles/iam.serviceAccount
 - `TF_LLM_JUDGE_MODEL`
 - `TF_LLM_IMAGE_MODEL`
 - `TF_RUST_LOG`
+- `TF_SPRITE_QUEUE_TIMEOUT_SECONDS`
+- `TF_IMAGE_JOB_MAX_CONCURRENCY`
 
 `TF_HOSTNAME_MODE=nip_io` is the zero-DNS default for a fresh project.
 `TF_STATE_BUCKET_NAME` is optional and defaults to `<project-id>-tfstate`.
@@ -73,6 +75,52 @@ For `managed_dns` or `external_dns`, public HTTPS verification depends on DNS de
 - `GCP_SERVICE_ACCOUNT_EMAIL`
 - `TF_PRODUCTION_DB_PASSWORD`
 - `TF_GEMINI_API_KEY`
+
+## Secret Manager Secrets (operator-managed, out-of-band)
+
+The production platform stack reads these Google Secret Manager secrets at apply time and
+projects each into a Kubernetes Secret consumed by the app pod. Operators must create and
+populate them **before** the first production apply; the Terraform apply fails otherwise.
+
+- `dragon-shift-production-database-url` - runtime `DATABASE_URL`; version is bumped through
+  `TF_DATABASE_URL_SECRET_VERSION` on the foundation stack.
+- `dragon-shift-production-session-cookie-key` - base64-encoded random bytes (>=64 decoded
+  bytes) used to sign and encrypt session cookies. Generate once per environment with
+  `openssl rand -base64 64 | tr -d '\n'` and store as the first version of this secret:
+  ```bash
+  openssl rand -base64 64 | tr -d '\n' \
+    | gcloud secrets create dragon-shift-production-session-cookie-key \
+        --project "<gcp-project-id>" \
+        --replication-policy=automatic \
+        --data-file=-
+  ```
+  Rotate by adding a new secret version; the platform apply re-reads `latest` on every run
+  and triggers a rollout when the projected Kubernetes Secret value changes.
+
+## Migration Rollback
+
+`platform/crates/persistence/migrations/0007_accounts_and_ownership.sql` adds the `accounts`
+table and the `characters.owner_account_id` FK. A matching rollback script lives at
+`platform/crates/persistence/migrations/0007_accounts_and_ownership.down.sql`.
+
+Rollback procedure (production):
+
+1. Roll the app container image back to the pre-0007 tag (`helm upgrade --set image.tag=<prev>`)
+   or re-deploy the previous digest through Terraform to stop writing to `accounts`.
+2. Take a logical backup of the affected tables:
+   ```bash
+   pg_dump --data-only --table=accounts --table=characters \
+     "$DATABASE_URL" > ./0007-pre-rollback.sql
+   ```
+3. Apply the rollback SQL (manual, not run by sqlx migrate):
+   ```bash
+   psql "$DATABASE_URL" -v ON_ERROR_STOP=1 \
+     -f platform/crates/persistence/migrations/0007_accounts_and_ownership.down.sql
+   ```
+4. Verify the app `/api/ready` returns 200 and character listings still load.
+
+Rollback is destructive: all rows in `accounts` are lost and every character becomes
+un-owned. Only execute it with a current backup and coordinated image rollback.
 
 ## Local Apply Path
 
@@ -103,7 +151,7 @@ This section documents configuration workarounds applied during the initial prod
 
 ### 1. Cloud Armor disabled — `TF_ENABLE_CLOUD_ARMOR=false`
 
-**Problem:** The GCP project `rna-workshop` has `SECURITY_POLICY_RULES` quota set to `0.0 globally`. Terraform fails with:
+**Problem:** The GCP project `rna-workshop2` has `SECURITY_POLICY_RULES` quota set to `0.0 globally`. Terraform fails with:
 ```
 Error waiting for Creating SecurityPolicy "dragon-shift-production":
 Quota 'SECURITY_POLICY_RULES' exceeded. Limit: 0.0 globally.

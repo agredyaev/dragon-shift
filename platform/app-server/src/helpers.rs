@@ -2,10 +2,10 @@ use crate::llm::normalize_sprite_base64;
 use chrono::Utc;
 use domain::{PlayerAction, SessionDragon, WorkshopSession};
 use protocol::{
-    create_session_settings, ActionPayload, ActiveTime, ClientDragon, ClientGameState,
-    ClientVotingState, DragonStats, DragonVisuals, FoodType, JudgeActionTrace, JudgeBundle,
-    JudgeDragonBundle, JudgeHandoverChain, JudgePlayerSummary, PlayType, Player,
-    SessionArtifactKind, SessionArtifactRecord, SessionMeta, VoteResult,
+    ActionPayload, ActiveTime, ClientDragon, ClientGameState, ClientVotingState, DragonStats,
+    DragonVisuals, FoodType, JudgeActionTrace, JudgeBundle, JudgeDragonBundle, JudgeHandoverChain,
+    JudgePlayerSummary, PlayType, Player, SessionArtifactKind, SessionArtifactRecord, SessionMeta,
+    VoteResult, create_session_settings,
 };
 use std::collections::BTreeMap;
 use uuid::Uuid;
@@ -59,36 +59,37 @@ fn client_dragon_visuals(dragon: &SessionDragon) -> DragonVisuals {
 }
 
 fn condition_hint(dragon: &SessionDragon, time: i32) -> String {
-    let is_day = (6..=17).contains(&time);
+    // 48-tick cycle: day = ticks 12..36, night = rest.
+    let is_day = (12..36).contains(&time);
 
     // Mood / happiness hint
-    let mood = if dragon.happiness >= 80 {
+    let mood = if dragon.happiness >= 70 {
         "Your dragon looks cheerful and content."
-    } else if dragon.happiness >= 50 {
+    } else if dragon.happiness >= 40 {
         "Your dragon seems fairly relaxed."
-    } else if dragon.happiness >= 25 {
+    } else if dragon.happiness >= 20 {
         "Your dragon is grumpy and restless."
     } else {
         "Your dragon is visibly unhappy — something isn't right."
     };
 
     // Hunger hint
-    let belly = if dragon.hunger >= 80 {
+    let belly = if dragon.hunger >= 70 {
         "Its belly is full."
-    } else if dragon.hunger >= 50 {
+    } else if dragon.hunger >= 40 {
         "It could probably eat something soon."
-    } else if dragon.hunger >= 25 {
+    } else if dragon.hunger >= 20 {
         "Its stomach growls audibly."
     } else {
         "It looks famished!"
     };
 
     // Energy hint
-    let energy = if dragon.energy >= 80 {
+    let energy = if dragon.energy >= 70 {
         "It's brimming with energy."
-    } else if dragon.energy >= 50 {
+    } else if dragon.energy >= 40 {
         "It seems moderately alert."
-    } else if dragon.energy >= 25 {
+    } else if dragon.energy >= 20 {
         "Its eyes are drooping."
     } else {
         "It can barely keep its eyes open."
@@ -149,10 +150,11 @@ pub(crate) fn to_client_game_state(
         .players
         .iter()
         .map(|(player_id, player)| {
-            (
-                player_id.clone(),
-                player.custom_sprites.as_ref().map(normalized_sprite_set),
-            )
+            let player_sprites = player
+                .selected_character
+                .as_ref()
+                .map(|character| &character.sprites);
+            (player_id.clone(), player_sprites.map(normalized_sprite_set))
         })
         .collect();
 
@@ -171,8 +173,17 @@ pub(crate) fn to_client_game_state(
                     achievements: player.achievements.clone(),
                     is_ready: player.is_ready,
                     is_connected: player.is_connected,
-                    pet_description: player.pet_description.clone(),
+                    character_id: player.character_id.clone(),
+                    pet_description: player
+                        .selected_character
+                        .as_ref()
+                        .map(|character| character.description.clone()),
                     custom_sprites: normalized_player_sprites.get(player_id).cloned().flatten(),
+                    remaining_sprite_regenerations: player
+                        .selected_character
+                        .as_ref()
+                        .map(|character| character.remaining_sprite_regenerations)
+                        .unwrap_or(0),
                 },
             )
         })
@@ -186,13 +197,14 @@ pub(crate) fn to_client_game_state(
                 session.phase,
                 protocol::Phase::Voting if !session.voting.as_ref().is_some_and(|v| v.results_revealed)
             );
+            let is_current_players_original_dragon = dragon.original_owner_id == current_player_id;
             (
                 dragon_id.clone(),
                 ClientDragon {
                     id: dragon.id.clone(),
                     name: dragon.name.clone(),
                     visuals: client_dragon_visuals(dragon),
-                    original_owner_id: if hide_owner_identity {
+                    original_owner_id: if hide_owner_identity && !is_current_players_original_dragon {
                         None
                     } else {
                         Some(dragon.original_owner_id.clone())
@@ -433,10 +445,8 @@ pub(crate) fn build_judge_bundle(
                     happiness: dragon.happiness,
                 },
                 actual_active_time: dragon.active_time,
-                actual_day_food: dragon.day_food,
-                actual_night_food: dragon.night_food,
-                actual_day_play: dragon.day_play,
-                actual_night_play: dragon.night_play,
+                actual_favorite_food: dragon.favorite_food,
+                actual_favorite_play: dragon.favorite_play,
                 actual_sleep_rate: dragon.sleep_rate,
                 handover_chain: JudgeHandoverChain {
                     creator_instructions: dragon.creator_instructions.clone(),
@@ -453,15 +463,5 @@ pub(crate) fn build_judge_bundle(
                 phase2_lowest_happiness: dragon.phase2_lowest_happiness,
             })
             .collect(),
-    }
-}
-
-pub(crate) fn session_config_from_request(
-    payload: &protocol::CreateWorkshopRequest,
-) -> protocol::WorkshopCreateConfig {
-    protocol::WorkshopCreateConfig {
-        phase0_minutes: payload.config.phase0_minutes,
-        phase1_minutes: payload.config.phase1_minutes,
-        phase2_minutes: payload.config.phase2_minutes,
     }
 }

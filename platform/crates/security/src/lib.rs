@@ -7,6 +7,63 @@ pub const SESSION_CODE_LENGTH: usize = 6;
 pub const DEFAULT_RUST_SESSION_CODE_PREFIX: &str = "9";
 const PNG_SIGNATURE: [u8; 8] = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
 
+// Argon2id parameters per refactor-plan.md §1: m=19456 KiB / t=2 / p=1.
+// Callers MUST invoke these helpers inside `tokio::task::spawn_blocking`
+// because argon2 is CPU-bound and would otherwise stall the async runtime.
+const ARGON2_MEMORY_KIB: u32 = 19_456;
+const ARGON2_ITERATIONS: u32 = 2;
+const ARGON2_PARALLELISM: u32 = 1;
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum PasswordHashError {
+    #[error("invalid argon2 parameters")]
+    InvalidParams,
+    #[error("failed to hash password")]
+    HashFailure,
+    #[error("stored hash is malformed")]
+    MalformedHash,
+}
+
+/// Hash a plaintext password with argon2id + a fresh 16-byte random salt.
+/// Returns a PHC-formatted string suitable for direct storage.
+///
+/// Blocking: ~60ms with the configured parameters. Wrap in `spawn_blocking`.
+pub fn hash_password(plaintext: &str) -> Result<String, PasswordHashError> {
+    use argon2::{Algorithm, Argon2, Params, Version};
+    use password_hash::{PasswordHasher, SaltString, rand_core::OsRng};
+
+    let params = Params::new(
+        ARGON2_MEMORY_KIB,
+        ARGON2_ITERATIONS,
+        ARGON2_PARALLELISM,
+        None,
+    )
+    .map_err(|_| PasswordHashError::InvalidParams)?;
+    let hasher = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
+    let salt = SaltString::generate(&mut OsRng);
+    hasher
+        .hash_password(plaintext.as_bytes(), &salt)
+        .map(|hash| hash.to_string())
+        .map_err(|_| PasswordHashError::HashFailure)
+}
+
+/// Verify a plaintext password against a stored PHC-formatted hash.
+/// Returns `Ok(true)` on match, `Ok(false)` on mismatch, `Err` if the stored
+/// hash is malformed (indicates corruption, not user error).
+///
+/// Blocking: ~60ms. Wrap in `spawn_blocking`.
+pub fn verify_password(plaintext: &str, stored_hash: &str) -> Result<bool, PasswordHashError> {
+    use argon2::Argon2;
+    use password_hash::{PasswordHash, PasswordVerifier};
+
+    let parsed = PasswordHash::new(stored_hash).map_err(|_| PasswordHashError::MalformedHash)?;
+    match Argon2::default().verify_password(plaintext.as_bytes(), &parsed) {
+        Ok(()) => Ok(true),
+        Err(password_hash::Error::Password) => Ok(false),
+        Err(_) => Err(PasswordHashError::MalformedHash),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OriginPolicy {
     pub allow_any_origin: bool,
@@ -377,5 +434,28 @@ mod tests {
         assert!(reopened.allowed);
         assert_eq!(reopened.retry_after_ms, 0);
         assert_eq!(reopened.remaining, 0);
+    }
+
+    #[test]
+    fn password_hash_round_trips() {
+        let hash = hash_password("correct horse battery staple").expect("hash");
+        assert!(hash.starts_with("$argon2id$"));
+        assert!(verify_password("correct horse battery staple", &hash).unwrap());
+        assert!(!verify_password("wrong password", &hash).unwrap());
+    }
+
+    #[test]
+    fn password_hash_is_salted_per_call() {
+        let a = hash_password("same-password").expect("hash a");
+        let b = hash_password("same-password").expect("hash b");
+        assert_ne!(a, b, "salt must differ per call");
+    }
+
+    #[test]
+    fn verify_password_rejects_malformed_hash() {
+        assert_eq!(
+            verify_password("pw", "not-a-phc-string"),
+            Err(PasswordHashError::MalformedHash)
+        );
     }
 }

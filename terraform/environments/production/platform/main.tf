@@ -235,6 +235,29 @@ resource "kubernetes_secret" "database_url" {
   depends_on = [kubernetes_namespace.app]
 }
 
+data "google_secret_manager_secret_version" "session_cookie_key" {
+  project = var.project_id
+  secret  = var.session_cookie_key_secret_id
+}
+
+resource "kubernetes_secret" "session_cookie_key" {
+  metadata {
+    name      = "dragon-shift-session-cookie-key"
+    namespace = kubernetes_namespace.app.metadata[0].name
+
+    labels = {
+      "app.kubernetes.io/name"    = "dragon-shift"
+      "app.kubernetes.io/part-of" = "dragon-shift"
+    }
+  }
+
+  data = {
+    SESSION_COOKIE_KEY = data.google_secret_manager_secret_version.session_cookie_key.secret_data
+  }
+
+  depends_on = [kubernetes_namespace.app]
+}
+
 resource "kubernetes_secret" "llm" {
   count = var.llm_provider_type == "api_key" && length(local.gemini_api_keys) > 0 ? 1 : 0
 
@@ -423,18 +446,20 @@ resource "helm_release" "app" {
         }
       }
       app = {
-        allowedOrigins        = format("https://%s", local.app_hostname)
-        viteAppUrl            = format("https://%s", local.app_hostname)
-        rustLog               = var.rust_log
-        rustSessionCodePrefix = var.rust_session_code_prefix
-        trustForwardedFor     = var.trust_forwarded_for
-        databasePoolSize      = var.database_pool_size
-        createRateLimitMax    = var.create_rate_limit_max
-        joinRateLimitMax      = var.join_rate_limit_max
-        commandRateLimitMax   = var.command_rate_limit_max
-        socketRateLimitMax    = var.websocket_rate_limit_max
-        googleCloudProject    = var.llm_provider_type == "vertex_ai" ? (var.google_cloud_project != "" ? var.google_cloud_project : var.project_id) : ""
-        googleCloudLocation   = var.llm_provider_type == "vertex_ai" ? (var.google_cloud_location != "" ? var.google_cloud_location : var.region) : ""
+        allowedOrigins            = format("https://%s", local.app_hostname)
+        viteAppUrl                = format("https://%s", local.app_hostname)
+        rustLog                   = var.rust_log
+        rustSessionCodePrefix     = var.rust_session_code_prefix
+        trustForwardedFor         = var.trust_forwarded_for
+        databasePoolSize          = var.database_pool_size
+        createRateLimitMax        = var.create_rate_limit_max
+        joinRateLimitMax          = var.join_rate_limit_max
+        commandRateLimitMax       = var.command_rate_limit_max
+        socketRateLimitMax        = var.websocket_rate_limit_max
+        spriteQueueTimeoutSeconds = var.sprite_queue_timeout_seconds
+        imageJobMaxConcurrency    = var.image_job_max_concurrency
+        googleCloudProject        = var.llm_provider_type == "vertex_ai" ? (var.google_cloud_project != "" ? var.google_cloud_project : var.project_id) : ""
+        googleCloudLocation       = var.llm_provider_type == "vertex_ai" ? (var.google_cloud_location != "" ? var.google_cloud_location : var.region) : ""
         judgeProviders = var.llm_provider_type == "api_key" ? [
           for index, _key in local.gemini_api_keys : {
             type             = "api_key"
@@ -466,6 +491,10 @@ resource "helm_release" "app" {
         existingSecretName = kubernetes_secret.database_url.metadata[0].name
         existingSecretKey  = "DATABASE_URL"
       }
+      sessionCookieKey = {
+        existingSecretName = kubernetes_secret.session_cookie_key.metadata[0].name
+        existingSecretKey  = "SESSION_COOKIE_KEY"
+      }
       postgresql = {
         enabled = false
       }
@@ -487,6 +516,7 @@ resource "helm_release" "app" {
     kubernetes_manifest.backend_config,
     kubernetes_manifest.managed_certificate,
     kubernetes_secret.database_url,
+    kubernetes_secret.session_cookie_key,
     kubernetes_service_account.app,
     google_service_account.app,
     google_service_account_iam_member.app_workload_identity,

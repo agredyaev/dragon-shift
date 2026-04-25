@@ -9,6 +9,12 @@ metadata:
     {{- toYaml . | nindent 4 }}
   {{- end }}
 spec:
+  {{- if ne (int .Values.replicaCount) 1 }}
+  {{- fail "replicaCount must remain 1 for the current singleton runtime" }}
+  {{- end }}
+  {{- if .Values.autoscaling.enabled }}
+  {{- fail "autoscaling.enabled must remain false for the current singleton runtime" }}
+  {{- end }}
   {{- if ne .Values.deploymentStrategy.type "Recreate" }}
   {{- fail "deploymentStrategy.type must remain Recreate for the current singleton runtime" }}
   {{- end }}
@@ -62,7 +68,7 @@ spec:
               protocol: TCP
           env:
             - name: NODE_ENV
-              value: production
+              value: {{ .Values.app.nodeEnv | quote }}
             - name: RUST_LOG
               value: {{ .Values.app.rustLog | quote }}
             - name: APP_SERVER_BIND_ADDR
@@ -81,10 +87,18 @@ spec:
               value: {{ .Values.app.createRateLimitMax | quote }}
             - name: JOIN_RATE_LIMIT_MAX
               value: {{ .Values.app.joinRateLimitMax | quote }}
+            - name: SIGNUP_RATE_LIMIT_MAX
+              value: {{ .Values.app.signupRateLimitMax | quote }}
+            - name: LOGIN_RATE_LIMIT_MAX
+              value: {{ .Values.app.loginRateLimitMax | quote }}
             - name: COMMAND_RATE_LIMIT_MAX
               value: {{ .Values.app.commandRateLimitMax | quote }}
             - name: WEBSOCKET_RATE_LIMIT_MAX
               value: {{ .Values.app.socketRateLimitMax | quote }}
+            - name: SPRITE_QUEUE_TIMEOUT_SECONDS
+              value: {{ .Values.app.spriteQueueTimeoutSeconds | quote }}
+            - name: IMAGE_JOB_MAX_CONCURRENCY
+              value: {{ .Values.app.imageJobMaxConcurrency | quote }}
             - name: DATABASE_POOL_SIZE
               value: {{ .Values.app.databasePoolSize | quote }}
             {{- with .Values.app.googleCloudProject }}
@@ -137,6 +151,13 @@ spec:
             {{- else if .Values.postgresql.enabled }}
             - name: DATABASE_URL
               value: {{ include "dragon-shift.databaseUrl" . | quote }}
+            {{- end }}
+            {{- if .Values.sessionCookieKey.existingSecretName }}
+            - name: SESSION_COOKIE_KEY
+              valueFrom:
+                secretKeyRef:
+                   name: {{ .Values.sessionCookieKey.existingSecretName | quote }}
+                   key: {{ .Values.sessionCookieKey.existingSecretKey | quote }}
             {{- end }}
             {{- with .Values.app.extraEnv }}
 {{ toYaml . | nindent 12 }}

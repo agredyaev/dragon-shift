@@ -44,6 +44,16 @@ GEMINI_API_KEY_2="${TF_GEMINI_API_KEY_2:-}"
 GEMINI_API_KEY_3="${TF_GEMINI_API_KEY_3:-}"
 GEMINI_API_KEY_4="${TF_GEMINI_API_KEY_4:-}"
 GEMINI_API_KEY_5="${TF_GEMINI_API_KEY_5:-}"
+GEMINI_API_KEY_6="${TF_GEMINI_API_KEY_6:-}"
+GEMINI_API_KEY_7="${TF_GEMINI_API_KEY_7:-}"
+GEMINI_API_KEY_8="${TF_GEMINI_API_KEY_8:-}"
+GEMINI_API_KEY_9="${TF_GEMINI_API_KEY_9:-}"
+GEMINI_API_KEY_10="${TF_GEMINI_API_KEY_10:-}"
+GEMINI_API_KEY_11="${TF_GEMINI_API_KEY_11:-}"
+GEMINI_API_KEY_12="${TF_GEMINI_API_KEY_12:-}"
+GEMINI_API_KEY_13="${TF_GEMINI_API_KEY_13:-}"
+GEMINI_API_KEY_14="${TF_GEMINI_API_KEY_14:-}"
+GEMINI_API_KEY_15="${TF_GEMINI_API_KEY_15:-}"
 DATABASE_POOL_SIZE="${TF_DATABASE_POOL_SIZE:-}"
 APP_CPU_REQUEST="${TF_APP_CPU_REQUEST:-}"
 APP_CPU_LIMIT="${TF_APP_CPU_LIMIT:-}"
@@ -53,6 +63,8 @@ CREATE_RATE_LIMIT_MAX="${TF_CREATE_RATE_LIMIT_MAX:-}"
 JOIN_RATE_LIMIT_MAX="${TF_JOIN_RATE_LIMIT_MAX:-}"
 COMMAND_RATE_LIMIT_MAX="${TF_COMMAND_RATE_LIMIT_MAX:-}"
 WEBSOCKET_RATE_LIMIT_MAX="${TF_WEBSOCKET_RATE_LIMIT_MAX:-}"
+SPRITE_QUEUE_TIMEOUT_SECONDS="${TF_SPRITE_QUEUE_TIMEOUT_SECONDS:-}"
+IMAGE_JOB_MAX_CONCURRENCY="${TF_IMAGE_JOB_MAX_CONCURRENCY:-}"
 
 if [[ -z "${IMAGE_DIGEST}" && -z "${IMAGE_TAG}" ]]; then
   printf 'Either IMAGE_DIGEST or IMAGE_TAG must be set.\n' >&2
@@ -82,6 +94,17 @@ require_integer() {
       exit 1
       ;;
   esac
+}
+
+require_positive_integer() {
+  local name="$1"
+  local value="$2"
+
+  require_integer "${name}" "${value}"
+  if [[ "${value}" == "0" ]]; then
+    printf '%s must be greater than zero.\n' "${name}" >&2
+    exit 1
+  fi
 }
 
 json_escape() {
@@ -146,6 +169,12 @@ fi
 if [[ -n "${WEBSOCKET_RATE_LIMIT_MAX}" ]]; then
   require_integer "TF_WEBSOCKET_RATE_LIMIT_MAX" "${WEBSOCKET_RATE_LIMIT_MAX}"
 fi
+if [[ -n "${SPRITE_QUEUE_TIMEOUT_SECONDS}" ]]; then
+  require_positive_integer "TF_SPRITE_QUEUE_TIMEOUT_SECONDS" "${SPRITE_QUEUE_TIMEOUT_SECONDS}"
+fi
+if [[ -n "${IMAGE_JOB_MAX_CONCURRENCY}" ]]; then
+  require_positive_integer "TF_IMAGE_JOB_MAX_CONCURRENCY" "${IMAGE_JOB_MAX_CONCURRENCY}"
+fi
 
 FOUNDATION_VARS_FILE="${TMP_DIR}/foundation.auto.tfvars.json"
 PLATFORM_VARS_FILE="${TMP_DIR}/platform.auto.tfvars.json"
@@ -203,6 +232,16 @@ if [[ -n "${WEBSOCKET_RATE_LIMIT_MAX}" ]]; then
   platform_websocket_rate_limit_json=$',\n  "websocket_rate_limit_max": '"${WEBSOCKET_RATE_LIMIT_MAX}"
 fi
 
+platform_sprite_queue_timeout_json=""
+if [[ -n "${SPRITE_QUEUE_TIMEOUT_SECONDS}" ]]; then
+  platform_sprite_queue_timeout_json=$',\n  "sprite_queue_timeout_seconds": '"${SPRITE_QUEUE_TIMEOUT_SECONDS}"
+fi
+
+platform_image_job_max_concurrency_json=""
+if [[ -n "${IMAGE_JOB_MAX_CONCURRENCY}" ]]; then
+  platform_image_job_max_concurrency_json=$',\n  "image_job_max_concurrency": '"${IMAGE_JOB_MAX_CONCURRENCY}"
+fi
+
 authorized_network_entries=()
 authorized_network_entries+=("{\"cidr_block\":\"$(json_escape "${RUNNER_PUBLIC_IPV4}/32")\",\"display_name\":\"automation-runner\"}")
 
@@ -256,7 +295,10 @@ fi
 
 gemini_api_keys_json=""
 gemini_api_keys=()
-for key in "${GEMINI_API_KEY_1}" "${GEMINI_API_KEY_2}" "${GEMINI_API_KEY_3}" "${GEMINI_API_KEY_4}" "${GEMINI_API_KEY_5}"; do
+for key in \
+  "${GEMINI_API_KEY_1}" "${GEMINI_API_KEY_2}" "${GEMINI_API_KEY_3}" "${GEMINI_API_KEY_4}" "${GEMINI_API_KEY_5}" \
+  "${GEMINI_API_KEY_6}" "${GEMINI_API_KEY_7}" "${GEMINI_API_KEY_8}" "${GEMINI_API_KEY_9}" "${GEMINI_API_KEY_10}" \
+  "${GEMINI_API_KEY_11}" "${GEMINI_API_KEY_12}" "${GEMINI_API_KEY_13}" "${GEMINI_API_KEY_14}" "${GEMINI_API_KEY_15}"; do
   if [[ -n "${key}" ]]; then
     gemini_api_keys+=("\"$(json_escape "${key}")\"")
   fi
@@ -297,7 +339,7 @@ cat >"${PLATFORM_VARS_FILE}" <<EOF
   "kubeconfig_path": "$(json_escape "${KUBECONFIG_PATH}")",
   "labels": {
     "owner": "platform"
-  }${notification_channel_json}${gemini_api_key_json}${gemini_api_keys_json}${platform_database_pool_json}${platform_app_cpu_request_json}${platform_app_cpu_limit_json}${platform_app_memory_request_json}${platform_app_memory_limit_json}${platform_create_rate_limit_json}${platform_join_rate_limit_json}${platform_command_rate_limit_json}${platform_websocket_rate_limit_json}
+  }${notification_channel_json}${gemini_api_key_json}${gemini_api_keys_json}${platform_database_pool_json}${platform_app_cpu_request_json}${platform_app_cpu_limit_json}${platform_app_memory_request_json}${platform_app_memory_limit_json}${platform_create_rate_limit_json}${platform_join_rate_limit_json}${platform_command_rate_limit_json}${platform_websocket_rate_limit_json}${platform_sprite_queue_timeout_json}${platform_image_job_max_concurrency_json}
 }
 EOF
 

@@ -6,6 +6,31 @@ pub type SessionStage = u8;
 pub type SpriteCatalog = BTreeMap<String, SpriteSet>;
 pub type SessionPhaseConfig = BTreeMap<Phase, SessionPhaseSettings>;
 
+pub const SPRITE_ATELIER_NOTICE_TITLE: &str = "Sprite Atelier";
+pub const SPRITE_ATELIER_ACCEPTED_NOTICE_MESSAGE: &str =
+    "The atelier accepted your dragon brief and is preparing a sketch slot.";
+pub const SPRITE_ATELIER_QUEUED_NOTICE_MESSAGE: &str =
+    "All easels are busy. Your dragon is waiting in the atelier queue.";
+pub const SPRITE_ATELIER_DRAWING_NOTICE_MESSAGE: &str =
+    "An easel is free. The atelier has started sketching your dragon.";
+pub const SPRITE_ATELIER_FALLBACK_NOTICE_MESSAGE: &str =
+    "The atelier prepared a reserve companion sprite sheet so you can keep playing.";
+
+/// Error code returned by `POST /api/auth/signin` when the submitted name
+/// exists but the password does not match. Shared wire constant so the
+/// backend handler (`app-server/src/auth.rs`) and the frontend matcher
+/// (`app-web/src/components/sign_in.rs`) cannot drift. Spec: `refactor.md:50`.
+pub const AUTH_ERR_NAME_TAKEN_WRONG_PASSWORD: &str = "name_taken_wrong_password";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionNoticeCode {
+    SpriteAtelierAccepted,
+    SpriteAtelierQueued,
+    SpriteAtelierDrawing,
+    SpriteAtelierFallback,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Phase {
@@ -30,8 +55,10 @@ pub enum CoordinatorType {
 #[serde(rename_all = "camelCase")]
 pub enum SessionCommand {
     Join,
-    StartPhase0,
-    UpdatePlayerPet,
+    // Session 4 / refactor: `StartPhase0` removed. Character creation no longer
+    // happens inside a workshop; hosts transition `Lobby→Phase1` directly via
+    // `StartPhase1`.
+    SelectCharacter,
     SubmitObservation,
     StartPhase1,
     StartHandover,
@@ -108,6 +135,16 @@ pub struct SpriteSet {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct CharacterProfile {
+    pub id: String,
+    pub description: String,
+    pub sprites: SpriteSet,
+    #[serde(default)]
+    pub remaining_sprite_regenerations: u8,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Player {
     pub id: String,
     pub name: String,
@@ -118,9 +155,13 @@ pub struct Player {
     pub is_ready: bool,
     pub is_connected: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub character_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pet_description: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_sprites: Option<SpriteSet>,
+    #[serde(default)]
+    pub remaining_sprite_regenerations: u8,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -135,9 +176,13 @@ pub struct ServerPlayer {
     pub is_ready: bool,
     pub is_connected: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub character_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pet_description: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_sprites: Option<SpriteSet>,
+    #[serde(default)]
+    pub remaining_sprite_regenerations: u8,
     pub joined_at: String,
     pub last_seen_at: String,
 }
@@ -163,10 +208,8 @@ pub struct DragonVisuals {
 #[serde(rename_all = "camelCase")]
 pub struct DragonTraits {
     pub active_time: ActiveTime,
-    pub day_food: FoodType,
-    pub night_food: FoodType,
-    pub day_play: PlayType,
-    pub night_play: PlayType,
+    pub favorite_food: FoodType,
+    pub favorite_play: PlayType,
     pub sleep_rate: i32,
 }
 
@@ -350,6 +393,8 @@ pub struct SessionNotice {
     pub level: NoticeLevel,
     pub title: String,
     pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<SessionNoticeCode>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -382,8 +427,14 @@ impl Default for WorkshopCreateConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CreateWorkshopRequest {
-    pub name: String,
-    pub config: WorkshopCreateConfig,
+    /// Ignored by the server (name is derived from the authenticated account).
+    /// Kept as optional for backward compatibility with older clients.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config: Option<WorkshopCreateConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub character_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -393,15 +444,15 @@ pub struct JoinWorkshopRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub character_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reconnect_token: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct UpdatePlayerPetRequest {
-    pub description: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sprites: Option<SpriteSet>,
+pub struct SelectCharacterRequest {
+    pub character_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -495,10 +546,8 @@ pub struct JudgeDragonBundle {
     pub creative_vote_count: i32,
     pub final_stats: DragonStats,
     pub actual_active_time: ActiveTime,
-    pub actual_day_food: FoodType,
-    pub actual_night_food: FoodType,
-    pub actual_day_play: PlayType,
-    pub actual_night_play: PlayType,
+    pub actual_favorite_food: FoodType,
+    pub actual_favorite_play: PlayType,
     pub actual_sleep_rate: i32,
     pub handover_chain: JudgeHandoverChain,
     pub phase2_actions: Vec<JudgeActionTrace>,
@@ -621,16 +670,63 @@ pub struct SpriteSheetRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CharacterSpriteSheetRequest {
+    pub session_code: String,
+    pub reconnect_token: String,
+    pub description: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub character_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct CharacterCatalogRequest {}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SpriteSheetSuccess {
     pub ok: bool,
     pub sprites: SpriteSet,
+    #[serde(default)]
+    pub fallback_used: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CharacterSpriteSheetSuccess {
+    pub ok: bool,
+    pub character_id: String,
+    pub sprites: SpriteSet,
+    #[serde(default)]
+    pub remaining_sprite_regenerations: u8,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum SpriteSheetResult {
     Success(SpriteSheetSuccess),
+    Error(WorkshopError),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum CharacterSpriteSheetResult {
+    Success(CharacterSpriteSheetSuccess),
+    Error(WorkshopError),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CharacterCatalogSuccess {
+    pub ok: bool,
+    pub characters: Vec<CharacterProfile>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum CharacterCatalogResult {
+    Success(CharacterCatalogSuccess),
     Error(WorkshopError),
 }
 
@@ -657,6 +753,14 @@ pub struct WorkshopJoinSuccess {
     #[serde(rename = "coordinatorType")]
     pub coordinator_type: CoordinatorType,
     pub state: ClientGameState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkshopCreateSuccess {
+    pub ok: bool,
+    pub session_code: String,
+    pub host_name: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -710,6 +814,13 @@ pub enum WorkshopJoinResult {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
+pub enum WorkshopCreateResult {
+    Success(WorkshopCreateSuccess),
+    Error(WorkshopError),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
 pub enum WorkshopCommandResult {
     Success(WorkshopCommandSuccess),
     Error(WorkshopError),
@@ -734,12 +845,13 @@ pub fn create_session_settings(config: &WorkshopCreateConfig) -> SessionSettings
             step: 0,
             label: "Lobby - Waiting Room".to_string(),
             description:
-                "Join the workshop, confirm the roster, and wait for the host to open character creation."
+                "Join the workshop, pick or create your character from the lobby, and wait for the host to begin discovery."
                     .to_string(),
             duration_seconds: 0,
             allowed_commands: vec![
                 SessionCommand::Join,
-                SessionCommand::StartPhase0,
+                SessionCommand::SelectCharacter,
+                SessionCommand::StartPhase1,
                 SessionCommand::ResetGame,
                 SessionCommand::LeaveWorkshop,
             ],
@@ -749,13 +861,13 @@ pub fn create_session_settings(config: &WorkshopCreateConfig) -> SessionSettings
         Phase::Phase0,
         SessionPhaseSettings {
             step: 1,
-            label: "Phase 0 - Create Pet".to_string(),
+            label: "Phase 0 - Character Atelier".to_string(),
             description:
-                "Describe your dragon, generate sprites, and save your character profile before discovery begins."
+                "Create or redraw a global character from the lobby before discovery begins."
                     .to_string(),
             duration_seconds: (config.phase0_minutes as i32) * 60,
             allowed_commands: vec![
-                SessionCommand::UpdatePlayerPet,
+                SessionCommand::SelectCharacter,
                 SessionCommand::StartPhase1,
                 SessionCommand::ResetGame,
                 SessionCommand::LeaveWorkshop,
@@ -853,6 +965,124 @@ pub fn create_session_settings(config: &WorkshopCreateConfig) -> SessionSettings
     SessionSettings { phases }
 }
 
+// ---------------------------------------------------------------------------
+// Accounts & character ownership (refactor-plan.md §3)
+// ---------------------------------------------------------------------------
+
+/// Public-facing account profile. Never carries the password hash.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountProfile {
+    pub id: String,
+    pub hero: String,
+    pub name: String,
+}
+
+/// Combined sign-in / sign-up form submission. Server disambiguates:
+/// - name free → create account
+/// - name exists + password matches → login
+/// - name exists + password mismatch → 401
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuthRequest {
+    pub hero: String,
+    pub name: String,
+    pub password: String,
+}
+
+/// Outcome of a successful `/api/auth` call. Cookie is set separately by the
+/// HTTP layer; this body is the account snapshot for the client.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuthResponse {
+    pub account: AccountProfile,
+    pub created: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateCharacterRequest {
+    pub description: String,
+    pub sprites: SpriteSet,
+}
+
+/// Request body for `POST /api/characters/preview-sprites`.
+///
+/// Account-scoped sprite-sheet preview. Unlike the workshop-scoped
+/// `CharacterSpriteSheetRequest`, this carries no session credentials —
+/// authentication is via the signed session cookie (`AccountSession`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CharacterSpritePreviewRequest {
+    pub description: String,
+}
+
+/// Response body for `POST /api/characters/preview-sprites`.
+///
+/// Returns the generated 4-frame sprite sheet without persisting anything.
+/// The frontend holds this in memory and, on confirm, submits it via
+/// `POST /api/characters`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CharacterSpritePreviewResponse {
+    pub sprites: SpriteSet,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MyCharactersResponse {
+    pub characters: Vec<CharacterProfile>,
+    pub limit: u8,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EligibleCharactersResponse {
+    pub characters: Vec<CharacterProfile>,
+}
+
+/// One row in the "open workshops" list shown on AccountHome.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenWorkshopSummary {
+    pub session_code: String,
+    pub host_name: String,
+    pub player_count: u32,
+    pub created_at: String,
+    #[serde(default)]
+    pub can_delete: bool,
+}
+
+/// Keyset cursor over the "open workshops" list. Pairs the RFC3339 `created_at`
+/// timestamp with the `session_code` tie-breaker so pagination is stable when
+/// two lobbies are created in the same tick. Ordering is DESC by `created_at`,
+/// then ASC by `session_code` (both in-memory and Postgres backends agree).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenWorkshopCursor {
+    pub created_at: String,
+    pub session_code: String,
+}
+
+/// Request shape for `GET /api/workshops/open` is transported as query
+/// params on the wire (`after_created_at` / `after_session_code` XOR
+/// `before_created_at` / `before_session_code`). No dedicated request
+/// struct is needed — the server parses those params directly and the
+/// client builds them via query-string construction.
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListOpenWorkshopsResponse {
+    pub workshops: Vec<OpenWorkshopSummary>,
+    /// Cursor to pass as `after=` for the next (older) page, if one exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<OpenWorkshopCursor>,
+    /// Cursor to pass as `before=` for the previous (newer) page, if one
+    /// exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prev_cursor: Option<OpenWorkshopCursor>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -876,6 +1106,7 @@ mod tests {
 
         assert_eq!(request.session_code, "123456");
         assert_eq!(request.name, None);
+        assert_eq!(request.character_id, None);
         assert_eq!(request.reconnect_token, None);
     }
 
@@ -952,29 +1183,56 @@ mod tests {
                 .step,
             0
         );
-        assert!(settings
-            .phases
-            .get(&Phase::Lobby)
-            .expect("lobby phase")
-            .allowed_commands
-            .contains(&SessionCommand::Join));
-        assert!(settings
-            .phases
-            .get(&Phase::Phase0)
-            .expect("phase0 phase")
-            .allowed_commands
-            .contains(&SessionCommand::UpdatePlayerPet));
-        assert!(settings
-            .phases
-            .get(&Phase::Judge)
-            .expect("judge phase")
-            .allowed_commands
-            .contains(&SessionCommand::StartVoting));
-        assert!(settings
-            .phases
-            .get(&Phase::Voting)
-            .expect("voting phase")
-            .allowed_commands
-            .contains(&SessionCommand::SubmitVote));
+        assert!(
+            settings
+                .phases
+                .get(&Phase::Lobby)
+                .expect("lobby phase")
+                .allowed_commands
+                .contains(&SessionCommand::Join)
+        );
+        assert!(
+            settings
+                .phases
+                .get(&Phase::Lobby)
+                .expect("lobby phase")
+                .allowed_commands
+                .contains(&SessionCommand::SelectCharacter)
+        );
+        assert!(
+            settings
+                .phases
+                .get(&Phase::Judge)
+                .expect("judge phase")
+                .allowed_commands
+                .contains(&SessionCommand::StartVoting)
+        );
+        assert!(
+            settings
+                .phases
+                .get(&Phase::Voting)
+                .expect("voting phase")
+                .allowed_commands
+                .contains(&SessionCommand::SubmitVote)
+        );
+    }
+
+    #[test]
+    fn character_sprite_sheet_request_skips_missing_character_id() {
+        let request = CharacterSpriteSheetRequest {
+            session_code: "123456".to_string(),
+            reconnect_token: "reconnect-1".to_string(),
+            description: "A moonlit dragon".to_string(),
+            character_id: None,
+        };
+
+        let value = serde_json::to_value(&request).expect("serialize character sprite request");
+        let object = value.as_object().expect("character sprite request object");
+
+        assert_eq!(
+            object.get("description").and_then(|value| value.as_str()),
+            Some("A moonlit dragon")
+        );
+        assert!(!object.contains_key("characterId"));
     }
 }

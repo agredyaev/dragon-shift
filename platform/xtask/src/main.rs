@@ -1,15 +1,16 @@
 use futures_util::{SinkExt, StreamExt};
 use protocol::{
-    ClientWsMessage, CreateWorkshopRequest, JoinWorkshopRequest, JudgeBundle, Phase,
-    ServerWsMessage, SessionCommand, SessionEnvelope, WorkshopCommandRequest,
-    WorkshopCommandResult, WorkshopJoinResult, WorkshopJoinSuccess, WorkshopJudgeBundleRequest,
-    WorkshopJudgeBundleResult,
+    AuthRequest, ClientWsMessage, CreateWorkshopRequest, JoinWorkshopRequest, JudgeBundle, Phase,
+    ServerWsMessage, SessionCommand, SessionEnvelope, SpriteSheetRequest, SpriteSheetResult,
+    WorkshopCommandRequest, WorkshopCommandResult, WorkshopJoinResult, WorkshopJoinSuccess,
+    WorkshopJudgeBundleRequest, WorkshopJudgeBundleResult,
 };
 use serde_json::json;
 use sqlx::PgPool;
 use std::env;
 use std::fs;
 use std::future::Future;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use tokio::net::TcpStream;
@@ -42,6 +43,12 @@ struct WebBuildConfig {
 struct JoinLoadConfig {
     base_url: String,
     clients: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SpriteLoadConfig {
+    base_url: String,
+    workers: usize,
 }
 
 fn main() {
@@ -86,6 +93,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
         }
         "smoke-phase1" => run_async(smoke_phase1(smoke_base_url(&forwarded)?)),
         "smoke-join-load" => run_async(smoke_join_load(join_load_config(&forwarded)?)),
+        "smoke-sprite-load" => run_async(smoke_sprite_load(sprite_load_config(&forwarded)?)),
         "smoke-judge-bundle" => run_async(smoke_judge_bundle(smoke_base_url(&forwarded)?)),
         "smoke-offline-failover" => run_async(smoke_offline_failover(smoke_base_url(&forwarded)?)),
         "smoke-persistence" => run_async(smoke_persistence(persistence_smoke_config(&forwarded)?)),
@@ -250,7 +258,7 @@ fn join_load_config(forwarded: &[String]) -> Result<JoinLoadConfig, String> {
     let mut base_url = env::var("XTASK_SMOKE_BASE_URL")
         .or_else(|_| env::var("SMOKE_TEST_BASE_URL"))
         .unwrap_or_else(|_| "http://127.0.0.1:4100".to_string());
-    let mut clients = 30usize;
+    let mut clients = 4usize;
     let mut args = forwarded.iter();
 
     while let Some(arg) = args.next() {
@@ -279,6 +287,42 @@ fn join_load_config(forwarded: &[String]) -> Result<JoinLoadConfig, String> {
     Ok(JoinLoadConfig {
         base_url: normalize_base_url(&base_url),
         clients,
+    })
+}
+
+fn sprite_load_config(forwarded: &[String]) -> Result<SpriteLoadConfig, String> {
+    let mut base_url = env::var("XTASK_SMOKE_BASE_URL")
+        .or_else(|_| env::var("SMOKE_TEST_BASE_URL"))
+        .unwrap_or_else(|_| "http://127.0.0.1:4100".to_string());
+    let mut workers = 40usize;
+    let mut args = forwarded.iter();
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--base-url" => {
+                base_url = args
+                    .next()
+                    .ok_or_else(|| "missing value for --base-url".to_string())?
+                    .clone();
+            }
+            "--workers" => {
+                workers = args
+                    .next()
+                    .ok_or_else(|| "missing value for --workers".to_string())?
+                    .parse::<usize>()
+                    .map_err(|error| format!("invalid value for --workers: {error}"))?;
+            }
+            unknown => return Err(format!("unknown sprite-load arg: {unknown}")),
+        }
+    }
+
+    if workers == 0 {
+        return Err("--workers must be greater than 0".to_string());
+    }
+
+    Ok(SpriteLoadConfig {
+        base_url: normalize_base_url(&base_url),
+        workers,
     })
 }
 
@@ -454,19 +498,45 @@ fn run_tool(program: &str, args: &[&str]) -> Result<(), String> {
 }
 
 fn build_web_bundle(config: WebBuildConfig) -> Result<(), String> {
-    if config.out_dir.exists() {
-        fs::remove_dir_all(&config.out_dir).map_err(|error| {
+    let parent_dir = config
+        .out_dir
+        .parent()
+        .ok_or_else(|| {
             format!(
-                "failed to clear app-web output dir {}: {error}",
+                "app-web output dir has no parent: {}",
                 config.out_dir.display()
+            )
+        })?
+        .to_path_buf();
+    let staging_dir = parent_dir.join(format!(
+        ".{}-staging",
+        config
+            .out_dir
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("app-web-dist")
+    ));
+    let backup_dir = parent_dir.join(format!(
+        ".{}-backup",
+        config
+            .out_dir
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("app-web-dist")
+    ));
+    if staging_dir.exists() {
+        fs::remove_dir_all(&staging_dir).map_err(|error| {
+            format!(
+                "failed to clear temporary app-web output dir {}: {error}",
+                staging_dir.display()
             )
         })?;
     }
 
-    fs::create_dir_all(&config.out_dir).map_err(|error| {
+    fs::create_dir_all(&staging_dir).map_err(|error| {
         format!(
-            "failed to create app-web output dir {}: {error}",
-            config.out_dir.display()
+            "failed to create temporary app-web output dir {}: {error}",
+            staging_dir.display()
         )
     })?;
 
@@ -493,7 +563,7 @@ fn build_web_bundle(config: WebBuildConfig) -> Result<(), String> {
         "--out-name".to_string(),
         "app-web".to_string(),
         "--out-dir".to_string(),
-        config.out_dir.to_string_lossy().into_owned(),
+        staging_dir.to_string_lossy().into_owned(),
         wasm_input.to_string_lossy().into_owned(),
     ];
     run_tool_owned("wasm-bindgen", wasm_bindgen_args).map_err(|error| {
@@ -502,7 +572,7 @@ fn build_web_bundle(config: WebBuildConfig) -> Result<(), String> {
         )
     })?;
 
-    let wasm_bg = config.out_dir.join("app-web_bg.wasm");
+    let wasm_bg = staging_dir.join("app-web_bg.wasm");
     let raw_wasm_bytes = fs::metadata(&wasm_input).map(|m| m.len()).unwrap_or(0);
     let bindgen_wasm_bytes = fs::metadata(&wasm_bg).map(|m| m.len()).unwrap_or(0);
     let skip_wasm_opt = env_flag_enabled("XTASK_SKIP_WASM_OPT");
@@ -541,11 +611,11 @@ fn build_web_bundle(config: WebBuildConfig) -> Result<(), String> {
     let opt_saved_pct = saved_percent(bindgen_wasm_bytes, post_opt_bytes);
     let total_saved_pct = saved_percent(raw_wasm_bytes, post_opt_bytes);
 
-    write_app_web_index_html(&config.out_dir)?;
-    copy_app_web_static_assets(&config.out_dir)?;
+    copy_app_web_static_assets(&staging_dir)?;
+    write_app_web_index_html(&staging_dir)?;
 
     // ── WASM bundle size gate ──────────────────────────────────────────
-    let wasm_output = config.out_dir.join("app-web_bg.wasm");
+    let wasm_output = staging_dir.join("app-web_bg.wasm");
     let wasm_size_bytes = fs::metadata(&wasm_output).map(|m| m.len()).unwrap_or(0);
     let wasm_size_kb = wasm_size_bytes / 1024;
     const WASM_SIZE_WARN_KB: u64 = 2048; // 2 MB — warn threshold
@@ -563,8 +633,62 @@ fn build_web_bundle(config: WebBuildConfig) -> Result<(), String> {
         None
     };
 
-    let js_output = config.out_dir.join("app-web.js");
+    let js_output = staging_dir.join("app-web.js");
     let js_size_bytes = fs::metadata(&js_output).map(|m| m.len()).unwrap_or(0);
+
+    if backup_dir.exists() {
+        fs::remove_dir_all(&backup_dir).map_err(|error| {
+            format!(
+                "failed to clear app-web backup dir {}: {error}",
+                backup_dir.display()
+            )
+        })?;
+    }
+
+    fs::create_dir_all(&parent_dir).map_err(|error| {
+        format!(
+            "failed to create app-web output parent dir {}: {error}",
+            parent_dir.display()
+        )
+    })?;
+
+    let had_previous_out_dir = config.out_dir.exists();
+    if had_previous_out_dir {
+        fs::rename(&config.out_dir, &backup_dir).map_err(|error| {
+            format!(
+                "failed to move existing app-web bundle out of the way {} -> {}: {error}",
+                config.out_dir.display(),
+                backup_dir.display()
+            )
+        })?;
+    }
+
+    if let Err(error) = fs::rename(&staging_dir, &config.out_dir) {
+        if had_previous_out_dir {
+            let restore_result = fs::rename(&backup_dir, &config.out_dir);
+            if let Err(restore_error) = restore_result {
+                return Err(format!(
+                    "failed to move built app-web bundle into {}: {error}; also failed to restore previous bundle: {restore_error}",
+                    config.out_dir.display()
+                ));
+            }
+        } else if error.kind() != ErrorKind::NotFound && backup_dir.exists() {
+            let _ = fs::remove_dir_all(&backup_dir);
+        }
+        return Err(format!(
+            "failed to move built app-web bundle into {}: {error}",
+            config.out_dir.display()
+        ));
+    }
+
+    if backup_dir.exists() {
+        fs::remove_dir_all(&backup_dir).map_err(|error| {
+            format!(
+                "failed to remove app-web backup dir {}: {error}",
+                backup_dir.display()
+            )
+        })?;
+    }
 
     let mut result = json!({
         "ok": true,
@@ -610,9 +734,11 @@ fn env_flag_enabled(name: &str) -> bool {
 
 fn write_app_web_index_html(out_dir: &Path) -> Result<(), String> {
     let index_path = out_dir.join("index.html");
+    let cache_bust = cache_bust_token(out_dir)?;
     fs::write(
         &index_path,
-        r#"<!doctype html>
+        format!(
+            r#"<!doctype html>
 <html lang="en">
   <head>
     <meta charset="utf-8" />
@@ -621,19 +747,36 @@ fn write_app_web_index_html(out_dir: &Path) -> Result<(), String> {
     <link rel="icon" href="data:," />
     <link rel="preload" href="fonts/silkscreen-400-latin.woff2" as="font" type="font/woff2" crossorigin />
     <link rel="preload" href="fonts/silkscreen-700-latin.woff2" as="font" type="font/woff2" crossorigin />
-    <link rel="stylesheet" href="style.css" />
+    <link rel="stylesheet" href="style.css?v={cache_bust}" />
   </head>
   <body>
-    <main id="main"></main>
+    <div id="main"></div>
     <script type="module">
-      import init from "./app-web.js";
-      init();
+      import init from "./app-web.js?v={cache_bust}";
+      init(new URL("./app-web_bg.wasm?v={cache_bust}", import.meta.url));
     </script>
   </body>
 </html>
-"#,
+"#
+        ),
     )
     .map_err(|error| format!("failed to write {}: {error}", index_path.display()))
+}
+
+fn cache_bust_token(out_dir: &Path) -> Result<String, String> {
+    let js_metadata = fs::metadata(out_dir.join("app-web.js"))
+        .map_err(|error| format!("failed to stat app-web.js for cache busting: {error}"))?;
+    let wasm_metadata = fs::metadata(out_dir.join("app-web_bg.wasm"))
+        .map_err(|error| format!("failed to stat app-web_bg.wasm for cache busting: {error}"))?;
+    let css_metadata = fs::metadata(out_dir.join("style.css"))
+        .map_err(|error| format!("failed to stat style.css for cache busting: {error}"))?;
+
+    Ok(format!(
+        "{}-{}-{}",
+        js_metadata.len(),
+        wasm_metadata.len(),
+        css_metadata.len()
+    ))
 }
 
 fn copy_app_web_static_assets(out_dir: &Path) -> Result<(), String> {
@@ -780,7 +923,7 @@ fn print_json(value: serde_json::Value) -> Result<(), String> {
 
 async fn smoke_phase1(base_url: String) -> Result<(), String> {
     let smoke_start = std::time::Instant::now();
-    let client = reqwest::Client::new();
+    let client = smoke_http_client()?;
 
     let t0 = std::time::Instant::now();
     let host = create_workshop(&client, &base_url, "XtaskSmokeHost").await?;
@@ -822,16 +965,26 @@ async fn smoke_phase1(base_url: String) -> Result<(), String> {
 }
 
 async fn smoke_join_load(config: JoinLoadConfig) -> Result<(), String> {
-    let client = reqwest::Client::new();
+    if config.clients > 4 {
+        return Err(
+            "smoke-join-load currently supports at most 4 guest clients under cookie-auth rate limits"
+                .to_string(),
+        );
+    }
+
+    let client = smoke_http_client()?;
     let host = create_workshop(&client, &config.base_url, "XtaskLoadHost").await?;
     let requested_clients = config.clients;
     let join_results = futures_util::future::join_all((0..requested_clients).map(|index| {
-        let client = client.clone();
         let base_url = config.base_url.clone();
         let session_code = host.session_code.clone();
         let player_name = format!("LoadPlayer{:02}", index + 1);
 
-        async move { join_workshop(&client, &base_url, &session_code, &player_name).await }
+        async move {
+            let client = smoke_http_client()?;
+            signin_account(&client, &base_url, &player_name).await?;
+            join_workshop(&client, &base_url, &session_code, &player_name).await
+        }
     }))
     .await;
 
@@ -866,9 +1019,163 @@ async fn smoke_join_load(config: JoinLoadConfig) -> Result<(), String> {
     }))
 }
 
+async fn smoke_sprite_load(config: SpriteLoadConfig) -> Result<(), String> {
+    let total_start = std::time::Instant::now();
+    let client = smoke_http_client()?;
+    let workers = config.workers;
+
+    // Reuse a small signed-in account pool so the smoke can stay within the
+    // public signup rate limit while still exercising the create-lobby and
+    // explicit-join flow.
+    let account_pool_size = workers.min(5);
+    let mut account_clients = Vec::with_capacity(account_pool_size);
+    for index in 0..account_pool_size {
+        let name = format!("SpriteWorkerAccount{:02}", index + 1);
+        account_clients.push(sign_in_smoke_client(&config.base_url, &name).await?);
+    }
+
+    // Full account flow: signed-in account → create empty lobby → explicit join.
+    let mut sessions: Vec<WorkshopJoinSuccess> = Vec::with_capacity(workers);
+    for index in 0..workers {
+        let account_client = &account_clients[index % account_clients.len()];
+        let host = create_workshop_on_client(account_client, &config.base_url).await?;
+        sessions.push(host);
+        // Pace create calls to stay under the public create limiter.
+        tokio::time::sleep(std::time::Duration::from_millis(3_100)).await;
+    }
+    let setup_ms = total_start.elapsed().as_millis();
+
+    // Phase 2: fire all sprite-sheet requests concurrently.
+
+    let gen_start = std::time::Instant::now();
+    let sprite_results =
+        futures_util::future::join_all(sessions.iter().enumerate().map(|(index, session)| {
+            let client = client.clone();
+            let base_url = config.base_url.clone();
+            let description = format!("Smoke test dragon {}", index + 1);
+            let session_code = session.session_code.clone();
+            let reconnect_token = session.reconnect_token.clone();
+
+            async move {
+                let t0 = std::time::Instant::now();
+                let result = client
+                    .post(format!("{base_url}/api/workshops/sprite-sheet"))
+                    .header("Origin", &base_url)
+                    .json(&SpriteSheetRequest {
+                        session_code,
+                        reconnect_token,
+                        description,
+                    })
+                    .send()
+                    .await;
+
+                let elapsed_ms = t0.elapsed().as_millis();
+                match result {
+                    Ok(response) => {
+                        let status = response.status().as_u16();
+                        let body = response.json::<SpriteSheetResult>().await;
+                        match body {
+                            Ok(SpriteSheetResult::Success(success)) => {
+                                let sprite_sizes: Vec<usize> = [
+                                    &success.sprites.neutral,
+                                    &success.sprites.happy,
+                                    &success.sprites.angry,
+                                    &success.sprites.sleepy,
+                                ]
+                                .iter()
+                                .map(|s| s.len())
+                                .collect();
+                                (index, elapsed_ms, status, Ok(sprite_sizes))
+                            }
+                            Ok(SpriteSheetResult::Error(err)) => {
+                                (index, elapsed_ms, status, Err(err.error))
+                            }
+                            Err(parse_err) => (
+                                index,
+                                elapsed_ms,
+                                status,
+                                Err(format!("response parse error: {parse_err}")),
+                            ),
+                        }
+                    }
+                    Err(req_err) => (
+                        index,
+                        elapsed_ms,
+                        0,
+                        Err(format!("request error: {req_err}")),
+                    ),
+                }
+            }
+        }))
+        .await;
+
+    let gen_ms = gen_start.elapsed().as_millis();
+
+    // Phase 3: summarize results.
+    let mut successes = 0u64;
+    let mut failures = 0u64;
+    let mut success_times: Vec<u128> = Vec::new();
+    let mut failure_details: Vec<serde_json::Value> = Vec::new();
+
+    for (index, elapsed_ms, status, result) in &sprite_results {
+        match result {
+            Ok(_sizes) => {
+                successes += 1;
+                success_times.push(*elapsed_ms);
+            }
+            Err(error) => {
+                failures += 1;
+                failure_details.push(json!({
+                    "worker": index,
+                    "status": status,
+                    "elapsedMs": elapsed_ms,
+                    "error": error,
+                }));
+            }
+        }
+    }
+
+    success_times.sort();
+    let p50 = success_times
+        .get(success_times.len() / 2)
+        .copied()
+        .unwrap_or(0);
+    let p95 = success_times
+        .get((success_times.len() as f64 * 0.95) as usize)
+        .copied()
+        .unwrap_or(0);
+    let p99 = success_times
+        .get((success_times.len() as f64 * 0.99) as usize)
+        .copied()
+        .unwrap_or(0);
+    let max = success_times.last().copied().unwrap_or(0);
+    let min = success_times.first().copied().unwrap_or(0);
+
+    let total_ms = total_start.elapsed().as_millis();
+
+    print_json(json!({
+        "ok": failures == 0,
+        "baseUrl": config.base_url,
+        "workers": workers,
+        "setupMs": setup_ms,
+        "generationMs": gen_ms,
+        "totalMs": total_ms,
+        "successes": successes,
+        "failures": failures,
+        "latency": {
+            "minMs": min,
+            "p50Ms": p50,
+            "p95Ms": p95,
+            "p99Ms": p99,
+            "maxMs": max,
+        },
+        "failureDetails": failure_details,
+    }))
+}
+
 async fn smoke_judge_bundle(base_url: String) -> Result<(), String> {
     let smoke_start = std::time::Instant::now();
-    let client = reqwest::Client::new();
+    let client = smoke_http_client()?;
     let mut host = create_workshop(&client, &base_url, "XtaskJudgeHost").await?;
     let mut guest =
         join_workshop(&client, &base_url, &host.session_code, "XtaskJudgeGuest").await?;
@@ -1043,7 +1350,7 @@ async fn smoke_judge_bundle(base_url: String) -> Result<(), String> {
 
 async fn smoke_offline_failover(base_url: String) -> Result<(), String> {
     let smoke_start = std::time::Instant::now();
-    let client = reqwest::Client::new();
+    let client = smoke_http_client()?;
     let host = create_workshop(&client, &base_url, "XtaskFailoverHost").await?;
     let mut guest =
         join_workshop(&client, &base_url, &host.session_code, "XtaskFailoverGuest").await?;
@@ -1118,7 +1425,7 @@ async fn smoke_offline_failover(base_url: String) -> Result<(), String> {
 }
 
 async fn smoke_persistence(config: PersistenceSmokeConfig) -> Result<(), String> {
-    let client = reqwest::Client::new();
+    let client = smoke_http_client()?;
     let host = create_workshop(&client, &config.base_url, "XtaskPersistenceHost").await?;
 
     send_command(
@@ -1167,7 +1474,7 @@ async fn smoke_persistence(config: PersistenceSmokeConfig) -> Result<(), String>
 async fn smoke_persistence_restart(config: PersistenceSmokeConfig) -> Result<(), String> {
     run_tool("cargo", &["build", "-p", "app-server"])?;
 
-    let client = reqwest::Client::new();
+    let client = smoke_http_client()?;
     let smoke_start = std::time::Instant::now();
     let mut server = AppServerProcess::spawn(&config.base_url, &config.database_url)?;
     wait_for_server_ready(&client, &config.base_url, &mut server).await?;
@@ -1293,7 +1600,7 @@ async fn smoke_persistence_restart(config: PersistenceSmokeConfig) -> Result<(),
 }
 
 async fn smoke_restore_reconnect(config: RestoreSmokeConfig) -> Result<(), String> {
-    let client = reqwest::Client::new();
+    let client = smoke_http_client()?;
     let smoke_start = std::time::Instant::now();
     let host = create_workshop(&client, &config.base_url, "XtaskRestoreHost").await?;
     send_command(
@@ -1618,22 +1925,88 @@ async fn create_workshop(
     base_url: &str,
     name: &str,
 ) -> Result<WorkshopJoinSuccess, String> {
+    signin_account(client, base_url, name).await?;
+    create_workshop_on_client(client, base_url).await
+}
+
+async fn create_workshop_on_client(
+    client: &reqwest::Client,
+    base_url: &str,
+) -> Result<WorkshopJoinSuccess, String> {
+    let session_code = create_workshop_lobby(client, base_url).await?;
+    join_workshop_authenticated(client, base_url, &session_code).await
+}
+
+async fn signin_account(
+    client: &reqwest::Client,
+    base_url: &str,
+    name: &str,
+) -> Result<(), String> {
     let response = client
-        .post(format!("{base_url}/api/workshops"))
+        .post(format!("{base_url}/api/auth/signin"))
         .header("Origin", base_url)
-        .json(&CreateWorkshopRequest {
+        .json(&AuthRequest {
+            hero: name.to_string(),
             name: name.to_string(),
-            config: protocol::WorkshopCreateConfig {
-                phase0_minutes: 5,
-                phase1_minutes: 10,
-                phase2_minutes: 10,
-            },
+            password: "smoketest-password-1234".to_string(),
         })
         .send()
         .await
-        .map_err(|error| format!("failed to reach backend: {error}"))?;
+        .map_err(|error| format!("signin failed: {error}"))?;
 
-    parse_join_response(response).await
+    let status = response.status().as_u16();
+    if status != 200 && status != 201 {
+        let body = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "<unreadable>".to_string());
+        return Err(format!("signin returned {status}: {body}"));
+    }
+
+    Ok(())
+}
+
+async fn sign_in_smoke_client(base_url: &str, name: &str) -> Result<reqwest::Client, String> {
+    let client = smoke_http_client()?;
+    signin_account(&client, base_url, name).await?;
+    Ok(client)
+}
+
+async fn create_workshop_lobby(client: &reqwest::Client, base_url: &str) -> Result<String, String> {
+    let response = client
+        .post(format!("{base_url}/api/workshops/lobby"))
+        .header("Origin", base_url)
+        .json(&CreateWorkshopRequest {
+            name: None,
+            config: Some(protocol::WorkshopCreateConfig {
+                phase0_minutes: 5,
+                phase1_minutes: 10,
+                phase2_minutes: 10,
+            }),
+            character_id: None,
+        })
+        .send()
+        .await
+        .map_err(|error| format!("create workshop lobby failed: {error}"))?;
+
+    let status = response.status().as_u16();
+    if status != 201 {
+        let body = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "<unreadable>".to_string());
+        return Err(format!("create workshop lobby returned {status}: {body}"));
+    }
+
+    let payload = response
+        .json::<protocol::WorkshopCreateResult>()
+        .await
+        .map_err(|error| format!("failed to parse create workshop response: {error}"))?;
+
+    match payload {
+        protocol::WorkshopCreateResult::Success(success) => Ok(success.session_code),
+        protocol::WorkshopCreateResult::Error(error) => Err(error.error),
+    }
 }
 
 async fn attach_ws_session(
@@ -1690,12 +2063,22 @@ async fn join_workshop(
     session_code: &str,
     name: &str,
 ) -> Result<WorkshopJoinSuccess, String> {
+    signin_account(client, base_url, name).await?;
+    join_workshop_authenticated(client, base_url, session_code).await
+}
+
+async fn join_workshop_authenticated(
+    client: &reqwest::Client,
+    base_url: &str,
+    session_code: &str,
+) -> Result<WorkshopJoinSuccess, String> {
     let response = client
         .post(format!("{base_url}/api/workshops/join"))
         .header("Origin", base_url)
         .json(&JoinWorkshopRequest {
             session_code: session_code.to_string(),
-            name: Some(name.to_string()),
+            name: None,
+            character_id: None,
             reconnect_token: None,
         })
         .send()
@@ -1716,6 +2099,7 @@ async fn reconnect_workshop(
         .json(&JoinWorkshopRequest {
             session_code: identity.session_code.clone(),
             name: None,
+            character_id: None,
             reconnect_token: Some(identity.reconnect_token.clone()),
         })
         .send()
@@ -1789,6 +2173,13 @@ async fn parse_join_response(response: reqwest::Response) -> Result<WorkshopJoin
     }
 }
 
+fn smoke_http_client() -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .cookie_store(true)
+        .build()
+        .map_err(|error| format!("failed to build smoke HTTP client: {error}"))
+}
+
 fn print_help() {
     println!(
         "xtask commands:
@@ -1801,7 +2192,8 @@ fn print_help() {
   cargo xtask build-web -- [--out-dir app-web/dist]
   cargo xtask server -- [app-server args]
   cargo xtask smoke-phase1 -- [--base-url http://127.0.0.1:4100]
-  cargo xtask smoke-join-load -- [--base-url http://127.0.0.1:4100] [--clients 30]
+  cargo xtask smoke-join-load -- [--base-url http://127.0.0.1:4100] [--clients 4]
+  cargo xtask smoke-sprite-load -- [--base-url http://127.0.0.1:4100] [--workers 40]
   cargo xtask smoke-judge-bundle -- [--base-url http://127.0.0.1:4100]
   cargo xtask smoke-offline-failover -- [--base-url http://127.0.0.1:4100]
   cargo xtask smoke-persistence -- [--base-url http://127.0.0.1:4100] [--database-url postgres://...]
@@ -1848,10 +2240,10 @@ mod tests {
     }
 
     #[test]
-    fn join_load_config_defaults_to_thirty_clients() {
+    fn join_load_config_defaults_to_four_clients() {
         let config = join_load_config(&[]).expect("join load config");
         assert_eq!(config.base_url, "http://127.0.0.1:4100");
-        assert_eq!(config.clients, 30);
+        assert_eq!(config.clients, 4);
     }
 
     #[test]
@@ -1865,6 +2257,26 @@ mod tests {
         .expect("join load config with flags");
         assert_eq!(config.base_url, "http://localhost:4300");
         assert_eq!(config.clients, 12);
+    }
+
+    #[test]
+    fn sprite_load_config_defaults_to_forty_workers() {
+        let config = sprite_load_config(&[]).expect("sprite load config");
+        assert_eq!(config.base_url, "http://127.0.0.1:4100");
+        assert_eq!(config.workers, 40);
+    }
+
+    #[test]
+    fn sprite_load_config_uses_forwarded_flags() {
+        let config = sprite_load_config(&[
+            "--base-url".to_string(),
+            "http://localhost:4300/".to_string(),
+            "--workers".to_string(),
+            "10".to_string(),
+        ])
+        .expect("sprite load config with flags");
+        assert_eq!(config.base_url, "http://localhost:4300");
+        assert_eq!(config.workers, 10);
     }
 
     #[test]

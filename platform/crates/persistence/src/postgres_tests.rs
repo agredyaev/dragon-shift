@@ -1,7 +1,10 @@
 #[cfg(test)]
 #[allow(clippy::module_inception)]
 mod postgres_tests {
-    use crate::{PlayerIdentity, PostgresSessionStore, SessionStore};
+    use crate::{
+        CharacterRecord, PlayerIdentity, PostgresSessionStore, SessionStore,
+        TIMEOUT_COMPANION_SPRITE_KEY, timeout_companion_defaults,
+    };
     use chrono::Utc;
     use domain::{SessionCode, SessionPlayer, WorkshopSession};
     use protocol::{Phase, SessionArtifactKind, SessionArtifactRecord};
@@ -291,7 +294,61 @@ mod postgres_tests {
                 .await
                 .expect("read applied migrations");
 
-        assert_eq!(versions, vec![(1,), (2,), (3,)]);
+        assert_eq!(versions, vec![(1,), (2,), (3,), (4,), (5,), (6,), (7,)]);
+        store.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn init_seeds_timeout_companion_defaults() {
+        let store = setup_store("init_seeds_timeout_companion_defaults").await;
+
+        let defaults = store
+            .load_app_sprite_defaults(TIMEOUT_COMPANION_SPRITE_KEY)
+            .await
+            .expect("load timeout companion defaults")
+            .expect("seeded timeout companion defaults");
+
+        assert_eq!(defaults.key, TIMEOUT_COMPANION_SPRITE_KEY);
+        assert_eq!(defaults.sprites, timeout_companion_defaults().sprites);
+        store.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn save_and_load_character_round_trip() {
+        let store = setup_store("save_and_load_character_round_trip").await;
+
+        let character = CharacterRecord {
+            id: "character_1".to_string(),
+            description: "A mossy lantern dragon".to_string(),
+            sprites: protocol::SpriteSet {
+                neutral: "neutral_b64".to_string(),
+                happy: "happy_b64".to_string(),
+                angry: "angry_b64".to_string(),
+                sleepy: "sleepy_b64".to_string(),
+            },
+            remaining_sprite_regenerations: 1,
+            created_at: Utc::now().to_rfc3339(),
+            updated_at: Utc::now().to_rfc3339(),
+            owner_account_id: None,
+        };
+
+        store
+            .save_character(&character)
+            .await
+            .expect("save character");
+
+        let loaded = store
+            .load_character("character_1")
+            .await
+            .expect("load character")
+            .expect("character must exist");
+
+        assert_eq!(loaded.id, character.id);
+        assert_eq!(loaded.description, character.description);
+        assert_eq!(loaded.sprites, character.sprites);
+        assert_eq!(loaded.remaining_sprite_regenerations, 1);
         store.cleanup().await;
     }
 
@@ -463,28 +520,50 @@ mod postgres_tests {
         session.add_player(SessionPlayer {
             id: "player_1".to_string(),
             name: "Alice".to_string(),
-            pet_description: Some("Alice's workshop dragon".to_string()),
+            account_id: None,
+            character_id: Some("character-1".to_string()),
+            selected_character: Some(protocol::CharacterProfile {
+                id: "character-1".to_string(),
+                description: "Alice's workshop dragon".to_string(),
+                sprites: protocol::SpriteSet {
+                    neutral: "neutral".to_string(),
+                    happy: "happy".to_string(),
+                    angry: "angry".to_string(),
+                    sleepy: "sleepy".to_string(),
+                },
+                remaining_sprite_regenerations: 1,
+            }),
             is_host: true,
             is_connected: false,
-            is_ready: false,
+            is_ready: true,
             score: 0,
             current_dragon_id: None,
             achievements: Vec::new(),
             joined_at: Utc::now(),
-            custom_sprites: None,
         });
         session.add_player(SessionPlayer {
             id: "player_2".to_string(),
             name: "Bob".to_string(),
-            pet_description: Some("Bob's workshop dragon".to_string()),
+            account_id: None,
+            character_id: Some("character-2".to_string()),
+            selected_character: Some(protocol::CharacterProfile {
+                id: "character-2".to_string(),
+                description: "Bob's workshop dragon".to_string(),
+                sprites: protocol::SpriteSet {
+                    neutral: "neutral".to_string(),
+                    happy: "happy".to_string(),
+                    angry: "angry".to_string(),
+                    sleepy: "sleepy".to_string(),
+                },
+                remaining_sprite_regenerations: 1,
+            }),
             is_host: false,
             is_connected: false,
-            is_ready: false,
+            is_ready: true,
             score: 0,
             current_dragon_id: None,
             achievements: Vec::new(),
             joined_at: Utc::now(),
-            custom_sprites: None,
         });
         session
             .players
@@ -850,6 +929,62 @@ mod postgres_tests {
         store.cleanup().await;
     }
 
+    #[tokio::test]
+    async fn deleting_postgres_realtime_connections_for_session_retires_all_connections() {
+        let store = setup_store(
+            "deleting_postgres_realtime_connections_for_session_retires_all_connections",
+        )
+        .await;
+
+        store
+            .claim_realtime_connection(&crate::RealtimeConnectionRegistration {
+                session_code: "INTEGRT5".to_string(),
+                player_id: "player-1".to_string(),
+                connection_id: "conn-1".to_string(),
+                replica_id: "replica-a".to_string(),
+            })
+            .await
+            .expect("claim first realtime connection");
+        store
+            .claim_realtime_connection(&crate::RealtimeConnectionRegistration {
+                session_code: "INTEGRT5".to_string(),
+                player_id: "player-2".to_string(),
+                connection_id: "conn-2".to_string(),
+                replica_id: "replica-b".to_string(),
+            })
+            .await
+            .expect("claim second realtime connection");
+
+        let deleted = store
+            .delete_realtime_connections_for_session("INTEGRT5")
+            .await
+            .expect("delete session realtime connections");
+        assert_eq!(deleted.len(), 2);
+        assert!(
+            store
+                .list_realtime_connections("INTEGRT5")
+                .await
+                .expect("list cleared realtime connections")
+                .is_empty()
+        );
+        assert!(
+            store
+                .take_retired_realtime_connection("conn-1", "replica-a")
+                .await
+                .expect("take retired first connection")
+                .is_some()
+        );
+        assert!(
+            store
+                .take_retired_realtime_connection("conn-2", "replica-b")
+                .await
+                .expect("take retired second connection")
+                .is_some()
+        );
+
+        store.cleanup().await;
+    }
+
     // ── Artifact tests ──────────────────────────────────────────────────
 
     #[tokio::test]
@@ -1071,5 +1206,223 @@ mod postgres_tests {
             ),
             "postgres://user:pass@localhost/db?sslmode=disable&options=-csearch_path%3Ditest_schema"
         );
+    }
+
+    // ── Open-workshops pagination (plan2 item 9) ────────────────────────
+    //
+    // Mirrors the in-memory suite in `src/lib.rs` so the Postgres backend is
+    // exercised against the same semantics. The critical one is the
+    // Before-cursor round-trip regression lock (#F1): before the fix, the
+    // Postgres `Before` branch dropped the wrong side of the +1 sentinel
+    // and silently lost the row adjacent to the cursor.
+
+    use crate::{OPEN_WORKSHOPS_PAGE_SIZE, OpenWorkshopsPaging};
+    use protocol::OpenWorkshopCursor;
+
+    /// Build a Lobby session with a single host player and a caller-supplied
+    /// `created_at_seconds` so pagination ordering is fully deterministic.
+    fn pg_lobby_session_at(code: &str, created_at_seconds: i64) -> WorkshopSession {
+        let created_at = fixed_timestamp(created_at_seconds);
+        let mut session = WorkshopSession::new(
+            Uuid::new_v4(),
+            SessionCode(code.to_string()),
+            created_at,
+            fixed_config(),
+        );
+        session.phase = Phase::Lobby;
+        let host_id = format!("host-{code}");
+        session.host_player_id = Some(host_id.clone());
+        session.add_player(SessionPlayer {
+            id: host_id,
+            name: format!("Host-{code}"),
+            account_id: None,
+            character_id: None,
+            selected_character: None,
+            is_host: true,
+            is_connected: true,
+            is_ready: true,
+            score: 0,
+            current_dragon_id: None,
+            achievements: Vec::new(),
+            joined_at: created_at,
+        });
+        session
+    }
+
+    async fn pg_seed_lobbies(store: &PostgresSessionStore, count: usize, start_seconds: i64) {
+        for i in 0..count {
+            let code = format!("{:06}", 300_000 + i);
+            let session = pg_lobby_session_at(&code, start_seconds + i as i64);
+            store.save_session(&session).await.expect("seed lobby");
+        }
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn list_open_workshops_postgres_first_page_with_more_than_page_size_rows() {
+        let store =
+            setup_store("list_open_workshops_postgres_first_page_with_more_than_page_size_rows")
+                .await;
+        pg_seed_lobbies(&store, 75, 1_000).await;
+
+        let page = store
+            .list_open_workshops(OpenWorkshopsPaging::First)
+            .await
+            .expect("first page");
+
+        assert_eq!(page.rows.len(), OPEN_WORKSHOPS_PAGE_SIZE);
+        assert!(page.has_more_after);
+        assert!(!page.has_more_before);
+        // Strict DESC ordering on created_at.
+        for pair in page.rows.windows(2) {
+            assert!(pair[0].created_at > pair[1].created_at);
+        }
+        store.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn list_open_workshops_postgres_after_cursor_returns_older_rows() {
+        let store =
+            setup_store("list_open_workshops_postgres_after_cursor_returns_older_rows").await;
+        pg_seed_lobbies(&store, 75, 1_000).await;
+
+        let first = store
+            .list_open_workshops(OpenWorkshopsPaging::First)
+            .await
+            .expect("first page");
+        let last = first.rows.last().unwrap().clone();
+        let cursor = OpenWorkshopCursor {
+            created_at: last.created_at.clone(),
+            session_code: last.session_code.clone(),
+        };
+
+        let page2 = store
+            .list_open_workshops(OpenWorkshopsPaging::After(cursor.clone()))
+            .await
+            .expect("after page");
+
+        assert_eq!(page2.rows.len(), OPEN_WORKSHOPS_PAGE_SIZE);
+        assert!(page2.has_more_after);
+        assert!(page2.has_more_before);
+        for row in &page2.rows {
+            assert!(row.created_at < cursor.created_at);
+        }
+        store.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn list_open_workshops_postgres_before_cursor_round_trip_returns_same_page() {
+        // REGRESSION LOCK for F1: the Postgres Before branch used to drop
+        // the wrong half of the +1 sentinel, losing the row adjacent to the
+        // cursor. A round trip (First → After → Before) must return page 1
+        // exactly.
+        let store =
+            setup_store("list_open_workshops_postgres_before_cursor_round_trip_returns_same_page")
+                .await;
+        // Seed 151 rows (≥ 3 × page_size + 1) so both After and Before
+        // results have strictly-more rows available in their respective
+        // directions when probed mid-stream.
+        pg_seed_lobbies(&store, 151, 1_000).await;
+
+        let page1 = store
+            .list_open_workshops(OpenWorkshopsPaging::First)
+            .await
+            .expect("page 1");
+        let p1_last = page1.rows.last().unwrap().clone();
+        let page2 = store
+            .list_open_workshops(OpenWorkshopsPaging::After(OpenWorkshopCursor {
+                created_at: p1_last.created_at.clone(),
+                session_code: p1_last.session_code.clone(),
+            }))
+            .await
+            .expect("page 2");
+
+        let p2_first = page2.rows.first().unwrap().clone();
+        let back = store
+            .list_open_workshops(OpenWorkshopsPaging::Before(OpenWorkshopCursor {
+                created_at: p2_first.created_at.clone(),
+                session_code: p2_first.session_code.clone(),
+            }))
+            .await
+            .expect("prev page");
+
+        assert_eq!(
+            back.rows, page1.rows,
+            "Before(page2.first) must return page 1 exactly; any drop on the \
+             wrong side of the +1 sentinel would manifest as lost rows here"
+        );
+        // Note: has_more_before is intentionally NOT asserted. A Before query
+        // against page2.first returns exactly page_size rows strictly newer
+        // than the cursor (that's page 1 by definition), so there are never
+        // yet-more rows beyond the newest — has_more_before is structurally
+        // false for any First→After→Before round-trip, regardless of seed
+        // size. has_more_after is tautologically true on Before results.
+        assert!(back.has_more_after);
+        store.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn list_open_workshops_postgres_tie_breaks_by_session_code_asc() {
+        let store =
+            setup_store("list_open_workshops_postgres_tie_breaks_by_session_code_asc").await;
+        // More tied rows than the page size, so the ASC tie-break stays visible across the boundary.
+        for code in ["AAAAAA", "BBBBBB", "CCCCCC", "DDDDDD", "EEEEEE"] {
+            let session = pg_lobby_session_at(code, 2_000);
+            store.save_session(&session).await.expect("save tied");
+        }
+        // Filler rows at other timestamps so the tied group is in the middle.
+        for i in 0..3 {
+            let code = format!("OTHR{:02}", i);
+            let session = pg_lobby_session_at(&code, 1_000 + i);
+            store.save_session(&session).await.expect("save filler");
+        }
+
+        let page = store
+            .list_open_workshops(OpenWorkshopsPaging::First)
+            .await
+            .expect("first page");
+
+        // The 5 tied rows come first (newest ts), ordered by session_code ASC.
+        let tied: Vec<&str> = page
+            .rows
+            .iter()
+            .take(OPEN_WORKSHOPS_PAGE_SIZE)
+            .map(|r| r.session_code.as_str())
+            .collect();
+        assert_eq!(tied, vec!["AAAAAA", "BBBBBB", "CCCCCC", "DDDDDD"]);
+        store.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn list_open_workshops_postgres_excludes_non_lobby() {
+        let store = setup_store("list_open_workshops_postgres_excludes_non_lobby").await;
+        // 3 lobby sessions.
+        for i in 0..3 {
+            let code = format!("LBBY{:02}", i);
+            let session = pg_lobby_session_at(&code, 1_000 + i);
+            store.save_session(&session).await.expect("save lobby");
+        }
+        // 2 non-lobby sessions at later timestamps — they'd sort first if
+        // erroneously included.
+        for i in 0..2 {
+            let code = format!("PLAY{:02}", i);
+            let mut session = pg_lobby_session_at(&code, 2_000 + i);
+            session.phase = Phase::Phase1;
+            store.save_session(&session).await.expect("save non-lobby");
+        }
+
+        let page = store
+            .list_open_workshops(OpenWorkshopsPaging::First)
+            .await
+            .expect("first page");
+        assert_eq!(page.rows.len(), 3);
+        for row in &page.rows {
+            assert!(row.session_code.starts_with("LBBY"));
+        }
+        store.cleanup().await;
     }
 }

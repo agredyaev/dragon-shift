@@ -9,6 +9,7 @@
     "test:mobile": "playwright test --project=mobile-safari",
     "test:restart-local": "playwright test --config=playwright.local-restart.config.ts",
     "test:deployed": "bash ./run-deployed.sh",
+    "test:deployed:local": "E2E_BASE_URL=${E2E_BASE_URL:-http://127.0.0.1:4100} ALLOW_PORT_FORWARD_FALLBACK=1 PORT_FORWARD_NAMESPACE=dragon-shift bash ./run-deployed.sh",
     "test:scenario": "playwright test --config=e2e-scenario.config.ts",
     "test:visual": "playwright test --config=visual-validators.config.ts",
     "install:browsers": "playwright install --with-deps chromium webkit"

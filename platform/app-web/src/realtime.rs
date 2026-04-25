@@ -11,7 +11,8 @@ use crate::api::{build_session_envelope, build_ws_url};
 
 #[cfg(target_arch = "wasm32")]
 use crate::state::{
-    ConnectionStatus, apply_realtime_connecting, apply_server_ws_message, error_notice,
+    ConnectionStatus, NoticeScope, apply_realtime_connecting, apply_server_ws_message,
+    error_notice, scoped_notice,
 };
 
 #[cfg(target_arch = "wasm32")]
@@ -68,7 +69,10 @@ pub fn bootstrap_realtime(
                 id.connection_status = ConnectionStatus::Offline;
             });
             open_ops.with_mut(|o| {
-                o.notice = Some(error_notice("Could not sync the session."));
+                o.notice = Some(scoped_notice(
+                    NoticeScope::Session,
+                    error_notice("Could not sync the session."),
+                ));
             });
         }
     }) as Box<dyn FnMut(_)>);
@@ -97,7 +101,10 @@ pub fn bootstrap_realtime(
                         id.connection_status = ConnectionStatus::Offline;
                     });
                     msg_ops.with_mut(|o| {
-                        o.notice = Some(error_notice("Received an invalid session update."));
+                        o.notice = Some(scoped_notice(
+                            NoticeScope::Session,
+                            error_notice("Received an invalid session update."),
+                        ));
                     });
                 }
             }
@@ -112,7 +119,10 @@ pub fn bootstrap_realtime(
             id.connection_status = ConnectionStatus::Offline;
         });
         err_ops.with_mut(|o| {
-            o.notice = Some(error_notice("Session connection failed."));
+            o.notice = Some(scoped_notice(
+                NoticeScope::Session,
+                error_notice("Session connection failed."),
+            ));
         });
     }) as Box<dyn FnMut(_)>);
     socket.set_onerror(Some(onerror.as_ref().unchecked_ref()));
@@ -120,12 +130,19 @@ pub fn bootstrap_realtime(
     let mut close_identity = identity;
     let mut close_ops = ops;
     let onclose = Closure::wrap(Box::new(move |_event: web_sys::Event| {
+        let should_announce_close =
+            close_identity.read().connection_status != ConnectionStatus::Offline;
         close_identity.with_mut(|id| {
             id.connection_status = ConnectionStatus::Offline;
         });
-        close_ops.with_mut(|o| {
-            o.notice = Some(crate::state::info_notice("Session connection closed."));
-        });
+        if should_announce_close {
+            close_ops.with_mut(|o| {
+                o.notice = Some(scoped_notice(
+                    NoticeScope::Session,
+                    crate::state::info_notice("Session connection closed."),
+                ));
+            });
+        }
     }) as Box<dyn FnMut(_)>);
     socket.set_onclose(Some(onclose.as_ref().unchecked_ref()));
 
