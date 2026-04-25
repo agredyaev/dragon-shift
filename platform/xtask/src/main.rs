@@ -1,8 +1,7 @@
 use futures_util::{SinkExt, StreamExt};
 use protocol::{
-    AuthRequest, CharacterProfile, ClientWsMessage, CreateCharacterRequest,
-    CreateWorkshopRequest, JoinWorkshopRequest, JudgeBundle, Phase, ServerWsMessage,
-    SessionCommand, SessionEnvelope, SpriteSet, SpriteSheetRequest, SpriteSheetResult,
+    AuthRequest, ClientWsMessage, CreateWorkshopRequest, JoinWorkshopRequest, JudgeBundle, Phase,
+    ServerWsMessage, SessionCommand, SessionEnvelope, SpriteSheetRequest, SpriteSheetResult,
     WorkshopCommandRequest, WorkshopCommandResult, WorkshopJoinResult, WorkshopJoinSuccess,
     WorkshopJudgeBundleRequest, WorkshopJudgeBundleResult,
 };
@@ -258,7 +257,7 @@ fn join_load_config(forwarded: &[String]) -> Result<JoinLoadConfig, String> {
     let mut base_url = env::var("XTASK_SMOKE_BASE_URL")
         .or_else(|_| env::var("SMOKE_TEST_BASE_URL"))
         .unwrap_or_else(|_| "http://127.0.0.1:4100".to_string());
-    let mut clients = 30usize;
+    let mut clients = 4usize;
     let mut args = forwarded.iter();
 
     while let Some(arg) = args.next() {
@@ -585,8 +584,8 @@ fn build_web_bundle(config: WebBuildConfig) -> Result<(), String> {
     let opt_saved_pct = saved_percent(bindgen_wasm_bytes, post_opt_bytes);
     let total_saved_pct = saved_percent(raw_wasm_bytes, post_opt_bytes);
 
-    write_app_web_index_html(&config.out_dir)?;
     copy_app_web_static_assets(&config.out_dir)?;
+    write_app_web_index_html(&config.out_dir)?;
 
     // ── WASM bundle size gate ──────────────────────────────────────────
     let wasm_output = config.out_dir.join("app-web_bg.wasm");
@@ -654,9 +653,11 @@ fn env_flag_enabled(name: &str) -> bool {
 
 fn write_app_web_index_html(out_dir: &Path) -> Result<(), String> {
     let index_path = out_dir.join("index.html");
+    let cache_bust = cache_bust_token(out_dir)?;
     fs::write(
         &index_path,
-        r#"<!doctype html>
+        format!(
+            r#"<!doctype html>
 <html lang="en">
   <head>
     <meta charset="utf-8" />
@@ -665,19 +666,36 @@ fn write_app_web_index_html(out_dir: &Path) -> Result<(), String> {
     <link rel="icon" href="data:," />
     <link rel="preload" href="fonts/silkscreen-400-latin.woff2" as="font" type="font/woff2" crossorigin />
     <link rel="preload" href="fonts/silkscreen-700-latin.woff2" as="font" type="font/woff2" crossorigin />
-    <link rel="stylesheet" href="style.css" />
+    <link rel="stylesheet" href="style.css?v={cache_bust}" />
   </head>
   <body>
     <div id="main"></div>
     <script type="module">
-      import init from "./app-web.js";
-      init();
+      import init from "./app-web.js?v={cache_bust}";
+      init(new URL("./app-web_bg.wasm?v={cache_bust}", import.meta.url));
     </script>
   </body>
 </html>
-"#,
+"#
+        ),
     )
     .map_err(|error| format!("failed to write {}: {error}", index_path.display()))
+}
+
+fn cache_bust_token(out_dir: &Path) -> Result<String, String> {
+    let js_metadata = fs::metadata(out_dir.join("app-web.js"))
+        .map_err(|error| format!("failed to stat app-web.js for cache busting: {error}"))?;
+    let wasm_metadata = fs::metadata(out_dir.join("app-web_bg.wasm"))
+        .map_err(|error| format!("failed to stat app-web_bg.wasm for cache busting: {error}"))?;
+    let css_metadata = fs::metadata(out_dir.join("style.css"))
+        .map_err(|error| format!("failed to stat style.css for cache busting: {error}"))?;
+
+    Ok(format!(
+        "{}-{}-{}",
+        js_metadata.len(),
+        wasm_metadata.len(),
+        css_metadata.len()
+    ))
 }
 
 fn copy_app_web_static_assets(out_dir: &Path) -> Result<(), String> {
@@ -824,7 +842,7 @@ fn print_json(value: serde_json::Value) -> Result<(), String> {
 
 async fn smoke_phase1(base_url: String) -> Result<(), String> {
     let smoke_start = std::time::Instant::now();
-    let client = reqwest::Client::new();
+    let client = smoke_http_client()?;
 
     let t0 = std::time::Instant::now();
     let host = create_workshop(&client, &base_url, "XtaskSmokeHost").await?;
@@ -866,16 +884,26 @@ async fn smoke_phase1(base_url: String) -> Result<(), String> {
 }
 
 async fn smoke_join_load(config: JoinLoadConfig) -> Result<(), String> {
-    let client = reqwest::Client::new();
+    if config.clients > 4 {
+        return Err(
+            "smoke-join-load currently supports at most 4 guest clients under cookie-auth rate limits"
+                .to_string(),
+        );
+    }
+
+    let client = smoke_http_client()?;
     let host = create_workshop(&client, &config.base_url, "XtaskLoadHost").await?;
     let requested_clients = config.clients;
     let join_results = futures_util::future::join_all((0..requested_clients).map(|index| {
-        let client = client.clone();
         let base_url = config.base_url.clone();
         let session_code = host.session_code.clone();
         let player_name = format!("LoadPlayer{:02}", index + 1);
 
-        async move { join_workshop(&client, &base_url, &session_code, &player_name).await }
+        async move {
+            let client = smoke_http_client()?;
+            signin_account(&client, &base_url, &player_name).await?;
+            join_workshop(&client, &base_url, &session_code, &player_name).await
+        }
     }))
     .await;
 
@@ -912,26 +940,27 @@ async fn smoke_join_load(config: JoinLoadConfig) -> Result<(), String> {
 
 async fn smoke_sprite_load(config: SpriteLoadConfig) -> Result<(), String> {
     let total_start = std::time::Instant::now();
-    let client = reqwest::Client::new();
+    let client = smoke_http_client()?;
     let workers = config.workers;
 
-    // Full account flow: sign in → create character → create workshop.
+    // Reuse a small signed-in account pool so the smoke can stay within the
+    // public signup rate limit while still exercising the create-lobby and
+    // explicit-join flow.
+    let account_pool_size = workers.min(5);
+    let mut account_clients = Vec::with_capacity(account_pool_size);
+    for index in 0..account_pool_size {
+        let name = format!("SpriteWorkerAccount{:02}", index + 1);
+        account_clients.push(sign_in_smoke_client(&config.base_url, &name).await?);
+    }
+
+    // Full account flow: signed-in account → create empty lobby → explicit join.
     let mut sessions: Vec<WorkshopJoinSuccess> = Vec::with_capacity(workers);
     for index in 0..workers {
-        let name = format!("SpriteWorker{:03}", index + 1);
-
-        // 1. Sign in (create-or-login).
-        let cookie = signin_account(&client, &config.base_url, &name).await?;
-
-        // 2. Create a character.
-        let desc = format!("Smoke test dragon {}", index + 1);
-        let character = create_xtask_character(&client, &config.base_url, &cookie, &desc).await?;
-
-        // 3. Create workshop with the character.
-        let host = create_workshop_with_auth(&client, &config.base_url, &cookie, Some(character.id)).await?;
+        let account_client = &account_clients[index % account_clients.len()];
+        let host = create_workshop_on_client(account_client, &config.base_url).await?;
         sessions.push(host);
-        // Pace creation to avoid hitting the per-IP rate limiter.
-        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        // Pace create calls to stay under the public create limiter.
+        tokio::time::sleep(std::time::Duration::from_millis(3_100)).await;
     }
     let setup_ms = total_start.elapsed().as_millis();
 
@@ -1058,7 +1087,7 @@ async fn smoke_sprite_load(config: SpriteLoadConfig) -> Result<(), String> {
 
 async fn smoke_judge_bundle(base_url: String) -> Result<(), String> {
     let smoke_start = std::time::Instant::now();
-    let client = reqwest::Client::new();
+    let client = smoke_http_client()?;
     let mut host = create_workshop(&client, &base_url, "XtaskJudgeHost").await?;
     let mut guest =
         join_workshop(&client, &base_url, &host.session_code, "XtaskJudgeGuest").await?;
@@ -1233,7 +1262,7 @@ async fn smoke_judge_bundle(base_url: String) -> Result<(), String> {
 
 async fn smoke_offline_failover(base_url: String) -> Result<(), String> {
     let smoke_start = std::time::Instant::now();
-    let client = reqwest::Client::new();
+    let client = smoke_http_client()?;
     let host = create_workshop(&client, &base_url, "XtaskFailoverHost").await?;
     let mut guest =
         join_workshop(&client, &base_url, &host.session_code, "XtaskFailoverGuest").await?;
@@ -1308,7 +1337,7 @@ async fn smoke_offline_failover(base_url: String) -> Result<(), String> {
 }
 
 async fn smoke_persistence(config: PersistenceSmokeConfig) -> Result<(), String> {
-    let client = reqwest::Client::new();
+    let client = smoke_http_client()?;
     let host = create_workshop(&client, &config.base_url, "XtaskPersistenceHost").await?;
 
     send_command(
@@ -1357,7 +1386,7 @@ async fn smoke_persistence(config: PersistenceSmokeConfig) -> Result<(), String>
 async fn smoke_persistence_restart(config: PersistenceSmokeConfig) -> Result<(), String> {
     run_tool("cargo", &["build", "-p", "app-server"])?;
 
-    let client = reqwest::Client::new();
+    let client = smoke_http_client()?;
     let smoke_start = std::time::Instant::now();
     let mut server = AppServerProcess::spawn(&config.base_url, &config.database_url)?;
     wait_for_server_ready(&client, &config.base_url, &mut server).await?;
@@ -1483,7 +1512,7 @@ async fn smoke_persistence_restart(config: PersistenceSmokeConfig) -> Result<(),
 }
 
 async fn smoke_restore_reconnect(config: RestoreSmokeConfig) -> Result<(), String> {
-    let client = reqwest::Client::new();
+    let client = smoke_http_client()?;
     let smoke_start = std::time::Instant::now();
     let host = create_workshop(&client, &config.base_url, "XtaskRestoreHost").await?;
     send_command(
@@ -1806,17 +1835,25 @@ async fn assert_health_endpoint(
 async fn create_workshop(
     client: &reqwest::Client,
     base_url: &str,
-    _name: &str,
+    name: &str,
 ) -> Result<WorkshopJoinSuccess, String> {
-    create_workshop_with_auth(client, base_url, "", None).await
+    signin_account(client, base_url, name).await?;
+    create_workshop_on_client(client, base_url).await
 }
 
-/// Sign in (create-or-login) and return the raw `Set-Cookie` header value.
+async fn create_workshop_on_client(
+    client: &reqwest::Client,
+    base_url: &str,
+) -> Result<WorkshopJoinSuccess, String> {
+    let session_code = create_workshop_lobby(client, base_url).await?;
+    join_workshop_authenticated(client, base_url, &session_code).await
+}
+
 async fn signin_account(
     client: &reqwest::Client,
     base_url: &str,
     name: &str,
-) -> Result<String, String> {
+) -> Result<(), String> {
     let response = client
         .post(format!("{base_url}/api/auth/signin"))
         .header("Origin", base_url)
@@ -1838,73 +1875,21 @@ async fn signin_account(
         return Err(format!("signin returned {status}: {body}"));
     }
 
-    // Extract the session cookie from the Set-Cookie header.
-    let cookie = response
-        .headers()
-        .get_all("set-cookie")
-        .iter()
-        .filter_map(|v| v.to_str().ok())
-        .find(|v| v.contains("ds_session="))
-        .ok_or_else(|| "signin response missing ds_session cookie".to_string())?
-        .to_string();
-
-    // Extract just the cookie key=value portion (before the first `;`).
-    let cookie_kv = cookie
-        .split(';')
-        .next()
-        .unwrap_or(&cookie)
-        .to_string();
-
-    Ok(cookie_kv)
+    Ok(())
 }
 
-/// Create a character and return its profile.
-async fn create_xtask_character(
+async fn sign_in_smoke_client(base_url: &str, name: &str) -> Result<reqwest::Client, String> {
+    let client = smoke_http_client()?;
+    signin_account(&client, base_url, name).await?;
+    Ok(client)
+}
+
+async fn create_workshop_lobby(
     client: &reqwest::Client,
     base_url: &str,
-    cookie: &str,
-    description: &str,
-) -> Result<CharacterProfile, String> {
+)-> Result<String, String> {
     let response = client
-        .post(format!("{base_url}/api/characters"))
-        .header("Origin", base_url)
-        .header("Cookie", cookie)
-        .json(&CreateCharacterRequest {
-            description: description.to_string(),
-            sprites: SpriteSet {
-                neutral: String::new(),
-                happy: String::new(),
-                angry: String::new(),
-                sleepy: String::new(),
-            },
-        })
-        .send()
-        .await
-        .map_err(|error| format!("create character failed: {error}"))?;
-
-    let status = response.status().as_u16();
-    if status != 201 {
-        let body = response
-            .text()
-            .await
-            .unwrap_or_else(|_| "<unreadable>".to_string());
-        return Err(format!("create character returned {status}: {body}"));
-    }
-
-    response
-        .json::<CharacterProfile>()
-        .await
-        .map_err(|error| format!("failed to parse character profile: {error}"))
-}
-
-async fn create_workshop_with_auth(
-    client: &reqwest::Client,
-    base_url: &str,
-    cookie: &str,
-    character_id: Option<String>,
-) -> Result<WorkshopJoinSuccess, String> {
-    let mut request = client
-        .post(format!("{base_url}/api/workshops"))
+        .post(format!("{base_url}/api/workshops/lobby"))
         .header("Origin", base_url)
         .json(&CreateWorkshopRequest {
             name: None,
@@ -1913,18 +1898,30 @@ async fn create_workshop_with_auth(
                 phase1_minutes: 10,
                 phase2_minutes: 10,
             }),
-            character_id,
-        });
-    if !cookie.is_empty() {
-        request = request.header("Cookie", cookie);
-    }
-
-    let response = request
+            character_id: None,
+        })
         .send()
         .await
-        .map_err(|error| format!("failed to reach backend: {error}"))?;
+        .map_err(|error| format!("create workshop lobby failed: {error}"))?;
 
-    parse_join_response(response).await
+    let status = response.status().as_u16();
+    if status != 201 {
+        let body = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "<unreadable>".to_string());
+        return Err(format!("create workshop lobby returned {status}: {body}"));
+    }
+
+    let payload = response
+        .json::<protocol::WorkshopCreateResult>()
+        .await
+        .map_err(|error| format!("failed to parse create workshop response: {error}"))?;
+
+    match payload {
+        protocol::WorkshopCreateResult::Success(success) => Ok(success.session_code),
+        protocol::WorkshopCreateResult::Error(error) => Err(error.error),
+    }
 }
 
 async fn attach_ws_session(
@@ -1981,12 +1978,21 @@ async fn join_workshop(
     session_code: &str,
     name: &str,
 ) -> Result<WorkshopJoinSuccess, String> {
+    signin_account(client, base_url, name).await?;
+    join_workshop_authenticated(client, base_url, session_code).await
+}
+
+async fn join_workshop_authenticated(
+    client: &reqwest::Client,
+    base_url: &str,
+    session_code: &str,
+) -> Result<WorkshopJoinSuccess, String> {
     let response = client
         .post(format!("{base_url}/api/workshops/join"))
         .header("Origin", base_url)
         .json(&JoinWorkshopRequest {
             session_code: session_code.to_string(),
-            name: Some(name.to_string()),
+            name: None,
             character_id: None,
             reconnect_token: None,
         })
@@ -2082,6 +2088,13 @@ async fn parse_join_response(response: reqwest::Response) -> Result<WorkshopJoin
     }
 }
 
+fn smoke_http_client() -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .cookie_store(true)
+        .build()
+        .map_err(|error| format!("failed to build smoke HTTP client: {error}"))
+}
+
 fn print_help() {
     println!(
         "xtask commands:
@@ -2094,7 +2107,7 @@ fn print_help() {
   cargo xtask build-web -- [--out-dir app-web/dist]
   cargo xtask server -- [app-server args]
   cargo xtask smoke-phase1 -- [--base-url http://127.0.0.1:4100]
-  cargo xtask smoke-join-load -- [--base-url http://127.0.0.1:4100] [--clients 30]
+  cargo xtask smoke-join-load -- [--base-url http://127.0.0.1:4100] [--clients 4]
   cargo xtask smoke-sprite-load -- [--base-url http://127.0.0.1:4100] [--workers 40]
   cargo xtask smoke-judge-bundle -- [--base-url http://127.0.0.1:4100]
   cargo xtask smoke-offline-failover -- [--base-url http://127.0.0.1:4100]
@@ -2142,10 +2155,10 @@ mod tests {
     }
 
     #[test]
-    fn join_load_config_defaults_to_thirty_clients() {
+    fn join_load_config_defaults_to_four_clients() {
         let config = join_load_config(&[]).expect("join load config");
         assert_eq!(config.base_url, "http://127.0.0.1:4100");
-        assert_eq!(config.clients, 30);
+        assert_eq!(config.clients, 4);
     }
 
     #[test]

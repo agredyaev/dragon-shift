@@ -14,7 +14,7 @@ What it does:
 - builds `dragon-shift-rust:kind-local`
 - loads the image into `kind-dragon-shift-local`
 - upgrades the Helm release in namespace `dragon-shift`
-- restarts the deployment and refreshes the `http://127.0.0.1:4100` port-forward
+- restarts the deployment and verifies the `http://127.0.0.1:4100` `kind` host-port mapping
 
 ## Local Checks
 

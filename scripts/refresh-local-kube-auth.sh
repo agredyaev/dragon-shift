@@ -13,8 +13,6 @@ RELEASE_NAME="dragon-shift"
 IMAGE_NAME="dragon-shift-rust:kind-local"
 ADC_SECRET_NAME="dragon-shift-gcp-adc"
 SESSION_COOKIE_SECRET_NAME="dragon-shift-session-cookie-key"
-PORT_FORWARD_LOG="/tmp/dragon-shift-k8s-port-4100.log"
-
 need_cmd() {
   if ! command -v "$1" >/dev/null 2>&1; then
     printf 'Missing required command: %s\n' "$1" >&2
@@ -75,14 +73,14 @@ printf 'Restarting deployment...\n'
 kubectl --context "$KUBE_CONTEXT" -n "$NAMESPACE" rollout restart deploy/dragon-shift-dragon-shift
 kubectl --context "$KUBE_CONTEXT" -n "$NAMESPACE" rollout status deploy/dragon-shift-dragon-shift --timeout=300s
 
-printf 'Refreshing local port-forward on 4100...\n'
-if lsof -tiTCP:4100 -sTCP:LISTEN >/dev/null 2>&1; then
-  lsof -tiTCP:4100 -sTCP:LISTEN | xargs kill >/dev/null 2>&1 || true
-  sleep 1
-fi
-nohup kubectl --context "$KUBE_CONTEXT" -n "$NAMESPACE" port-forward svc/dragon-shift-dragon-shift 4100:3000 >"$PORT_FORWARD_LOG" 2>&1 &
-sleep 2
+printf 'Verifying live endpoint on kind host port 4100...\n'
+for _ in 1 2 3 4 5; do
+  if curl -fsS "http://127.0.0.1:4100/api/live"; then
+    printf '\nDone. Local app is available at http://127.0.0.1:4100\n'
+    exit 0
+  fi
+  sleep 2
+done
 
-printf 'Verifying live endpoint...\n'
-curl -fsS "http://127.0.0.1:4100/api/live"
-printf '\nDone. Local app is available at http://127.0.0.1:4100\n'
+printf 'Live endpoint did not become ready at http://127.0.0.1:4100/api/live\n' >&2
+exit 1
