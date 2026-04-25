@@ -1,4 +1,4 @@
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, SecondsFormat, Utc};
 use domain::WorkshopSession;
 use protocol::{CharacterProfile, OpenWorkshopCursor, SessionArtifactRecord, SpriteSet};
 use std::collections::HashMap;
@@ -385,8 +385,10 @@ fn is_older_open_workshop_cursor(
     session_code: &str,
     cursor: &OpenWorkshopCursor,
 ) -> bool {
-    created_at < cursor.created_at.as_str()
-        || (created_at == cursor.created_at.as_str() && session_code > cursor.session_code.as_str())
+    let created_at = normalize_open_workshop_cursor_created_at(created_at);
+    let cursor_created_at = normalize_open_workshop_cursor_created_at(&cursor.created_at);
+    created_at < cursor_created_at
+        || (created_at == cursor_created_at && session_code > cursor.session_code.as_str())
 }
 
 fn is_newer_open_workshop_cursor(
@@ -394,8 +396,20 @@ fn is_newer_open_workshop_cursor(
     session_code: &str,
     cursor: &OpenWorkshopCursor,
 ) -> bool {
-    created_at > cursor.created_at.as_str()
-        || (created_at == cursor.created_at.as_str() && session_code < cursor.session_code.as_str())
+    let created_at = normalize_open_workshop_cursor_created_at(created_at);
+    let cursor_created_at = normalize_open_workshop_cursor_created_at(&cursor.created_at);
+    created_at > cursor_created_at
+        || (created_at == cursor_created_at && session_code < cursor.session_code.as_str())
+}
+
+fn normalize_open_workshop_cursor_created_at(created_at: &str) -> String {
+    DateTime::parse_from_rfc3339(created_at)
+        .map(|parsed| {
+            parsed
+                .with_timezone(&Utc)
+                .to_rfc3339_opts(SecondsFormat::AutoSi, true)
+        })
+        .unwrap_or_else(|_| created_at.to_string())
 }
 
 pub trait SessionStore: Send + Sync {
@@ -2070,9 +2084,10 @@ impl SessionStore for PostgresSessionStore {
     {
         Box::pin(async move {
             // Ordering: DESC by `payload->>'created_at'` with `session_code`
-            // ASC as tie-breaker. `created_at` is RFC3339 UTC (all writers go
-            // through `to_rfc3339`), so TEXT lex-compare gives the correct
-            // chronological order without a schema migration. `player_count`
+            // ASC as tie-breaker. Stored payload timestamps are canonical
+            // RFC3339 UTC strings; normalize cursor timestamps to the same
+            // representation before doing TEXT keyset compares so equivalent
+            // `Z` / `+00:00` forms do not shift page boundaries. `player_count`
             // and `host_name` are still derived from the JSON payload because
             // the lobby set is expected to be small; this query is cold
             // relative to the command-handler hot paths.
@@ -2104,6 +2119,8 @@ impl SessionStore for PostgresSessionStore {
                     (rows, false)
                 }
                 OpenWorkshopsPaging::After(cursor) => {
+                    let cursor_created_at =
+                        normalize_open_workshop_cursor_created_at(&cursor.created_at);
                     // Strictly older than the DESC/ASC sort key:
                     // `(created_at DESC, session_code ASC)`.
                     let rows = sqlx::query(
@@ -2119,7 +2136,7 @@ impl SessionStore for PostgresSessionStore {
                             LIMIT $3
                         ",
                     )
-                    .bind(&cursor.created_at)
+                    .bind(&cursor_created_at)
                     .bind(&cursor.session_code)
                     .bind(fetch_limit)
                     .fetch_all(&self.pool)
@@ -2127,6 +2144,8 @@ impl SessionStore for PostgresSessionStore {
                     (rows, false)
                 }
                 OpenWorkshopsPaging::Before(cursor) => {
+                    let cursor_created_at =
+                        normalize_open_workshop_cursor_created_at(&cursor.created_at);
                     // Strictly newer than the DESC/ASC sort key. We
                     // query in the opposite order to grab the rows closest
                     // to the cursor, then reverse so the final page is in
@@ -2144,7 +2163,7 @@ impl SessionStore for PostgresSessionStore {
                             LIMIT $3
                         ",
                     )
-                    .bind(&cursor.created_at)
+                    .bind(&cursor_created_at)
                     .bind(&cursor.session_code)
                     .bind(fetch_limit)
                     .fetch_all(&self.pool)

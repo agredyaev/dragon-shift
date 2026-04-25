@@ -294,7 +294,7 @@ mod postgres_tests {
                 .await
                 .expect("read applied migrations");
 
-        assert_eq!(versions, vec![(1,), (2,), (3,), (4,), (5,), (6,)]);
+        assert_eq!(versions, vec![(1,), (2,), (3,), (4,), (5,), (6,), (7,)]);
         store.cleanup().await;
     }
 
