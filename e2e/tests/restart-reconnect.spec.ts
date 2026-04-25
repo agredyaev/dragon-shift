@@ -4,13 +4,11 @@ import { expect, test, type APIRequestContext } from '@playwright/test'
 
 import {
   cloneSignedInSession,
-  createCharacter,
   createWorkshopAndJoinAsHost,
   joinWorkshop,
   newPlayerContext,
   readSessionSnapshot,
   saveHandoverTags,
-  signInAccount,
   voteForVisibleDragon,
   waitForNotice,
 } from './gameplay-helpers'
@@ -83,11 +81,6 @@ test.describe('browser restart reconnect proof', () => {
     const reconnect = await newPlayerContext(browser)
 
     try {
-      await signInAccount(host.page, 'Alice')
-      await createCharacter(host.page, 'A lantern-scaled dragon with ember whiskers.')
-      await signInAccount(guest.page, 'Bob')
-      await createCharacter(guest.page, 'A mint dragon with ribbon fins and calm eyes.')
-
       const workshopCode = await createWorkshopAndJoinAsHost(host.page, 'Alice')
       await joinWorkshop(guest.page, workshopCode, 'Bob')
 
