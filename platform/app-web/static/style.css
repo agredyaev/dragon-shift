@@ -184,6 +184,9 @@
     .shell__container--card {
         width: min(var(--container-max-card), calc(100% - 2rem));
     }
+    .shell__container--pick-character {
+        width: min(100%, 60rem);
+    }
     .shell__container--phase0 > .notice,
     .shell__container--handover > .notice {
         max-width: 640px;
@@ -414,6 +417,16 @@
         gap: 12px;
         flex-wrap: wrap;
     }
+    .button-row--session-controls {
+        align-items: center;
+        flex-wrap: nowrap;
+        overflow-x: auto;
+        padding-bottom: 4px;
+    }
+    .button-row--session-controls .button {
+        flex: 0 0 auto;
+        white-space: nowrap;
+    }
     .button-row--home-action .button {
         flex: 1 1 0;
         min-width: 0;
@@ -540,6 +553,13 @@
     }
     .roster--modal {
         max-height: 52vh;
+        overflow: auto;
+        padding-right: 6px;
+        overscroll-behavior: contain;
+        contain: layout paint;
+    }
+    .roster--pick-character {
+        max-height: min(52vh, 34rem);
         overflow: auto;
         padding-right: 6px;
         overscroll-behavior: contain;
@@ -1160,8 +1180,15 @@
         .button-row {
             flex-direction: column;
         }
+        .button-row--session-controls {
+            flex-direction: row;
+            flex-wrap: nowrap;
+        }
         .button:not(.button--cta) {
             width: 100%;
+        }
+        .button-row--session-controls .button:not(.button--cta) {
+            width: auto;
         }
         .roster__item {
             flex-direction: column;
@@ -1285,13 +1312,14 @@
 
     /* ---- Clock HUD (Phase 1 + Phase 2) ---- */
     .clock-hud {
-        position: fixed;
-        top: 24px;
-        right: 24px;
+        position: sticky;
+        top: calc(var(--appbar-height-desktop) + 12px);
         z-index: 3;
         display: flex;
         align-items: center;
         gap: 12px;
+        width: max-content;
+        margin: 0 0 16px auto;
         background: rgba(15, 23, 42, 0.92);
         border: 4px solid #0f172a;
         padding: 10px 18px;
@@ -1307,10 +1335,10 @@
     }
     @media (max-width: 720px) {
         .clock-hud {
-            top: 8px;
-            right: 8px;
+            top: calc(var(--appbar-height-mobile) + 8px);
             padding: 6px 12px;
             gap: 8px;
+            margin-bottom: 12px;
         }
         .clock-hud__time {
             font-size: 18px;

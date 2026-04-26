@@ -1,7 +1,7 @@
 use dioxus::prelude::*;
 use protocol::{ClientGameState, JudgeBundle, SessionCommand};
 
-use crate::flows::{leave_workshop, start_workshop_command};
+use crate::flows::{leave_workshop, start_judge_bundle_request, start_workshop_command};
 use crate::helpers::*;
 use crate::state::{ConnectionStatus, IdentityState, OperationState};
 
@@ -47,6 +47,17 @@ pub fn EndView(
     let commands_disabled = {
         let o = ops.read();
         o.pending_flow.is_some() || o.pending_command.is_some() || o.pending_judge_bundle
+    };
+    let scores_ready = !score_rows.is_empty();
+    let archive_built = judge_bundle.read().is_some();
+    let archive_disabled = commands_disabled
+        || archive_built
+        || !scores_ready
+        || (is_voting_screen && !results_revealed);
+    let archive_label = if archive_built {
+        "Archive ready"
+    } else {
+        "Archive workshop"
     };
     let connection_status = identity.read().connection_status;
     let connection_label = match connection_status {
@@ -167,8 +178,8 @@ pub fn EndView(
             }
             span { class: "roster__status roster__status--phase status-connected", {header_status} }
         }
-        if is_voting_screen {
-            div { class: "button-row",
+        if is_voting_screen || is_host {
+            div { class: "button-row button-row--session-controls",
                 if !results_revealed {
                     button {
                         class: if active_tab_key == "vote" { "button button--primary" } else { "button button--secondary" },
@@ -189,6 +200,53 @@ pub fn EndView(
                         disabled: commands_disabled,
                         onclick: move |_| active_tab.set("design".to_string()),
                         "Design results"
+                    }
+                }
+                if is_host {
+                    if is_voting_screen && !results_revealed {
+                        button {
+                            class: "button button--primary",
+                            "data-testid": "reveal-results-button",
+                            disabled: commands_disabled || !reveal_enabled,
+                            onclick: move |_| {
+                                if start_workshop_command(identity, ops, handover_tags_input, judge_bundle, SessionCommand::RevealVotingResults, None) {
+                                    active_tab.set("design".to_string());
+                                }
+                            },
+                            "Finish voting"
+                        }
+                    }
+                    if is_voting_screen {
+                        button {
+                            class: "button button--danger",
+                            "data-testid": "end-session-button",
+                            disabled: commands_disabled || !results_revealed,
+                            onclick: move |_| {
+                                let _ = start_workshop_command(identity, ops, handover_tags_input, judge_bundle, SessionCommand::EndSession, None);
+                            },
+                            "End game"
+                        }
+                    }
+                    if is_voting_screen || is_end_screen {
+                        button {
+                            class: if archive_built { "button button--primary" } else { "button button--secondary" },
+                            "data-testid": "archive-workshop-button",
+                            disabled: archive_disabled,
+                            onclick: move |_| {
+                                let _ = start_judge_bundle_request(identity, game_state, ops, judge_bundle);
+                            },
+                            {archive_label}
+                        }
+                    }
+                    if is_end_screen {
+                        button {
+                            class: "button button--secondary",
+                            "data-testid": "leave-workshop-button",
+                            onclick: move |_| {
+                                leave_workshop(identity, ops);
+                            },
+                            "Leave workshop"
+                        }
                     }
                 }
             }
@@ -329,58 +387,12 @@ pub fn EndView(
                 }
             }
         }
-        // ---- Host controls ----
-        if is_host {
-            div { class: "button-row",
-                if is_voting_screen && !results_revealed {
-                    button {
-                        class: "button button--primary",
-                        "data-testid": "reveal-results-button",
-                        disabled: commands_disabled || !reveal_enabled,
-                        onclick: move |_| {
-                            if start_workshop_command(identity, ops, handover_tags_input, judge_bundle, SessionCommand::RevealVotingResults, None) {
-                                active_tab.set("design".to_string());
-                            }
-                        },
-                        "Finish voting"
-                    }
-                }
-                if is_voting_screen {
-                    button {
-                        class: "button button--danger",
-                        "data-testid": "end-session-button",
-                        disabled: commands_disabled || !results_revealed,
-                        onclick: move |_| {
-                            let _ = start_workshop_command(identity, ops, handover_tags_input, judge_bundle, SessionCommand::EndSession, None);
-                        },
-                        "End game"
-                    }
-                }
-                button {
-                    class: "button button--secondary",
-                        "data-testid": "reset-game-button",
-                        disabled: commands_disabled,
-                        onclick: move |_| {
-                            let _ = start_workshop_command(identity, ops, handover_tags_input, judge_bundle, SessionCommand::ResetGame, None);
-                        },
-                    "Reset workshop"
-                }
-                if is_end_screen {
-                    button {
-                        class: "button button--secondary",
-                        "data-testid": "leave-workshop-button",
-                        onclick: move |_| {
-                            leave_workshop(identity, ops);
-                        },
-                        "Leave workshop"
-                    }
-                }
-            }
-        } else {
+        // ---- Participant waiting / leave controls ----
+        if !is_host {
             p {
                 class: "meta",
                 if is_end_screen {
-                    "Waiting for the host to reset or archive this workshop."
+                    "Waiting for the host to archive this workshop."
                 } else if results_revealed {
                     "Waiting for the host to open the final game over screen."
                 } else {
@@ -400,8 +412,8 @@ pub fn EndView(
                 }
             }
         }
-        // ---- Workshop archive (End phase only) ----
-        if is_end_screen {
+        // ---- Workshop archive ----
+        if is_end_screen || archive_built {
             ArchivePanel { game_state, judge_bundle }
         }
         }

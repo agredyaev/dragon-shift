@@ -67,10 +67,11 @@ test.describe('dragon shift deployed gameplay', () => {
       await expect(host.page.getByTestId('archive-panel')).toContainText('Build the workshop archive')
       await expect(guest.page.getByTestId('archive-panel')).toContainText('Build the workshop archive')
 
-      await host.page.getByTestId('reset-game-button').click()
-      await waitForNotice(host.page, 'Workshop reset.')
-      await expect(host.page.getByTestId('session-panel')).toContainText(lobbyTitlePattern)
-      await expect(guest.page.getByTestId('session-panel')).toContainText(lobbyTitlePattern)
+      await host.page.getByTestId('archive-workshop-button').click()
+      await waitForNotice(host.page, 'Workshop archive ready.')
+      await expect(host.page.getByTestId('archive-panel')).toContainText('Captured final standings')
+      await expect(host.page.getByTestId('session-panel')).toContainText('Game over')
+      await expect(guest.page.getByTestId('session-panel')).toContainText('Game over')
     } finally {
       await safeClose(host.context, guest.context)
     }

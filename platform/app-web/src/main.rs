@@ -98,9 +98,10 @@ fn App() -> Element {
         pre_session_screen.as_ref(),
         Some(ShellScreen::CreateCharacter)
     );
-    let is_centered_card_screen = matches!(
+    let is_centered_card_screen = matches!(pre_session_screen.as_ref(), Some(ShellScreen::SignIn));
+    let is_pick_character_screen = matches!(
         pre_session_screen.as_ref(),
-        Some(ShellScreen::SignIn) | Some(ShellScreen::PickCharacter { .. })
+        Some(ShellScreen::PickCharacter { .. })
     );
 
     // ---- Container class ----
@@ -114,6 +115,8 @@ fn App() -> Element {
         "shell__container shell__container--end"
     } else if is_create_character_screen {
         "shell__container shell__container--phase0"
+    } else if is_pick_character_screen {
+        "shell__container shell__container--pick-character"
     } else if is_centered_card_screen {
         "shell__container shell__container--card"
     } else {

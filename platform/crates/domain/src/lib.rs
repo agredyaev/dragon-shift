@@ -1455,6 +1455,7 @@ mod tests {
             character_id: Some(format!("character-{id}")),
             selected_character: Some(CharacterProfile {
                 id: format!("character-{id}"),
+                name: None,
                 description: format!("test character for player-{id}"),
                 sprites: SpriteSet {
                     neutral: "neutral".to_string(),
@@ -1577,6 +1578,7 @@ mod tests {
         let mut p1 = player("p1", true, 10);
         p1.selected_character = Some(CharacterProfile {
             id: "character-p1".into(),
+            name: None,
             description: "Curious cave dragon".into(),
             sprites: SpriteSet {
                 neutral: "neutral".into(),
@@ -1698,6 +1700,7 @@ mod tests {
                 "p1",
                 CharacterProfile {
                     id: "character-1".into(),
+                    name: None,
                     description: "Crystal dragon".into(),
                     sprites: SpriteSet {
                         neutral: "neutral_b64".into(),
@@ -1786,6 +1789,7 @@ mod tests {
             player.character_id = Some("character-1".into());
             player.selected_character = Some(CharacterProfile {
                 id: "character-1".into(),
+                name: None,
                 description: "Cool dragon".into(),
                 sprites: SpriteSet {
                     neutral: "neutral".into(),

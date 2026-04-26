@@ -3,7 +3,7 @@
 use dioxus::prelude::*;
 use protocol::{
     AuthRequest, ClientGameState, JoinWorkshopRequest, JudgeBundle, ListOpenWorkshopsResponse,
-    OpenWorkshopCursor, SessionCommand, SpriteSet, UpdateCharacterRequest,
+    OpenWorkshopCursor, Phase, SessionCommand, SpriteSet, UpdateCharacterRequest,
 };
 
 use crate::api::{AppWebApi, build_command_request, build_judge_bundle_request};
@@ -357,7 +357,7 @@ pub async fn submit_judge_bundle_request(
 
 async fn submit_judge_bundle_request_reserved(
     mut identity: Signal<IdentityState>,
-    _game_state: Signal<Option<ClientGameState>>,
+    game_state: Signal<Option<ClientGameState>>,
     mut ops: Signal<OperationState>,
     mut judge_bundle: Signal<Option<JudgeBundle>>,
     ticket: PendingJudgeBundleTicket,
@@ -382,6 +382,64 @@ async fn submit_judge_bundle_request_reserved(
     };
 
     let api = AppWebApi::new(base_url);
+    let should_finalize_voting = {
+        let gs = game_state.read();
+        match gs.as_ref().map(|state| state.phase) {
+            Some(Phase::Voting) => {
+                let results_revealed = gs
+                    .as_ref()
+                    .and_then(|state| state.voting.as_ref())
+                    .is_some_and(|voting| voting.results_revealed);
+                if !results_revealed {
+                    ops.with_mut(|o| {
+                        if !pending_judge_bundle_ticket_is_current(o, &ticket) {
+                            return;
+                        }
+                        clear_pending_judge_bundle_if_current(o, &ticket);
+                        o.notice = Some(scoped_notice(
+                            NoticeScope::Session,
+                            error_notice("Finish voting before archiving the workshop."),
+                        ));
+                    });
+                    return;
+                }
+                true
+            }
+            _ => false,
+        }
+    };
+
+    if should_finalize_voting {
+        match api
+            .send_command(build_command_request(
+                &snapshot,
+                SessionCommand::EndSession,
+                None,
+            ))
+            .await
+        {
+            Ok(()) => {}
+            Err(error) => {
+                if identity.read().session_snapshot.as_ref() != Some(&snapshot) {
+                    ops.with_mut(|o| clear_pending_judge_bundle_if_current(o, &ticket));
+                    return;
+                }
+                if !pending_judge_bundle_ticket_is_current(&ops.read(), &ticket) {
+                    return;
+                }
+                identity.with_mut(|id| {
+                    ops.with_mut(|o| {
+                        if !pending_judge_bundle_ticket_is_current(o, &ticket) {
+                            return;
+                        }
+                        apply_judge_bundle_error(id, o, error);
+                    });
+                });
+                return;
+            }
+        }
+    }
+
     match api
         .fetch_judge_bundle(build_judge_bundle_request(&snapshot))
         .await
@@ -1788,6 +1846,53 @@ mod tests {
         (format!("http://{address}"), handle)
     }
 
+    fn spawn_archive_from_voting_server() -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind archive test server");
+        let address = listener
+            .local_addr()
+            .expect("read archive test server address");
+
+        let handle = thread::spawn(move || {
+            let (mut end_stream, _) = listener.accept().expect("accept end session request");
+            let end_request = read_http_request(&mut end_stream);
+            assert!(
+                end_request.starts_with("POST /api/workshops/command HTTP/1.1"),
+                "unexpected end request: {end_request}"
+            );
+            assert!(
+                end_request.contains(r#""command":"endSession""#),
+                "expected endSession command: {end_request}"
+            );
+            let command_body = serde_json::to_string(&protocol::WorkshopCommandResult::Success(
+                protocol::WorkshopCommandSuccess { ok: true },
+            ))
+            .expect("encode command response");
+            end_stream
+                .write_all(json_response(&command_body).as_bytes())
+                .expect("write end session response");
+
+            let (mut archive_stream, _) = listener.accept().expect("accept archive request");
+            let archive_request = read_http_request(&mut archive_stream);
+            assert!(
+                archive_request.starts_with("POST /api/workshops/judge-bundle HTTP/1.1"),
+                "unexpected archive request: {archive_request}"
+            );
+            let archive_body =
+                serde_json::to_string(&protocol::WorkshopJudgeBundleResult::Success(
+                    protocol::WorkshopJudgeBundleSuccess {
+                        ok: true,
+                        bundle: crate::helpers::tests::mock_judge_bundle(),
+                    },
+                ))
+                .expect("encode archive response");
+            archive_stream
+                .write_all(json_response(&archive_body).as_bytes())
+                .expect("write archive response");
+        });
+
+        (format!("http://{address}"), handle)
+    }
+
     #[test]
     fn reconnect_success_bootstraps_realtime() {
         let (base_url, server) = spawn_join_success_server(mock_join_success());
@@ -1898,6 +2003,61 @@ mod tests {
             assert_eq!(*current_paging.read(), OpenWorkshopsPaging::First);
             assert_eq!(identity.read().screen, ShellScreen::AccountHome);
             assert_eq!(identity.read().connection_status, ConnectionStatus::Offline);
+        });
+    }
+
+    #[test]
+    fn judge_bundle_request_finalizes_voting_before_archiving() {
+        let (base_url, server) = spawn_archive_from_voting_server();
+
+        let mut dom = VirtualDom::new(|| rsx! { div {} });
+        dom.rebuild_in_place();
+
+        dom.in_scope(ScopeId::ROOT, || {
+            let runtime = tokio::runtime::Runtime::new().expect("create tokio runtime");
+
+            let mut initial_identity = default_identity_state();
+            initial_identity.api_base_url = base_url;
+            initial_identity.session_snapshot = Some(protocol::ClientSessionSnapshot {
+                session_code: "123456".to_string(),
+                reconnect_token: "reconnect-1".to_string(),
+                player_id: "player-1".to_string(),
+                coordinator_type: CoordinatorType::Rust,
+            });
+
+            let mut state = mock_join_success().state;
+            state.phase = Phase::Voting;
+            state.voting = Some(protocol::ClientVotingState {
+                eligible_count: 2,
+                submitted_count: 2,
+                current_player_vote_dragon_id: Some("dragon-2".to_string()),
+                results_revealed: true,
+                results: None,
+            });
+
+            let identity = Signal::new(initial_identity);
+            let game_state = Signal::new(Some(state));
+            let ops = Signal::new(default_operation_state());
+            let judge_bundle = Signal::new(None);
+
+            runtime.block_on(submit_judge_bundle_request(
+                identity,
+                game_state,
+                ops,
+                judge_bundle,
+            ));
+
+            server.join().expect("join archive server thread");
+
+            assert!(!ops.read().pending_judge_bundle);
+            assert!(judge_bundle.read().is_some());
+            assert_eq!(
+                ops.read()
+                    .notice
+                    .as_ref()
+                    .map(|notice| notice.message.as_str()),
+                Some("Workshop archive ready.")
+            );
         });
     }
 

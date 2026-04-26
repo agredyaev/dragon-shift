@@ -91,7 +91,7 @@ pub fn PickCharacterView(
                 } else if characters.is_empty() {
                     p { class: "meta", role: "status", "aria-live": "polite", "aria-atomic": "true", "Loading dragons..." }
                 } else {
-                    div { class: "roster",
+                    div { class: "roster roster--pick-character",
                         for (character_index, character) in characters.iter().enumerate() {
                             {
                                 let char_id = character.id.clone();

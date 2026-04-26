@@ -293,20 +293,20 @@ test.describe.serial('e2e evolution scenario', () => {
           page: host.page,
         })
 
-        await host.page.getByTestId('reset-game-button').click()
-        await waitForNotice(host.page, 'Workshop reset.')
-        await expect(host.page.getByTestId('session-panel')).toContainText('Workshop Lobby')
+        await host.page.getByTestId('archive-workshop-button').click()
+        await waitForNotice(host.page, 'Workshop archive ready.')
+        await expect(host.page.getByTestId('archive-panel')).toContainText('Workshop archive')
         logStep({
           role: 'Host',
           iteration,
           step: '11',
-          action: 'Reset workshop back to lobby',
-          expected: 'Workshop returns to lobby',
-          actual: 'Workshop Lobby visible again',
+          action: 'Archive workshop final snapshot',
+          expected: 'Workshop archive captures the final standings',
+          actual: 'Workshop archive is ready on the final screen',
           status: 'pass',
           kind: 'ok',
           workshopCode,
-          phase: 'Lobby',
+          phase: 'End',
           playerCount: '5',
           page: host.page,
         })
