@@ -200,7 +200,7 @@ variable "database_url_secret_id" {
 }
 
 variable "session_cookie_key_secret_id" {
-  description = "Secret Manager secret ID that stores the runtime SESSION_COOKIE_KEY (base64-encoded, >=64 decoded bytes). Generate once per environment with `openssl rand -base64 64` and store under the latest version of this secret before the first production apply."
+  description = "Secret Manager secret ID that stores the runtime SESSION_COOKIE_KEY (base64-encoded, >=64 decoded bytes). The foundation stack ensures this secret exists and seeds its first enabled version before platform apply."
   type        = string
   default     = "dragon-shift-production-session-cookie-key"
 }

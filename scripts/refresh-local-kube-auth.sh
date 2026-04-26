@@ -5,6 +5,9 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 PLATFORM_DIR="$ROOT_DIR/platform"
 ADC_FILE="${HOME}/.config/gcloud/application_default_credentials.json"
+GCP_PROJECT_ID="${GCP_PROJECT_ID:-rna-workshop2}"
+LOCAL_GCP_SERVICE_ACCOUNT_ID="${LOCAL_GCP_SERVICE_ACCOUNT_ID:-dragon-shift-local-kube}"
+LOCAL_GCP_SERVICE_ACCOUNT_EMAIL="${LOCAL_GCP_SERVICE_ACCOUNT_EMAIL:-${LOCAL_GCP_SERVICE_ACCOUNT_ID}@${GCP_PROJECT_ID}.iam.gserviceaccount.com}"
 
 KIND_CLUSTER_NAME="dragon-shift-local"
 KUBE_CONTEXT="kind-dragon-shift-local"
@@ -37,6 +40,7 @@ need_cmd() {
 
 need_cmd cargo
 need_cmd docker
+need_cmd gcloud
 need_cmd kind
 need_cmd kubectl
 need_cmd helm
@@ -50,6 +54,49 @@ fi
 if [ ! -f "$ADC_FILE" ]; then
   printf 'ADC file not found: %s\n' "$ADC_FILE" >&2
   printf 'Run: gcloud auth application-default login\n' >&2
+  exit 1
+fi
+
+GCLOUD_ACCOUNT="$(gcloud config get-value account 2>/dev/null || true)"
+if [ -z "$GCLOUD_ACCOUNT" ] || [ "$GCLOUD_ACCOUNT" = "(unset)" ]; then
+  printf 'No active gcloud account found. Run: gcloud auth login\n' >&2
+  exit 1
+fi
+
+printf 'Ensuring local GCP service account %s exists...\n' "$LOCAL_GCP_SERVICE_ACCOUNT_EMAIL"
+if ! gcloud iam service-accounts describe "$LOCAL_GCP_SERVICE_ACCOUNT_EMAIL" \
+  --project "$GCP_PROJECT_ID" >/dev/null 2>&1; then
+  gcloud iam service-accounts create "$LOCAL_GCP_SERVICE_ACCOUNT_ID" \
+    --project "$GCP_PROJECT_ID" \
+    --display-name "Dragon Shift local kind" >/dev/null
+fi
+
+printf 'Ensuring local service account can call Vertex AI...\n'
+gcloud projects add-iam-policy-binding "$GCP_PROJECT_ID" \
+  --member="serviceAccount:${LOCAL_GCP_SERVICE_ACCOUNT_EMAIL}" \
+  --role="roles/aiplatform.user" \
+  --quiet >/dev/null
+
+printf 'Ensuring %s can impersonate the local service account...\n' "$GCLOUD_ACCOUNT"
+gcloud iam service-accounts add-iam-policy-binding "$LOCAL_GCP_SERVICE_ACCOUNT_EMAIL" \
+  --project "$GCP_PROJECT_ID" \
+  --member="user:${GCLOUD_ACCOUNT}" \
+  --role="roles/iam.serviceAccountTokenCreator" \
+  --quiet >/dev/null
+
+printf 'Verifying local service account impersonation...\n'
+for _ in 1 2 3 4 5 6; do
+  if gcloud auth print-access-token \
+    --impersonate-service-account="$LOCAL_GCP_SERVICE_ACCOUNT_EMAIL" \
+    --quiet >/dev/null 2>&1; then
+    break
+  fi
+  sleep 5
+done
+if ! gcloud auth print-access-token \
+  --impersonate-service-account="$LOCAL_GCP_SERVICE_ACCOUNT_EMAIL" \
+  --quiet >/dev/null; then
+  printf 'Failed to impersonate %s after granting roles. Check IAM propagation and your gcloud account.\n' "$LOCAL_GCP_SERVICE_ACCOUNT_EMAIL" >&2
   exit 1
 fi
 
@@ -89,7 +136,10 @@ helm upgrade --install "$RELEASE_NAME" "$ROOT_DIR/helm/dragon-shift" \
   --namespace "$NAMESPACE" \
   --create-namespace \
   --reset-values \
-  -f "$ROOT_DIR/helm/dragon-shift/values.kind-local.yaml"
+  -f "$ROOT_DIR/helm/dragon-shift/values.kind-local.yaml" \
+  --set "app.googleCloudProject=${GCP_PROJECT_ID}" \
+  --set "app.extraEnv[0].name=GOOGLE_IMPERSONATE_SERVICE_ACCOUNT" \
+  --set "app.extraEnv[0].value=${LOCAL_GCP_SERVICE_ACCOUNT_EMAIL}"
 
 printf 'Restarting deployment...\n'
 kubectl --context "$KUBE_CONTEXT" -n "$NAMESPACE" rollout restart deploy/dragon-shift-dragon-shift
