@@ -24,10 +24,10 @@ use protocol::{
     SPRITE_ATELIER_FALLBACK_NOTICE_MESSAGE, SPRITE_ATELIER_NOTICE_TITLE,
     SPRITE_ATELIER_QUEUED_NOTICE_MESSAGE, SelectCharacterRequest, SessionArtifactKind,
     SessionArtifactRecord, SessionCommand, SessionNoticeCode, SpriteSheetRequest,
-    SpriteSheetResult, SpriteSheetSuccess, VotePayload, WorkshopCommandRequest,
-    WorkshopCommandResult, WorkshopCommandSuccess, WorkshopCreateResult, WorkshopCreateSuccess,
-    WorkshopError, WorkshopJoinResult, WorkshopJoinSuccess, WorkshopJudgeBundleRequest,
-    WorkshopJudgeBundleResult, WorkshopJudgeBundleSuccess,
+    SpriteSheetResult, SpriteSheetSuccess, UpdateCharacterRequest, VotePayload,
+    WorkshopCommandRequest, WorkshopCommandResult, WorkshopCommandSuccess, WorkshopCreateResult,
+    WorkshopCreateSuccess, WorkshopError, WorkshopJoinResult, WorkshopJoinSuccess,
+    WorkshopJudgeBundleRequest, WorkshopJudgeBundleResult, WorkshopJudgeBundleSuccess,
 };
 use security::{FixedWindowRateLimiter, OriginPolicy};
 use serde_json::json;
@@ -2882,6 +2882,9 @@ async fn generate_or_update_character_sprite_sheet(
         let timestamp = Utc::now().to_rfc3339();
         let character_record = CharacterRecord {
             id: character_id.clone(),
+            name: existing_character
+                .as_ref()
+                .and_then(|character| character.name.clone()),
             description: description.to_string(),
             sprites: sprites.clone(),
             remaining_sprite_regenerations: next_remaining_sprite_regenerations,
@@ -3259,6 +3262,7 @@ pub(crate) async fn create_character(
     let now = Utc::now().to_rfc3339();
     let record = CharacterRecord {
         id: random_prefixed_id("character"),
+        name: None,
         description,
         sprites: request.sprites,
         remaining_sprite_regenerations: 1,
@@ -3417,6 +3421,68 @@ pub(crate) async fn delete_character(
             .into_response(),
         Err(error) => {
             tracing::error!(%error, "delete_character_by_owner failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "internal error" })),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// `PATCH /api/characters/:id` — rename an owned character.
+pub(crate) async fn update_character(
+    State(state): State<AppState>,
+    session: AccountSession,
+    Path(character_id): Path<String>,
+    Json(request): Json<UpdateCharacterRequest>,
+) -> Response {
+    let name = request.name.trim().to_string();
+    if name.is_empty() || name.chars().count() > 64 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "name must be 1-64 characters" })),
+        )
+            .into_response();
+    }
+
+    let updated = match state
+        .store
+        .update_character_name_by_owner(&character_id, &session.account.id, &name)
+        .await
+    {
+        Ok(updated) => updated,
+        Err(error) => {
+            tracing::error!(%error, "update_character_name_by_owner failed");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "internal error" })),
+            )
+                .into_response();
+        }
+    };
+
+    if !updated {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "character not found or not owned by you" })),
+        )
+            .into_response();
+    }
+
+    match state.store.load_character(&character_id).await {
+        Ok(Some(record))
+            if record.owner_account_id.as_deref() == Some(session.account.id.as_str()) =>
+        {
+            (StatusCode::OK, Json(record.profile())).into_response()
+        }
+        Ok(Some(_)) | Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "character not found or not owned by you" })),
+        )
+            .into_response(),
+        Err(error) => {
+            tracing::error!(%error, "load_character after rename failed");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({ "error": "internal error" })),

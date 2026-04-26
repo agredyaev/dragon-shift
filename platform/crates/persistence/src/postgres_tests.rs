@@ -294,7 +294,7 @@ mod postgres_tests {
                 .await
                 .expect("read applied migrations");
 
-        assert_eq!(versions, vec![(1,), (2,), (3,), (4,), (5,), (6,), (7,)]);
+        assert_eq!(versions, vec![(1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,)]);
         store.cleanup().await;
     }
 
@@ -321,6 +321,7 @@ mod postgres_tests {
 
         let character = CharacterRecord {
             id: "character_1".to_string(),
+            name: None,
             description: "A mossy lantern dragon".to_string(),
             sprites: protocol::SpriteSet {
                 neutral: "neutral_b64".to_string(),
@@ -524,6 +525,7 @@ mod postgres_tests {
             character_id: Some("character-1".to_string()),
             selected_character: Some(protocol::CharacterProfile {
                 id: "character-1".to_string(),
+                name: None,
                 description: "Alice's workshop dragon".to_string(),
                 sprites: protocol::SpriteSet {
                     neutral: "neutral".to_string(),
@@ -548,6 +550,7 @@ mod postgres_tests {
             character_id: Some("character-2".to_string()),
             selected_character: Some(protocol::CharacterProfile {
                 id: "character-2".to_string(),
+                name: None,
                 description: "Bob's workshop dragon".to_string(),
                 sprites: protocol::SpriteSet {
                     neutral: "neutral".to_string(),

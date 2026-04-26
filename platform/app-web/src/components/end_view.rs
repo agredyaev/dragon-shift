@@ -1,7 +1,7 @@
 use dioxus::prelude::*;
 use protocol::{ClientGameState, JudgeBundle, SessionCommand};
 
-use crate::flows::{leave_workshop, submit_workshop_command};
+use crate::flows::{leave_workshop, start_workshop_command};
 use crate::helpers::*;
 use crate::state::{ConnectionStatus, IdentityState, OperationState};
 
@@ -46,7 +46,7 @@ pub fn EndView(
 
     let commands_disabled = {
         let o = ops.read();
-        o.pending_flow.is_some() || o.pending_command.is_some()
+        o.pending_flow.is_some() || o.pending_command.is_some() || o.pending_judge_bundle
     };
     let connection_status = identity.read().connection_status;
     let connection_label = match connection_status {
@@ -246,14 +246,14 @@ pub fn EndView(
                                     onclick: {
                                         let vote_target = row.dragon_id.clone();
                                         move |_| {
-                                            spawn(submit_workshop_command(
+                                            let _ = start_workshop_command(
                                                 identity,
                                                 ops,
                                                 handover_tags_input,
                                                 judge_bundle,
                                                 SessionCommand::SubmitVote,
                                                 Some(serde_json::json!({ "dragonId": vote_target.clone() })),
-                                            ));
+                                            );
                                         }
                                     },
                                     "Vote"
@@ -338,8 +338,9 @@ pub fn EndView(
                         "data-testid": "reveal-results-button",
                         disabled: commands_disabled || !reveal_enabled,
                         onclick: move |_| {
-                            spawn(submit_workshop_command(identity, ops, handover_tags_input, judge_bundle, SessionCommand::RevealVotingResults, None));
-                            active_tab.set("design".to_string());
+                            if start_workshop_command(identity, ops, handover_tags_input, judge_bundle, SessionCommand::RevealVotingResults, None) {
+                                active_tab.set("design".to_string());
+                            }
                         },
                         "Finish voting"
                     }
@@ -350,18 +351,18 @@ pub fn EndView(
                         "data-testid": "end-session-button",
                         disabled: commands_disabled || !results_revealed,
                         onclick: move |_| {
-                            spawn(submit_workshop_command(identity, ops, handover_tags_input, judge_bundle, SessionCommand::EndSession, None));
+                            let _ = start_workshop_command(identity, ops, handover_tags_input, judge_bundle, SessionCommand::EndSession, None);
                         },
                         "End game"
                     }
                 }
                 button {
                     class: "button button--secondary",
-                    "data-testid": "reset-game-button",
-                    disabled: commands_disabled,
-                    onclick: move |_| {
-                        spawn(submit_workshop_command(identity, ops, handover_tags_input, judge_bundle, SessionCommand::ResetGame, None));
-                    },
+                        "data-testid": "reset-game-button",
+                        disabled: commands_disabled,
+                        onclick: move |_| {
+                            let _ = start_workshop_command(identity, ops, handover_tags_input, judge_bundle, SessionCommand::ResetGame, None);
+                        },
                     "Reset workshop"
                 }
                 if is_end_screen {

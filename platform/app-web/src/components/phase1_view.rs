@@ -1,7 +1,7 @@
 use dioxus::prelude::*;
 use protocol::{ClientGameState, JudgeBundle, SessionCommand};
 
-use crate::flows::submit_workshop_command;
+use crate::flows::start_workshop_command;
 use crate::helpers::*;
 use crate::state::{ConnectionStatus, IdentityState, OperationState};
 
@@ -25,7 +25,10 @@ pub fn Phase1View(
     let commands_disabled = {
         let id = identity.read();
         let o = ops.read();
-        o.pending_flow.is_some() || o.pending_command.is_some() || id.session_snapshot.is_none()
+        o.pending_flow.is_some()
+            || o.pending_command.is_some()
+            || o.pending_judge_bundle
+            || id.session_snapshot.is_none()
     };
 
     let dragon_name = current_dragon(state)
@@ -234,12 +237,14 @@ pub fn Phase1View(
                                 onclick: move |_| {
                                     let text = observation_input.read().trim().to_string();
                                     if !text.is_empty() {
-                                        observation_input_w.set(String::new());
-                                        spawn(submit_workshop_command(
+                                        let started = start_workshop_command(
                                             identity, ops, handover_tags_input, judge_bundle,
                                             SessionCommand::SubmitObservation,
                                             Some(serde_json::json!({"text": text})),
-                                        ));
+                                        );
+                                        if started {
+                                            observation_input_w.set(String::new());
+                                        }
                                     }
                                 },
                                 "Save observation"
@@ -283,11 +288,11 @@ pub fn Phase1View(
                                 "data-testid": "action-feed-meat",
                                 disabled: commands_disabled || on_cooldown,
                                 onclick: move |_| {
-                                    spawn(submit_workshop_command(
+                                    let _ = start_workshop_command(
                                         identity, ops, handover_tags_input, judge_bundle,
                                         SessionCommand::Action,
                                         Some(serde_json::json!({"type": "feed", "value": "meat"})),
-                                    ));
+                                    );
                                 },
                                 img { class: "pixel-icon", src: "{poke_icon_url(\"meat\")}", alt: "meat", width: 32, height: 32 }
                                 "Meat"
@@ -297,11 +302,11 @@ pub fn Phase1View(
                                 "data-testid": "action-feed-fruit",
                                 disabled: commands_disabled || on_cooldown,
                                 onclick: move |_| {
-                                    spawn(submit_workshop_command(
+                                    let _ = start_workshop_command(
                                         identity, ops, handover_tags_input, judge_bundle,
                                         SessionCommand::Action,
                                         Some(serde_json::json!({"type": "feed", "value": "fruit"})),
-                                    ));
+                                    );
                                 },
                                 img { class: "pixel-icon", src: "{poke_icon_url(\"fruit\")}", alt: "fruit", width: 32, height: 32 }
                                 "Fruit"
@@ -311,11 +316,11 @@ pub fn Phase1View(
                                 "data-testid": "action-feed-fish",
                                 disabled: commands_disabled || on_cooldown,
                                 onclick: move |_| {
-                                    spawn(submit_workshop_command(
+                                    let _ = start_workshop_command(
                                         identity, ops, handover_tags_input, judge_bundle,
                                         SessionCommand::Action,
                                         Some(serde_json::json!({"type": "feed", "value": "fish"})),
-                                    ));
+                                    );
                                 },
                                 img { class: "pixel-icon", src: "{poke_icon_url(\"fish\")}", alt: "fish", width: 32, height: 32 }
                                 "Fish"
@@ -329,11 +334,11 @@ pub fn Phase1View(
                                 "data-testid": "action-play-fetch",
                                 disabled: commands_disabled || on_cooldown,
                                 onclick: move |_| {
-                                    spawn(submit_workshop_command(
+                                    let _ = start_workshop_command(
                                         identity, ops, handover_tags_input, judge_bundle,
                                         SessionCommand::Action,
                                         Some(serde_json::json!({"type": "play", "value": "fetch"})),
-                                    ));
+                                    );
                                 },
                                 img { class: "pixel-icon", src: "{poke_icon_url(\"fetch\")}", alt: "fetch", width: 32, height: 32 }
                                 "Fetch"
@@ -343,11 +348,11 @@ pub fn Phase1View(
                                 "data-testid": "action-play-puzzle",
                                 disabled: commands_disabled || on_cooldown,
                                 onclick: move |_| {
-                                    spawn(submit_workshop_command(
+                                    let _ = start_workshop_command(
                                         identity, ops, handover_tags_input, judge_bundle,
                                         SessionCommand::Action,
                                         Some(serde_json::json!({"type": "play", "value": "puzzle"})),
-                                    ));
+                                    );
                                 },
                                 img { class: "pixel-icon", src: "{poke_icon_url(\"puzzle\")}", alt: "puzzle", width: 32, height: 32 }
                                 "Puzzle"
@@ -357,11 +362,11 @@ pub fn Phase1View(
                                 "data-testid": "action-play-music",
                                 disabled: commands_disabled || on_cooldown,
                                 onclick: move |_| {
-                                    spawn(submit_workshop_command(
+                                    let _ = start_workshop_command(
                                         identity, ops, handover_tags_input, judge_bundle,
                                         SessionCommand::Action,
                                         Some(serde_json::json!({"type": "play", "value": "music"})),
-                                    ));
+                                    );
                                 },
                                 img { class: "pixel-icon", src: "{poke_icon_url(\"music\")}", alt: "music", width: 32, height: 32 }
                                 "Music"
@@ -375,11 +380,11 @@ pub fn Phase1View(
                                 "data-testid": "action-sleep",
                                 disabled: commands_disabled || on_cooldown,
                                 onclick: move |_| {
-                                    spawn(submit_workshop_command(
+                                    let _ = start_workshop_command(
                                         identity, ops, handover_tags_input, judge_bundle,
                                         SessionCommand::Action,
                                         Some(serde_json::json!({"type": "sleep"})),
-                                    ));
+                                    );
                                 },
                                 img { class: "pixel-icon", src: "{poke_icon_url(\"sleep\")}", alt: "sleep", width: 32, height: 32 }
                                 "Put to Sleep"
@@ -426,11 +431,11 @@ pub fn Phase1View(
                                 "data-testid": "start-handover-button",
                                 disabled: commands_disabled,
                                 onclick: move |_| {
-                                    spawn(submit_workshop_command(
+                                    let _ = start_workshop_command(
                                         identity, ops, handover_tags_input, judge_bundle,
                                         SessionCommand::StartHandover,
                                         None,
-                                    ));
+                                    );
                                 },
                                 "Start Handover"
                             }

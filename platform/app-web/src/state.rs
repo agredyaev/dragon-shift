@@ -7,6 +7,7 @@ use protocol::{
 };
 
 use crate::api::build_client_session_snapshot;
+use crate::realtime::disconnect_realtime;
 
 // ---------------------------------------------------------------------------
 // Enums
@@ -35,7 +36,9 @@ pub enum PendingFlow {
     Join,
     Reconnect,
     DeleteCharacter,
+    RenameCharacter,
     DeleteWorkshop,
+    Logout,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -101,17 +104,33 @@ pub struct IdentityState {
 pub struct OperationState {
     pub pending_flow: Option<PendingFlow>,
     pub pending_command: Option<SessionCommand>,
+    pub pending_flow_generation: u64,
+    pub pending_command_generation: u64,
+    pub my_characters_request_generation: u64,
+    pub open_workshops_request_generation: u64,
+    pub eligible_characters_request_generation: u64,
     pub pending_judge_bundle: bool,
+    pub pending_judge_bundle_generation: u64,
     pub sprite_generation_request_pending: bool,
     pub sprite_generation_stage: Option<SpriteGenerationStage>,
     pub selected_character_id: Option<String>,
+    pub my_characters_loading: bool,
+    pub my_characters_loaded: bool,
+    pub my_characters_load_failed: bool,
     pub my_characters: Vec<CharacterProfile>,
     pub my_characters_limit: u8,
+    pub open_workshops_loading: bool,
+    pub open_workshops_loaded: bool,
+    pub open_workshops_load_failed: bool,
     pub open_workshops: Vec<OpenWorkshopSummary>,
     /// Cursor to use for the "Next" (older) pager button; `None` disables it.
     pub open_workshops_next_cursor: Option<OpenWorkshopCursor>,
     /// Cursor to use for the "Prev" (newer) pager button; `None` disables it.
     pub open_workshops_prev_cursor: Option<OpenWorkshopCursor>,
+    pub eligible_characters_loading: bool,
+    pub eligible_characters_loaded: bool,
+    pub eligible_characters_load_failed: bool,
+    pub eligible_characters_workshop_code: Option<String>,
     pub eligible_characters: Vec<CharacterProfile>,
     pub notice: Option<ShellNotice>,
     /// Notice to show on the first realtime attach instead of the default
@@ -119,6 +138,23 @@ pub struct OperationState {
     /// flow-specific notices (e.g. "Reconnected to workshop.") that would
     /// otherwise be overwritten by the realtime bootstrap sequence.
     pub pending_realtime_notice: Option<ShellNotice>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingFlowTicket {
+    flow: PendingFlow,
+    generation: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingCommandTicket {
+    command: SessionCommand,
+    generation: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingJudgeBundleTicket {
+    generation: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -152,6 +188,100 @@ pub fn error_notice(message: &str) -> ShellNotice {
 pub fn scoped_notice(scope: NoticeScope, mut notice: ShellNotice) -> ShellNotice {
     notice.scope = scope;
     notice
+}
+
+fn next_submission_generation(generation: u64) -> u64 {
+    generation.checked_add(1).unwrap_or(1).max(1)
+}
+
+pub fn reserve_pending_flow(
+    ops: &mut OperationState,
+    flow: PendingFlow,
+    notice: ShellNotice,
+) -> Option<PendingFlowTicket> {
+    if ops.pending_flow.is_some() || ops.pending_command.is_some() || ops.pending_judge_bundle {
+        return None;
+    }
+    ops.pending_flow_generation = next_submission_generation(ops.pending_flow_generation);
+    ops.pending_flow = Some(flow);
+    ops.notice = Some(notice);
+    Some(PendingFlowTicket {
+        flow,
+        generation: ops.pending_flow_generation,
+    })
+}
+
+pub fn pending_flow_ticket_is_current(ops: &OperationState, ticket: &PendingFlowTicket) -> bool {
+    ops.pending_flow == Some(ticket.flow) && ops.pending_flow_generation == ticket.generation
+}
+
+pub fn clear_pending_flow_if_current(ops: &mut OperationState, ticket: &PendingFlowTicket) {
+    if pending_flow_ticket_is_current(ops, ticket) {
+        ops.pending_flow = None;
+    }
+}
+
+pub fn reserve_pending_command(
+    ops: &mut OperationState,
+    command: SessionCommand,
+    notice: ShellNotice,
+) -> Option<PendingCommandTicket> {
+    if ops.pending_flow.is_some() || ops.pending_command.is_some() || ops.pending_judge_bundle {
+        return None;
+    }
+    ops.pending_command_generation = next_submission_generation(ops.pending_command_generation);
+    ops.pending_command = Some(command);
+    ops.notice = Some(notice);
+    Some(PendingCommandTicket {
+        command,
+        generation: ops.pending_command_generation,
+    })
+}
+
+pub fn pending_command_ticket_is_current(
+    ops: &OperationState,
+    ticket: &PendingCommandTicket,
+) -> bool {
+    ops.pending_command == Some(ticket.command)
+        && ops.pending_command_generation == ticket.generation
+}
+
+pub fn clear_pending_command_if_current(ops: &mut OperationState, ticket: &PendingCommandTicket) {
+    if pending_command_ticket_is_current(ops, ticket) {
+        ops.pending_command = None;
+    }
+}
+
+pub fn reserve_pending_judge_bundle(
+    ops: &mut OperationState,
+    notice: ShellNotice,
+) -> Option<PendingJudgeBundleTicket> {
+    if ops.pending_flow.is_some() || ops.pending_command.is_some() || ops.pending_judge_bundle {
+        return None;
+    }
+    ops.pending_judge_bundle_generation =
+        next_submission_generation(ops.pending_judge_bundle_generation);
+    ops.pending_judge_bundle = true;
+    ops.notice = Some(notice);
+    Some(PendingJudgeBundleTicket {
+        generation: ops.pending_judge_bundle_generation,
+    })
+}
+
+pub fn pending_judge_bundle_ticket_is_current(
+    ops: &OperationState,
+    ticket: &PendingJudgeBundleTicket,
+) -> bool {
+    ops.pending_judge_bundle && ops.pending_judge_bundle_generation == ticket.generation
+}
+
+pub fn clear_pending_judge_bundle_if_current(
+    ops: &mut OperationState,
+    ticket: &PendingJudgeBundleTicket,
+) {
+    if pending_judge_bundle_ticket_is_current(ops, ticket) {
+        ops.pending_judge_bundle = false;
+    }
 }
 
 pub fn notice_scope_for_screen(screen: &ShellScreen) -> NoticeScope {
@@ -231,15 +361,31 @@ pub fn default_operation_state() -> OperationState {
     OperationState {
         pending_flow: None,
         pending_command: None,
+        pending_flow_generation: 0,
+        pending_command_generation: 0,
+        my_characters_request_generation: 0,
+        open_workshops_request_generation: 0,
+        eligible_characters_request_generation: 0,
         pending_judge_bundle: false,
+        pending_judge_bundle_generation: 0,
         sprite_generation_request_pending: false,
         sprite_generation_stage: None,
         selected_character_id: None,
+        my_characters_loading: false,
+        my_characters_loaded: false,
+        my_characters_load_failed: false,
         my_characters: Vec::new(),
         my_characters_limit: 5,
+        open_workshops_loading: false,
+        open_workshops_loaded: false,
+        open_workshops_load_failed: false,
         open_workshops: Vec::new(),
         open_workshops_next_cursor: None,
         open_workshops_prev_cursor: None,
+        eligible_characters_loading: false,
+        eligible_characters_loaded: false,
+        eligible_characters_load_failed: false,
+        eligible_characters_workshop_code: None,
         eligible_characters: Vec::new(),
         notice: None,
         pending_realtime_notice: None,
@@ -626,8 +772,10 @@ pub fn apply_join_success(
         PendingFlow::Join => "Joined workshop.",
         PendingFlow::Reconnect => "Reconnected to workshop.",
         PendingFlow::DeleteCharacter => "Character deleted.",
+        PendingFlow::RenameCharacter => "Character renamed.",
         PendingFlow::DeleteWorkshop => "Workshop deleted.",
         PendingFlow::SignIn => "Workshop created.",
+        PendingFlow::Logout => "Signed out.",
     };
 
     identity.screen = ShellScreen::Session;
@@ -698,18 +846,20 @@ pub fn command_success_message(command: SessionCommand) -> &'static str {
     }
 }
 
-fn command_completed_by_phase_update(command: SessionCommand, phase: Phase) -> bool {
-    matches!(
-        (command, phase),
-        (SessionCommand::StartPhase1, Phase::Phase1)
-            | (SessionCommand::StartHandover, Phase::Handover)
-            | (SessionCommand::StartPhase2, Phase::Phase2)
-            | (SessionCommand::EndGame, Phase::Voting)
-            | (SessionCommand::StartVoting, Phase::Voting)
-            | (SessionCommand::RevealVotingResults, Phase::Voting)
-            | (SessionCommand::EndSession, Phase::End)
-            | (SessionCommand::ResetGame, Phase::Lobby)
-    )
+fn command_completed_by_state_update(command: SessionCommand, state: &ClientGameState) -> bool {
+    match command {
+        SessionCommand::StartPhase1 => state.phase == Phase::Phase1,
+        SessionCommand::StartHandover => state.phase == Phase::Handover,
+        SessionCommand::StartPhase2 => state.phase == Phase::Phase2,
+        SessionCommand::EndGame | SessionCommand::StartVoting => state.phase == Phase::Voting,
+        SessionCommand::RevealVotingResults => state
+            .voting
+            .as_ref()
+            .is_some_and(|voting| voting.results_revealed),
+        SessionCommand::EndSession => state.phase == Phase::End,
+        SessionCommand::ResetGame => state.phase == Phase::Lobby,
+        _ => false,
+    }
 }
 
 pub fn apply_successful_command(
@@ -804,12 +954,47 @@ fn should_clear_session_snapshot(error: &str) -> bool {
 }
 
 pub fn clear_session_identity(identity: &mut IdentityState) {
+    disconnect_realtime();
     identity.screen = ShellScreen::AccountHome;
     identity.connection_status = ConnectionStatus::Offline;
     identity.identity = None;
     identity.session_snapshot = None;
     identity.realtime_bootstrap_attempted = false;
     let _ = clear_browser_session_snapshot();
+}
+
+pub fn clear_pre_session_caches(ops: &mut OperationState) {
+    ops.my_characters_request_generation = ops
+        .my_characters_request_generation
+        .checked_add(1)
+        .unwrap_or(1)
+        .max(1);
+    ops.open_workshops_request_generation = ops
+        .open_workshops_request_generation
+        .checked_add(1)
+        .unwrap_or(1)
+        .max(1);
+    ops.eligible_characters_request_generation = ops
+        .eligible_characters_request_generation
+        .checked_add(1)
+        .unwrap_or(1)
+        .max(1);
+    ops.my_characters_loading = false;
+    ops.my_characters_loaded = false;
+    ops.my_characters_load_failed = false;
+    ops.my_characters.clear();
+    ops.my_characters_limit = 5;
+    ops.open_workshops_loading = false;
+    ops.open_workshops_loaded = false;
+    ops.open_workshops_load_failed = false;
+    ops.open_workshops.clear();
+    ops.open_workshops_next_cursor = None;
+    ops.open_workshops_prev_cursor = None;
+    ops.eligible_characters_loading = false;
+    ops.eligible_characters_loaded = false;
+    ops.eligible_characters_load_failed = false;
+    ops.eligible_characters_workshop_code = None;
+    ops.eligible_characters.clear();
 }
 
 pub fn navigate_to_screen(
@@ -850,7 +1035,7 @@ pub fn apply_server_ws_message(
             let phase = client_state.phase;
             let completed_pending_command = ops
                 .pending_command
-                .filter(|command| command_completed_by_phase_update(*command, phase));
+                .filter(|command| command_completed_by_state_update(*command, &client_state));
             identity.screen = ShellScreen::Session;
             *game_state = Some(client_state);
             identity.connection_status = ConnectionStatus::Connected;
@@ -870,10 +1055,18 @@ pub fn apply_server_ws_message(
                 ops.pending_judge_bundle = false;
             }
             if first_attach {
-                ops.pending_command = None;
-                ops.notice = Some(ops.pending_realtime_notice.take().unwrap_or_else(|| {
-                    scoped_notice(NoticeScope::Session, info_notice("Session synced."))
-                }));
+                if let Some(command) = completed_pending_command {
+                    ops.pending_command = None;
+                    ops.pending_realtime_notice = None;
+                    ops.notice = Some(scoped_notice(
+                        NoticeScope::Session,
+                        success_notice(command_success_message(command)),
+                    ));
+                } else {
+                    ops.notice = Some(ops.pending_realtime_notice.take().unwrap_or_else(|| {
+                        scoped_notice(NoticeScope::Session, info_notice("Session synced."))
+                    }));
+                }
             } else if let Some(command) = completed_pending_command {
                 // Phase-transition commands can unmount the source component before
                 // the HTTP task applies its success notice, so confirm them from the
@@ -930,8 +1123,8 @@ pub fn apply_server_ws_message(
 mod tests {
     use super::*;
     use protocol::{
-        ClientGameState, CoordinatorType, Phase, Player, SessionMeta, SessionNoticeCode,
-        WorkshopJoinSuccess, create_default_session_settings,
+        ClientGameState, ClientVotingState, CoordinatorType, Phase, Player, SessionMeta,
+        SessionNoticeCode, WorkshopJoinSuccess, create_default_session_settings,
     };
     use std::collections::BTreeMap;
 
@@ -1065,6 +1258,20 @@ mod tests {
         assert_eq!(identity.screen, ShellScreen::AccountHome);
         assert_eq!(identity.identity, None);
         assert_eq!(identity.session_snapshot, None);
+    }
+
+    #[test]
+    fn clear_pre_session_caches_invalidates_request_generations() {
+        let mut ops = default_operation_state();
+        ops.my_characters_request_generation = 7;
+        ops.open_workshops_request_generation = 11;
+        ops.eligible_characters_request_generation = 13;
+
+        clear_pre_session_caches(&mut ops);
+
+        assert_eq!(ops.my_characters_request_generation, 8);
+        assert_eq!(ops.open_workshops_request_generation, 12);
+        assert_eq!(ops.eligible_characters_request_generation, 14);
     }
 
     #[test]
@@ -1242,6 +1449,109 @@ mod tests {
     }
 
     #[test]
+    fn pending_flow_reservation_is_single_flight_until_cleared() {
+        let mut ops = default_operation_state();
+
+        let first = reserve_pending_flow(
+            &mut ops,
+            PendingFlow::SignIn,
+            scoped_notice(NoticeScope::SignIn, info_notice("Signing in…")),
+        )
+        .expect("first signin reservation succeeds");
+
+        assert_eq!(ops.pending_flow, Some(PendingFlow::SignIn));
+        assert!(pending_flow_ticket_is_current(&ops, &first));
+        assert!(
+            reserve_pending_flow(
+                &mut ops,
+                PendingFlow::SignIn,
+                scoped_notice(NoticeScope::SignIn, info_notice("Signing in…")),
+            )
+            .is_none()
+        );
+
+        clear_pending_flow_if_current(&mut ops, &first);
+
+        assert_eq!(ops.pending_flow, None);
+        assert!(
+            reserve_pending_flow(
+                &mut ops,
+                PendingFlow::SignIn,
+                scoped_notice(NoticeScope::SignIn, info_notice("Signing in…")),
+            )
+            .is_some()
+        );
+    }
+
+    #[test]
+    fn pending_command_reservation_blocks_flows_until_cleared() {
+        let mut ops = default_operation_state();
+
+        let command_ticket = reserve_pending_command(
+            &mut ops,
+            SessionCommand::StartPhase1,
+            scoped_notice(NoticeScope::Session, info_notice("Starting Phase 1…")),
+        )
+        .expect("first command reservation succeeds");
+
+        assert_eq!(ops.pending_command, Some(SessionCommand::StartPhase1));
+        assert!(pending_command_ticket_is_current(&ops, &command_ticket));
+        assert!(
+            reserve_pending_command(
+                &mut ops,
+                SessionCommand::ResetGame,
+                scoped_notice(NoticeScope::Session, info_notice("Resetting workshop…")),
+            )
+            .is_none()
+        );
+        assert!(
+            reserve_pending_flow(
+                &mut ops,
+                PendingFlow::Logout,
+                scoped_notice(NoticeScope::AccountHome, info_notice("Signing out…")),
+            )
+            .is_none()
+        );
+
+        clear_pending_command_if_current(&mut ops, &command_ticket);
+
+        assert_eq!(ops.pending_command, None);
+        assert!(
+            reserve_pending_flow(
+                &mut ops,
+                PendingFlow::Logout,
+                scoped_notice(NoticeScope::AccountHome, info_notice("Signing out…")),
+            )
+            .is_some()
+        );
+    }
+
+    #[test]
+    fn stale_pending_flow_ticket_cannot_clear_newer_reservation() {
+        let mut ops = default_operation_state();
+
+        let stale = reserve_pending_flow(
+            &mut ops,
+            PendingFlow::Create,
+            scoped_notice(NoticeScope::AccountHome, info_notice("Creating workshop…")),
+        )
+        .expect("first create reservation succeeds");
+        clear_pending_flow_if_current(&mut ops, &stale);
+        let current = reserve_pending_flow(
+            &mut ops,
+            PendingFlow::Create,
+            scoped_notice(NoticeScope::AccountHome, info_notice("Creating workshop…")),
+        )
+        .expect("second create reservation succeeds");
+
+        clear_pending_flow_if_current(&mut ops, &stale);
+
+        assert_eq!(ops.pending_flow, Some(PendingFlow::Create));
+        assert!(!pending_flow_ticket_is_current(&ops, &stale));
+        assert!(pending_flow_ticket_is_current(&ops, &current));
+    }
+
+    #[test]
     fn auth_errors_clear_stale_session_snapshot() {
         let mut identity = default_identity_state();
         identity.screen = ShellScreen::Session;
@@ -1312,7 +1622,7 @@ mod tests {
             PendingFlow::Join,
         );
         identity.connection_status = ConnectionStatus::Connecting;
-        ops.pending_command = Some(SessionCommand::StartPhase1);
+        ops.pending_command = Some(SessionCommand::SubmitObservation);
 
         apply_server_ws_message(
             &mut identity,
@@ -1323,10 +1633,118 @@ mod tests {
         );
 
         assert_eq!(identity.connection_status, ConnectionStatus::Connected);
-        assert_eq!(ops.pending_command, None);
+        assert_eq!(ops.pending_command, Some(SessionCommand::SubmitObservation));
         assert_eq!(
             ops.notice.as_ref().map(|n| n.message.as_str()),
             Some("Session synced.")
+        );
+    }
+
+    #[test]
+    fn first_attach_phase_update_confirms_matching_pending_command() {
+        let mut identity = default_identity_state();
+        let mut game_state = None;
+        let mut ops = default_operation_state();
+        let mut reconnect_session_code = String::new();
+        let mut reconnect_token = String::new();
+        let mut judge_bundle = None;
+
+        apply_join_success(
+            &mut identity,
+            &mut game_state,
+            &mut ops,
+            &mut reconnect_session_code,
+            &mut reconnect_token,
+            &mut judge_bundle,
+            mock_join_success(),
+            PendingFlow::Join,
+        );
+        identity.connection_status = ConnectionStatus::Connecting;
+        ops.pending_command = Some(SessionCommand::StartPhase1);
+        ops.notice = Some(scoped_notice(
+            NoticeScope::Session,
+            info_notice("Starting Phase 1…"),
+        ));
+
+        let mut next_state = mock_join_success().state;
+        next_state.phase = Phase::Phase1;
+
+        apply_server_ws_message(
+            &mut identity,
+            &mut game_state,
+            &mut ops,
+            &mut judge_bundle,
+            ServerWsMessage::StateUpdate(next_state),
+        );
+
+        assert_eq!(identity.connection_status, ConnectionStatus::Connected);
+        assert_eq!(ops.pending_command, None);
+        assert_eq!(
+            ops.notice.as_ref().map(|n| n.message.as_str()),
+            Some("Phase 1 started.")
+        );
+    }
+
+    #[test]
+    fn voting_update_confirms_reveal_only_after_results_revealed() {
+        let mut identity = default_identity_state();
+        let mut game_state = None;
+        let mut ops = default_operation_state();
+        let mut reconnect_session_code = String::new();
+        let mut reconnect_token = String::new();
+        let mut judge_bundle = None;
+
+        apply_join_success(
+            &mut identity,
+            &mut game_state,
+            &mut ops,
+            &mut reconnect_session_code,
+            &mut reconnect_token,
+            &mut judge_bundle,
+            mock_join_success(),
+            PendingFlow::Join,
+        );
+        let mut next_state = mock_join_success().state;
+        next_state.phase = Phase::Voting;
+        next_state.voting = Some(ClientVotingState {
+            eligible_count: 2,
+            submitted_count: 1,
+            current_player_vote_dragon_id: None,
+            results_revealed: false,
+            results: None,
+        });
+        ops.pending_command = Some(SessionCommand::RevealVotingResults);
+
+        apply_server_ws_message(
+            &mut identity,
+            &mut game_state,
+            &mut ops,
+            &mut judge_bundle,
+            ServerWsMessage::StateUpdate(next_state.clone()),
+        );
+
+        assert_eq!(
+            ops.pending_command,
+            Some(SessionCommand::RevealVotingResults)
+        );
+
+        next_state
+            .voting
+            .as_mut()
+            .expect("voting state")
+            .results_revealed = true;
+        apply_server_ws_message(
+            &mut identity,
+            &mut game_state,
+            &mut ops,
+            &mut judge_bundle,
+            ServerWsMessage::StateUpdate(next_state),
+        );
+
+        assert_eq!(ops.pending_command, None);
+        assert_eq!(
+            ops.notice.as_ref().map(|n| n.message.as_str()),
+            Some("Voting finished.")
         );
     }
 

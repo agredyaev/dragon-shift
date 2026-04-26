@@ -87,6 +87,7 @@ fn App() -> Element {
     let is_voting = render_session_panels_first && current_phase == Some(Phase::Voting);
     let is_judge = render_session_panels_first && current_phase == Some(Phase::Judge);
     let is_end = render_session_panels_first && current_phase == Some(Phase::End);
+    let is_session_bootstrapping = render_session_panels_first && current_phase.is_none();
     let show_clock = render_session_panels_first && is_clock_phase;
 
     let time_string = format!("{:02}:00", game_time.rem_euclid(24));
@@ -121,7 +122,7 @@ fn App() -> Element {
 
     // Day/night background only applies during clock phases (Phase1/Phase2).
     // Home screen (no game_state) and other phases use the neutral shell background.
-    let shell_class = if is_clock_phase {
+    let shell_class = if render_session_panels_first && is_clock_phase {
         if is_daytime {
             "shell shell--day"
         } else {
@@ -137,6 +138,8 @@ fn App() -> Element {
 
     let mut effect_identity = identity;
     let mut effect_ops = ops;
+    let mut bootstrap_back_identity = identity;
+    let mut bootstrap_back_ops = ops;
 
     use_effect(move || {
         if should_bootstrap_realtime
@@ -166,7 +169,15 @@ fn App() -> Element {
                 }
             }
             section { class: container_class,
-                if is_lobby || is_phase1 || is_handover || is_phase2 || is_voting || is_judge || is_end {
+                if is_lobby
+                    || is_phase1
+                    || is_handover
+                    || is_phase2
+                    || is_voting
+                    || is_judge
+                    || is_end
+                    || is_session_bootstrapping
+                {
                     NoticeBar {
                         ops,
                         scope: NoticeScope::Session,
@@ -235,6 +246,28 @@ fn App() -> Element {
                         handover_tags_input,
                         judge_bundle,
                     }
+                } else if is_session_bootstrapping {
+                    article { class: "panel", "data-testid": "session-bootstrap-panel",
+                        h1 { class: "panel__title", "Reconnecting to workshop" }
+                        p { class: "panel__body", "Syncing your workshop session..." }
+                        div { class: "button-row",
+                            button {
+                                class: "button button--secondary",
+                                "data-testid": "bootstrap-back-button",
+                                onclick: move |_| {
+                                    bootstrap_back_identity.with_mut(|id| {
+                                        bootstrap_back_ops.with_mut(|o| {
+                                            state::clear_session_identity(id);
+                                            o.pending_flow = None;
+                                            o.pending_command = None;
+                                            o.pending_judge_bundle = false;
+                                        });
+                                    });
+                                },
+                                "Back to home"
+                            }
+                        }
+                    }
                 } else {
                     // ---- Pre-session screens (SignIn / AccountHome / etc.) ----
                     match pre_session_screen.as_ref() {
@@ -249,6 +282,7 @@ fn App() -> Element {
                         },
                         Some(ShellScreen::PickCharacter { workshop_code }) => rsx! {
                             PickCharacterView {
+                                key: "{workshop_code}",
                                 identity,
                                 game_state,
                                 ops,

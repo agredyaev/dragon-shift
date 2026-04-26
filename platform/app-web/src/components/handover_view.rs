@@ -1,7 +1,7 @@
 use dioxus::prelude::*;
 use protocol::{ClientGameState, JudgeBundle};
 
-use crate::flows::{submit_handover_tags_command, submit_workshop_command};
+use crate::flows::start_workshop_command;
 use crate::helpers::*;
 use crate::state::{ConnectionStatus, IdentityState, OperationState};
 
@@ -47,7 +47,10 @@ pub fn HandoverView(
     let commands_disabled = {
         let id = identity.read();
         let o = ops.read();
-        o.pending_flow.is_some() || o.pending_command.is_some() || id.session_snapshot.is_none()
+        o.pending_flow.is_some()
+            || o.pending_command.is_some()
+            || o.pending_judge_bundle
+            || id.session_snapshot.is_none()
     };
 
     let rule1_val = rule1.read().clone();
@@ -146,8 +149,16 @@ pub fn HandoverView(
                             .filter(|s| !s.is_empty())
                             .collect::<Vec<_>>()
                             .join(", ");
-                        handover_tags_input_w.set(combined);
-                        spawn(submit_handover_tags_command(identity, ops, handover_tags_input, judge_bundle));
+                        if start_workshop_command(
+                            identity,
+                            ops,
+                            handover_tags_input,
+                            judge_bundle,
+                            protocol::SessionCommand::SubmitTags,
+                            Some(serde_json::json!(parse_tags_input(&combined))),
+                        ) {
+                            handover_tags_input_w.set(combined);
+                        }
                     },
                     "Save Notes"
                 }
@@ -161,14 +172,14 @@ pub fn HandoverView(
                         "data-testid": "start-phase2-button",
                         disabled: commands_disabled,
                         onclick: move |_| {
-                            spawn(submit_workshop_command(
+                            let _ = start_workshop_command(
                                 identity,
                                 ops,
                                 handover_tags_input,
                                 judge_bundle,
                                 protocol::SessionCommand::StartPhase2,
                                 None,
-                            ));
+                            );
                         },
                         "Start Phase 2"
                     }

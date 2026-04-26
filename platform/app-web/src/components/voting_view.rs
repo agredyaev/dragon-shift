@@ -1,7 +1,7 @@
 use dioxus::prelude::*;
 use protocol::{ClientGameState, JudgeBundle, SessionCommand};
 
-use crate::flows::submit_workshop_command;
+use crate::flows::start_workshop_command;
 use crate::helpers::*;
 use crate::state::{IdentityState, OperationState};
 
@@ -21,7 +21,10 @@ pub fn VotingView(
     let commands_disabled = {
         let id = identity.read();
         let o = ops.read();
-        o.pending_flow.is_some() || o.pending_command.is_some() || id.session_snapshot.is_none()
+        o.pending_flow.is_some()
+            || o.pending_command.is_some()
+            || o.pending_judge_bundle
+            || id.session_snapshot.is_none()
     };
 
     let progress = voting_progress_label(state);
@@ -112,14 +115,14 @@ pub fn VotingView(
                             onclick: {
                                 let vote_target = row.dragon_id.clone();
                                 move |_| {
-                                    spawn(submit_workshop_command(
+                                    let _ = start_workshop_command(
                                         identity,
                                         ops,
                                         handover_tags_input,
                                         judge_bundle,
                                         SessionCommand::SubmitVote,
                                         Some(serde_json::json!({ "dragonId": vote_target.clone() })),
-                                    ));
+                                    );
                                 }
                             },
                             "Vote"
@@ -136,29 +139,29 @@ pub fn VotingView(
             div { class: "button-row",
                 button {
                     class: "button button--primary",
-                    "data-testid": "reveal-results-button",
-                    disabled: commands_disabled || !reveal_enabled,
-                    onclick: move |_| {
-                        spawn(submit_workshop_command(identity, ops, handover_tags_input, judge_bundle, SessionCommand::RevealVotingResults, None));
-                    },
+                        "data-testid": "reveal-results-button",
+                        disabled: commands_disabled || !reveal_enabled,
+                        onclick: move |_| {
+                            let _ = start_workshop_command(identity, ops, handover_tags_input, judge_bundle, SessionCommand::RevealVotingResults, None);
+                        },
                     "Finish voting"
                 }
                 button {
                     class: "button button--danger",
-                    "data-testid": "end-session-button",
-                    disabled: commands_disabled,
-                    onclick: move |_| {
-                        spawn(submit_workshop_command(identity, ops, handover_tags_input, judge_bundle, SessionCommand::EndSession, None));
-                    },
+                        "data-testid": "end-session-button",
+                        disabled: commands_disabled,
+                        onclick: move |_| {
+                            let _ = start_workshop_command(identity, ops, handover_tags_input, judge_bundle, SessionCommand::EndSession, None);
+                        },
                     "End game"
                 }
                 button {
                     class: "button button--secondary",
-                    "data-testid": "reset-game-button",
-                    disabled: commands_disabled,
-                    onclick: move |_| {
-                        spawn(submit_workshop_command(identity, ops, handover_tags_input, judge_bundle, SessionCommand::ResetGame, None));
-                    },
+                        "data-testid": "reset-game-button",
+                        disabled: commands_disabled,
+                        onclick: move |_| {
+                            let _ = start_workshop_command(identity, ops, handover_tags_input, judge_bundle, SessionCommand::ResetGame, None);
+                        },
                     "Reset workshop"
                 }
             }

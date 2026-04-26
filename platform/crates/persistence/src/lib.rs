@@ -94,6 +94,7 @@ pub struct AppSpriteDefaults {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CharacterRecord {
     pub id: String,
+    pub name: Option<String>,
     pub description: String,
     pub sprites: SpriteSet,
     pub remaining_sprite_regenerations: u8,
@@ -109,6 +110,7 @@ impl CharacterRecord {
     pub fn profile(&self) -> CharacterProfile {
         CharacterProfile {
             id: self.id.clone(),
+            name: self.name.clone(),
             description: self.description.clone(),
             sprites: self.sprites.clone(),
             remaining_sprite_regenerations: self.remaining_sprite_regenerations,
@@ -195,6 +197,7 @@ pub fn starter_character_defaults() -> Vec<CharacterRecord> {
     vec![
         CharacterRecord {
             id: "starter_violet_crystal".to_string(),
+            name: None,
             description:
                 "A violet crystal dragon with lantern eyes and a careful, observant posture."
                     .to_string(),
@@ -206,6 +209,7 @@ pub fn starter_character_defaults() -> Vec<CharacterRecord> {
         },
         CharacterRecord {
             id: "starter_moss_forest".to_string(),
+            name: None,
             description:
                 "A mossy forest dragon with fern-like frills and a warm trail-guide demeanor."
                     .to_string(),
@@ -217,6 +221,7 @@ pub fn starter_character_defaults() -> Vec<CharacterRecord> {
         },
         CharacterRecord {
             id: "starter_sunset_coral".to_string(),
+            name: None,
             description:
                 "A coral sunset dragon with tide-polished scales and a bright show-off streak."
                     .to_string(),
@@ -228,6 +233,7 @@ pub fn starter_character_defaults() -> Vec<CharacterRecord> {
         },
         CharacterRecord {
             id: "starter_midnight_moon".to_string(),
+            name: None,
             description:
                 "A midnight moon dragon with silver horns, soft wings, and a nocturnal calm."
                     .to_string(),
@@ -629,6 +635,16 @@ pub trait SessionStore: Send + Sync {
         owner_account_id: &str,
     ) -> Pin<Box<dyn Future<Output = Result<bool, PersistenceError>> + Send + '_>>;
 
+    /// Rename a character owned by the given account. Returns `true` if the
+    /// row was updated, `false` if the id was not found or belonged to another
+    /// account.
+    fn update_character_name_by_owner(
+        &self,
+        character_id: &str,
+        owner_account_id: &str,
+        name: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, PersistenceError>> + Send + '_>>;
+
     fn delete_lobby_workshop_by_owner(
         &self,
         session_code: &str,
@@ -777,6 +793,7 @@ impl PostgresSessionStore {
             "
                 INSERT INTO characters (
                     character_id,
+                    name,
                     description,
                     neutral_sprite,
                     happy_sprite,
@@ -787,8 +804,9 @@ impl PostgresSessionStore {
                     updated_at,
                     owner_account_id
                 )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
                 ON CONFLICT (character_id) DO UPDATE SET
+                    name = EXCLUDED.name,
                     description = EXCLUDED.description,
                     neutral_sprite = EXCLUDED.neutral_sprite,
                     happy_sprite = EXCLUDED.happy_sprite,
@@ -801,6 +819,7 @@ impl PostgresSessionStore {
             ",
         )
         .bind(&character.id)
+        .bind(&character.name)
         .bind(&character.description)
         .bind(&character.sprites.neutral)
         .bind(&character.sprites.happy)
@@ -820,6 +839,7 @@ impl PostgresSessionStore {
 
         CharacterRecord {
             id: row.get("character_id"),
+            name: row.try_get::<Option<String>, _>("name").ok().flatten(),
             description: row.get("description"),
             sprites: SpriteSet {
                 neutral: row.get("neutral_sprite"),
@@ -1661,6 +1681,7 @@ impl SessionStore for PostgresSessionStore {
                 "
                     SELECT
                         character_id,
+                        name,
                         description,
                         neutral_sprite,
                         happy_sprite,
@@ -1691,6 +1712,7 @@ impl SessionStore for PostgresSessionStore {
                 "
                     SELECT
                         character_id,
+                        name,
                         description,
                         neutral_sprite,
                         happy_sprite,
@@ -1895,6 +1917,7 @@ impl SessionStore for PostgresSessionStore {
                 "
                     SELECT
                         character_id,
+                        name,
                         description,
                         neutral_sprite,
                         happy_sprite,
@@ -1950,6 +1973,29 @@ impl SessionStore for PostgresSessionStore {
             )
             .bind(&character_id)
             .bind(&owner)
+            .execute(&self.pool)
+            .await?;
+            Ok(result.rows_affected() > 0)
+        })
+    }
+
+    fn update_character_name_by_owner(
+        &self,
+        character_id: &str,
+        owner_account_id: &str,
+        name: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, PersistenceError>> + Send + '_>> {
+        let character_id = character_id.to_string();
+        let owner = owner_account_id.to_string();
+        let name = name.to_string();
+        Box::pin(async move {
+            let result = sqlx::query(
+                "UPDATE characters SET name = $3, updated_at = $4 WHERE character_id = $1 AND owner_account_id = $2",
+            )
+            .bind(&character_id)
+            .bind(&owner)
+            .bind(&name)
+            .bind(Utc::now().to_rfc3339())
             .execute(&self.pool)
             .await?;
             Ok(result.rows_affected() > 0)
@@ -3194,6 +3240,31 @@ impl SessionStore for InMemorySessionStore {
         })
     }
 
+    fn update_character_name_by_owner(
+        &self,
+        character_id: &str,
+        owner_account_id: &str,
+        name: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, PersistenceError>> + Send + '_>> {
+        let character_id = character_id.to_string();
+        let owner = owner_account_id.to_string();
+        let name = name.to_string();
+        Box::pin(async move {
+            let mut characters = self
+                .characters_by_id
+                .write()
+                .map_err(|_| PersistenceError::LockPoisoned)?;
+            match characters.get_mut(&character_id) {
+                Some(record) if record.owner_account_id.as_deref() == Some(owner.as_str()) => {
+                    record.name = Some(name);
+                    record.updated_at = Utc::now().to_rfc3339();
+                    Ok(true)
+                }
+                _ => Ok(false),
+            }
+        })
+    }
+
     fn delete_lobby_workshop_by_owner(
         &self,
         session_code: &str,
@@ -3527,6 +3598,7 @@ mod tests {
             character_id: Some("character-1".to_string()),
             selected_character: Some(protocol::CharacterProfile {
                 id: "character-1".to_string(),
+                name: None,
                 description: "Alice's workshop dragon".to_string(),
                 sprites: SpriteSet {
                     neutral: "neutral".to_string(),
@@ -3579,6 +3651,7 @@ mod tests {
         let store = InMemorySessionStore::new();
         let character = CharacterRecord {
             id: "character-1".to_string(),
+            name: None,
             description: "A violet crystal dragon".to_string(),
             sprites: SpriteSet {
                 neutral: "neutral".to_string(),

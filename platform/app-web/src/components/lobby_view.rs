@@ -1,7 +1,7 @@
 use dioxus::prelude::*;
 use protocol::{ClientGameState, SessionCommand};
 
-use crate::flows::{leave_workshop, submit_workshop_command};
+use crate::flows::{leave_workshop, start_workshop_command};
 use crate::helpers::{current_player, lobby_player_rows, lobby_ready_summary, lobby_status_copy};
 use crate::state::ConnectionStatus;
 use crate::state::{IdentityState, OperationState};
@@ -37,8 +37,9 @@ pub fn LobbyView(
     };
     let commands_disabled = {
         let o = ops.read();
-        o.pending_flow.is_some() || o.pending_command.is_some()
+        o.pending_flow.is_some() || o.pending_command.is_some() || o.pending_judge_bundle
     };
+    let leave_disabled = ops.read().pending_flow.is_some();
 
     drop(gs);
 
@@ -89,10 +90,10 @@ pub fn LobbyView(
                             "data-testid": "start-phase1-button",
                             disabled: commands_disabled,
                             onclick: move |_| {
-                                spawn(submit_workshop_command(
+                                let _ = start_workshop_command(
                                     identity, ops, handover_tags_input, judge_bundle,
                                     SessionCommand::StartPhase1, None,
-                                ));
+                                );
                             },
                             "Start Phase 1"
                         }
@@ -105,7 +106,7 @@ pub fn LobbyView(
                     button {
                         class: "button button--secondary",
                         "data-testid": "leave-workshop-button",
-                        disabled: commands_disabled,
+                        disabled: leave_disabled,
                         onclick: move |_| {
                             leave_workshop(identity, ops);
                         },

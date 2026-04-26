@@ -40,8 +40,8 @@ use crate::http::{
     create_character, create_workshop, create_workshop_lobby, delete_character, delete_workshop,
     eligible_characters, generate_character_sprite_preview, generate_character_sprite_sheet,
     generate_sprite_sheet, join_workshop, list_character_catalog, list_my_characters,
-    list_open_workshops, live, llm_generate_image, llm_judge, ready, workshop_command,
-    workshop_judge_bundle,
+    list_open_workshops, live, llm_generate_image, llm_judge, ready, update_character,
+    workshop_command, workshop_judge_bundle,
 };
 use crate::llm::{LlmClient, LlmPoolConfig, load_llm_pool_config};
 use crate::ws::{WsOutbound, workshop_ws};
@@ -226,7 +226,10 @@ pub(crate) fn build_app(state: AppState) -> Router {
             "/characters/preview-sprites",
             post(generate_character_sprite_preview),
         )
-        .route("/characters/{id}", delete(delete_character))
+        .route(
+            "/characters/{id}",
+            delete(delete_character).patch(update_character),
+        )
         .route("/workshops", post(create_workshop))
         .route("/workshops/lobby", post(create_workshop_lobby))
         .route("/workshops/open", get(list_open_workshops))

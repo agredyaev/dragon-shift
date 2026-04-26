@@ -760,6 +760,16 @@ impl SessionStore for FaultyStore {
             .delete_character_by_owner(character_id, owner_account_id)
     }
 
+    fn update_character_name_by_owner(
+        &self,
+        character_id: &str,
+        owner_account_id: &str,
+        name: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, PersistenceError>> + Send + '_>> {
+        self.inner
+            .update_character_name_by_owner(character_id, owner_account_id, name)
+    }
+
     fn delete_lobby_workshop_by_owner(
         &self,
         session_code: &str,
@@ -838,6 +848,7 @@ fn test_character_profile(
 ) -> protocol::CharacterProfile {
     protocol::CharacterProfile {
         id: id.to_string(),
+        name: None,
         description: description.to_string(),
         sprites,
         remaining_sprite_regenerations,
@@ -4598,6 +4609,7 @@ async fn workshop_command_rejects_duplicate_starter_selection_in_lobby() {
 
     let starter = persistence::CharacterRecord {
         id: "starter_shared_001".to_string(),
+        name: None,
         description: "Shared starter dragon".to_string(),
         sprites: protocol::SpriteSet {
             neutral: "starter-neutral".to_string(),
@@ -12286,6 +12298,159 @@ async fn delete_character_returns_404_for_nonexistent() {
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
 }
 
+#[tokio::test]
+async fn update_character_renames_owned() {
+    let state = test_state();
+    let app = build_app(state);
+    let cookie = signin_and_get_cookie(&app, "knight", "Alice", "correcthorse").await;
+
+    let body = serde_json::json!({
+        "description": "Rename me",
+        "sprites": {
+            "neutral": "base64neutral",
+            "happy": "base64happy",
+            "angry": "base64angry",
+            "sleepy": "base64sleepy"
+        }
+    })
+    .to_string();
+    let create_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/characters")
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .header(axum::http::header::COOKIE, &cookie)
+                .body(Body::from(body))
+                .expect("build create request"),
+        )
+        .await
+        .expect("create response");
+    assert_eq!(create_resp.status(), StatusCode::CREATED);
+    let bytes = to_bytes(create_resp.into_body(), 64 * 1024)
+        .await
+        .expect("read create body");
+    let created: serde_json::Value = serde_json::from_slice(&bytes).expect("body is json");
+    let character_id = created["id"].as_str().unwrap();
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri(format!("/api/characters/{character_id}"))
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .header(axum::http::header::COOKIE, &cookie)
+                .body(Body::from(
+                    serde_json::json!({ "name": "Sparky" }).to_string(),
+                ))
+                .expect("build update request"),
+        )
+        .await
+        .expect("update response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .expect("read update body");
+    let updated: serde_json::Value = serde_json::from_slice(&bytes).expect("body is json");
+    assert_eq!(updated["name"], "Sparky");
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/characters/mine")
+                .header(axum::http::header::COOKIE, &cookie)
+                .body(Body::empty())
+                .expect("build list request"),
+        )
+        .await
+        .expect("list response");
+    let bytes = to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .expect("read list body");
+    let value: serde_json::Value = serde_json::from_slice(&bytes).expect("body is json");
+    assert_eq!(value["characters"][0]["name"], "Sparky");
+}
+
+#[tokio::test]
+async fn update_character_rejects_blank_name() {
+    let state = test_state();
+    let app = build_app(state);
+    let cookie = signin_and_get_cookie(&app, "knight", "Alice", "correcthorse").await;
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri("/api/characters/character_1")
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .header(axum::http::header::COOKIE, &cookie)
+                .body(Body::from(serde_json::json!({ "name": "   " }).to_string()))
+                .expect("build update request"),
+        )
+        .await
+        .expect("update response");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn update_character_rejects_wrong_owner() {
+    let state = test_state();
+    let app = build_app(state);
+    let alice_cookie = signin_and_get_cookie(&app, "knight", "Alice", "correcthorse").await;
+    let bob_cookie = signin_and_get_cookie(&app, "knight", "Bob", "correcthorse").await;
+
+    let body = serde_json::json!({
+        "description": "Alice's dragon",
+        "sprites": {
+            "neutral": "base64neutral",
+            "happy": "base64happy",
+            "angry": "base64angry",
+            "sleepy": "base64sleepy"
+        }
+    })
+    .to_string();
+    let create_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/characters")
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .header(axum::http::header::COOKIE, &alice_cookie)
+                .body(Body::from(body))
+                .expect("build create request"),
+        )
+        .await
+        .expect("create response");
+    let bytes = to_bytes(create_resp.into_body(), 64 * 1024)
+        .await
+        .expect("read create body");
+    let created: serde_json::Value = serde_json::from_slice(&bytes).expect("body is json");
+    let character_id = created["id"].as_str().unwrap();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri(format!("/api/characters/{character_id}"))
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .header(axum::http::header::COOKIE, &bob_cookie)
+                .body(Body::from(
+                    serde_json::json!({ "name": "Stolen" }).to_string(),
+                ))
+                .expect("build update request"),
+        )
+        .await
+        .expect("update response");
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
 // ---------------------------------------------------------------------------
 // C2-b tests: open workshops list
 // ---------------------------------------------------------------------------
@@ -13414,6 +13579,7 @@ async fn join_workshop_leases_starter_when_zero_owned_characters() {
     // Seed a starter character in the store.
     let starter = persistence::CharacterRecord {
         id: "character_starter_001".to_string(),
+        name: None,
         description: "A friendly starter dragon".to_string(),
         sprites: protocol::SpriteSet {
             neutral: "sn".to_string(),

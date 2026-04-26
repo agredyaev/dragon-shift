@@ -137,6 +137,8 @@ pub struct SpriteSet {
 #[serde(rename_all = "camelCase")]
 pub struct CharacterProfile {
     pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     pub description: String,
     pub sprites: SpriteSet,
     #[serde(default)]
@@ -1004,6 +1006,12 @@ pub struct AuthResponse {
 pub struct CreateCharacterRequest {
     pub description: String,
     pub sprites: SpriteSet,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateCharacterRequest {
+    pub name: String,
 }
 
 /// Request body for `POST /api/characters/preview-sprites`.

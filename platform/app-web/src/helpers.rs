@@ -1497,8 +1497,10 @@ pub mod tests {
             "expected short random starter button copy"
         );
         assert!(
-            src.contains("if characters.is_empty() {\n                        button"),
-            "random starter button must only render when no owned characters are eligible"
+            src.contains(
+                "if characters_loaded && !characters_load_failed && characters.is_empty()"
+            ),
+            "random starter button must only render after confirmed empty eligibility"
         );
     }
 
