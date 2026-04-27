@@ -1532,9 +1532,10 @@ pub mod tests {
             "expected PickCharacter to render character sprites"
         );
         assert!(
-            src.contains("data:image/png;base64"),
-            "expected PickCharacter to render embedded sprite images"
+            src.contains("src: sprite_src(sprite_for_index(&character.sprites, sprite_index))"),
+            "expected PickCharacter to render embedded sprite images via sprite_src"
         );
+        assert_eq!(sprite_src("raw-base64"), "data:image/png;base64,raw-base64");
         assert!(
             !src.contains("character.description"),
             "PickCharacter must not render prompt/description text in the selectable rows"
