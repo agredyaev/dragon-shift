@@ -270,11 +270,6 @@ pub fn AccountHomeView(identity: Signal<IdentityState>, ops: Signal<OperationSta
                                 }
                             }
                         }
-                        if open_workshops_loading {
-                            p { class: "meta", role: "status", "aria-live": "polite", "aria-atomic": "true", "Refreshing open workshops..." }
-                        } else if open_workshops_load_failed {
-                            p { class: "meta", role: "alert", "Could not refresh open workshops right now." }
-                        }
                     }
                 }
         }
