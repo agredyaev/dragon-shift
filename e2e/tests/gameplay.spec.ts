@@ -12,8 +12,11 @@ import {
   enterPhase1,
   enterPhase2,
   enterVoting,
+  expectNoUnexpectedBootstrapPanels,
+  expectNoUnexpectedPreSessionPanels,
   expectToStayOnHome,
   hostJoinOwnWorkshop,
+  installUnexpectedPreSessionObserver,
   joinWorkshop,
   newPlayerContext,
   readSessionSnapshot,
@@ -67,10 +70,27 @@ test.describe('dragon shift deployed gameplay', () => {
       await expect(host.page.getByTestId('archive-panel')).toContainText('Build the workshop archive')
       await expect(guest.page.getByTestId('archive-panel')).toContainText('Build the workshop archive')
 
-      await host.page.getByTestId('reset-game-button').click()
-      await waitForNotice(host.page, 'Workshop reset.')
-      await expect(host.page.getByTestId('session-panel')).toContainText(lobbyTitlePattern)
-      await expect(guest.page.getByTestId('session-panel')).toContainText(lobbyTitlePattern)
+      await host.page.getByTestId('archive-workshop-button').click()
+      await waitForNotice(host.page, 'Workshop archive ready.')
+      await expect(host.page.getByTestId('archive-panel')).toContainText('Captured final standings')
+      await expect(host.page.getByTestId('session-panel')).toContainText('Game over')
+      await expect(guest.page.getByTestId('session-panel')).toContainText('Game over')
+
+      await host.page.getByTestId('leave-workshop-button').click()
+      await expect(host.page.getByTestId('open-workshops-panel')).toBeVisible()
+      const archivedRow = host.page.locator('.roster__item').filter({ hasText: workshopCode }).first()
+      await expect(archivedRow).toContainText('Archived', { timeout: 15_000 })
+      await expect(archivedRow.getByTestId('join-workshop-button')).toHaveCount(0)
+      const reviewResponse = host.page.waitForResponse(response =>
+        response.url().includes('/api/workshops/join')
+        && response.request().method() === 'POST'
+        && response.ok(),
+      )
+      await archivedRow.getByTestId('review-workshop-button').click()
+      await reviewResponse
+      await dismissGameOverOverlay(host.page)
+      await expect(host.page.getByTestId('session-panel')).toContainText('Game over')
+      await expect(host.page.getByTestId('archive-panel')).toContainText('Captured final standings')
     } finally {
       await safeClose(host.context, guest.context)
     }
@@ -135,6 +155,7 @@ test.describe('dragon shift deployed gameplay', () => {
       await expect(reconnect.page.getByTestId('session-panel')).toContainText(lobbyTitlePattern)
       await expect(reconnect.page.getByTestId('connection-badge')).toContainText('Connected')
       await expect(reconnect.page.getByTestId('workshop-code-badge')).toContainText(workshopCode)
+      await expect(reconnect.page.getByTestId('session-bootstrap-panel')).toHaveCount(0)
       await waitForNotice(reconnect.page, 'Session synced.')
 
       await joinWorkshop(lateJoiner.page, workshopCode, 'Carol')
@@ -157,11 +178,15 @@ test.describe('dragon shift deployed gameplay', () => {
 
       await expect(host.page.getByTestId('session-panel')).toContainText(lobbyTitlePattern)
 
+      await installUnexpectedPreSessionObserver(host.page)
       await host.page.reload()
 
       await expect(host.page.getByTestId('session-panel')).toContainText(lobbyTitlePattern)
       await expect(host.page.getByTestId('workshop-code-badge')).toContainText(workshopCode)
       await expect(host.page.getByTestId('connection-badge')).toContainText('Connected')
+      await expect(host.page.getByTestId('session-bootstrap-panel')).toHaveCount(0)
+      await expectNoUnexpectedPreSessionPanels(host.page)
+      await expectNoUnexpectedBootstrapPanels(host.page)
       const snapshot = await readSessionSnapshot(host.page)
       expect(snapshot.sessionCode).toBe(workshopCode)
       expect(snapshot.reconnectToken).toBeTruthy()
@@ -172,6 +197,30 @@ test.describe('dragon shift deployed gameplay', () => {
       await expect(host.page.getByTestId('connection-badge')).toContainText('Connected')
     } finally {
       await safeClose(host.context, guest.context, lateJoiner.context)
+    }
+  })
+
+  test('stale saved api target is ignored in favor of the current app origin', async ({ browser }) => {
+    const player = await newPlayerContext(browser)
+
+    try {
+      const storageKey = 'dragon-switch/platform/api-base-url'
+      const staleApiBaseUrl = 'http://127.0.0.1:9'
+      const expectedApiBaseUrl = new URL('/', String(test.info().project.use.baseURL)).origin
+
+      await player.context.addInitScript(([key, apiBaseUrl]) => {
+        window.localStorage.setItem(key, apiBaseUrl)
+      }, [storageKey, staleApiBaseUrl] as const)
+
+      const signInRequest = player.page.waitForRequest(request =>
+        request.method() === 'POST' && request.url().includes('/api/auth/signin'),
+      )
+
+      await signInAccount(player.page, 'StaleApiGuard')
+
+      expect((await signInRequest).url()).toBe(`${expectedApiBaseUrl}/api/auth/signin`)
+    } finally {
+      await safeClose(player.context)
     }
   })
 
@@ -240,6 +289,34 @@ test.describe('dragon shift deployed gameplay', () => {
       await expect(guest.page.getByTestId('start-phase1-button')).toHaveCount(0)
       await expect(host.page.getByTestId('session-panel')).toContainText(lobbyTitlePattern)
       await expect(guest.page.getByTestId('session-panel')).toContainText(lobbyTitlePattern)
+    } finally {
+      await safeClose(host.context, guest.context)
+    }
+  })
+
+  test('guest-first reserved lobby keeps host controls with creator and remains listed after leave', async ({ browser }) => {
+    const host = await newPlayerContext(browser)
+    const guest = await newPlayerContext(browser)
+
+    try {
+      const workshopCode = await createWorkshop(host.page, 'Alice')
+      await joinWorkshop(guest.page, workshopCode, 'Bob')
+
+      await expect(guest.page.getByTestId('controls-panel')).toContainText('hidden')
+      await expect(guest.page.getByTestId('start-phase1-button')).toHaveCount(0)
+
+      await hostJoinOwnWorkshop(host.page, workshopCode)
+      await expect(host.page.getByTestId('controls-panel')).toContainText('visible')
+      await expect(host.page.getByTestId('start-phase1-button')).toBeVisible()
+      await expect(guest.page.getByTestId('controls-panel')).toContainText('hidden')
+      await expect(guest.page.getByTestId('start-phase1-button')).toHaveCount(0)
+
+      await guest.page.getByTestId('leave-workshop-button').click()
+      await host.page.getByTestId('leave-workshop-button').click()
+      await expect(host.page.getByTestId('open-workshops-panel')).toBeVisible()
+      const row = host.page.locator('.roster__item').filter({ hasText: workshopCode }).first()
+      await expect(row).toContainText('2 player(s)', { timeout: 15_000 })
+      await expect(row.getByTestId('delete-workshop-button')).toHaveCount(0)
     } finally {
       await safeClose(host.context, guest.context)
     }
@@ -351,9 +428,13 @@ test.describe('dragon shift deployed gameplay', () => {
       await joinWorkshop(lateJoiner.page, workshopCode, 'Carol')
       await expect(host.page.getByTestId('session-panel')).not.toContainText('Carol')
 
+      await installUnexpectedPreSessionObserver(host.page)
       await host.page.reload()
       await waitForNotice(host.page, 'Session synced.')
       await expect(host.page.getByTestId('session-panel')).toContainText('Carol')
+      await expect(host.page.getByTestId('session-bootstrap-panel')).toHaveCount(0)
+      await expectNoUnexpectedPreSessionPanels(host.page)
+      await expectNoUnexpectedBootstrapPanels(host.page)
     } finally {
       await safeClose(host.context, guest.context, lateJoiner.context)
     }

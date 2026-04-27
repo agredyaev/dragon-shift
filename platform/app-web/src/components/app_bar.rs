@@ -5,7 +5,11 @@ use std::cell::RefCell;
 #[cfg(target_arch = "wasm32")]
 use std::rc::Rc;
 
-use crate::flows::{load_my_characters_flow, submit_delete_character_flow, submit_logout_flow};
+use crate::flows::{
+    begin_load_my_characters, load_my_characters_flow, start_delete_character_flow,
+    start_logout_flow, start_rename_character_flow,
+};
+use crate::helpers::sprite_src;
 use crate::state::{IdentityState, OperationState, PendingFlow, ShellScreen, navigate_to_screen};
 use protocol::SpriteSet;
 
@@ -15,6 +19,10 @@ use protocol::SpriteSet;
 const TRIGGER_ID: &str = "app-bar-menu-trigger";
 const MENU_ID: &str = "app-bar-menu";
 const MENU_ITEM_ID_PREFIX: &str = "app-bar-menu-item-";
+const MANAGE_DRAGONS_TITLE_ID: &str = "manage-dragons-modal-title";
+const DELETE_CHARACTER_TITLE_ID: &str = "delete-character-modal-title";
+const RENAME_CHARACTER_TITLE_ID: &str = "rename-character-modal-title";
+const RENAME_CHARACTER_INPUT_ID: &str = "rename-character-input";
 /// Id on the disclosure wrapper element. The document-level
 /// outside-click handler uses it to decide whether a pointerdown
 /// originated inside the disclosure (trigger + menu) or outside.
@@ -69,6 +77,22 @@ fn sprite_for_index(sprites: &SpriteSet, index: usize) -> &str {
         2 => &sprites.angry,
         _ => &sprites.sleepy,
     }
+}
+
+fn character_display_name(character_name: Option<&str>, fallback_number: usize) -> String {
+    character_name
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("Dragon {fallback_number}"))
+}
+
+fn character_name_input_value(character_name: Option<&str>) -> String {
+    character_name
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .unwrap_or_default()
 }
 
 /// Install a document-level `pointerdown` listener that closes the
@@ -183,8 +207,15 @@ pub fn AppBar(identity: Signal<IdentityState>, ops: Signal<OperationState>) -> E
     // Local disclosure state. Lives in the component so the menu closes
     // automatically when `AppBar` unmounts (e.g. on sign-out).
     let mut open = use_signal(|| false);
+    let mut focus_menu_on_open = use_signal(|| false);
     let mut manage_dragons_open = use_signal(|| false);
+    let mut focus_manage_dragons_on_open = use_signal(|| false);
+    let mut focus_manage_dragons_after_nested_close = use_signal(|| false);
     let mut pending_delete_character = use_signal(|| None::<(String, usize)>);
+    let mut focus_delete_character_on_open = use_signal(|| false);
+    let mut pending_rename_character = use_signal(|| None::<(String, String)>);
+    let mut focus_rename_character_on_open = use_signal(|| false);
+    let mut rename_character_name = use_signal(String::new);
 
     // Snapshot read: account is the only bit we need from identity.
     let (account_name, is_signed_in, current_screen) = {
@@ -200,23 +231,42 @@ pub fn AppBar(identity: Signal<IdentityState>, ops: Signal<OperationState>) -> E
     // another pending flow is in-flight. Mirrors the prior
     // account_home.rs contract (`disabled: ops.read().pending_flow.is_some()`).
     let flow_pending = ops.read().pending_flow.is_some();
+    let command_pending = ops.read().pending_command.is_some();
+    let judge_bundle_pending = ops.read().pending_judge_bundle;
     let delete_character_pending = ops.read().pending_flow == Some(PendingFlow::DeleteCharacter);
-    let my_characters = ops.read().my_characters.clone();
+    let rename_character_pending = ops.read().pending_flow == Some(PendingFlow::RenameCharacter);
+    let my_characters_loading = ops.read().my_characters_loading;
+    let my_characters_loaded = ops.read().my_characters_loaded;
+    let my_characters_load_failed = ops.read().my_characters_load_failed;
+    let my_characters_count = ops.read().my_characters.len();
     let my_characters_limit = ops.read().my_characters_limit;
+    let rename_input_value = rename_character_name.read().clone();
+    let rename_input_empty = rename_input_value.trim().is_empty();
+    let secondary_dialog_open =
+        pending_delete_character.read().is_some() || pending_rename_character.read().is_some();
+    let visible_my_characters = if *manage_dragons_open.read() {
+        ops.read().my_characters.clone()
+    } else {
+        Vec::new()
+    };
 
     // Disabled-state snapshot for each menu item, in render order.
     // Used by `handle_menu_item_key` to skip over disabled items when
     // arrow-navigating (V1 M1 / V3 MEDIUM-1 / V5 MEDIUM-2).
     // Index 0: Create dragon (always enabled).
     // Index 1: Log out (disabled while a flow is pending).
-    let menu_disabled: [bool; MENU_ITEM_COUNT] = [false, flow_pending];
+    let menu_disabled: [bool; MENU_ITEM_COUNT] = [
+        my_characters_loading || flow_pending || command_pending || judge_bundle_pending,
+        flow_pending || command_pending || judge_bundle_pending,
+    ];
 
     // Wordmark routes home when signed in and not already there. On
     // SignIn or AccountHome it's a no-op (disabled) so keyboard users
     // don't get a trap that looks interactive.
     // CreateCharacter holds draft form state; wordmark is disabled
     // there until Tier 3a-2 adds a T-5 confirmation modal.
-    let wordmark_disabled = !matches!(current_screen, ShellScreen::PickCharacter { .. });
+    let wordmark_disabled = !matches!(current_screen, ShellScreen::PickCharacter { .. })
+        || ops.read().pending_flow == Some(PendingFlow::Join);
 
     // Outside-click close (UX_RECOMPOSE_v2 §4.A contract A-3). Attach a
     // document-level pointerdown listener while `open` is true and
@@ -245,37 +295,81 @@ pub fn AppBar(identity: Signal<IdentityState>, ops: Signal<OperationState>) -> E
         });
     }
 
+    use_effect(move || {
+        if *open.read() && *focus_menu_on_open.read() {
+            focus_menu_on_open.set(false);
+            focus_first_enabled_menu_item(menu_disabled);
+        }
+    });
+
+    use_effect(move || {
+        if *manage_dragons_open.read() && *focus_manage_dragons_on_open.read() {
+            focus_manage_dragons_on_open.set(false);
+            focus_element_by_id(MANAGE_DRAGONS_TITLE_ID);
+        }
+    });
+
+    use_effect(move || {
+        if *manage_dragons_open.read()
+            && pending_delete_character.read().is_none()
+            && pending_rename_character.read().is_none()
+            && *focus_manage_dragons_after_nested_close.read()
+        {
+            focus_manage_dragons_after_nested_close.set(false);
+            focus_element_by_id(MANAGE_DRAGONS_TITLE_ID);
+        }
+    });
+
+    use_effect(move || {
+        if pending_delete_character.read().is_some() && *focus_delete_character_on_open.read() {
+            focus_delete_character_on_open.set(false);
+            focus_element_by_id(DELETE_CHARACTER_TITLE_ID);
+        }
+    });
+
+    use_effect(move || {
+        if pending_rename_character.read().is_some() && *focus_rename_character_on_open.read() {
+            focus_rename_character_on_open.set(false);
+            focus_element_by_id(RENAME_CHARACTER_INPUT_ID);
+        }
+    });
+
     rsx! {
         if *manage_dragons_open.read() {
             div {
                 class: "modal-backdrop",
                 role: "presentation",
-                onclick: move |_| manage_dragons_open.set(false),
+                hidden: secondary_dialog_open,
+                onclick: move |_| {
+                    manage_dragons_open.set(false);
+                    focus_element_by_id(TRIGGER_ID);
+                },
                 div {
                     class: "modal-card modal-card--characters",
                     role: "dialog",
                     "aria-modal": "true",
-                    "aria-labelledby": "manage-dragons-modal-title",
+                    "aria-labelledby": MANAGE_DRAGONS_TITLE_ID,
                     "aria-describedby": "manage-dragons-modal-body",
                     onclick: move |event| event.stop_propagation(),
                     div { class: "panel__header",
                         h2 {
-                            id: "manage-dragons-modal-title",
+                            id: MANAGE_DRAGONS_TITLE_ID,
                             class: "panel__title modal-card__title",
+                            tabindex: "-1",
                             "Your Dragons"
                         }
-                        span { class: "badge", "{my_characters.len()} / {my_characters_limit}" }
+                        span { class: "badge", "{my_characters_count} / {my_characters_limit}" }
                     }
                     p {
                         id: "manage-dragons-modal-body",
                         class: "panel__body modal-card__body",
-                        "Create a dragon or delete an existing one from your account."
+                        "Create, rename, or delete dragons from your account."
                     }
                     div { class: "button-row button-row--home-action modal-card__primary-action",
                         button {
                             class: "button button--secondary",
                             "data-testid": "create-character-button",
-                            disabled: flow_pending,
+                            disabled: flow_pending || command_pending || judge_bundle_pending,
                             onclick: move |_| {
                                 manage_dragons_open.set(false);
                                 identity.with_mut(|id| {
@@ -288,16 +382,30 @@ pub fn AppBar(identity: Signal<IdentityState>, ops: Signal<OperationState>) -> E
                         }
                     }
                     div { class: "panel__stack",
-                        if my_characters.is_empty() {
-                            p { class: "meta", "No dragons yet. Create one to use it in workshops." }
+                        if my_characters_loading && visible_my_characters.is_empty() {
+                            p { class: "meta", role: "status", "aria-live": "polite", "aria-atomic": "true", "Loading dragons..." }
+                        } else if my_characters_load_failed && visible_my_characters.is_empty() {
+                            p { class: "meta", role: "alert", "Could not load dragons right now." }
+                        } else if my_characters_loaded && visible_my_characters.is_empty() {
+                            p { class: "meta", role: "status", "aria-live": "polite", "aria-atomic": "true", "No dragons yet. Create one to use it in workshops." }
+                        } else if visible_my_characters.is_empty() {
+                            p { class: "meta", role: "status", "aria-live": "polite", "aria-atomic": "true", "Loading dragons..." }
                         } else {
                             div { class: "roster roster--modal",
-                                for (character_index, character) in my_characters.iter().enumerate() {
+                                for (character_index, character) in visible_my_characters.iter().enumerate() {
                                     {
-                                        let character_id = character.id.clone();
+                                        let rename_character_id = character.id.clone();
+                                        let delete_character_id = character.id.clone();
                                         let character_number = character_index + 1;
+                                        let character_name = character_display_name(
+                                            character.name.as_deref(),
+                                            character_number,
+                                        );
+                                        let rename_current_name = character_name_input_value(
+                                            character.name.as_deref(),
+                                        );
                                         rsx! {
-                                            article { class: "roster__item pick-character-row",
+                                            article { class: "roster__item pick-character-row", key: "{character.id}",
                                                 div { class: "pick-character-row__body",
                                                     div {
                                                         class: "pick-character-row__sprites",
@@ -306,40 +414,68 @@ pub fn AppBar(identity: Signal<IdentityState>, ops: Signal<OperationState>) -> E
                                                             div { class: "pick-character-row__sprite-frame",
                                                                 img {
                                                                     class: "pick-character-row__sprite",
-                                                                    src: "data:image/png;base64,{sprite_for_index(&character.sprites, sprite_index)}",
-                                                                    alt: "Dragon {character_number}: {label} sprite",
+                                                                    src: sprite_src(sprite_for_index(&character.sprites, sprite_index)),
+                                                                    alt: "{character_name}: {label} sprite",
                                                                 }
                                                             }
                                                         }
                                                     }
                                                     div { class: "pick-character-row__copy",
-                                                        p { class: "roster__name", "Dragon {character_number}" }
+                                                        p { class: "roster__name", "{character_name}" }
                                                         p { class: "roster__meta", "Ready for workshops" }
                                                     }
                                                 }
-                                                button {
-                                                    class: "button button--danger button--small",
-                                                    "data-testid": "delete-character-button",
-                                                    disabled: flow_pending,
-                                                    onclick: move |_| {
-                                                        pending_delete_character.set(Some((
-                                                            character_id.clone(),
-                                                            character_number,
-                                                        )));
-                                                    },
-                                                    if delete_character_pending { "Deleting..." } else { "Delete" }
+                                                if !my_characters_loading {
+                                                    div { class: "button-row roster__actions",
+                                                        button {
+                                                            class: "button button--secondary button--small",
+                                                            "data-testid": "rename-character-button",
+                                                            disabled: flow_pending || command_pending || judge_bundle_pending,
+                                                            onclick: move |_| {
+                                                                let current_name = rename_current_name.clone();
+                                                                rename_character_name.set(current_name.clone());
+                                                                pending_rename_character.set(Some((
+                                                                    rename_character_id.clone(),
+                                                                    character_name.clone(),
+                                                                )));
+                                                                focus_rename_character_on_open.set(true);
+                                                            },
+                                                            if rename_character_pending { "Renaming..." } else { "Rename" }
+                                                        }
+                                                        button {
+                                                            class: "button button--danger button--small",
+                                                            "data-testid": "delete-character-button",
+                                                            disabled: flow_pending || command_pending || judge_bundle_pending,
+                                                            onclick: move |_| {
+                                                                pending_delete_character.set(Some((
+                                                                    delete_character_id.clone(),
+                                                                    character_number,
+                                                                )));
+                                                                focus_delete_character_on_open.set(true);
+                                                            },
+                                                            if delete_character_pending { "Deleting..." } else { "Delete" }
+                                                        }
+                                                    }
                                                 }
                                             }
                                         }
                                     }
                                 }
                             }
+                            if my_characters_loading {
+                                p { class: "meta", role: "status", "aria-live": "polite", "aria-atomic": "true", "Refreshing dragons..." }
+                            } else if my_characters_load_failed {
+                                p { class: "meta", role: "alert", "Could not refresh dragons right now." }
+                            }
                         }
                     }
                     div { class: "button-row modal-card__actions",
                         button {
                             class: "button button--primary",
-                            onclick: move |_| manage_dragons_open.set(false),
+                            onclick: move |_| {
+                                manage_dragons_open.set(false);
+                                focus_element_by_id(TRIGGER_ID);
+                            },
                             "Close"
                         }
                     }
@@ -351,17 +487,21 @@ pub fn AppBar(identity: Signal<IdentityState>, ops: Signal<OperationState>) -> E
             div {
                 class: "modal-backdrop",
                 role: "presentation",
-                onclick: move |_| pending_delete_character.set(None),
+                onclick: move |_| {
+                    pending_delete_character.set(None);
+                    focus_manage_dragons_after_nested_close.set(true);
+                },
                 div {
                     class: "modal-card",
                     role: "dialog",
                     "aria-modal": "true",
-                    "aria-labelledby": "delete-character-modal-title",
+                    "aria-labelledby": DELETE_CHARACTER_TITLE_ID,
                     "aria-describedby": "delete-character-modal-body",
                     onclick: move |event| event.stop_propagation(),
                     h2 {
-                        id: "delete-character-modal-title",
+                        id: DELETE_CHARACTER_TITLE_ID,
                         class: "panel__title modal-card__title",
+                        tabindex: "-1",
                         "Delete Dragon"
                     }
                     p {
@@ -373,7 +513,10 @@ pub fn AppBar(identity: Signal<IdentityState>, ops: Signal<OperationState>) -> E
                         button {
                             class: "button button--secondary",
                             disabled: delete_character_pending,
-                            onclick: move |_| pending_delete_character.set(None),
+                            onclick: move |_| {
+                                pending_delete_character.set(None);
+                                focus_manage_dragons_after_nested_close.set(true);
+                            },
                             "Cancel"
                         }
                         button {
@@ -381,14 +524,84 @@ pub fn AppBar(identity: Signal<IdentityState>, ops: Signal<OperationState>) -> E
                             "data-testid": "confirm-delete-character-button",
                             disabled: delete_character_pending,
                             onclick: move |_| {
-                                pending_delete_character.set(None);
-                                spawn(submit_delete_character_flow(
+                                if start_delete_character_flow(
                                     identity,
                                     ops,
                                     delete_character_id.clone(),
-                                ));
+                                ) {
+                                    pending_delete_character.set(None);
+                                    focus_manage_dragons_after_nested_close.set(true);
+                                }
                             },
                             if delete_character_pending { "Deleting..." } else { "Delete" }
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some((rename_character_id, current_character_name)) = pending_rename_character.read().clone() {
+            div {
+                class: "modal-backdrop",
+                role: "presentation",
+                onclick: move |_| {
+                    pending_rename_character.set(None);
+                    focus_manage_dragons_after_nested_close.set(true);
+                },
+                div {
+                    class: "modal-card",
+                    role: "dialog",
+                    "aria-modal": "true",
+                    "aria-labelledby": RENAME_CHARACTER_TITLE_ID,
+                    "aria-describedby": "rename-character-modal-body",
+                    onclick: move |event| event.stop_propagation(),
+                    h2 {
+                        id: RENAME_CHARACTER_TITLE_ID,
+                        class: "panel__title modal-card__title",
+                        "Rename Dragon"
+                    }
+                    p {
+                        id: "rename-character-modal-body",
+                        class: "panel__body modal-card__body",
+                        "Choose a new name for {current_character_name}."
+                    }
+                    input {
+                        class: "input",
+                        "data-testid": "rename-character-input",
+                        id: RENAME_CHARACTER_INPUT_ID,
+                        r#type: "text",
+                        maxlength: 64,
+                        value: "{rename_input_value}",
+                        disabled: rename_character_pending,
+                        oninput: move |event| rename_character_name.set(event.value()),
+                    }
+                    div { class: "button-row modal-card__actions",
+                        button {
+                            class: "button button--secondary",
+                            disabled: rename_character_pending,
+                            onclick: move |_| {
+                                pending_rename_character.set(None);
+                                focus_manage_dragons_after_nested_close.set(true);
+                            },
+                            "Cancel"
+                        }
+                        button {
+                            class: "button button--primary",
+                            "data-testid": "confirm-rename-character-button",
+                            disabled: rename_character_pending || rename_input_empty,
+                            onclick: move |_| {
+                                let next_name = rename_character_name.read().clone();
+                                if start_rename_character_flow(
+                                    identity,
+                                    ops,
+                                    rename_character_id.clone(),
+                                    next_name,
+                                ) {
+                                    pending_rename_character.set(None);
+                                    focus_manage_dragons_after_nested_close.set(true);
+                                }
+                            },
+                            if rename_character_pending { "Renaming..." } else { "Save" }
                         }
                     }
                 }
@@ -456,7 +669,7 @@ pub fn AppBar(identity: Signal<IdentityState>, ops: Signal<OperationState>) -> E
                             let next = !*open.read();
                             open.set(next);
                             if next {
-                                focus_element_by_id(&menu_item_id(0));
+                                focus_menu_on_open.set(true);
                             }
                         },
                         onkeydown: move |event| {
@@ -467,14 +680,16 @@ pub fn AppBar(identity: Signal<IdentityState>, ops: Signal<OperationState>) -> E
                                 let next = !*open.read();
                                 open.set(next);
                                 if next {
-                                    focus_element_by_id(&menu_item_id(0));
+                                    focus_menu_on_open.set(true);
                                 }
                             } else if matches!(key, Key::ArrowDown) {
                                 event.prevent_default();
                                 if !*open.read() {
                                     open.set(true);
+                                    focus_menu_on_open.set(true);
+                                } else {
+                                    focus_first_enabled_menu_item(menu_disabled);
                                 }
-                                focus_element_by_id(&menu_item_id(0));
                             } else if matches!(key, Key::Escape) && *open.read() {
                                 event.prevent_default();
                                 open.set(false);
@@ -502,9 +717,15 @@ pub fn AppBar(identity: Signal<IdentityState>, ops: Signal<OperationState>) -> E
                                 r#type: "button",
                                 role: "menuitem",
                                 tabindex: "-1",
+                                disabled: my_characters_loading || flow_pending || command_pending || judge_bundle_pending,
                                 onclick: move |_| {
+                                    if my_characters_loading || flow_pending || command_pending || judge_bundle_pending {
+                                        return;
+                                    }
                                     open.set(false);
+                                    ops.with_mut(begin_load_my_characters);
                                     manage_dragons_open.set(true);
+                                    focus_manage_dragons_on_open.set(true);
                                     spawn(load_my_characters_flow(identity, ops));
                                 },
                                 onkeydown: move |event| {
@@ -522,10 +743,10 @@ pub fn AppBar(identity: Signal<IdentityState>, ops: Signal<OperationState>) -> E
                                 r#type: "button",
                                 role: "menuitem",
                                 tabindex: "-1",
-                                disabled: flow_pending,
+                                disabled: flow_pending || command_pending || judge_bundle_pending,
                                 onclick: move |_| {
                                     open.set(false);
-                                    spawn(submit_logout_flow(identity, ops));
+                                    let _ = start_logout_flow(identity, ops);
                                 },
                                 onkeydown: move |event| {
                                     handle_menu_item_key(event, 1, open, menu_disabled);
@@ -537,6 +758,13 @@ pub fn AppBar(identity: Signal<IdentityState>, ops: Signal<OperationState>) -> E
                 }
             }
         }
+    }
+}
+
+fn focus_first_enabled_menu_item(disabled: [bool; MENU_ITEM_COUNT]) {
+    match disabled.iter().position(|&item_disabled| !item_disabled) {
+        Some(index) => focus_element_by_id(&menu_item_id(index)),
+        None => focus_element_by_id(TRIGGER_ID),
     }
 }
 

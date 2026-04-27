@@ -87,6 +87,7 @@ fn App() -> Element {
     let is_voting = render_session_panels_first && current_phase == Some(Phase::Voting);
     let is_judge = render_session_panels_first && current_phase == Some(Phase::Judge);
     let is_end = render_session_panels_first && current_phase == Some(Phase::End);
+    let is_session_bootstrapping = render_session_panels_first && current_phase.is_none();
     let show_clock = render_session_panels_first && is_clock_phase;
 
     let time_string = format!("{:02}:00", game_time.rem_euclid(24));
@@ -97,9 +98,10 @@ fn App() -> Element {
         pre_session_screen.as_ref(),
         Some(ShellScreen::CreateCharacter)
     );
-    let is_centered_card_screen = matches!(
+    let is_centered_card_screen = matches!(pre_session_screen.as_ref(), Some(ShellScreen::SignIn));
+    let is_pick_character_screen = matches!(
         pre_session_screen.as_ref(),
-        Some(ShellScreen::SignIn) | Some(ShellScreen::PickCharacter { .. })
+        Some(ShellScreen::PickCharacter { .. })
     );
 
     // ---- Container class ----
@@ -113,6 +115,8 @@ fn App() -> Element {
         "shell__container shell__container--end"
     } else if is_create_character_screen {
         "shell__container shell__container--phase0"
+    } else if is_pick_character_screen {
+        "shell__container shell__container--pick-character"
     } else if is_centered_card_screen {
         "shell__container shell__container--card"
     } else {
@@ -121,7 +125,7 @@ fn App() -> Element {
 
     // Day/night background only applies during clock phases (Phase1/Phase2).
     // Home screen (no game_state) and other phases use the neutral shell background.
-    let shell_class = if is_clock_phase {
+    let shell_class = if render_session_panels_first && is_clock_phase {
         if is_daytime {
             "shell shell--day"
         } else {
@@ -136,15 +140,19 @@ fn App() -> Element {
     };
 
     let mut effect_identity = identity;
+    let mut effect_game_state = game_state;
     let mut effect_ops = ops;
-
+    let mut bootstrap_back_identity = identity;
+    let mut bootstrap_back_ops = ops;
     use_effect(move || {
         if should_bootstrap_realtime
             && let Err(error) = bootstrap_realtime(identity, game_state, ops, judge_bundle)
         {
             effect_identity.with_mut(|id| {
-                effect_ops.with_mut(|o| {
-                    apply_realtime_bootstrap_error(id, o, error);
+                effect_game_state.with_mut(|gs| {
+                    effect_ops.with_mut(|o| {
+                        apply_realtime_bootstrap_error(id, gs, o, error);
+                    });
                 });
             });
         }
@@ -166,7 +174,15 @@ fn App() -> Element {
                 }
             }
             section { class: container_class,
-                if is_lobby || is_phase1 || is_handover || is_phase2 || is_voting || is_judge || is_end {
+                if is_lobby
+                    || is_phase1
+                    || is_handover
+                    || is_phase2
+                    || is_voting
+                    || is_judge
+                    || is_end
+                    || is_session_bootstrapping
+                {
                     NoticeBar {
                         ops,
                         scope: NoticeScope::Session,
@@ -235,13 +251,74 @@ fn App() -> Element {
                         handover_tags_input,
                         judge_bundle,
                     }
+                } else if is_session_bootstrapping {
+                    article { class: "panel panel--session", "data-testid": "session-bootstrap-panel",
+                        div { class: "sr-only", "data-testid": "workshop-code-badge",
+                            {reconnect_session_code.read().clone()}
+                        }
+                        div {
+                            class: format!(
+                                "sr-only {}",
+                                if identity.read().connection_status == state::ConnectionStatus::Offline {
+                                    "status-offline"
+                                } else {
+                                    "status-connecting"
+                                },
+                            ),
+                            "data-testid": "connection-badge",
+                            {
+                                if identity.read().connection_status == state::ConnectionStatus::Offline {
+                                    "Offline"
+                                } else {
+                                    "Connecting"
+                                }
+                            }
+                        }
+                        div { class: "sr-only", "data-testid": "controls-panel", "hidden" }
+                        div { class: "panel__stack",
+                            h1 { class: "panel__title", "Syncing session" }
+                            p { class: "panel__body",
+                                "Reconnecting to your workshop and waiting for the latest live state."
+                            }
+                            p {
+                                class: "meta",
+                                role: "status",
+                                "aria-live": "polite",
+                                "aria-atomic": "true",
+                                "Your workshop view will appear as soon as the session sync completes."
+                            }
+                            if identity.read().connection_status == state::ConnectionStatus::Offline {
+                                div { class: "button-row",
+                                    button {
+                                        class: "button button--secondary",
+                                        "data-testid": "bootstrap-back-button",
+                                        onclick: move |_| {
+                                            bootstrap_back_identity.with_mut(|id| {
+                                                bootstrap_back_ops.with_mut(|o| {
+                                                    state::clear_session_identity(id);
+                                                    o.pending_flow = None;
+                                                    o.pending_command = None;
+                                                    o.pending_judge_bundle = false;
+                                                });
+                                            });
+                                        },
+                                        "Back to home"
+                                    }
+                                }
+                            }
+                        }
+                    }
                 } else {
                     // ---- Pre-session screens (SignIn / AccountHome / etc.) ----
                     match pre_session_screen.as_ref() {
                         Some(ShellScreen::AccountHome) => rsx! {
                             AccountHomeView {
                                 identity,
+                                game_state,
                                 ops,
+                                reconnect_session_code,
+                                reconnect_token,
+                                judge_bundle,
                             }
                         },
                         Some(ShellScreen::CreateCharacter) => rsx! {
@@ -249,6 +326,7 @@ fn App() -> Element {
                         },
                         Some(ShellScreen::PickCharacter { workshop_code }) => rsx! {
                             PickCharacterView {
+                                key: "{workshop_code}",
                                 identity,
                                 game_state,
                                 ops,

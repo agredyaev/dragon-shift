@@ -387,6 +387,13 @@ with_port_forward_health() {
   local pid=""
   local service_port=""
 
+  print_port_forward_log() {
+    if [[ -s "${PORT_FORWARD_LOG}" ]]; then
+      printf 'Port-forward log:\n' >&2
+      sed 's/^/  /' "${PORT_FORWARD_LOG}" >&2 || true
+    fi
+  }
+
   cleanup_port_forward() {
     if [[ -n "${pid}" ]]; then
       kill "${pid}" >/dev/null 2>&1 || true
@@ -409,10 +416,16 @@ with_port_forward_health() {
       && curl --fail --silent --show-error "http://127.0.0.1:${local_port}/api/ready" >/dev/null; then
       return 0
     fi
+    if ! kill -0 "${pid}" >/dev/null 2>&1; then
+      printf 'kubectl port-forward exited before internal health checks succeeded.\n' >&2
+      print_port_forward_log
+      return 1
+    fi
     sleep 2
   done
 
   printf 'Port-forward health check failed. See %s\n' "${PORT_FORWARD_LOG}" >&2
+  print_port_forward_log
   return 1
 }
 
@@ -457,7 +470,12 @@ HELM_RELEASE_NAME="$(terraform -chdir="${ROOT_DIR}/terraform/environments/produc
 PORT_FORWARD_SERVICE="${PORT_FORWARD_SERVICE:-${HELM_RELEASE_NAME}-dragon-shift}"
 
 kubectl --kubeconfig "${KUBECONFIG_PATH}" rollout status deployment/"${HELM_RELEASE_NAME}-dragon-shift" -n "${VERIFY_NAMESPACE}" --timeout=10m
-with_port_forward_health "${VERIFY_NAMESPACE}" "${PORT_FORWARD_SERVICE}"
+if ! with_port_forward_health "${VERIFY_NAMESPACE}" "${PORT_FORWARD_SERVICE}"; then
+  if [[ "${VERIFY_PUBLIC_EDGE}" != "true" ]]; then
+    exit 1
+  fi
+  printf 'Internal port-forward verification failed; continuing because TF_VERIFY_PUBLIC_EDGE=true and public verification will run next.\n' >&2
+fi
 
 if [[ "${VERIFY_PUBLIC_EDGE}" == "true" ]]; then
   printf 'Waiting for managed certificate...\n'

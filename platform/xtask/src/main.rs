@@ -753,7 +753,7 @@ fn write_app_web_index_html(out_dir: &Path) -> Result<(), String> {
     <div id="main"></div>
     <script type="module">
       import init from "./app-web.js?v={cache_bust}";
-      init(new URL("./app-web_bg.wasm?v={cache_bust}", import.meta.url));
+      init({{ module_or_path: new URL("./app-web_bg.wasm?v={cache_bust}", import.meta.url) }});
     </script>
   </body>
 </html>

@@ -57,6 +57,7 @@
 - `db_password` - Cloud SQL application password
 - `db_password_version` - write-only password version bump
 - `database_url_secret_version` - optional extra Secret Manager version bump
+- `session_cookie_key_secret_id` - Secret Manager secret ID for the runtime `SESSION_COOKIE_KEY`; the foundation stack ensures the secret exists and seeds the first version automatically when missing
 - `support_email` - support contact used by monitoring and ownership flows
 - `master_authorized_networks` - allowed control-plane CIDRs
 
@@ -68,7 +69,7 @@
 - `image_digest` - deployed image digest
 - `image_tag` - deployed image tag
 - `database_url_secret_id` - Secret Manager secret ID for the runtime `DATABASE_URL` (default `dragon-shift-production-database-url`)
-- `session_cookie_key_secret_id` - Secret Manager secret ID for the runtime `SESSION_COOKIE_KEY` (default `dragon-shift-production-session-cookie-key`); operators must create this secret and populate its first version with `openssl rand -base64 64` output **before** the first production apply
+- `session_cookie_key_secret_id` - Secret Manager secret ID for the runtime `SESSION_COOKIE_KEY` (default `dragon-shift-production-session-cookie-key`); by default the foundation stack ensures this secret exists and seeds its first enabled version before platform apply
 - `database_pool_size` - runtime `DATABASE_POOL_SIZE` override for production
 - `app_cpu_request` - optional production app pod CPU request override
 - `app_cpu_limit` - optional production app pod CPU limit override

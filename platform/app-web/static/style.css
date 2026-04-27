@@ -184,6 +184,9 @@
     .shell__container--card {
         width: min(var(--container-max-card), calc(100% - 2rem));
     }
+    .shell__container--pick-character {
+        width: min(100%, 60rem);
+    }
     .shell__container--phase0 > .notice,
     .shell__container--handover > .notice {
         max-width: 640px;
@@ -360,6 +363,26 @@
     .panel__stack--home-action {
         margin-top: auto;
     }
+    /* Open Workshops list polls every 5s and toggles a transient
+       "Refreshing..." status paragraph as the last child of the stack.
+       Without reservation, that paragraph (line-height + 12px gap)
+       grew/collapsed the panel on every poll round-trip, making the
+       bottom border visibly flicker. We anchor only that trailing
+       refresh/error meta line so panel height stays constant. */
+    [data-testid="open-workshops-panel"] .panel__stack {
+        position: relative;
+        /* 24px reserves one line of `.meta` (13px * 1.7 ≈ 22px) plus
+           ~12px to mirror the grid `gap` so refresh status does not
+           kiss the last roster item. */
+        padding-bottom: 36px;
+    }
+    [data-testid="open-workshops-panel"] .panel__stack > .roster ~ .meta {
+        position: absolute;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        margin: 0;
+    }
     .flow-cards {
         display: grid;
         gap: 12px;
@@ -414,9 +437,39 @@
         gap: 12px;
         flex-wrap: wrap;
     }
+    .button-row--session-controls {
+        align-items: center;
+        flex-wrap: nowrap;
+        overflow-x: auto;
+        padding-bottom: 4px;
+    }
+    .button-row--session-controls .button {
+        flex: 0 0 auto;
+        white-space: nowrap;
+    }
     .button-row--home-action .button {
         flex: 1 1 0;
         min-width: 0;
+    }
+    .workshop-status-badge {
+        display: inline-flex;
+        align-items: center;
+        margin-left: 8px;
+        padding: 2px 6px;
+        border: 2px solid currentColor;
+        font-family: var(--font-display);
+        font-size: 10px;
+        line-height: 1.2;
+        text-transform: uppercase;
+        letter-spacing: 0.06em;
+    }
+    .workshop-status-badge--archived {
+        color: #7c2d12;
+        background: #ffedd5;
+    }
+    .workshop-status-badge--active {
+        color: #14532d;
+        background: #dcfce7;
     }
     .button {
         border: 4px solid #0f172a;
@@ -438,6 +491,11 @@
     .button--cta {
         width: var(--btn-width-cta);
         height: var(--btn-height-cta);
+    }
+    .button--small {
+        min-width: 112px;
+        height: 44px;
+        padding: 0 14px;
     }
     @media (max-width: 767px) {
         .button {
@@ -468,7 +526,7 @@
         color: #082f49;
     }
     .button--danger {
-        background: #f43f5e;
+        background: #be123c;
         color: #fff;
     }
     .notice {
@@ -537,6 +595,15 @@
         max-height: 52vh;
         overflow: auto;
         padding-right: 6px;
+        overscroll-behavior: contain;
+        contain: layout paint;
+    }
+    .roster--pick-character {
+        max-height: min(52vh, 34rem);
+        overflow: auto;
+        padding-right: 6px;
+        overscroll-behavior: contain;
+        contain: layout paint;
     }
     .roster__item {
         border: 4px solid #0f172a;
@@ -580,7 +647,6 @@
         justify-content: center;
         padding: 24px;
         background: rgba(2, 6, 23, 0.54);
-        backdrop-filter: blur(2px);
     }
     .modal-card {
         width: min(560px, 100%);
@@ -609,7 +675,10 @@
     .modal-card--characters {
         width: min(960px, 100%);
         max-height: min(84vh, 860px);
-        overflow: auto;
+        overflow: hidden;
+    }
+    .modal-card--characters::before {
+        display: none;
     }
     .modal-card--characters .panel__stack {
         margin-top: 8px;
@@ -661,6 +730,14 @@
         font-size: 12px;
         line-height: 1.7;
         max-width: 54ch;
+    }
+    .roster__actions {
+        justify-content: flex-end;
+        flex: 0 0 auto;
+        flex-wrap: nowrap;
+    }
+    .roster__actions .button {
+        min-width: 112px;
     }
     .pick-character-row {
         align-items: center;
@@ -733,30 +810,100 @@
         line-height: 1.7;
     }
     /* ---- Voting grid + pixel dragon sprites ---- */
+    .scoring-screen {
+        display: grid;
+        gap: 18px;
+        color: #f8fafc;
+    }
+    .scoring-screen > .roster__item--phase {
+        background:
+            linear-gradient(180deg, rgba(255, 251, 235, 0.98) 0%, rgba(248, 250, 252, 0.98) 100%);
+        color: #0f172a;
+        border-color: #111827;
+        box-shadow:
+            inset 4px 4px 0 rgba(255, 255, 255, 0.62),
+            inset -4px -4px 0 rgba(0, 0, 0, 0.12),
+            6px 6px 0 rgba(0, 0, 0, 0.45);
+    }
+    .scoring-screen > .roster__item--phase .roster__name {
+        color: #0f172a;
+        text-shadow: 2px 2px 0 rgba(255, 255, 255, 0.68);
+    }
+    .scoring-screen > .roster__item--phase .roster__meta {
+        color: #334155;
+        font-size: 14px;
+    }
+    .scoring-status,
+    .scoring-section-title {
+        margin: 0;
+        color: #f8fafc;
+    }
+    .scoring-status {
+        padding: 12px 14px;
+        font-family: var(--font-body);
+        font-size: 14px;
+        font-weight: 700;
+        line-height: 1.6;
+        color: #e2e8f0;
+        background: rgba(15, 23, 42, 0.84);
+        border: 3px solid rgba(148, 163, 184, 0.68);
+        box-shadow: 4px 4px 0 rgba(0, 0, 0, 0.28);
+    }
+    .scoring-status--muted {
+        color: #cbd5e1;
+        background: rgba(30, 41, 59, 0.78);
+    }
+    .scoring-section-title {
+        width: fit-content;
+        padding: 8px 12px;
+        font-family: var(--font-display);
+        font-size: 13px;
+        font-weight: 700;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+        color: #fef9c3;
+        background: #0f172a;
+        border: 3px solid #facc15;
+        box-shadow: 4px 4px 0 rgba(0, 0, 0, 0.35);
+    }
     .voting-grid {
         display: grid;
-        grid-template-columns: 1fr;
-        gap: 16px;
+        grid-template-columns: repeat(auto-fit, minmax(min(100%, 320px), 1fr));
+        gap: 18px;
     }
     .voting-card {
         border: 4px solid #0f172a;
-        background: #ffffff;
-        padding: 16px;
+        background:
+            linear-gradient(180deg, #ffffff 0%, #eff6ff 100%);
+        padding: 18px;
         display: flex;
         align-items: center;
         gap: 16px;
+        min-width: 0;
+        overflow: hidden;
         box-shadow:
             inset 3px 3px 0 0 rgba(255,255,255,0.72),
             inset -3px -3px 0 0 rgba(0,0,0,0.08),
-            4px 4px 0 0 rgba(0,0,0,0.24);
+            5px 5px 0 0 rgba(0,0,0,0.3);
         transition: transform 0.08s ease-out;
     }
+    .voting-card:hover {
+        transform: translate(-1px, -1px);
+    }
     .voting-card--selected {
-        border-color: #166534;
-        background: #dcfce7;
+        border-color: #14532d;
+        background:
+            linear-gradient(180deg, #f0fdf4 0%, #bbf7d0 100%);
+        box-shadow:
+            inset 3px 3px 0 0 rgba(255,255,255,0.72),
+            inset -3px -3px 0 0 rgba(20,83,45,0.16),
+            5px 5px 0 0 rgba(20,83,45,0.42);
     }
     .voting-card--blocked {
-        opacity: 0.55;
+        background:
+            repeating-linear-gradient(135deg, rgba(148, 163, 184, 0.18) 0 8px, rgba(226, 232, 240, 0.45) 8px 16px),
+            linear-gradient(180deg, #f8fafc 0%, #e2e8f0 100%);
+        border-color: #475569;
     }
     .voting-card__sprite {
         width: 64px;
@@ -771,8 +918,15 @@
         display: grid;
         gap: 8px;
         flex: 0 0 auto;
-        min-width: 184px;
+        min-width: min(100%, 196px);
+        max-width: 100%;
+        padding: 10px;
         justify-items: start;
+        background: #dbeafe;
+        border: 3px solid #0f172a;
+        box-shadow:
+            inset 3px 3px 0 0 rgba(255,255,255,0.7),
+            inset -3px -3px 0 0 rgba(0,0,0,0.12);
     }
     .voting-card__emotion-row {
         display: grid;
@@ -838,17 +992,22 @@
     }
     .voting-card__name {
         margin: 0;
+        min-width: 0;
+        max-width: 100%;
         font-family: var(--font-display);
-        font-size: 12px;
+        font-size: 14px;
+        line-height: 1.35;
         text-transform: uppercase;
         text-align: left;
+        color: #0f172a;
+        overflow-wrap: anywhere;
     }
     .voting-card__badge {
         font-family: var(--font-display);
-        font-size: 10px;
+        font-size: 11px;
         text-transform: uppercase;
         letter-spacing: 0.08em;
-        padding: 4px 8px;
+        padding: 6px 9px;
         border: 2px solid currentColor;
     }
     .voting-card__summary {
@@ -856,12 +1015,15 @@
         grid-template-columns: 1fr auto;
         gap: 10px;
         flex: 1 1 auto;
+        min-width: 0;
         align-content: center;
         align-items: center;
     }
     .voting-card__button {
-        font-size: 11px;
-        padding: 6px 12px;
+        min-height: 44px;
+        max-width: 100%;
+        font-size: 12px;
+        padding: 8px 14px;
         justify-self: end;
         grid-column: 2;
         grid-row: 1 / span 2;
@@ -872,9 +1034,10 @@
         max-width: 84px;
         aspect-ratio: 1 / 1;
         image-rendering: pixelated;
+        object-fit: contain;
         display: block;
         border: 3px solid #0f172a;
-        background: #e2e8f0;
+        background: #f8fafc;
         box-shadow:
             inset 2px 2px 0 0 rgba(255,255,255,0.55),
             inset -2px -2px 0 0 rgba(0,0,0,0.08),
@@ -944,10 +1107,11 @@
     .leaderboard {
         border: 4px solid #0f172a;
         background: #ffffff;
+        overflow: hidden;
         box-shadow:
             inset 3px 3px 0 0 rgba(255,255,255,0.72),
             inset -3px -3px 0 0 rgba(0,0,0,0.08),
-            4px 4px 0 0 rgba(0,0,0,0.24);
+            6px 6px 0 0 rgba(0,0,0,0.36);
     }
     .leaderboard__header {
         display: grid;
@@ -957,7 +1121,7 @@
         background: #0f172a;
         color: #f8fafc;
         font-family: var(--font-display);
-        font-size: 10px;
+        font-size: 11px;
         text-transform: uppercase;
         letter-spacing: 0.08em;
     }
@@ -965,7 +1129,7 @@
         display: grid;
         grid-template-columns: 40px 1fr 60px 60px 72px 64px;
         gap: 0;
-        padding: 10px 14px;
+        padding: 12px 14px;
         align-items: center;
         border-top: 2px solid #e2e8f0;
     }
@@ -973,11 +1137,12 @@
         border-top: none;
     }
     .leaderboard__row--winner {
-        background: #fffbeb;
+        background:
+            linear-gradient(90deg, #facc15 0 8px, #fffbeb 8px 100%);
     }
     .leaderboard__col {
         font-family: var(--font-body);
-        font-size: 12px;
+        font-size: 13px;
         color: #0f172a;
         overflow: hidden;
         text-overflow: ellipsis;
@@ -985,13 +1150,13 @@
     }
     .leaderboard__col--rank {
         font-family: var(--font-display);
-        font-size: 12px;
+        font-size: 13px;
         font-weight: 700;
         text-transform: uppercase;
     }
     .leaderboard__col--name {
         font-family: var(--font-display);
-        font-size: 12px;
+        font-size: 13px;
         font-weight: 700;
         text-transform: uppercase;
     }
@@ -1008,7 +1173,7 @@
     .leaderboard__col--status {
         text-align: center;
         font-family: var(--font-display);
-        font-size: 10px;
+        font-size: 11px;
         text-transform: uppercase;
         letter-spacing: 0.06em;
     }
@@ -1019,32 +1184,68 @@
         color: #991b1b;
         cursor: default;
     }
-    .leaderboard__tooltip-anchor {
-        position: relative;
+    .judge-feedback-disclosure {
+        border-top: 2px solid #fecdd3;
+        background: #fff7ed;
     }
-    .leaderboard__tooltip {
+    .judge-feedback-disclosure__summary {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        padding: 10px 14px;
+        cursor: pointer;
+        color: #7f1d1d;
+        list-style: none;
+    }
+    .judge-feedback-disclosure__summary::-webkit-details-marker {
         display: none;
-        position: absolute;
-        right: 0;
-        top: 100%;
-        margin-top: 6px;
-        z-index: 10;
-        min-width: 220px;
-        max-width: 320px;
-        padding: 10px 12px;
-        font-family: var(--font-body);
-        font-size: 11px;
-        text-transform: none;
-        letter-spacing: normal;
-        line-height: 1.6;
-        color: #1e293b;
-        white-space: normal;
-        background: #fff1f2;
-        border: 3px solid #991b1b;
-        box-shadow: 3px 3px 0 0 rgba(0,0,0,0.18);
     }
-    .leaderboard__tooltip-anchor:hover .leaderboard__tooltip {
-        display: block;
+    .judge-feedback-disclosure__summary::before {
+        content: "+";
+        display: inline-grid;
+        place-items: center;
+        width: 22px;
+        height: 22px;
+        flex: 0 0 auto;
+        border: 2px solid currentColor;
+        font-family: var(--font-display);
+        font-size: 14px;
+        line-height: 1;
+        background: #fee2e2;
+    }
+    .judge-feedback-disclosure[open] .judge-feedback-disclosure__summary::before {
+        content: "-";
+    }
+    .judge-feedback-disclosure__summary:focus-visible {
+        outline: 4px solid #fde047;
+        outline-offset: -4px;
+    }
+    .judge-feedback-disclosure__label,
+    .judge-feedback-disclosure__player {
+        font-family: var(--font-display);
+        font-size: 11px;
+        font-weight: 700;
+        text-transform: uppercase;
+        letter-spacing: 0.06em;
+    }
+    .judge-feedback-disclosure__label {
+        margin-right: auto;
+    }
+    .judge-feedback-disclosure__player {
+        color: #991b1b;
+    }
+    .judge-feedback-disclosure__body {
+        margin: 0 14px 14px 50px;
+        padding: 12px 14px;
+        font-family: var(--font-body);
+        font-size: 13px;
+        line-height: 1.65;
+        color: #1e293b;
+        background: #ffffff;
+        border: 3px solid #991b1b;
+        box-shadow: 3px 3px 0 rgba(0,0,0,0.18);
+        white-space: normal;
     }
     /* Creativity leaderboard uses a 4-column grid */
     .leaderboard--creativity .leaderboard__header,
@@ -1143,8 +1344,15 @@
         .button-row {
             flex-direction: column;
         }
+        .button-row--session-controls {
+            flex-direction: row;
+            flex-wrap: nowrap;
+        }
         .button:not(.button--cta) {
             width: 100%;
+        }
+        .button-row--session-controls .button:not(.button--cta) {
+            width: auto;
         }
         .roster__item {
             flex-direction: column;
@@ -1191,6 +1399,14 @@
             flex: 1 1 0;
             min-width: 0;
         }
+        .roster__actions {
+            width: 100%;
+            flex-wrap: wrap;
+        }
+        .roster__actions .button {
+            flex: 1 1 0;
+            min-width: 0;
+        }
         .voting-card {
             flex-direction: column;
             align-items: stretch;
@@ -1203,10 +1419,26 @@
         .voting-card__name {
             text-align: center;
         }
+        .voting-card__summary {
+            grid-template-columns: 1fr;
+            justify-items: stretch;
+            text-align: center;
+        }
         .voting-card__button {
             grid-column: 1;
             grid-row: auto;
             justify-self: stretch;
+        }
+        .leaderboard {
+            overflow-x: auto;
+        }
+        .leaderboard__header,
+        .leaderboard__row {
+            min-width: 640px;
+        }
+        .leaderboard--creativity .leaderboard__header,
+        .leaderboard--creativity .leaderboard__row {
+            min-width: 520px;
         }
     }
     /* ---- Phase 0: sprite grid (all 4 emotions) ---- */
@@ -1260,13 +1492,14 @@
 
     /* ---- Clock HUD (Phase 1 + Phase 2) ---- */
     .clock-hud {
-        position: fixed;
-        top: 24px;
-        right: 24px;
+        position: sticky;
+        top: calc(var(--appbar-height-desktop) + 12px);
         z-index: 3;
         display: flex;
         align-items: center;
         gap: 12px;
+        width: max-content;
+        margin: 0 0 16px auto;
         background: rgba(15, 23, 42, 0.92);
         border: 4px solid #0f172a;
         padding: 10px 18px;
@@ -1282,10 +1515,10 @@
     }
     @media (max-width: 720px) {
         .clock-hud {
-            top: 8px;
-            right: 8px;
+            top: calc(var(--appbar-height-mobile) + 8px);
             padding: 6px 12px;
             gap: 8px;
+            margin-bottom: 12px;
         }
         .clock-hud__time {
             font-size: 18px;
@@ -1755,10 +1988,14 @@
         .shell::before {
             animation: none;
         }
-        .button {
+        .button,
+        .voting-card {
             transition: none;
         }
         .button:active {
+            transform: none;
+        }
+        .voting-card:hover {
             transform: none;
         }
         .dragon-stage__mover,

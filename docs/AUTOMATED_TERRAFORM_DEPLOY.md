@@ -76,26 +76,17 @@ For `managed_dns` or `external_dns`, public HTTPS verification depends on DNS de
 - `TF_PRODUCTION_DB_PASSWORD`
 - `TF_GEMINI_API_KEY`
 
-## Secret Manager Secrets (operator-managed, out-of-band)
+## Secret Manager Secrets
 
 The production platform stack reads these Google Secret Manager secrets at apply time and
-projects each into a Kubernetes Secret consumed by the app pod. Operators must create and
-populate them **before** the first production apply; the Terraform apply fails otherwise.
+projects each into a Kubernetes Secret consumed by the app pod.
 
-- `dragon-shift-production-database-url` - runtime `DATABASE_URL`; version is bumped through
-  `TF_DATABASE_URL_SECRET_VERSION` on the foundation stack.
-- `dragon-shift-production-session-cookie-key` - base64-encoded random bytes (>=64 decoded
-  bytes) used to sign and encrypt session cookies. Generate once per environment with
-  `openssl rand -base64 64 | tr -d '\n'` and store as the first version of this secret:
-  ```bash
-  openssl rand -base64 64 | tr -d '\n' \
-    | gcloud secrets create dragon-shift-production-session-cookie-key \
-        --project "<gcp-project-id>" \
-        --replication-policy=automatic \
-        --data-file=-
-  ```
-  Rotate by adding a new secret version; the platform apply re-reads `latest` on every run
-  and triggers a rollout when the projected Kubernetes Secret value changes.
+- `dragon-shift-production-database-url` - runtime `DATABASE_URL`; created and updated by the
+  foundation stack. Version changes are driven through `TF_DATABASE_URL_SECRET_VERSION`.
+- `dragon-shift-production-session-cookie-key` - runtime `SESSION_COOKIE_KEY`; the foundation
+  stack now ensures the secret exists and seeds its first enabled version automatically when
+  a project is bootstrapped. Existing environments keep their current latest version unless
+  operators rotate the secret out of band.
 
 ## Migration Rollback
 
@@ -193,3 +184,24 @@ Error creating service account: googleapi: Error 403: Permission 'iam.serviceAcc
 ```
 
 **Fix (permanent):** Added `roles/iam.serviceAccountAdmin` and `roles/resourcemanager.projectIamAdmin` to `terraform/bootstrap/variables.tf`. After pulling this change, re-apply `terraform/bootstrap` with the original local bootstrap state before re-running `Publish Image` for production.
+
+### 6. Default compute service account access for GKE cluster creation
+
+**Problem:** GKE cluster creation can fail even with `roles/container.admin` when the deployer
+cannot act as the project default compute service account:
+```
+The user does not have access to service account
+"<project-number>-compute@developer.gserviceaccount.com"
+```
+
+**Fix (permanent):** Added `roles/iam.serviceAccountUser` to the GitHub Actions Terraform
+service-account role set in `terraform/bootstrap/variables.tf`. Re-apply `terraform/bootstrap`
+with the saved local bootstrap state so the deployer picks up the additional project IAM role.
+
+### 7. Session cookie secret bootstrap moved into Terraform
+
+**Problem:** Fresh projects previously required a manual `gcloud secrets create`
+for `dragon-shift-production-session-cookie-key` before the first platform apply.
+
+**Fix (permanent):** The production foundation stack now ensures that secret exists and, if it
+has no enabled versions yet, creates the first version automatically with a generated base64 key.

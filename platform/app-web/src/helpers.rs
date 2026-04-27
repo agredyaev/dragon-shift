@@ -316,7 +316,15 @@ pub fn sprite_url_for_emotion(sprites: &SpriteSet, emotion: DragonEmotion) -> St
         DragonEmotion::Sleepy => &sprites.sleepy,
         DragonEmotion::Neutral => &sprites.neutral,
     };
-    format!("data:image/png;base64,{base64}")
+    sprite_src(base64)
+}
+
+pub fn sprite_src(sprite: &str) -> String {
+    if sprite.starts_with('/') || sprite.starts_with("http://") || sprite.starts_with("https://") {
+        sprite.to_string()
+    } else {
+        format!("data:image/png;base64,{sprite}")
+    }
 }
 
 pub fn dragon_emotion_anim_class(emotion: DragonEmotion) -> &'static str {
@@ -764,10 +772,14 @@ pub fn end_vote_result_rows(state: &ClientGameState) -> Vec<EndVoteResultRow> {
                 dragon_name: dragon
                     .map(|d| d.name.clone())
                     .unwrap_or_else(|| "Unknown dragon".to_string()),
-                creator_name: player_name_by_id(
-                    state,
-                    dragon.and_then(|d| d.original_owner_id.as_deref()),
-                ),
+                creator_name: dragon
+                    .and_then(|d| d.design_creator_name.clone())
+                    .unwrap_or_else(|| {
+                        player_name_by_id(
+                            state,
+                            dragon.and_then(|d| d.original_owner_id.as_deref()),
+                        )
+                    }),
                 votes_label: if result.votes == 1 {
                     "1 vote".to_string()
                 } else {
@@ -900,7 +912,7 @@ fn player_phase_scores(state: &ClientGameState, player_id: &str) -> (i32, i32, V
     for dragon in state.dragons.values() {
         let is_creator = dragon.original_owner_id.as_deref() == Some(player_id);
         let is_caretaker = dragon.current_owner_id.as_deref() == Some(player_id);
-        let feedback = dragon
+        let fallback_feedback = dragon
             .judge_feedback
             .as_deref()
             .filter(|text| !text.trim().is_empty())
@@ -909,6 +921,12 @@ fn player_phase_scores(state: &ClientGameState, player_id: &str) -> (i32, i32, V
         if is_creator {
             let obs = dragon.judge_observation_score.unwrap_or(0);
             obs_total += obs;
+            let feedback = dragon
+                .judge_observation_feedback
+                .as_deref()
+                .filter(|text| !text.trim().is_empty())
+                .map(str::trim)
+                .or(fallback_feedback);
             if let Some(feedback) = feedback {
                 judge_comments.push(format!(
                     "Phase 1 / {} ({} pts): {}",
@@ -919,6 +937,12 @@ fn player_phase_scores(state: &ClientGameState, player_id: &str) -> (i32, i32, V
         if is_caretaker {
             let care = dragon.judge_care_score.unwrap_or(0);
             care_total += care;
+            let feedback = dragon
+                .judge_care_feedback
+                .as_deref()
+                .filter(|text| !text.trim().is_empty())
+                .map(str::trim)
+                .or(fallback_feedback);
             if let Some(feedback) = feedback {
                 judge_comments.push(format!(
                     "Phase 2 / {} ({} pts): {}",
@@ -1088,6 +1112,7 @@ pub mod tests {
                     color_a: "#ffee88".to_string(),
                 },
                 original_owner_id: Some("player-1".to_string()),
+                design_creator_name: Some("Alice".to_string()),
                 current_owner_id: Some("player-1".to_string()),
                 stats: protocol::DragonStats {
                     hunger: 72,
@@ -1106,6 +1131,8 @@ pub mod tests {
                 judge_observation_score: None,
                 judge_care_score: None,
                 judge_feedback: None,
+                judge_observation_feedback: None,
+                judge_care_feedback: None,
             },
         );
         state
@@ -1163,6 +1190,7 @@ pub mod tests {
                     color_a: "#fff0aa".to_string(),
                 },
                 original_owner_id: Some("player-2".to_string()),
+                design_creator_name: Some("Bob".to_string()),
                 current_owner_id: Some("player-2".to_string()),
                 stats: protocol::DragonStats {
                     hunger: 61,
@@ -1181,6 +1209,8 @@ pub mod tests {
                 judge_observation_score: None,
                 judge_care_score: None,
                 judge_feedback: None,
+                judge_observation_feedback: None,
+                judge_care_feedback: None,
             },
         );
         state.voting = Some(protocol::ClientVotingState {
@@ -1225,6 +1255,16 @@ pub mod tests {
             .judge_feedback = Some("Solid handover.".to_string());
         state
             .dragons
+            .get_mut("dragon-1")
+            .expect("dragon-1")
+            .judge_observation_feedback = Some("Phase 1 identified useful food clues.".to_string());
+        state
+            .dragons
+            .get_mut("dragon-1")
+            .expect("dragon-1")
+            .judge_care_feedback = Some("Phase 2 followed a relevant handover.".to_string());
+        state
+            .dragons
             .get_mut("dragon-2")
             .expect("dragon-2")
             .judge_observation_score = Some(8);
@@ -1238,6 +1278,16 @@ pub mod tests {
             .get_mut("dragon-2")
             .expect("dragon-2")
             .judge_feedback = Some("Strong recovery and care.".to_string());
+        state
+            .dragons
+            .get_mut("dragon-2")
+            .expect("dragon-2")
+            .judge_observation_feedback = Some("Phase 1 handover was partly relevant.".to_string());
+        state
+            .dragons
+            .get_mut("dragon-2")
+            .expect("dragon-2")
+            .judge_care_feedback = Some("Phase 2 adapted despite vague instructions.".to_string());
         state.voting = Some(protocol::ClientVotingState {
             eligible_count: 2,
             submitted_count: 2,
@@ -1284,6 +1334,7 @@ pub mod tests {
                     dragon_name: "Nova".to_string(),
                     creator_player_id: "player-2".to_string(),
                     creator_name: "Bob".to_string(),
+                    design_creator_name: Some("Bob".to_string()),
                     current_owner_id: "player-2".to_string(),
                     current_owner_name: "Bob".to_string(),
                     creative_vote_count: 2,
@@ -1325,6 +1376,7 @@ pub mod tests {
                     dragon_name: "Comet".to_string(),
                     creator_player_id: "player-1".to_string(),
                     creator_name: "Alice".to_string(),
+                    design_creator_name: Some("Alice".to_string()),
                     current_owner_id: "player-1".to_string(),
                     current_owner_name: "Alice".to_string(),
                     creative_vote_count: 1,
@@ -1480,9 +1532,10 @@ pub mod tests {
             "expected PickCharacter to render character sprites"
         );
         assert!(
-            src.contains("data:image/png;base64"),
-            "expected PickCharacter to render embedded sprite images"
+            src.contains("src: sprite_src(sprite_for_index(&character.sprites, sprite_index))"),
+            "expected PickCharacter to render embedded sprite images via sprite_src"
         );
+        assert_eq!(sprite_src("raw-base64"), "data:image/png;base64,raw-base64");
         assert!(
             !src.contains("character.description"),
             "PickCharacter must not render prompt/description text in the selectable rows"
@@ -1497,8 +1550,10 @@ pub mod tests {
             "expected short random starter button copy"
         );
         assert!(
-            src.contains("if characters.is_empty() {\n                        button"),
-            "random starter button must only render when no owned characters are eligible"
+            src.contains(
+                "if characters_loaded && !characters_load_failed && characters.is_empty()"
+            ),
+            "random starter button must only render after confirmed empty eligibility"
         );
     }
 
@@ -1755,6 +1810,31 @@ pub mod tests {
         assert_eq!(score_rows[0].player_name, "Bob");
         assert_eq!(score_rows[0].total_score_label, "18 pts");
         assert!(score_rows[0].is_winner);
+        assert!(
+            score_rows[0]
+                .judge_status_tooltip
+                .contains("Phase 1 / Nova (8 pts): Phase 1 handover was partly relevant.")
+        );
+        assert!(
+            score_rows[0]
+                .judge_status_tooltip
+                .contains("Phase 2 / Nova (10 pts): Phase 2 adapted despite vague instructions.")
+        );
+    }
+
+    #[test]
+    fn end_helpers_use_design_creator_name_for_summoned_dragons() {
+        let mut state = mock_end_state();
+        state
+            .dragons
+            .get_mut("dragon-2")
+            .expect("dragon-2")
+            .design_creator_name = Some("Alex".to_string());
+
+        let vote_rows = end_vote_result_rows(&state);
+
+        assert_eq!(vote_rows[0].dragon_name, "Nova");
+        assert_eq!(vote_rows[0].creator_name, "Alex");
     }
 
     #[test]
@@ -1850,6 +1930,7 @@ pub mod tests {
                         color_a: "#ddeeff".to_string(),
                     },
                     original_owner_id: Some(pid.clone()),
+                    design_creator_name: Some(format!("Player{i}")),
                     current_owner_id: Some(pid.clone()),
                     stats: protocol::DragonStats {
                         hunger: 50 + (i % 30) as i32,
@@ -1868,6 +1949,8 @@ pub mod tests {
                     judge_observation_score: None,
                     judge_care_score: None,
                     judge_feedback: None,
+                    judge_observation_feedback: None,
+                    judge_care_feedback: None,
                 },
             );
         }
@@ -1903,6 +1986,7 @@ pub mod tests {
                 dragon_name: format!("Dragon{i}"),
                 creator_player_id: format!("player-{i}"),
                 creator_name: format!("Player{i}"),
+                design_creator_name: Some(format!("Player{i}")),
                 current_owner_id: format!("player-{i}"),
                 current_owner_name: format!("Player{i}"),
                 creative_vote_count: (BUDGET_PLAYERS - i) as i32,

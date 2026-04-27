@@ -69,6 +69,11 @@ output "database_url_secret_id" {
   value       = google_secret_manager_secret.database_url.secret_id
 }
 
+output "session_cookie_key_secret_id" {
+  description = "Secret Manager secret ID that stores SESSION_COOKIE_KEY."
+  value       = var.session_cookie_key_secret_id
+}
+
 output "cloud_sql_activation_policy" {
   description = "Cloud SQL activation policy."
   value       = module.cloud_sql.activation_policy

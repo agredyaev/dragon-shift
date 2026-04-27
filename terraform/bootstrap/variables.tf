@@ -86,6 +86,7 @@ variable "github_actions_service_account_roles" {
     "roles/container.admin",
     "roles/dns.admin",
     "roles/iam.serviceAccountAdmin",
+    "roles/iam.serviceAccountUser",
     "roles/resourcemanager.projectIamAdmin",
     "roles/monitoring.alertPolicyEditor",
     "roles/monitoring.notificationChannelEditor",

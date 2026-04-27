@@ -294,7 +294,10 @@ mod postgres_tests {
                 .await
                 .expect("read applied migrations");
 
-        assert_eq!(versions, vec![(1,), (2,), (3,), (4,), (5,), (6,), (7,)]);
+        assert_eq!(
+            versions,
+            vec![(1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,)]
+        );
         store.cleanup().await;
     }
 
@@ -321,6 +324,7 @@ mod postgres_tests {
 
         let character = CharacterRecord {
             id: "character_1".to_string(),
+            name: None,
             description: "A mossy lantern dragon".to_string(),
             sprites: protocol::SpriteSet {
                 neutral: "neutral_b64".to_string(),
@@ -524,6 +528,7 @@ mod postgres_tests {
             character_id: Some("character-1".to_string()),
             selected_character: Some(protocol::CharacterProfile {
                 id: "character-1".to_string(),
+                name: None,
                 description: "Alice's workshop dragon".to_string(),
                 sprites: protocol::SpriteSet {
                     neutral: "neutral".to_string(),
@@ -532,6 +537,8 @@ mod postgres_tests {
                     sleepy: "sleepy".to_string(),
                 },
                 remaining_sprite_regenerations: 1,
+                creator_account_id: None,
+                creator_name: None,
             }),
             is_host: true,
             is_connected: false,
@@ -548,6 +555,7 @@ mod postgres_tests {
             character_id: Some("character-2".to_string()),
             selected_character: Some(protocol::CharacterProfile {
                 id: "character-2".to_string(),
+                name: None,
                 description: "Bob's workshop dragon".to_string(),
                 sprites: protocol::SpriteSet {
                     neutral: "neutral".to_string(),
@@ -556,6 +564,8 @@ mod postgres_tests {
                     sleepy: "sleepy".to_string(),
                 },
                 remaining_sprite_regenerations: 1,
+                creator_account_id: None,
+                creator_name: None,
             }),
             is_host: false,
             is_connected: false,
@@ -1257,6 +1267,49 @@ mod postgres_tests {
         }
     }
 
+    fn pg_archived_session_at(
+        code: &str,
+        created_at_seconds: i64,
+        owner_account_id: &str,
+    ) -> (WorkshopSession, SessionArtifactRecord) {
+        let created_at = fixed_timestamp(created_at_seconds);
+        let mut session = WorkshopSession::new(
+            Uuid::new_v4(),
+            SessionCode(code.to_string()),
+            created_at,
+            fixed_config(),
+        );
+        session.phase = Phase::End;
+        session.owner_account_id = Some(owner_account_id.to_string());
+        let host_id = format!("host-{code}");
+        session.host_player_id = Some(host_id.clone());
+        session.add_player(SessionPlayer {
+            id: host_id.clone(),
+            name: format!("Host-{code}"),
+            account_id: Some(owner_account_id.to_string()),
+            character_id: None,
+            selected_character: None,
+            is_host: true,
+            is_connected: false,
+            is_ready: true,
+            score: 0,
+            current_dragon_id: None,
+            achievements: Vec::new(),
+            joined_at: created_at,
+        });
+        let artifact = SessionArtifactRecord {
+            id: format!("archive-artifact-{code}"),
+            session_id: session.id.to_string(),
+            phase: Phase::End,
+            step: 0,
+            kind: SessionArtifactKind::JudgeBundleGenerated,
+            player_id: Some(host_id),
+            created_at: created_at.to_rfc3339(),
+            payload: json!({ "dragonCount": 0, "artifactCount": 1 }),
+        };
+        (session, artifact)
+    }
+
     #[tokio::test]
     #[ignore]
     async fn list_open_workshops_postgres_first_page_with_more_than_page_size_rows() {
@@ -1266,7 +1319,7 @@ mod postgres_tests {
         pg_seed_lobbies(&store, 75, 1_000).await;
 
         let page = store
-            .list_open_workshops(OpenWorkshopsPaging::First)
+            .list_open_workshops(OpenWorkshopsPaging::First, None)
             .await
             .expect("first page");
 
@@ -1288,7 +1341,7 @@ mod postgres_tests {
         pg_seed_lobbies(&store, 75, 1_000).await;
 
         let first = store
-            .list_open_workshops(OpenWorkshopsPaging::First)
+            .list_open_workshops(OpenWorkshopsPaging::First, None)
             .await
             .expect("first page");
         let last = first.rows.last().unwrap().clone();
@@ -1298,7 +1351,7 @@ mod postgres_tests {
         };
 
         let page2 = store
-            .list_open_workshops(OpenWorkshopsPaging::After(cursor.clone()))
+            .list_open_workshops(OpenWorkshopsPaging::After(cursor.clone()), None)
             .await
             .expect("after page");
 
@@ -1327,24 +1380,30 @@ mod postgres_tests {
         pg_seed_lobbies(&store, 151, 1_000).await;
 
         let page1 = store
-            .list_open_workshops(OpenWorkshopsPaging::First)
+            .list_open_workshops(OpenWorkshopsPaging::First, None)
             .await
             .expect("page 1");
         let p1_last = page1.rows.last().unwrap().clone();
         let page2 = store
-            .list_open_workshops(OpenWorkshopsPaging::After(OpenWorkshopCursor {
-                created_at: p1_last.created_at.clone(),
-                session_code: p1_last.session_code.clone(),
-            }))
+            .list_open_workshops(
+                OpenWorkshopsPaging::After(OpenWorkshopCursor {
+                    created_at: p1_last.created_at.clone(),
+                    session_code: p1_last.session_code.clone(),
+                }),
+                None,
+            )
             .await
             .expect("page 2");
 
         let p2_first = page2.rows.first().unwrap().clone();
         let back = store
-            .list_open_workshops(OpenWorkshopsPaging::Before(OpenWorkshopCursor {
-                created_at: p2_first.created_at.clone(),
-                session_code: p2_first.session_code.clone(),
-            }))
+            .list_open_workshops(
+                OpenWorkshopsPaging::Before(OpenWorkshopCursor {
+                    created_at: p2_first.created_at.clone(),
+                    session_code: p2_first.session_code.clone(),
+                }),
+                None,
+            )
             .await
             .expect("prev page");
 
@@ -1381,7 +1440,7 @@ mod postgres_tests {
         }
 
         let page = store
-            .list_open_workshops(OpenWorkshopsPaging::First)
+            .list_open_workshops(OpenWorkshopsPaging::First, None)
             .await
             .expect("first page");
 
@@ -1398,31 +1457,85 @@ mod postgres_tests {
 
     #[tokio::test]
     #[ignore]
-    async fn list_open_workshops_postgres_excludes_non_lobby() {
-        let store = setup_store("list_open_workshops_postgres_excludes_non_lobby").await;
-        // 3 lobby sessions.
+    async fn list_open_workshops_postgres_includes_in_progress_for_participants_only() {
+        let store =
+            setup_store("list_open_workshops_postgres_includes_in_progress_for_participants_only")
+                .await;
+        let viewer_account_id = "viewer-account".to_string();
+        // 3 lobby sessions remain public.
         for i in 0..3 {
             let code = format!("LBBY{:02}", i);
             let session = pg_lobby_session_at(&code, 1_000 + i);
             store.save_session(&session).await.expect("save lobby");
         }
-        // 2 non-lobby sessions at later timestamps — they'd sort first if
-        // erroneously included.
-        for i in 0..2 {
-            let code = format!("PLAY{:02}", i);
-            let mut session = pg_lobby_session_at(&code, 2_000 + i);
-            session.phase = Phase::Phase1;
-            store.save_session(&session).await.expect("save non-lobby");
+
+        let mut visible = pg_lobby_session_at("PLAY01", 2_000);
+        visible.phase = Phase::Voting;
+        visible.owner_account_id = Some(viewer_account_id.clone());
+        if let Some(player) = visible.players.values_mut().next() {
+            player.account_id = Some(viewer_account_id.clone());
         }
+        store
+            .save_session(&visible)
+            .await
+            .expect("save resumable workshop");
+
+        let mut hidden = pg_lobby_session_at("PLAY02", 2_001);
+        hidden.phase = Phase::Phase1;
+        hidden.owner_account_id = Some("foreign-account".to_string());
+        if let Some(player) = hidden.players.values_mut().next() {
+            player.account_id = Some("foreign-account".to_string());
+        }
+        store
+            .save_session(&hidden)
+            .await
+            .expect("save foreign resumable workshop");
 
         let page = store
-            .list_open_workshops(OpenWorkshopsPaging::First)
+            .list_open_workshops(OpenWorkshopsPaging::First, Some(viewer_account_id))
             .await
             .expect("first page");
-        assert_eq!(page.rows.len(), 3);
-        for row in &page.rows {
-            assert!(row.session_code.starts_with("LBBY"));
+        assert_eq!(page.rows.len(), 4);
+        assert_eq!(page.rows[0].session_code, "PLAY01");
+        assert!(page.rows[0].resumable);
+        assert!(!page.rows.iter().any(|row| row.session_code == "PLAY02"));
+        store.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn list_open_workshops_postgres_filters_archived_visibility_before_limit() {
+        let store =
+            setup_store("list_open_workshops_postgres_filters_archived_visibility_before_limit")
+                .await;
+
+        for i in 0..OPEN_WORKSHOPS_PAGE_SIZE {
+            let code = format!("79{:04}", i);
+            let (session, artifact) =
+                pg_archived_session_at(&code, 2_000 + i as i64, &format!("foreign-owner-{i}"));
+            store
+                .save_session_with_artifact(&session, &artifact)
+                .await
+                .expect("seed foreign archived workshop");
         }
+
+        let (visible, artifact) = pg_archived_session_at("799999", 1_000, "viewer-account");
+        store
+            .save_session_with_artifact(&visible, &artifact)
+            .await
+            .expect("seed visible archived workshop");
+
+        let page = store
+            .list_open_workshops(
+                OpenWorkshopsPaging::First,
+                Some("viewer-account".to_string()),
+            )
+            .await
+            .expect("first page");
+
+        assert_eq!(page.rows.len(), 1);
+        assert_eq!(page.rows[0].session_code, "799999");
+        assert!(page.rows[0].archived);
         store.cleanup().await;
     }
 }

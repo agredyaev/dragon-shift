@@ -41,6 +41,10 @@ pub struct SessionDragon {
     pub id: String,
     pub name: String,
     pub original_owner_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub design_creator_account_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub design_creator_name: Option<String>,
     pub current_owner_id: String,
     pub creator_instructions: String,
     pub active_time: ActiveTime,
@@ -86,6 +90,10 @@ pub struct SessionDragon {
     pub judge_care_score: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub judge_feedback: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub judge_observation_feedback: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub judge_care_feedback: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -274,6 +282,7 @@ impl WorkshopSession {
 
     pub fn add_player(&mut self, player: SessionPlayer) {
         let player_id = player.id.clone();
+        let player_account_id = player.account_id.clone();
         self.players.insert(player_id.clone(), player);
 
         let should_assign_reserved_host = self
@@ -288,7 +297,13 @@ impl WorkshopSession {
         if should_assign_reserved_host {
             self.assign_reserved_host_to_player(&player_id);
         } else if self.host_player_id.is_none() && self.reserved_host_account_id.is_none() {
-            self.host_player_id = Some(player_id.clone());
+            let can_assign_first_host = match self.owner_account_id.as_deref() {
+                Some(owner_account_id) => player_account_id.as_deref() == Some(owner_account_id),
+                None => true,
+            };
+            if can_assign_first_host {
+                self.host_player_id = Some(player_id.clone());
+            }
         }
 
         self.ensure_host_assigned(false);
@@ -411,6 +426,14 @@ impl WorkshopSession {
                     .as_ref()
                     .map(|character| character.description.clone())
                     .expect("selected_character presence enforced by begin_phase1 guard above");
+                let design_creator_account_id = player
+                    .selected_character
+                    .as_ref()
+                    .and_then(|character| character.creator_account_id.clone());
+                let design_creator_name = player
+                    .selected_character
+                    .as_ref()
+                    .and_then(|character| character.creator_name.clone());
                 player.current_dragon_id = Some(assignment.dragon_id.clone());
                 self.dragons.insert(
                     assignment.dragon_id.clone(),
@@ -418,6 +441,8 @@ impl WorkshopSession {
                         id: assignment.dragon_id.clone(),
                         name: random_dragon_name(),
                         original_owner_id: assignment.player_id.clone(),
+                        design_creator_account_id,
+                        design_creator_name,
                         current_owner_id: assignment.player_id.clone(),
                         creator_instructions,
                         active_time: random_active_time(),
@@ -453,6 +478,8 @@ impl WorkshopSession {
                         judge_observation_score: None,
                         judge_care_score: None,
                         judge_feedback: None,
+                        judge_observation_feedback: None,
+                        judge_care_feedback: None,
                     },
                 );
             }
@@ -1189,20 +1216,30 @@ impl WorkshopSession {
     /// so the final score = observation_score + care_score.
     pub fn apply_judge_scores(
         &mut self,
-        evaluations: &[(String, i32, i32, String)], // (dragon_id, observation_score, care_score, feedback)
+        evaluations: &[(String, i32, i32, String, String, String)], // (dragon_id, observation_score, care_score, feedback, observation_feedback, care_feedback)
     ) {
         // Reset scores first
         for player in self.players.values_mut() {
             player.score = 0;
         }
 
-        for (dragon_id, observation_score, care_score, feedback) in evaluations {
+        for (
+            dragon_id,
+            observation_score,
+            care_score,
+            feedback,
+            observation_feedback,
+            care_feedback,
+        ) in evaluations
+        {
             let Some(dragon) = self.dragons.get_mut(dragon_id) else {
                 continue;
             };
             dragon.judge_observation_score = Some(*observation_score);
             dragon.judge_care_score = Some(*care_score);
             dragon.judge_feedback = Some(feedback.clone());
+            dragon.judge_observation_feedback = Some(observation_feedback.clone());
+            dragon.judge_care_feedback = Some(care_feedback.clone());
             let creator_id = dragon.original_owner_id.clone();
             let caretaker_id = dragon.current_owner_id.clone();
 
@@ -1277,6 +1314,41 @@ impl WorkshopSession {
             self.host_player_id = None;
             self.reconcile_host_flags(None);
             return None;
+        }
+
+        if let Some(owner_account_id) = self.owner_account_id.as_deref() {
+            let owner_host_id = self.players.iter().find_map(|(player_id, player)| {
+                if player.account_id.as_deref() == Some(owner_account_id)
+                    && (!prefer_connected || player.is_connected)
+                {
+                    Some(player_id.clone())
+                } else {
+                    None
+                }
+            });
+            if let Some(player_id) = owner_host_id {
+                let current_matches_owner = self
+                    .host_player_id
+                    .as_ref()
+                    .and_then(|current_host_id| self.players.get(current_host_id))
+                    .and_then(|player| player.account_id.as_deref())
+                    == Some(owner_account_id);
+                if !current_matches_owner {
+                    self.host_player_id = Some(player_id.clone());
+                    self.reconcile_host_flags(Some(player_id.clone()));
+                    return Some(player_id);
+                }
+            }
+
+            let has_owner_player = self
+                .players
+                .values()
+                .any(|player| player.account_id.as_deref() == Some(owner_account_id));
+            if !has_owner_player && self.host_player_id.is_none() {
+                self.host_player_id = None;
+                self.reconcile_host_flags(None);
+                return None;
+            }
         }
 
         if let Some(current_host_id) = self.host_player_id.clone()
@@ -1455,6 +1527,7 @@ mod tests {
             character_id: Some(format!("character-{id}")),
             selected_character: Some(CharacterProfile {
                 id: format!("character-{id}"),
+                name: None,
                 description: format!("test character for player-{id}"),
                 sprites: SpriteSet {
                     neutral: "neutral".to_string(),
@@ -1463,6 +1536,8 @@ mod tests {
                     sleepy: "sleepy".to_string(),
                 },
                 remaining_sprite_regenerations: 1,
+                creator_account_id: None,
+                creator_name: None,
             }),
             is_host: false,
             is_connected: connected,
@@ -1552,6 +1627,90 @@ mod tests {
     }
 
     #[test]
+    fn owner_host_is_restored_before_guest_when_owner_is_connected() {
+        let mut session = WorkshopSession::new(
+            Uuid::new_v4(),
+            SessionCode("123456".into()),
+            ts(1),
+            config(),
+        );
+        session.owner_account_id = Some("acct-alice".to_string());
+        let mut owner = player("p1", true, 10);
+        owner.account_id = Some("acct-alice".to_string());
+        session.add_player(owner);
+        let mut guest = player("p2", true, 20);
+        guest.account_id = Some("acct-bob".to_string());
+        session.add_player(guest);
+        session.host_player_id = None;
+        session.reconcile_host_flags(None);
+
+        let host = session.ensure_host_assigned(true);
+
+        assert_eq!(host.as_deref(), Some("p1"));
+        assert!(session.players.get("p1").expect("owner player").is_host);
+        assert!(!session.players.get("p2").expect("guest player").is_host);
+    }
+
+    #[test]
+    fn owner_reserved_lobby_does_not_promote_guest_after_reservation_is_consumed() {
+        let mut session = WorkshopSession::new(
+            Uuid::new_v4(),
+            SessionCode("123456".into()),
+            ts(1),
+            config(),
+        );
+        session.owner_account_id = Some("acct-alice".to_string());
+
+        let mut guest = player("p2", true, 20);
+        guest.account_id = Some("acct-bob".to_string());
+        session.add_player(guest);
+
+        assert_eq!(session.host_player_id, None);
+        assert!(!session.players.get("p2").expect("guest player").is_host);
+    }
+
+    #[test]
+    fn owner_reserved_lobby_promotes_owner_when_owner_player_is_present() {
+        let mut session = WorkshopSession::new(
+            Uuid::new_v4(),
+            SessionCode("123456".into()),
+            ts(1),
+            config(),
+        );
+        session.owner_account_id = Some("acct-alice".to_string());
+
+        let mut guest = player("p2", true, 20);
+        guest.account_id = Some("acct-bob".to_string());
+        session.add_player(guest);
+        let mut owner = player("p1", true, 10);
+        owner.account_id = Some("acct-alice".to_string());
+        session.add_player(owner);
+
+        assert_eq!(session.host_player_id.as_deref(), Some("p1"));
+        assert!(session.players.get("p1").expect("owner player").is_host);
+        assert!(!session.players.get("p2").expect("guest player").is_host);
+    }
+
+    #[test]
+    fn non_owner_host_is_not_cleared_without_owner_player_after_legacy_assignment() {
+        let mut session = WorkshopSession::new(
+            Uuid::new_v4(),
+            SessionCode("123456".into()),
+            ts(1),
+            config(),
+        );
+        let mut guest = player("p2", true, 20);
+        guest.account_id = Some("acct-bob".to_string());
+        session.add_player(guest);
+        session.owner_account_id = Some("acct-alice".to_string());
+
+        let host = session.ensure_host_assigned(true);
+
+        assert_eq!(host.as_deref(), Some("p2"));
+        assert!(session.players.get("p2").expect("guest player").is_host);
+    }
+
+    #[test]
     fn ensure_host_assigned_returns_none_when_session_has_no_players() {
         let mut session = WorkshopSession::new(
             Uuid::new_v4(),
@@ -1577,6 +1736,7 @@ mod tests {
         let mut p1 = player("p1", true, 10);
         p1.selected_character = Some(CharacterProfile {
             id: "character-p1".into(),
+            name: None,
             description: "Curious cave dragon".into(),
             sprites: SpriteSet {
                 neutral: "neutral".into(),
@@ -1585,6 +1745,8 @@ mod tests {
                 sleepy: "sleepy".into(),
             },
             remaining_sprite_regenerations: 1,
+            creator_account_id: None,
+            creator_name: None,
         });
         p1.character_id = Some("character-p1".into());
         p1.is_ready = true;
@@ -1592,6 +1754,10 @@ mod tests {
         p1.achievements = vec!["master_chef".into()];
         p1.current_dragon_id = Some("old-dragon".into());
         let mut p2 = player("p2", true, 20);
+        p2.selected_character
+            .as_mut()
+            .expect("p2 selected character")
+            .creator_name = Some("External Artist".to_string());
         p2.score = 50;
         p2.achievements = vec!["playful_spirit".into()];
         session.add_player(p1);
@@ -1641,8 +1807,13 @@ mod tests {
         );
         assert!(!dragon_a.name.is_empty(), "Dragon name should not be empty");
         assert_eq!(dragon_a.creator_instructions, "Curious cave dragon");
+        assert_eq!(dragon_a.design_creator_name, None);
         assert!(dragon_a.discovery_observations.is_empty());
         let dragon_b = session.dragons.get("dragon-b").expect("dragon b");
+        assert_eq!(
+            dragon_b.design_creator_name.as_deref(),
+            Some("External Artist")
+        );
         // Session 4 / refactor: `default_pet_description` fallback removed.
         // p2 now carries the default test character from the `player()` helper.
         assert_eq!(
@@ -1698,6 +1869,7 @@ mod tests {
                 "p1",
                 CharacterProfile {
                     id: "character-1".into(),
+                    name: None,
                     description: "Crystal dragon".into(),
                     sprites: SpriteSet {
                         neutral: "neutral_b64".into(),
@@ -1706,6 +1878,8 @@ mod tests {
                         sleepy: "sleepy_b64".into(),
                     },
                     remaining_sprite_regenerations: 1,
+                    creator_account_id: None,
+                    creator_name: None,
                 },
             )
             .expect("assign character");
@@ -1786,6 +1960,7 @@ mod tests {
             player.character_id = Some("character-1".into());
             player.selected_character = Some(CharacterProfile {
                 id: "character-1".into(),
+                name: None,
                 description: "Cool dragon".into(),
                 sprites: SpriteSet {
                     neutral: "neutral".into(),
@@ -1794,6 +1969,8 @@ mod tests {
                     sleepy: "sleepy".into(),
                 },
                 remaining_sprite_regenerations: 1,
+                creator_account_id: None,
+                creator_name: None,
             });
         }
 
@@ -2262,14 +2439,34 @@ mod tests {
         assert_ne!(dragon_b_owner.as_deref(), Some("p2"));
 
         session.apply_judge_scores(&[
-            ("dragon-a".into(), 70, 80, "solid discovery".into()),
-            ("dragon-b".into(), 60, 90, "strong recovery".into()),
+            (
+                "dragon-a".into(),
+                70,
+                80,
+                "solid discovery; good care".into(),
+                "solid discovery".into(),
+                "good care".into(),
+            ),
+            (
+                "dragon-b".into(),
+                60,
+                90,
+                "clear handover; strong recovery".into(),
+                "clear handover".into(),
+                "strong recovery".into(),
+            ),
         ]);
 
         // p1 = observation_score for dragon-a (70) + care_score for dragon-b (90) = 160
         // p2 = observation_score for dragon-b (60) + care_score for dragon-a (80) = 140
         assert_eq!(session.players.get("p1").map(|p| p.score), Some(70 + 90));
         assert_eq!(session.players.get("p2").map(|p| p.score), Some(60 + 80));
+        let dragon_a = session.dragons.get("dragon-a").expect("dragon-a");
+        assert_eq!(
+            dragon_a.judge_observation_feedback.as_deref(),
+            Some("solid discovery")
+        );
+        assert_eq!(dragon_a.judge_care_feedback.as_deref(), Some("good care"));
     }
 
     #[test]
@@ -4698,7 +4895,14 @@ mod tests {
         let mut s = setup_deterministic_session();
         s.players.get_mut("p1").unwrap().score = 50;
 
-        s.apply_judge_scores(&[("d1".to_string(), 10, 20, "ok".to_string())]);
+        s.apply_judge_scores(&[(
+            "d1".to_string(),
+            10,
+            20,
+            "ok".to_string(),
+            "handover ok".to_string(),
+            "care ok".to_string(),
+        )]);
         // Score should be 10 + 20 = 30, NOT 50 + 10 + 20 = 80
         assert_eq!(s.players.get("p1").unwrap().score, 30);
     }
@@ -4707,8 +4911,22 @@ mod tests {
     fn validator12_apply_judge_scores_unknown_dragon_skipped() {
         let mut s = setup_deterministic_session();
         s.apply_judge_scores(&[
-            ("d1".to_string(), 10, 20, "ok".to_string()),
-            ("nonexistent".to_string(), 100, 100, "skip".to_string()),
+            (
+                "d1".to_string(),
+                10,
+                20,
+                "ok".to_string(),
+                "handover ok".to_string(),
+                "care ok".to_string(),
+            ),
+            (
+                "nonexistent".to_string(),
+                100,
+                100,
+                "skip".to_string(),
+                "skip handover".to_string(),
+                "skip care".to_string(),
+            ),
         ]);
         assert_eq!(s.players.get("p1").unwrap().score, 30);
     }
@@ -4717,7 +4935,14 @@ mod tests {
     fn validator12_single_player_score_gets_both_components() {
         let mut s = setup_deterministic_session();
         // In single player, original_owner == current_owner
-        s.apply_judge_scores(&[("d1".to_string(), 15, 25, "good".to_string())]);
+        s.apply_judge_scores(&[(
+            "d1".to_string(),
+            15,
+            25,
+            "good".to_string(),
+            "good handover".to_string(),
+            "good care".to_string(),
+        )]);
         // p1 gets both observation_score (15) + care_score (25) = 40
         assert_eq!(s.players.get("p1").unwrap().score, 40);
     }
@@ -4738,8 +4963,22 @@ mod tests {
         assert_ne!(d1_creator, d1_caretaker);
 
         s.apply_judge_scores(&[
-            ("d1".to_string(), 10, 20, "good".to_string()),
-            ("d2".to_string(), 30, 40, "great".to_string()),
+            (
+                "d1".to_string(),
+                10,
+                20,
+                "good".to_string(),
+                "good handover".to_string(),
+                "good care".to_string(),
+            ),
+            (
+                "d2".to_string(),
+                30,
+                40,
+                "great".to_string(),
+                "great handover".to_string(),
+                "great care".to_string(),
+            ),
         ]);
 
         // Each player gets observation from their created dragon + care from their cared dragon

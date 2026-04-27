@@ -137,10 +137,16 @@ pub struct SpriteSet {
 #[serde(rename_all = "camelCase")]
 pub struct CharacterProfile {
     pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     pub description: String,
     pub sprites: SpriteSet,
     #[serde(default)]
     pub remaining_sprite_regenerations: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub creator_account_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub creator_name: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -256,6 +262,8 @@ pub struct ClientDragon {
     pub name: String,
     pub visuals: DragonVisuals,
     pub original_owner_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub design_creator_name: Option<String>,
     pub current_owner_id: Option<String>,
     pub stats: DragonStats,
     pub condition_hint: Option<String>,
@@ -274,6 +282,10 @@ pub struct ClientDragon {
     pub judge_care_score: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub judge_feedback: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub judge_observation_feedback: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub judge_care_feedback: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -541,6 +553,8 @@ pub struct JudgeDragonBundle {
     pub dragon_name: String,
     pub creator_player_id: String,
     pub creator_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub design_creator_name: Option<String>,
     pub current_owner_id: String,
     pub current_owner_name: String,
     pub creative_vote_count: i32,
@@ -618,6 +632,8 @@ pub struct LlmDragonEvaluation {
     pub observation_score: i32,
     pub care_score: i32,
     pub creativity_score: i32,
+    pub observation_feedback: String,
+    pub care_feedback: String,
     pub feedback: String,
 }
 
@@ -1006,6 +1022,12 @@ pub struct CreateCharacterRequest {
     pub sprites: SpriteSet,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateCharacterRequest {
+    pub name: String,
+}
+
 /// Request body for `POST /api/characters/preview-sprites`.
 ///
 /// Account-scoped sprite-sheet preview. Unlike the workshop-scoped
@@ -1050,7 +1072,11 @@ pub struct OpenWorkshopSummary {
     pub player_count: u32,
     pub created_at: String,
     #[serde(default)]
+    pub archived: bool,
+    #[serde(default)]
     pub can_delete: bool,
+    #[serde(default)]
+    pub can_resume: bool,
 }
 
 /// Keyset cursor over the "open workshops" list. Pairs the RFC3339 `created_at`

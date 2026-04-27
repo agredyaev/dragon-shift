@@ -1,16 +1,18 @@
 use axum::{
     Json,
+    body::Body,
     extract::{ConnectInfo, FromRequestParts, Path, Query, State},
-    http::{HeaderMap, StatusCode, request::Parts},
+    http::{HeaderMap, HeaderValue, StatusCode, header, request::Parts},
     response::{IntoResponse, Response},
 };
 use axum_extra::extract::cookie::{Key, SignedCookieJar};
+use base64::Engine as _;
 use chrono::{DateTime, Utc};
 use domain::{
     DomainError, MAX_CHARACTERS_PER_ACCOUNT, Phase1Assignment, SessionCode, SessionPlayer,
     WorkshopSession,
 };
-use persistence::CharacterRecord;
+use persistence::{CharacterRecord, timeout_companion_defaults};
 use protocol::{
     ActionPayload, CharacterCatalogRequest, CharacterCatalogResult, CharacterCatalogSuccess,
     CharacterProfile, CharacterSpritePreviewRequest, CharacterSpritePreviewResponse,
@@ -24,10 +26,10 @@ use protocol::{
     SPRITE_ATELIER_FALLBACK_NOTICE_MESSAGE, SPRITE_ATELIER_NOTICE_TITLE,
     SPRITE_ATELIER_QUEUED_NOTICE_MESSAGE, SelectCharacterRequest, SessionArtifactKind,
     SessionArtifactRecord, SessionCommand, SessionNoticeCode, SpriteSheetRequest,
-    SpriteSheetResult, SpriteSheetSuccess, VotePayload, WorkshopCommandRequest,
-    WorkshopCommandResult, WorkshopCommandSuccess, WorkshopCreateResult, WorkshopCreateSuccess,
-    WorkshopError, WorkshopJoinResult, WorkshopJoinSuccess, WorkshopJudgeBundleRequest,
-    WorkshopJudgeBundleResult, WorkshopJudgeBundleSuccess,
+    SpriteSheetResult, SpriteSheetSuccess, UpdateCharacterRequest, VotePayload,
+    WorkshopCommandRequest, WorkshopCommandResult, WorkshopCommandSuccess, WorkshopCreateResult,
+    WorkshopCreateSuccess, WorkshopError, WorkshopJoinResult, WorkshopJoinSuccess,
+    WorkshopJudgeBundleRequest, WorkshopJudgeBundleResult, WorkshopJudgeBundleSuccess,
 };
 use security::{FixedWindowRateLimiter, OriginPolicy};
 use serde_json::json;
@@ -44,7 +46,8 @@ use crate::app::AppState;
 use crate::auth::{AccountSession, SESSION_COOKIE_NAME};
 use crate::cache::{SessionWriteLease, ensure_session_cached, reload_cached_session};
 use crate::helpers::{
-    build_judge_bundle, parse_player_action, phase_step, random_prefixed_id, to_client_game_state,
+    build_judge_bundle, character_sprite_reference_set, parse_player_action, phase_step,
+    random_prefixed_id, sprite_set_uses_references, to_client_game_state,
 };
 use crate::ws::{
     broadcast_session_state, close_local_workshop_connections, send_player_notice_with_code,
@@ -79,6 +82,31 @@ enum ImageQueueAdmissionOutcome {
 }
 
 const SPRITE_PREVIEW_BUSY_ERROR: &str = "Sprite API is busy. Please try again in a few minutes.";
+
+fn character_profile_with_sprite_references(record: &CharacterRecord) -> CharacterProfile {
+    CharacterProfile {
+        id: record.id.clone(),
+        name: record.name.clone(),
+        description: record.description.clone(),
+        sprites: character_sprite_reference_set(&record.id),
+        remaining_sprite_regenerations: record.remaining_sprite_regenerations,
+        creator_account_id: record.owner_account_id.clone(),
+        creator_name: None,
+    }
+}
+
+fn sprite_base64_for_emotion<'a>(
+    sprites: &'a protocol::SpriteSet,
+    emotion: &str,
+) -> Option<&'a str> {
+    match emotion {
+        "neutral" => Some(&sprites.neutral),
+        "happy" => Some(&sprites.happy),
+        "angry" => Some(&sprites.angry),
+        "sleepy" => Some(&sprites.sleepy),
+        _ => None,
+    }
+}
 
 fn sprite_preview_busy_response() -> Response {
     (
@@ -226,27 +254,14 @@ fn clamp_score(score: i32) -> i32 {
     score.clamp(0, 100)
 }
 
-async fn load_character_profile(
-    state: &AppState,
-    character_id: &str,
-) -> Result<Option<CharacterProfile>, String> {
-    state
-        .store
-        .load_character(character_id)
-        .await
-        .map_err(|error| format!("failed to load character: {error}"))
-        .map(|record| record.as_ref().map(CharacterRecord::profile))
-}
-
 /// Resolve the character to use when entering a workshop.
 ///
 /// Rules (locked decision #6, #9):
 /// - If `character_id` is supplied, load that specific character (must be
 ///   owned by the account OR be a starter-pool character).
-/// - If the account owns zero characters, **lease** a random starter from the
-///   pool. "Lease" means we copy the `CharacterProfile` into
-///   `SessionPlayer.selected_character` but do NOT flip `owner_account_id` —
-///   the starter row stays available for others.
+/// - If the account owns zero characters, **lease** random existing sprites.
+///   "Lease" means we copy a `CharacterProfile` into
+///   `SessionPlayer.selected_character` but do NOT flip `owner_account_id`.
 /// - If the account owns characters but passed no `character_id`, return
 ///   `Err` asking them to pick one.
 async fn resolve_character_for_session(
@@ -283,7 +298,7 @@ async fn resolve_character_for_session(
                 if is_starter && excluded_character_ids.contains(character_id) {
                     return Err("that starter is already taken in this workshop".to_string());
                 }
-                Ok(Some(r.profile()))
+                Ok(Some(character_profile_with_sprite_references(&r)))
             }
             None => Ok(None),
         };
@@ -301,18 +316,14 @@ async fn resolve_character_for_session(
         return Err("please select a character".to_string());
     }
 
-    // Zero characters — lease a random starter, excluding any already leased
-    // to other players in the same session (plan2.md item 3). Duplicate
-    // starters would produce two indistinguishable pets in one session and
-    // break voting/judging UX. Callers that cannot tolerate `Ok(None)` (e.g.
-    // the join-workshop path) inspect the result and produce a join error.
+    // Zero characters — lease random existing sprites so the player can start
+    // immediately without generating a fresh sprite sheet.
     pick_random_starter_profile(state, excluded_character_ids).await
 }
 
-/// Pick a random character from the starter pool (owner_account_id IS NULL),
-/// excluding any character ids already in use by other players in the caller's
-/// session. Returns `Ok(None)` when the filtered pool is empty; the caller
-/// decides how to surface that (same path as "no starters seeded at all").
+/// Pick random reusable sprites from persisted characters. Prefer generated
+/// non-placeholder sprites; fall back to legacy starter rows when no generated
+/// sprites have been saved yet.
 async fn pick_random_starter_profile(
     state: &AppState,
     excluded_character_ids: &BTreeSet<String>,
@@ -322,6 +333,36 @@ async fn pick_random_starter_profile(
         .list_characters()
         .await
         .map_err(|error| format!("failed to list characters: {error}"))?;
+    let fallback_sprites = timeout_companion_defaults().sprites;
+    let reusable: Vec<_> = characters
+        .iter()
+        .filter(|r| r.sprites != fallback_sprites && !excluded_character_ids.contains(&r.id))
+        .collect();
+    if !reusable.is_empty() {
+        let index = rand::random_range(0..reusable.len());
+        let Some(record) = reusable.get(index) else {
+            return Ok(None);
+        };
+        let creator_name = match record.owner_account_id.as_deref() {
+            Some(account_id) => state
+                .store
+                .find_account_by_id(account_id)
+                .await
+                .map_err(|error| format!("failed to load character creator: {error}"))?
+                .map(|account| account.name),
+            None => None,
+        };
+        return Ok(Some(CharacterProfile {
+            id: random_prefixed_id("starter"),
+            name: record.name.clone(),
+            description: record.description.clone(),
+            sprites: character_sprite_reference_set(&record.id),
+            remaining_sprite_regenerations: 0,
+            creator_account_id: record.owner_account_id.clone(),
+            creator_name,
+        }));
+    }
+
     let starters: Vec<_> = characters
         .iter()
         .filter(|r| r.owner_account_id.is_none() && !excluded_character_ids.contains(&r.id))
@@ -330,7 +371,15 @@ async fn pick_random_starter_profile(
         return Ok(None);
     }
     let index = rand::random_range(0..starters.len());
-    Ok(starters.get(index).map(|r| r.profile()))
+    Ok(starters.get(index).map(|record| CharacterProfile {
+        id: record.id.clone(),
+        name: record.name.clone(),
+        description: record.description.clone(),
+        sprites: character_sprite_reference_set(&record.id),
+        remaining_sprite_regenerations: record.remaining_sprite_regenerations,
+        creator_account_id: record.owner_account_id.clone(),
+        creator_name: None,
+    }))
 }
 
 /// Extract the authenticated account from request headers without going
@@ -404,14 +453,11 @@ fn deterministic_local_judge_dragon_evaluation(dragon: &JudgeDragonBundle) -> Ll
         .filter(|tag| !tag.trim().is_empty())
         .count() as i32;
 
-    let combined_notes = std::iter::once(dragon.handover_chain.creator_instructions.as_str())
-        .chain(
-            dragon
-                .handover_chain
-                .discovery_observations
-                .iter()
-                .map(String::as_str),
-        )
+    let combined_notes = dragon
+        .handover_chain
+        .discovery_observations
+        .iter()
+        .map(String::as_str)
         .chain(
             dragon
                 .handover_chain
@@ -492,20 +538,31 @@ fn deterministic_local_judge_dragon_evaluation(dragon: &JudgeDragonBundle) -> Ll
         clamp_score(20 + (word_count / 2).min(45) + observation_count * 5 + tags_count * 5);
 
     let mistake_count = dragon.wrong_food_count.max(0) + dragon.wrong_play_count.max(0);
-    let feedback = if total_actions == 0 {
+    let observation_feedback = format!(
+        "Phase 1 handover matched {mechanic_clue_hits}/3 hidden habits with {observation_count} observation(s) and {tags_count} handover tag(s). Character design text was ignored for care scoring."
+    );
+    let handover_relevance = if mechanic_clue_hits >= 2 {
+        "the received handover was relevant"
+    } else if mechanic_clue_hits == 1 {
+        "the received handover was only partly relevant"
+    } else {
+        "the received handover was not relevant to the hidden habits"
+    };
+    let care_feedback = if total_actions == 0 {
         format!(
-            "Discovery covered {mechanic_clue_hits}/5 core clues with {tags_count} handover tags. Care had no recorded Phase 2 actions and finished at {stat_average}/100 average stats.",
+            "Phase 2 had no recorded care actions; {handover_relevance}, and final average stats were {stat_average}/100.",
         )
     } else if mistake_count > 0 || dragon.cooldown_violations > 0 {
         format!(
-            "Discovery covered {mechanic_clue_hits}/5 core clues with {tags_count} handover tags. Care finished at {stat_average}/100 average stats with {correct_actions}/{total_actions} correct actions, {mistake_count} wrong actions, and {} cooldown violations.",
+            "Phase 2 followed {correct_actions}/{total_actions} actions correctly; {handover_relevance}, with {mistake_count} wrong food/play actions, {} cooldown violations, and {stat_average}/100 final average stats.",
             dragon.cooldown_violations.max(0),
         )
     } else {
         format!(
-            "Discovery covered {mechanic_clue_hits}/5 core clues with {tags_count} handover tags. Care finished at {stat_average}/100 average stats with {correct_actions}/{total_actions} correct actions.",
+            "Phase 2 followed {correct_actions}/{total_actions} actions correctly; {handover_relevance}, and final average stats were {stat_average}/100.",
         )
     };
+    let feedback = format!("{observation_feedback} {care_feedback}");
 
     LlmDragonEvaluation {
         dragon_id: dragon.dragon_id.clone(),
@@ -513,6 +570,8 @@ fn deterministic_local_judge_dragon_evaluation(dragon: &JudgeDragonBundle) -> Ll
         observation_score,
         care_score,
         creativity_score,
+        observation_feedback,
+        care_feedback,
         feedback,
     }
 }
@@ -614,7 +673,7 @@ async fn run_judge_for_session(
         if session.phase == protocol::Phase::Phase2 {
             session.award_phase_end_achievements();
         }
-        let score_tuples: Vec<(String, i32, i32, String)> = evaluation
+        let score_tuples: Vec<(String, i32, i32, String, String, String)> = evaluation
             .dragon_evaluations
             .iter()
             .map(|d| {
@@ -623,6 +682,8 @@ async fn run_judge_for_session(
                     d.observation_score,
                     d.care_score,
                     d.feedback.clone(),
+                    d.observation_feedback.clone(),
+                    d.care_feedback.clone(),
                 )
             })
             .collect();
@@ -736,6 +797,41 @@ where
 
 pub(crate) async fn live() -> Json<serde_json::Value> {
     Json(json!({ "ok": true, "service": "app-server", "status": "live" }))
+}
+
+pub(crate) async fn get_character_sprite(
+    State(state): State<AppState>,
+    Path((character_id, emotion)): Path<(String, String)>,
+) -> Response {
+    let record = match state.store.load_character(&character_id).await {
+        Ok(Some(record)) => record,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(error) => {
+            tracing::error!(%error, character_id = %character_id, "load_character failed");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+
+    let Some(base64) = sprite_base64_for_emotion(&record.sprites, emotion.as_str()) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let bytes = match base64::engine::general_purpose::STANDARD.decode(base64) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            tracing::warn!(%error, character_id = %character_id, emotion = %emotion, "sprite base64 decode failed");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+
+    let mut response = Body::from(bytes).into_response();
+    response
+        .headers_mut()
+        .insert(header::CONTENT_TYPE, HeaderValue::from_static("image/png"));
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("public, max-age=31536000, immutable"),
+    );
+    response
 }
 
 pub(crate) async fn create_workshop(
@@ -1091,44 +1187,165 @@ pub(crate) async fn join_workshop(
     };
     let normalized_name = account.name.clone();
 
-    // Build the starter-exclusion set from the existing session roster so two
-    // players joining with zero owned characters cannot be leased the same
-    // starter (plan2.md item 3). Ensure the session is cached; if it is not
-    // found we fall through with an empty set and let the downstream
-    // "Workshop not found." branch (after the write lease) produce the real
-    // error response with the correct status.
-    //
-    // Note: this snapshot is taken without the write lease, so two concurrent
-    // new-join requests could both observe a starter as free. The final
-    // seating happens later under `state.sessions.lock()`, but the leased
-    // character is fixed here — so a TOCTOU race could still yield a
-    // duplicate. Refactoring the lock scheme is out of scope for item 3.
-    let excluded_starter_ids: BTreeSet<String> =
-        match ensure_session_cached(&state, session_code).await {
-            Ok(true) => {
-                let sessions = state.sessions.lock().await;
-                sessions
-                    .get(session_code)
-                    .map(|session| {
-                        session
-                            .players
-                            .values()
-                            .filter(|player| player.account_id.as_deref() != Some(&account.id))
-                            .filter_map(|player| {
-                                player
-                                    .selected_character
-                                    .as_ref()
-                                    .map(|character| character.id.clone())
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default()
-            }
-            Ok(false) => BTreeSet::new(),
+    let (_, _write_guard, write_lease) =
+        match SessionWriteLease::acquire(&state, session_code).await {
+            Ok(guard) => guard,
             Err(error) => {
-                return internal_join_error(format!("failed to load session: {error}"));
+                return internal_join_error(format!("failed to acquire session lease: {error}"));
             }
         };
+    if let Err(error) = write_lease.ensure_active() {
+        return internal_join_error(format!("lost session lease before join load: {error}"));
+    }
+
+    match reload_cached_session(&state, session_code).await {
+        Ok(true) => {}
+        Ok(false) => return bad_join_request("Workshop not found."),
+        Err(error) => return internal_join_error(format!("failed to load session: {error}")),
+    }
+    if let Err(error) = write_lease.ensure_active() {
+        return internal_join_error(format!("lost session lease before join mutation: {error}"));
+    }
+
+    let restore_candidate = {
+        let mut sessions = state.sessions.lock().await;
+        let Some(session) = sessions.get_mut(session_code) else {
+            return bad_join_request("Workshop not found.");
+        };
+        if let Some(existing_player_id) = session.players.values().find_map(|player| {
+            (player.account_id.as_deref() == Some(&account.id)).then(|| player.id.clone())
+        }) {
+            let fallback_sprites = timeout_companion_defaults().sprites;
+            let needs_sprite_upgrade = session.phase == protocol::Phase::Lobby
+                && session
+                    .players
+                    .get(&existing_player_id)
+                    .and_then(|player| player.selected_character.as_ref())
+                    .is_some_and(|character| character.sprites == fallback_sprites);
+            let excluded_starter_ids = session
+                .players
+                .values()
+                .filter(|player| player.account_id.as_deref() != Some(&account.id))
+                .filter_map(|player| {
+                    player
+                        .selected_character
+                        .as_ref()
+                        .map(|character| character.id.clone())
+                })
+                .collect();
+            Some((
+                existing_player_id,
+                needs_sprite_upgrade,
+                excluded_starter_ids,
+            ))
+        } else {
+            if session.phase != protocol::Phase::Lobby {
+                return conflict_join_request(
+                    "This workshop has already started. New players can only join in the lobby.",
+                );
+            }
+            None
+        }
+    };
+
+    if let Some((player_id, needs_sprite_upgrade, excluded_starter_ids)) = restore_candidate {
+        let upgraded_character = if needs_sprite_upgrade {
+            match pick_random_starter_profile(&state, &excluded_starter_ids).await {
+                Ok(character) => character,
+                Err(error) => return internal_join_error(error),
+            }
+        } else {
+            None
+        };
+        let (session_before, session_clone, reconnect_token, timestamp) = {
+            let mut sessions = state.sessions.lock().await;
+            let Some(session) = sessions.get_mut(session_code) else {
+                return bad_join_request("Workshop not found.");
+            };
+            let session_before = session.clone();
+            let timestamp = Utc::now();
+            let reconnect_token = random_prefixed_id("reconnect");
+            let Some(player) = session.players.get_mut(&player_id) else {
+                return bad_join_request("Session identity is invalid or expired.");
+            };
+            player.is_connected = true;
+            if let Some(character) = upgraded_character {
+                player.character_id = Some(character.id.clone());
+                player.selected_character = Some(character);
+                player.is_ready = true;
+            }
+            session.ensure_host_assigned(true);
+            session.updated_at = timestamp;
+            (session_before, session.clone(), reconnect_token, timestamp)
+        };
+
+        let identity = persistence::PlayerIdentity {
+            session_id: session_clone.id.to_string(),
+            player_id: player_id.clone(),
+            reconnect_token: reconnect_token.clone(),
+            created_at: timestamp.to_rfc3339(),
+            last_seen_at: timestamp.to_rfc3339(),
+        };
+        let reconnect_artifact = SessionArtifactRecord {
+            id: random_prefixed_id("artifact"),
+            session_id: session_clone.id.to_string(),
+            phase: session_clone.phase,
+            step: phase_step(session_clone.phase),
+            kind: SessionArtifactKind::PlayerReconnected,
+            player_id: Some(player_id.clone()),
+            created_at: timestamp.to_rfc3339(),
+            payload: json!({ "sessionCode": session_code, "playerId": player_id.clone(), "source": "account" }),
+        };
+        if let Err(error) = write_lease.ensure_active() {
+            let mut sessions = state.sessions.lock().await;
+            sessions.insert(session_code.to_string(), session_before);
+            return internal_join_error(format!(
+                "lost session lease before account restore persist: {error}"
+            ));
+        }
+        if let Err(error) = state
+            .store
+            .save_session_with_identity_and_artifact(&session_clone, &identity, &reconnect_artifact)
+            .await
+        {
+            let mut sessions = state.sessions.lock().await;
+            sessions.insert(session_code.to_string(), session_before);
+            return internal_join_error(format!("failed to persist account restore: {error}"));
+        }
+
+        let response = WorkshopJoinSuccess {
+            ok: true,
+            session_code: session_clone.code.0.clone(),
+            player_id: player_id.clone(),
+            reconnect_token,
+            coordinator_type: CoordinatorType::Rust,
+            state: to_client_game_state(&session_clone, &player_id),
+        };
+
+        let response = (StatusCode::OK, Json(WorkshopJoinResult::Success(response)));
+        broadcast_session_state(&state, session_code, None).await;
+        return response;
+    }
+
+    let excluded_starter_ids: BTreeSet<String> = {
+        let sessions = state.sessions.lock().await;
+        sessions
+            .get(session_code)
+            .map(|session| {
+                session
+                    .players
+                    .values()
+                    .filter(|player| player.account_id.as_deref() != Some(&account.id))
+                    .filter_map(|player| {
+                        player
+                            .selected_character
+                            .as_ref()
+                            .map(|character| character.id.clone())
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
 
     let selected_character = match resolve_character_for_session(
         &state,
@@ -1164,26 +1381,6 @@ pub(crate) async fn join_workshop(
         return conflict_join_request("no starter available");
     }
 
-    let (_, _write_guard, write_lease) =
-        match SessionWriteLease::acquire(&state, session_code).await {
-            Ok(guard) => guard,
-            Err(error) => {
-                return internal_join_error(format!("failed to acquire session lease: {error}"));
-            }
-        };
-    if let Err(error) = write_lease.ensure_active() {
-        return internal_join_error(format!("lost session lease before join load: {error}"));
-    }
-
-    match reload_cached_session(&state, session_code).await {
-        Ok(true) => {}
-        Ok(false) => return bad_join_request("Workshop not found."),
-        Err(error) => return internal_join_error(format!("failed to load session: {error}")),
-    }
-    if let Err(error) = write_lease.ensure_active() {
-        return internal_join_error(format!("lost session lease before join mutation: {error}"));
-    }
-
     let (session_before, session_clone, player_id, reconnect_token) = {
         let mut sessions = state.sessions.lock().await;
         let Some(session) = sessions.get_mut(session_code) else {
@@ -1192,20 +1389,6 @@ pub(crate) async fn join_workshop(
         if session.phase != protocol::Phase::Lobby {
             return conflict_join_request(
                 "This workshop has already started. New players can only join in the lobby.",
-            );
-        }
-        // Spec: same account_id already in session → 409.
-        let duplicate_account = session
-            .players
-            .values()
-            .any(|player| player.account_id.as_deref() == Some(&account.id));
-        if duplicate_account {
-            return (
-                StatusCode::CONFLICT,
-                Json(WorkshopJoinResult::Error(WorkshopError {
-                    ok: false,
-                    error: "You have already joined this workshop.".to_string(),
-                })),
             );
         }
         let duplicate_name = session
@@ -1221,6 +1404,9 @@ pub(crate) async fn join_workshop(
         let player_id = random_prefixed_id("player");
         let reconnect_token = random_prefixed_id("reconnect");
         let is_reserved_host = session.reserved_host_account_id() == Some(account.id.as_str());
+        let host_pending_owner_join = session.host_player_id.is_none()
+            && session.reserved_host_account_id().is_none()
+            && session.owner_account_id() == Some(account.id.as_str());
         let player = SessionPlayer {
             id: player_id.clone(),
             name: normalized_name.clone(),
@@ -1229,7 +1415,7 @@ pub(crate) async fn join_workshop(
                 .as_ref()
                 .map(|character| character.id.clone()),
             selected_character: selected_character.clone(),
-            is_host: is_reserved_host,
+            is_host: is_reserved_host || host_pending_owner_join,
             is_connected: true,
             is_ready: selected_character.is_some(),
             score: 0,
@@ -1240,6 +1426,8 @@ pub(crate) async fn join_workshop(
         session.add_player(player.clone());
         if is_reserved_host {
             session.assign_reserved_host_to_player(&player_id);
+        } else if host_pending_owner_join {
+            session.ensure_host_assigned(false);
         }
         (session_before, session.clone(), player_id, reconnect_token)
     };
@@ -1455,6 +1643,14 @@ pub(crate) async fn workshop_command(
                 };
 
                 let character_id = payload.character_id.trim();
+                if character_id.starts_with("starter_")
+                    && session.players.values().any(|player| {
+                        player.id != identity.player_id
+                            && player.character_id.as_deref() == Some(character_id)
+                    })
+                {
+                    return bad_command_request("That starter is already taken in this workshop.");
+                }
                 let record = match state.store.load_character(character_id).await {
                     Ok(Some(r)) => r,
                     Ok(None) => return bad_command_request("Selected character was not found."),
@@ -1485,7 +1681,7 @@ pub(crate) async fn workshop_command(
                 {
                     return bad_command_request("That starter is already taken in this workshop.");
                 }
-                let character = record.profile();
+                let character = character_profile_with_sprite_references(&record);
 
                 if let Err(error) =
                     session.assign_player_character(&identity.player_id, character.clone())
@@ -2116,9 +2312,6 @@ pub(crate) async fn workshop_judge_bundle(
         session.clone()
     };
 
-    if session.host_player_id.as_deref() != Some(identity.player_id.as_str()) {
-        return bad_judge_bundle_request("Only the host can build the workshop archive.");
-    }
     if session.phase != protocol::Phase::End {
         return conflict_judge_bundle_request(
             "Workshop archive can only be built after the game ends.",
@@ -2138,26 +2331,39 @@ pub(crate) async fn workshop_judge_bundle(
         }
     };
 
+    let archive_already_built = artifacts
+        .iter()
+        .any(|artifact| artifact.kind == SessionArtifactKind::JudgeBundleGenerated);
+    if !archive_already_built
+        && session.host_player_id.as_deref() != Some(identity.player_id.as_str())
+    {
+        return bad_judge_bundle_request("Only the host can build the workshop archive.");
+    }
+
     let bundle = build_judge_bundle(&session, &artifacts);
 
-    if let Err(error) = state
-        .store
-        .append_session_artifact(&SessionArtifactRecord {
-            id: random_prefixed_id("artifact"),
-            session_id: session.id.to_string(),
-            phase: session.phase,
-            step: phase_step(session.phase),
-            kind: SessionArtifactKind::JudgeBundleGenerated,
-            player_id: Some(identity.player_id.clone()),
-            created_at: Utc::now().to_rfc3339(),
-            payload: json!({
-                "dragonCount": bundle.dragons.len(),
-                "artifactCount": bundle.artifact_count,
-            }),
-        })
-        .await
-    {
-        return internal_judge_bundle_error(format!("failed to append session artifact: {error}"));
+    if !archive_already_built {
+        if let Err(error) = state
+            .store
+            .append_session_artifact(&SessionArtifactRecord {
+                id: random_prefixed_id("artifact"),
+                session_id: session.id.to_string(),
+                phase: session.phase,
+                step: phase_step(session.phase),
+                kind: SessionArtifactKind::JudgeBundleGenerated,
+                player_id: Some(identity.player_id.clone()),
+                created_at: Utc::now().to_rfc3339(),
+                payload: json!({
+                    "dragonCount": bundle.dragons.len(),
+                    "artifactCount": bundle.artifact_count,
+                }),
+            })
+            .await
+        {
+            return internal_judge_bundle_error(format!(
+                "failed to append session artifact: {error}"
+            ));
+        }
     }
 
     (
@@ -2814,10 +3020,10 @@ async fn generate_or_update_character_sprite_sheet(
         }
     }
 
-    if current_character
-        .as_ref()
-        .is_some_and(|character| character.remaining_sprite_regenerations == 0)
-    {
+    if current_character.as_ref().is_some_and(|character| {
+        character.remaining_sprite_regenerations == 0
+            && !sprite_set_uses_references(&character.sprites)
+    }) {
         return conflict_character_sprite_sheet_request(
             "Your dragon has already used its one redraw.",
         );
@@ -2875,13 +3081,23 @@ async fn generate_or_update_character_sprite_sheet(
             .as_ref()
             .map(|character| character.remaining_sprite_regenerations.saturating_sub(1))
             .unwrap_or(1);
-        let character_id = existing_character
+        let character_id = if existing_character
             .as_ref()
-            .map(|character| character.id.clone())
-            .unwrap_or_else(|| random_prefixed_id("character"));
+            .is_some_and(|character| sprite_set_uses_references(&character.sprites))
+        {
+            random_prefixed_id("character")
+        } else {
+            existing_character
+                .as_ref()
+                .map(|character| character.id.clone())
+                .unwrap_or_else(|| random_prefixed_id("character"))
+        };
         let timestamp = Utc::now().to_rfc3339();
         let character_record = CharacterRecord {
             id: character_id.clone(),
+            name: existing_character
+                .as_ref()
+                .and_then(|character| character.name.clone()),
             description: description.to_string(),
             sprites: sprites.clone(),
             remaining_sprite_regenerations: next_remaining_sprite_regenerations,
@@ -2891,8 +3107,9 @@ async fn generate_or_update_character_sprite_sheet(
             updated_at: timestamp,
             owner_account_id: existing_owner_account_id,
         };
-        if let Err(error) =
-            session.assign_player_character(&identity.player_id, character_record.profile())
+        let mut character_profile = character_record.profile();
+        character_profile.sprites = sprites.clone();
+        if let Err(error) = session.assign_player_character(&identity.player_id, character_profile)
         {
             return conflict_character_sprite_sheet_request(&error.to_string());
         }
@@ -3065,16 +3282,6 @@ fn too_many_llm_image_requests() -> (StatusCode, Json<LlmImageResult>) {
     )
 }
 
-fn too_many_sprite_sheet_requests() -> (StatusCode, Json<SpriteSheetResult>) {
-    (
-        StatusCode::TOO_MANY_REQUESTS,
-        Json(SpriteSheetResult::Error(WorkshopError {
-            ok: false,
-            error: "Too many requests. Please slow down and try again.".to_string(),
-        })),
-    )
-}
-
 fn too_many_character_catalog_requests() -> (StatusCode, Json<CharacterCatalogResult>) {
     (
         StatusCode::TOO_MANY_REQUESTS,
@@ -3093,24 +3300,6 @@ fn too_many_character_sprite_sheet_requests() -> (StatusCode, Json<CharacterSpri
             error: "Too many requests. Please slow down and try again.".to_string(),
         })),
     )
-}
-
-fn reject_disallowed_sprite_sheet_origin(
-    headers: &HeaderMap,
-    policy: &OriginPolicy,
-) -> Option<(StatusCode, Json<SpriteSheetResult>)> {
-    let origin = headers.get("origin").and_then(|value| value.to_str().ok());
-    if security::is_origin_allowed(origin, policy) {
-        None
-    } else {
-        Some((
-            StatusCode::FORBIDDEN,
-            Json(SpriteSheetResult::Error(WorkshopError {
-                ok: false,
-                error: "Origin is not allowed.".to_string(),
-            })),
-        ))
-    }
 }
 
 fn reject_disallowed_character_catalog_origin(
@@ -3147,26 +3336,6 @@ fn reject_disallowed_character_sprite_sheet_origin(
             })),
         ))
     }
-}
-
-fn bad_sprite_sheet_request(message: &str) -> (StatusCode, Json<SpriteSheetResult>) {
-    (
-        StatusCode::BAD_REQUEST,
-        Json(SpriteSheetResult::Error(WorkshopError {
-            ok: false,
-            error: message.to_string(),
-        })),
-    )
-}
-
-fn bad_character_catalog_request(message: &str) -> (StatusCode, Json<CharacterCatalogResult>) {
-    (
-        StatusCode::BAD_REQUEST,
-        Json(CharacterCatalogResult::Error(WorkshopError {
-            ok: false,
-            error: message.to_string(),
-        })),
-    )
 }
 
 fn internal_character_catalog_error(message: String) -> (StatusCode, Json<CharacterCatalogResult>) {
@@ -3215,16 +3384,6 @@ fn internal_character_sprite_sheet_error(
     )
 }
 
-fn internal_sprite_sheet_error(message: String) -> (StatusCode, Json<SpriteSheetResult>) {
-    (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        Json(SpriteSheetResult::Error(WorkshopError {
-            ok: false,
-            error: message,
-        })),
-    )
-}
-
 // ---------------------------------------------------------------------------
 // Account-scoped character CRUD (C2-b)
 // ---------------------------------------------------------------------------
@@ -3259,6 +3418,7 @@ pub(crate) async fn create_character(
     let now = Utc::now().to_rfc3339();
     let record = CharacterRecord {
         id: random_prefixed_id("character"),
+        name: None,
         description,
         sprites: request.sprites,
         remaining_sprite_regenerations: 1,
@@ -3426,6 +3586,68 @@ pub(crate) async fn delete_character(
     }
 }
 
+/// `PATCH /api/characters/:id` — rename an owned character.
+pub(crate) async fn update_character(
+    State(state): State<AppState>,
+    session: AccountSession,
+    Path(character_id): Path<String>,
+    Json(request): Json<UpdateCharacterRequest>,
+) -> Response {
+    let name = request.name.trim().to_string();
+    if name.is_empty() || name.chars().count() > 64 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "name must be 1-64 characters" })),
+        )
+            .into_response();
+    }
+
+    let updated = match state
+        .store
+        .update_character_name_by_owner(&character_id, &session.account.id, &name)
+        .await
+    {
+        Ok(updated) => updated,
+        Err(error) => {
+            tracing::error!(%error, "update_character_name_by_owner failed");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "internal error" })),
+            )
+                .into_response();
+        }
+    };
+
+    if !updated {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "character not found or not owned by you" })),
+        )
+            .into_response();
+    }
+
+    match state.store.load_character(&character_id).await {
+        Ok(Some(record))
+            if record.owner_account_id.as_deref() == Some(session.account.id.as_str()) =>
+        {
+            (StatusCode::OK, Json(record.profile())).into_response()
+        }
+        Ok(Some(_)) | Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "character not found or not owned by you" })),
+        )
+            .into_response(),
+        Err(error) => {
+            tracing::error!(%error, "load_character after rename failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "internal error" })),
+            )
+                .into_response()
+        }
+    }
+}
+
 /// `DELETE /api/workshops/:code` — delete an owned lobby workshop.
 pub(crate) async fn delete_workshop(
     State(state): State<AppState>,
@@ -3539,7 +3761,7 @@ pub(crate) struct OpenWorkshopsQuery {
     pub before_session_code: Option<String>,
 }
 
-/// `GET /api/workshops/open` — list workshops in Lobby phase.
+/// `GET /api/workshops/open` — list open lobbies and archived workshops.
 /// Supports bidirectional keyset pagination via query params:
 ///   `?after_created_at=<rfc3339>&after_session_code=<code>` (Next) XOR
 ///   `?before_created_at=<rfc3339>&before_session_code=<code>` (Prev).
@@ -3603,7 +3825,12 @@ pub(crate) async fn list_open_workshops(
         persistence::OpenWorkshopsPaging::First
     };
 
-    let page = match state.store.list_open_workshops(paging.clone()).await {
+    let account_id = session.account.id.as_str();
+    let page = match state
+        .store
+        .list_open_workshops(paging.clone(), Some(account_id.to_string()))
+        .await
+    {
         Ok(p) => p,
         Err(error) => {
             tracing::error!(%error, "list_open_workshops failed");
@@ -3668,8 +3895,12 @@ pub(crate) async fn list_open_workshops(
             host_name: r.host_name,
             player_count: r.player_count,
             created_at: r.created_at,
-            can_delete: r.player_count == 0
-                && r.owner_account_id.as_deref() == Some(session.account.id.as_str()),
+            archived: r.archived,
+            can_delete: !r.archived
+                && !r.resumable
+                && r.player_count == 0
+                && r.owner_account_id.as_deref() == Some(account_id),
+            can_resume: r.resumable,
         })
         .collect();
     (

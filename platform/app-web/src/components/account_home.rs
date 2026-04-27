@@ -1,17 +1,38 @@
 use dioxus::prelude::*;
 
 use crate::flows::{
-    OpenWorkshopsPaging, load_open_workshops_flow, submit_create_workshop_flow,
-    submit_delete_workshop_flow,
+    OpenWorkshopsPaging, begin_load_open_workshops, load_open_workshops_flow,
+    request_open_workshops_flow, start_create_workshop_flow, start_delete_workshop_flow,
+    start_resume_workshop_flow, start_review_workshop_flow,
 };
 use crate::state::{IdentityState, OperationState, PendingFlow, ShellScreen, navigate_to_screen};
+use protocol::{ClientGameState, JudgeBundle};
 
 #[component]
-pub fn AccountHomeView(identity: Signal<IdentityState>, ops: Signal<OperationState>) -> Element {
+pub fn AccountHomeView(
+    identity: Signal<IdentityState>,
+    game_state: Signal<Option<ClientGameState>>,
+    ops: Signal<OperationState>,
+    reconnect_session_code: Signal<String>,
+    reconnect_token: Signal<String>,
+    judge_bundle: Signal<Option<JudgeBundle>>,
+) -> Element {
+    let mut refreshed_on_mount = use_signal(|| false);
+    if !*refreshed_on_mount.read() {
+        ops.with_mut(begin_load_open_workshops);
+        refreshed_on_mount.set(true);
+        spawn(async move {
+            let _ = load_open_workshops_flow(identity, ops, OpenWorkshopsPaging::First).await;
+        });
+    }
+
     // Account name is surfaced by the app bar's disclosure menu
     // trigger; no need to read it here any more.
     let pending = ops.read().pending_flow.is_some();
     let delete_workshop_pending = ops.read().pending_flow == Some(PendingFlow::DeleteWorkshop);
+    let open_workshops_loading = ops.read().open_workshops_loading;
+    let open_workshops_loaded = ops.read().open_workshops_loaded;
+    let open_workshops_load_failed = ops.read().open_workshops_load_failed;
     let open_workshops = ops.read().open_workshops.clone();
     let next_cursor = ops.read().open_workshops_next_cursor.clone();
     let prev_cursor = ops.read().open_workshops_prev_cursor.clone();
@@ -28,18 +49,6 @@ pub fn AccountHomeView(identity: Signal<IdentityState>, ops: Signal<OperationSta
     // back to page 1 on every tick.
     let mut current_paging = use_signal(|| OpenWorkshopsPaging::First);
 
-    // Load account-scoped lists on mount.
-    let mut loaded = use_signal(|| false);
-    let initial_open_workshops_loaded = loaded.read().clone();
-    if !*loaded.read() {
-        loaded.set(true);
-        spawn(load_open_workshops_flow(
-            identity,
-            ops,
-            OpenWorkshopsPaging::First,
-        ));
-    }
-
     // Poll open workshops every 5 seconds. Re-issues whichever paging
     // direction the user last selected so pagination isn't clobbered.
     use_future(move || {
@@ -51,8 +60,15 @@ pub fn AccountHomeView(identity: Signal<IdentityState>, ops: Signal<OperationSta
                 gloo_timers::future::TimeoutFuture::new(5_000).await;
                 #[cfg(not(target_arch = "wasm32"))]
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                if matches!(
+                    ops.read().pending_flow,
+                    Some(PendingFlow::DeleteWorkshop | PendingFlow::Create)
+                ) || ops.read().open_workshops_loading
+                {
+                    continue;
+                }
                 let paging = current_paging.read().clone();
-                load_open_workshops_flow(identity, ops, paging).await;
+                let _ = request_open_workshops_flow(identity, ops, paging).await;
             }
         }
     });
@@ -97,14 +113,15 @@ pub fn AccountHomeView(identity: Signal<IdentityState>, ops: Signal<OperationSta
                             disabled: delete_workshop_pending,
                             onclick: move |_| {
                                 let paging = current_paging.read().clone();
-                                pending_delete_workshop_code.set(None);
-                                spawn(submit_delete_workshop_flow(
+                                if start_delete_workshop_flow(
                                     identity,
                                     ops,
                                     current_paging,
                                     delete_code.clone(),
                                     paging,
-                                ));
+                                ) {
+                                    pending_delete_workshop_code.set(None);
+                                }
                             },
                             if delete_workshop_pending { "Deleting..." } else { "Delete" }
                         }
@@ -127,8 +144,7 @@ pub fn AccountHomeView(identity: Signal<IdentityState>, ops: Signal<OperationSta
                             "data-testid": "create-workshop-button",
                             disabled: pending,
                             onclick: move |_| {
-                                current_paging.set(OpenWorkshopsPaging::First);
-                                spawn(submit_create_workshop_flow(identity, ops));
+                                let _ = start_create_workshop_flow(identity, ops, current_paging);
                             },
                             "Create Workshop"
                         }
@@ -164,7 +180,7 @@ pub fn AccountHomeView(identity: Signal<IdentityState>, ops: Signal<OperationSta
 
         section { class: "panel panel--wide", "data-testid": "open-workshops-panel",
                 div { class: "panel__header",
-                    h2 { class: "panel__title", "Open Workshops" }
+                    h2 { class: "panel__title", "Workshops" }
                     if show_pager {
                         div { class: "button-row button-row--workshop-pager",
                             button {
@@ -175,7 +191,10 @@ pub fn AccountHomeView(identity: Signal<IdentityState>, ops: Signal<OperationSta
                                     if let Some(cursor) = pager_prev_cursor.clone() {
                                         let paging = OpenWorkshopsPaging::Before(cursor);
                                         current_paging.set(paging.clone());
-                                        spawn(load_open_workshops_flow(identity, ops, paging));
+                                        spawn(async move {
+                                            let _ = request_open_workshops_flow(identity, ops, paging)
+                                                .await;
+                                        });
                                     }
                                 },
                                 "Prev"
@@ -188,7 +207,10 @@ pub fn AccountHomeView(identity: Signal<IdentityState>, ops: Signal<OperationSta
                                     if let Some(cursor) = pager_next_cursor.clone() {
                                         let paging = OpenWorkshopsPaging::After(cursor);
                                         current_paging.set(paging.clone());
-                                        spawn(load_open_workshops_flow(identity, ops, paging));
+                                        spawn(async move {
+                                            let _ = request_open_workshops_flow(identity, ops, paging)
+                                                .await;
+                                        });
                                     }
                                 },
                                 "Next"
@@ -197,25 +219,74 @@ pub fn AccountHomeView(identity: Signal<IdentityState>, ops: Signal<OperationSta
                     }
                 }
                 div { class: "panel__stack",
-                    if open_workshops.is_empty() && initial_open_workshops_loaded {
-                        p { class: "meta", "No open workshops at the moment." }
+                    if open_workshops_loading && open_workshops.is_empty() {
+                        p { class: "meta", role: "status", "aria-live": "polite", "aria-atomic": "true", "Loading workshops..." }
+                    } else if open_workshops_load_failed && open_workshops.is_empty() {
+                        p { class: "meta", role: "alert", "Could not load workshops right now." }
+                    } else if open_workshops.is_empty() && open_workshops_loaded {
+                        p { class: "meta", role: "status", "aria-live": "polite", "aria-atomic": "true", "No workshops at the moment." }
                     } else {
                         div { class: "roster",
                             for workshop in open_workshops.iter() {
                                 {
                                     let code = workshop.session_code.clone();
+                                    let resume_code = workshop.session_code.clone();
+                                    let review_code = workshop.session_code.clone();
                                     let delete_code = workshop.session_code.clone();
                                     let can_delete = workshop.can_delete;
+                                    let is_archived = workshop.archived;
+                                    let can_resume = workshop.can_resume;
                                     rsx! {
-                                        article { class: "roster__item",
+                                        article { class: "roster__item", key: "{workshop.session_code}",
                                             div {
                                                 p { class: "roster__name", "{workshop.host_name}'s workshop" }
                                                 p { class: "roster__meta",
                                                     "{workshop.player_count} player(s) \u{2014} Code: {workshop.session_code}"
+                                                    if is_archived {
+                                                        span { class: "workshop-status-badge workshop-status-badge--archived", "Archived" }
+                                                    } else if can_resume {
+                                                        span { class: "workshop-status-badge workshop-status-badge--active", "In progress" }
+                                                    }
                                                 }
                                             }
                                             div { class: "button-row button-row--workshop-actions",
-                                                if can_delete {
+                                                if is_archived {
+                                                    button {
+                                                        class: "button button--secondary button--small",
+                                                        "data-testid": "review-workshop-button",
+                                                        disabled: pending,
+                                                        onclick: move |_| {
+                                                            let _ = start_review_workshop_flow(
+                                                                identity,
+                                                                game_state,
+                                                                ops,
+                                                                reconnect_session_code,
+                                                                reconnect_token,
+                                                                judge_bundle,
+                                                                review_code.clone(),
+                                                            );
+                                                        },
+                                                        "Review"
+                                                    }
+                                                } else if can_resume {
+                                                    button {
+                                                        class: "button button--primary button--small",
+                                                        "data-testid": "resume-workshop-button",
+                                                        disabled: pending,
+                                                        onclick: move |_| {
+                                                            let _ = start_resume_workshop_flow(
+                                                                identity,
+                                                                game_state,
+                                                                ops,
+                                                                reconnect_session_code,
+                                                                reconnect_token,
+                                                                judge_bundle,
+                                                                resume_code.clone(),
+                                                            );
+                                                        },
+                                                        "Resume"
+                                                    }
+                                                } else if can_delete {
                                                     button {
                                                         class: "button button--danger button--small",
                                                         "data-testid": "delete-workshop-button",
@@ -227,25 +298,27 @@ pub fn AccountHomeView(identity: Signal<IdentityState>, ops: Signal<OperationSta
                                                         if delete_workshop_pending { "Deleting..." } else { "Delete" }
                                                     }
                                                 }
-                                                button {
-                                                    class: "button button--primary button--small",
-                                                    "data-testid": "join-workshop-button",
-                                                    disabled: pending,
-                                                    onclick: move |_| {
-                                                        let c = code.clone();
-                                                        identity.with_mut(|id| {
-                                                            ops.with_mut(|o| {
-                                                                navigate_to_screen(
-                                                                    id,
-                                                                    o,
-                                                                    ShellScreen::PickCharacter {
-                                                                        workshop_code: c,
-                                                                    },
-                                                                );
+                                                if !is_archived && !can_resume {
+                                                    button {
+                                                        class: "button button--primary button--small",
+                                                        "data-testid": "join-workshop-button",
+                                                        disabled: pending,
+                                                        onclick: move |_| {
+                                                            let c = code.clone();
+                                                            identity.with_mut(|id| {
+                                                                ops.with_mut(|o| {
+                                                                    navigate_to_screen(
+                                                                        id,
+                                                                        o,
+                                                                        ShellScreen::PickCharacter {
+                                                                            workshop_code: c,
+                                                                        },
+                                                                    );
+                                                                });
                                                             });
-                                                        });
-                                                    },
-                                                    "Join"
+                                                        },
+                                                        "Join"
+                                                    }
                                                 }
                                             }
                                         }

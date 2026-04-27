@@ -2,9 +2,11 @@ use dioxus::prelude::*;
 use protocol::{CharacterSpritePreviewRequest, CreateCharacterRequest, SpriteSet};
 
 use crate::api::AppWebApi;
+use crate::helpers::sprite_src;
 use crate::state::{
     IdentityState, NoticeScope, OperationState, PendingFlow, ShellScreen, error_notice,
-    info_notice, navigate_to_screen, scoped_notice, success_notice,
+    info_notice, navigate_to_screen, pending_flow_ticket_is_current, reserve_pending_flow,
+    scoped_notice, success_notice,
 };
 
 const EMOTION_LABELS: [&str; 4] = ["Neutral", "Happy", "Angry", "Sleepy"];
@@ -144,15 +146,20 @@ pub fn CreateCharacterView(
             if desc.is_empty() {
                 return;
             }
+            let Some(ticket) = ops.with_mut(|o| {
+                reserve_pending_flow(
+                    o,
+                    PendingFlow::Create,
+                    scoped_notice(
+                        NoticeScope::CreateCharacter,
+                        info_notice("Creating character…"),
+                    ),
+                )
+            }) else {
+                return;
+            };
             let base_url = { identity.read().api_base_url.clone() };
             saving.set(true);
-            ops.with_mut(|o| {
-                o.pending_flow = Some(PendingFlow::Create);
-                o.notice = Some(scoped_notice(
-                    NoticeScope::CreateCharacter,
-                    info_notice("Creating character…"),
-                ));
-            });
             spawn(async move {
                 let api = AppWebApi::new(base_url);
                 let request = CreateCharacterRequest {
@@ -161,12 +168,22 @@ pub fn CreateCharacterView(
                 };
                 match api.create_character(&request).await {
                     Ok(_profile) => {
+                        if !pending_flow_ticket_is_current(&ops.read(), &ticket) {
+                            saving.set(false);
+                            return;
+                        }
                         identity.with_mut(|id| {
                             ops.with_mut(|o| {
+                                if !pending_flow_ticket_is_current(o, &ticket) {
+                                    return;
+                                }
                                 navigate_to_screen(id, o, ShellScreen::AccountHome);
                             });
                         });
                         ops.with_mut(|o| {
+                            if !pending_flow_ticket_is_current(o, &ticket) {
+                                return;
+                            }
                             o.pending_flow = None;
                             o.notice = Some(scoped_notice(
                                 NoticeScope::AccountHome,
@@ -175,7 +192,14 @@ pub fn CreateCharacterView(
                         });
                     }
                     Err(error) => {
+                        if !pending_flow_ticket_is_current(&ops.read(), &ticket) {
+                            saving.set(false);
+                            return;
+                        }
                         ops.with_mut(|o| {
+                            if !pending_flow_ticket_is_current(o, &ticket) {
+                                return;
+                            }
                             o.pending_flow = None;
                             o.notice = Some(scoped_notice(
                                 NoticeScope::CreateCharacter,
@@ -297,7 +321,7 @@ pub fn CreateCharacterView(
                                         div { class: "sprite-grid__image-wrap phase0-sprite-frame",
                                             img {
                                                 class: "sprite-grid__image",
-                                                src: "data:image/png;base64,{sprite_for_index(sp, i)}",
+                                                src: sprite_src(sprite_for_index(sp, i)),
                                                 alt: "Dragon emotion: {label}",
                                             }
                                         }

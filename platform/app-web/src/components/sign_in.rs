@@ -1,7 +1,7 @@
 use dioxus::prelude::*;
 use protocol::AUTH_ERR_NAME_TAKEN_WRONG_PASSWORD;
 
-use crate::flows::submit_signin_flow;
+use crate::flows::start_signin_flow;
 use crate::state::{IdentityState, OperationState};
 
 /// Map a backend signin error code (the `error` field of the JSON body,
@@ -57,7 +57,7 @@ pub fn SignInView(identity: Signal<IdentityState>, ops: Signal<OperationState>) 
                         onclick: move |_| {
                             let n = name.read().clone();
                             let p = password.read().clone();
-                            spawn(submit_signin_flow(identity, ops, n, p, String::new()));
+                            let _ = start_signin_flow(identity, ops, n, p, String::new());
                         },
                         "Sign In"
                     }

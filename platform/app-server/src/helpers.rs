@@ -28,12 +28,36 @@ pub(crate) fn random_prefixed_id(prefix: &str) -> String {
 }
 
 fn normalized_sprite_set(sprites: &protocol::SpriteSet) -> protocol::SpriteSet {
+    if sprite_set_uses_references(sprites) {
+        return sprites.clone();
+    }
+
     protocol::SpriteSet {
         neutral: normalize_sprite_base64(&sprites.neutral)
             .unwrap_or_else(|_| sprites.neutral.clone()),
         happy: normalize_sprite_base64(&sprites.happy).unwrap_or_else(|_| sprites.happy.clone()),
         angry: normalize_sprite_base64(&sprites.angry).unwrap_or_else(|_| sprites.angry.clone()),
         sleepy: normalize_sprite_base64(&sprites.sleepy).unwrap_or_else(|_| sprites.sleepy.clone()),
+    }
+}
+
+pub(crate) fn sprite_set_uses_references(sprites: &protocol::SpriteSet) -> bool {
+    [
+        &sprites.neutral,
+        &sprites.happy,
+        &sprites.angry,
+        &sprites.sleepy,
+    ]
+    .iter()
+    .all(|sprite| sprite.starts_with("/api/characters/"))
+}
+
+pub(crate) fn character_sprite_reference_set(character_id: &str) -> protocol::SpriteSet {
+    protocol::SpriteSet {
+        neutral: format!("/api/characters/{character_id}/sprites/neutral"),
+        happy: format!("/api/characters/{character_id}/sprites/happy"),
+        angry: format!("/api/characters/{character_id}/sprites/angry"),
+        sleepy: format!("/api/characters/{character_id}/sprites/sleepy"),
     }
 }
 
@@ -209,6 +233,16 @@ pub(crate) fn to_client_game_state(
                     } else {
                         Some(dragon.original_owner_id.clone())
                     },
+                    design_creator_name: if hide_owner_identity && !is_current_players_original_dragon {
+                        None
+                    } else {
+                        dragon.design_creator_name.clone().or_else(|| {
+                            session
+                                .players
+                                .get(&dragon.original_owner_id)
+                                .map(|player| player.name.clone())
+                        })
+                    },
                     current_owner_id: if hide_owner_identity {
                         None
                     } else {
@@ -234,6 +268,8 @@ pub(crate) fn to_client_game_state(
                     judge_observation_score: dragon.judge_observation_score,
                     judge_care_score: dragon.judge_care_score,
                     judge_feedback: dragon.judge_feedback.clone(),
+                    judge_observation_feedback: dragon.judge_observation_feedback.clone(),
+                    judge_care_feedback: dragon.judge_care_feedback.clone(),
                 },
             )
         })
@@ -311,6 +347,9 @@ pub(crate) fn build_judge_action_traces(
 
     for artifact in artifacts {
         if artifact.kind != SessionArtifactKind::ActionProcessed {
+            continue;
+        }
+        if artifact.phase != protocol::Phase::Phase2 {
             continue;
         }
 
@@ -432,6 +471,7 @@ pub(crate) fn build_judge_bundle(
                     .get(&dragon.original_owner_id)
                     .map(|player| player.name.clone())
                     .unwrap_or_else(|| "Unknown".to_string()),
+                design_creator_name: dragon.design_creator_name.clone(),
                 current_owner_id: dragon.current_owner_id.clone(),
                 current_owner_name: session
                     .players

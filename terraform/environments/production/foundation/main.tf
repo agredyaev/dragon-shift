@@ -112,6 +112,38 @@ resource "google_secret_manager_secret_version" "database_url" {
   secret_data_wo_version = var.database_url_secret_version
 }
 
+resource "terraform_data" "ensure_session_cookie_key_secret" {
+  input = {
+    project_id = var.project_id
+    secret_id  = var.session_cookie_key_secret_id
+  }
+
+  provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
+
+    environment = {
+      PROJECT_ID = var.project_id
+      SECRET_ID  = var.session_cookie_key_secret_id
+    }
+
+    command = <<-EOT
+      set -euo pipefail
+
+      if ! gcloud secrets describe "$SECRET_ID" --project "$PROJECT_ID" >/dev/null 2>&1; then
+        gcloud secrets create "$SECRET_ID" \
+          --project "$PROJECT_ID" \
+          --replication-policy=automatic >/dev/null
+      fi
+
+      if [[ -z "$(gcloud secrets versions list "$SECRET_ID" --project "$PROJECT_ID" --filter='state=ENABLED' --limit=1 --format='value(name)')" ]]; then
+        openssl rand -base64 64 | tr -d '\n' | gcloud secrets versions add "$SECRET_ID" --project "$PROJECT_ID" --data-file=- >/dev/null
+      fi
+    EOT
+  }
+
+  depends_on = [module.project_services]
+}
+
 resource "google_monitoring_notification_channel" "email" {
   display_name = "Dragon Shift Production Email"
   type         = "email"

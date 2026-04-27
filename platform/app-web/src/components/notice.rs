@@ -1,7 +1,7 @@
 use dioxus::prelude::*;
 
 use crate::helpers::notice_class;
-use crate::state::{NoticeScope, OperationState};
+use crate::state::{NoticeScope, NoticeTone, OperationState};
 
 #[component]
 pub fn NoticeBar(ops: Signal<OperationState>, scope: NoticeScope) -> Element {
@@ -12,13 +12,18 @@ pub fn NoticeBar(ops: Signal<OperationState>, scope: NoticeScope) -> Element {
     if notice.scope != scope {
         return rsx! {};
     }
+    let (role, live) = if notice.tone == NoticeTone::Error {
+        ("alert", "assertive")
+    } else {
+        ("status", "polite")
+    };
 
     rsx! {
         article {
             class: format!("notice {}", notice_class(notice.tone)),
             "data-testid": "notice-bar",
-            role: "status",
-            "aria-live": "polite",
+            role: role,
+            "aria-live": live,
             "aria-atomic": "true",
             {notice.message}
         }

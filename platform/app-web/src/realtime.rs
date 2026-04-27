@@ -16,7 +16,7 @@ use crate::state::{
 };
 
 #[cfg(target_arch = "wasm32")]
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::{JsCast, closure::Closure};
@@ -33,6 +33,45 @@ pub struct RealtimeClientHandle {
 #[cfg(target_arch = "wasm32")]
 std::thread_local! {
     static REALTIME_CLIENT: RefCell<Option<RealtimeClientHandle>> = const { RefCell::new(None) };
+    static REALTIME_GENERATION: Cell<u64> = const { Cell::new(0) };
+}
+
+#[cfg(target_arch = "wasm32")]
+fn next_realtime_generation() -> u64 {
+    REALTIME_GENERATION.with(|generation| {
+        let next = generation.get().checked_add(1).unwrap_or(1).max(1);
+        generation.set(next);
+        next
+    })
+}
+
+#[cfg(target_arch = "wasm32")]
+fn is_current_generation(generation: u64) -> bool {
+    REALTIME_GENERATION.with(|current| current.get() == generation)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn close_socket_silently(handle: RealtimeClientHandle) {
+    handle.socket.set_onopen(None);
+    handle.socket.set_onmessage(None);
+    handle.socket.set_onerror(None);
+    handle.socket.set_onclose(None);
+    let _ = handle.socket.close();
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn disconnect_realtime() {
+    next_realtime_generation();
+    clear_realtime_client();
+}
+
+#[cfg(target_arch = "wasm32")]
+fn clear_realtime_client() {
+    REALTIME_CLIENT.with(|client| {
+        if let Some(existing) = client.borrow_mut().take() {
+            close_socket_silently(existing);
+        }
+    });
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -42,6 +81,9 @@ pub fn bootstrap_realtime(
     mut ops: Signal<OperationState>,
     judge_bundle: Signal<Option<JudgeBundle>>,
 ) -> Result<(), String> {
+    let generation = next_realtime_generation();
+    clear_realtime_client();
+
     let (base_url, snapshot) = {
         let id = identity.read();
         (id.api_base_url.clone(), id.session_snapshot.clone())
@@ -62,17 +104,32 @@ pub fn bootstrap_realtime(
 
     let open_socket = socket.clone();
     let mut open_identity = identity;
+    let mut open_game_state = game_state;
     let mut open_ops = ops;
     let onopen = Closure::wrap(Box::new(move |_event: web_sys::Event| {
+        if !is_current_generation(generation) {
+            return;
+        }
         if open_socket.send_with_str(&envelope_json).is_err() {
             open_identity.with_mut(|id| {
-                id.connection_status = ConnectionStatus::Offline;
-            });
-            open_ops.with_mut(|o| {
-                o.notice = Some(scoped_notice(
-                    NoticeScope::Session,
-                    error_notice("Could not sync the session."),
-                ));
+                open_game_state.with_mut(|gs| {
+                    open_ops.with_mut(|o| {
+                        if id.restored_session_needs_realtime {
+                            crate::state::apply_realtime_bootstrap_error(
+                                id,
+                                gs,
+                                o,
+                                "Could not sync the session.".to_string(),
+                            );
+                        } else {
+                            id.connection_status = ConnectionStatus::Offline;
+                            o.notice = Some(scoped_notice(
+                                NoticeScope::Session,
+                                error_notice("Could not sync the session."),
+                            ));
+                        }
+                    });
+                });
             });
         }
     }) as Box<dyn FnMut(_)>);
@@ -83,6 +140,9 @@ pub fn bootstrap_realtime(
     let mut msg_ops = ops;
     let mut msg_judge_bundle = judge_bundle;
     let onmessage = Closure::wrap(Box::new(move |event: web_sys::MessageEvent| {
+        if !is_current_generation(generation) {
+            return;
+        }
         if let Some(text) = event.data().as_string() {
             match serde_json::from_str::<ServerWsMessage>(&text) {
                 Ok(message) => {
@@ -98,13 +158,24 @@ pub fn bootstrap_realtime(
                 }
                 Err(_) => {
                     msg_identity.with_mut(|id| {
-                        id.connection_status = ConnectionStatus::Offline;
-                    });
-                    msg_ops.with_mut(|o| {
-                        o.notice = Some(scoped_notice(
-                            NoticeScope::Session,
-                            error_notice("Received an invalid session update."),
-                        ));
+                        msg_game_state.with_mut(|gs| {
+                            msg_ops.with_mut(|o| {
+                                if id.restored_session_needs_realtime {
+                                    crate::state::apply_realtime_bootstrap_error(
+                                        id,
+                                        gs,
+                                        o,
+                                        "Received an invalid session update.".to_string(),
+                                    );
+                                } else {
+                                    id.connection_status = ConnectionStatus::Offline;
+                                    o.notice = Some(scoped_notice(
+                                        NoticeScope::Session,
+                                        error_notice("Received an invalid session update."),
+                                    ));
+                                }
+                            });
+                        });
                     });
                 }
             }
@@ -113,23 +184,57 @@ pub fn bootstrap_realtime(
     socket.set_onmessage(Some(onmessage.as_ref().unchecked_ref()));
 
     let mut err_identity = identity;
+    let mut err_game_state = game_state;
     let mut err_ops = ops;
     let onerror = Closure::wrap(Box::new(move |_event: web_sys::ErrorEvent| {
+        if !is_current_generation(generation) {
+            return;
+        }
         err_identity.with_mut(|id| {
-            id.connection_status = ConnectionStatus::Offline;
-        });
-        err_ops.with_mut(|o| {
-            o.notice = Some(scoped_notice(
-                NoticeScope::Session,
-                error_notice("Session connection failed."),
-            ));
+            err_game_state.with_mut(|gs| {
+                err_ops.with_mut(|o| {
+                    if id.restored_session_needs_realtime {
+                        crate::state::apply_realtime_bootstrap_error(
+                            id,
+                            gs,
+                            o,
+                            "Session connection failed.".to_string(),
+                        );
+                    } else {
+                        id.connection_status = ConnectionStatus::Offline;
+                        o.notice = Some(scoped_notice(
+                            NoticeScope::Session,
+                            error_notice("Session connection failed."),
+                        ));
+                    }
+                });
+            });
         });
     }) as Box<dyn FnMut(_)>);
     socket.set_onerror(Some(onerror.as_ref().unchecked_ref()));
 
     let mut close_identity = identity;
+    let mut close_game_state = game_state;
     let mut close_ops = ops;
     let onclose = Closure::wrap(Box::new(move |_event: web_sys::Event| {
+        if !is_current_generation(generation) {
+            return;
+        }
+        if close_identity.read().restored_session_needs_realtime {
+            close_identity.with_mut(|id| {
+                close_game_state.with_mut(|gs| {
+                    close_ops.with_mut(|o| {
+                        crate::state::apply_realtime_bootstrap_error(
+                            id,
+                            gs,
+                            o,
+                            "Session connection closed.".to_string(),
+                        );
+                    });
+                });
+            });
+            return;
+        }
         let should_announce_close =
             close_identity.read().connection_status != ConnectionStatus::Offline;
         close_identity.with_mut(|id| {
@@ -147,9 +252,6 @@ pub fn bootstrap_realtime(
     socket.set_onclose(Some(onclose.as_ref().unchecked_ref()));
 
     REALTIME_CLIENT.with(|client| {
-        if let Some(existing) = client.borrow_mut().take() {
-            let _ = existing.socket.close();
-        }
         client.borrow_mut().replace(RealtimeClientHandle {
             socket,
             _onopen: onopen,
@@ -161,6 +263,9 @@ pub fn bootstrap_realtime(
 
     Ok(())
 }
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn disconnect_realtime() {}
 
 #[cfg(not(target_arch = "wasm32"))]
 pub fn bootstrap_realtime(

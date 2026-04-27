@@ -104,6 +104,12 @@ variable "database_url_secret_id" {
   default     = "dragon-shift-production-database-url"
 }
 
+variable "session_cookie_key_secret_id" {
+  description = "Secret Manager secret ID that stores the runtime SESSION_COOKIE_KEY."
+  type        = string
+  default     = "dragon-shift-production-session-cookie-key"
+}
+
 variable "release_channel" {
   description = "GKE release channel."
   type        = string

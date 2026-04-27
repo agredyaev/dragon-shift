@@ -3,8 +3,9 @@ use protocol::{
     CharacterSpritePreviewResponse, ClientSessionSnapshot, CreateCharacterRequest,
     CreateWorkshopRequest, EligibleCharactersResponse, JoinWorkshopRequest, JudgeBundle,
     ListOpenWorkshopsResponse, MyCharactersResponse, SessionCommand, SessionEnvelope,
-    WorkshopCommandRequest, WorkshopCommandResult, WorkshopCreateResult, WorkshopCreateSuccess,
-    WorkshopJoinResult, WorkshopJoinSuccess, WorkshopJudgeBundleRequest, WorkshopJudgeBundleResult,
+    UpdateCharacterRequest, WorkshopCommandRequest, WorkshopCommandResult, WorkshopCreateResult,
+    WorkshopCreateSuccess, WorkshopJoinResult, WorkshopJoinSuccess, WorkshopJudgeBundleRequest,
+    WorkshopJudgeBundleResult,
 };
 
 use serde::de::DeserializeOwned;
@@ -19,6 +20,12 @@ use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::JsFuture;
 
 use crate::state::default_api_base_url;
+
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+const DEFAULT_REQUEST_TIMEOUT_MS: u32 = 10_000;
+
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+const SPRITE_PREVIEW_TIMEOUT_MS: u32 = 75_000;
 
 /// Minimal RFC3986 `application/x-www-form-urlencoded` percent-encoder for
 /// query-param values. Kept local to avoid pulling in a dedicated crate —
@@ -174,12 +181,25 @@ impl AppWebApi {
         &self,
         request: &CharacterSpritePreviewRequest,
     ) -> Result<CharacterSpritePreviewResponse, String> {
-        self.post_json("/api/characters/preview-sprites", request)
-            .await
+        self.post_json_with_timeout(
+            "/api/characters/preview-sprites",
+            request,
+            SPRITE_PREVIEW_TIMEOUT_MS,
+        )
+        .await
     }
 
     pub async fn delete_character(&self, character_id: &str) -> Result<(), String> {
         self.delete_empty(&format!("/api/characters/{character_id}"))
+            .await
+    }
+
+    pub async fn update_character(
+        &self,
+        character_id: &str,
+        request: &UpdateCharacterRequest,
+    ) -> Result<CharacterProfile, String> {
+        self.patch_json(&format!("/api/characters/{character_id}"), request)
             .await
     }
 
@@ -239,6 +259,21 @@ impl AppWebApi {
         Req: serde::Serialize,
         Res: DeserializeOwned,
     {
+        self.post_json_with_timeout(path, body, DEFAULT_REQUEST_TIMEOUT_MS)
+            .await
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    async fn post_json_with_timeout<Req, Res>(
+        &self,
+        path: &str,
+        body: &Req,
+        timeout_ms: u32,
+    ) -> Result<Res, String>
+    where
+        Req: serde::Serialize,
+        Res: DeserializeOwned,
+    {
         let body_json = serde_json::to_string(body)
             .map_err(|error| format!("failed to encode request body: {error}"))?;
 
@@ -254,16 +289,7 @@ impl AppWebApi {
             .map_err(|_| "failed to set request headers".to_string())?;
         init.set_headers_headers(&headers);
 
-        let url = format!("{}{}", self.base_url, path);
-        let request = web_sys::Request::new_with_str_and_init(&url, &init)
-            .map_err(|_| "failed to prepare browser request".to_string())?;
-        let window = web_sys::window().ok_or_else(|| "window is unavailable".to_string())?;
-        let response = JsFuture::from(window.fetch_with_request(&request))
-            .await
-            .map_err(|e| format!("failed to reach backend: {}", js_error_message(e)))?;
-        let response: web_sys::Response = response
-            .dyn_into()
-            .map_err(|_| "failed to read browser response".to_string())?;
+        let response = wasm_fetch(&self.base_url, path, &init, timeout_ms).await?;
         let text = js_future_string(
             response
                 .text()
@@ -302,7 +328,7 @@ impl AppWebApi {
             .map_err(|_| "failed to set request headers".to_string())?;
         init.set_headers_headers(&headers);
 
-        let response = wasm_fetch(&self.base_url, path, &init).await?;
+        let response = wasm_fetch(&self.base_url, path, &init, DEFAULT_REQUEST_TIMEOUT_MS).await?;
         if !response.ok() {
             let text = js_future_string(
                 response
@@ -326,7 +352,7 @@ impl AppWebApi {
         init.set_method("GET");
         init.set_credentials(web_sys::RequestCredentials::SameOrigin);
 
-        let response = wasm_fetch(&self.base_url, path, &init).await?;
+        let response = wasm_fetch(&self.base_url, path, &init, DEFAULT_REQUEST_TIMEOUT_MS).await?;
         let text = js_future_string(
             response
                 .text()
@@ -350,7 +376,7 @@ impl AppWebApi {
         init.set_method("DELETE");
         init.set_credentials(web_sys::RequestCredentials::SameOrigin);
 
-        let response = wasm_fetch(&self.base_url, path, &init).await?;
+        let response = wasm_fetch(&self.base_url, path, &init, DEFAULT_REQUEST_TIMEOUT_MS).await?;
         if !response.ok() {
             let text = js_future_string(
                 response
@@ -363,6 +389,59 @@ impl AppWebApi {
             }));
         }
         Ok(())
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    async fn patch_json<Req, Res>(&self, path: &str, body: &Req) -> Result<Res, String>
+    where
+        Req: serde::Serialize,
+        Res: DeserializeOwned,
+    {
+        let body_json = serde_json::to_string(body)
+            .map_err(|error| format!("failed to encode request body: {error}"))?;
+
+        let init = web_sys::RequestInit::new();
+        init.set_method("PATCH");
+        init.set_body(&JsValue::from_str(&body_json));
+        init.set_credentials(web_sys::RequestCredentials::SameOrigin);
+
+        let headers =
+            web_sys::Headers::new().map_err(|_| "failed to prepare request headers".to_string())?;
+        headers
+            .set("Content-Type", "application/json")
+            .map_err(|_| "failed to set request headers".to_string())?;
+        init.set_headers_headers(&headers);
+
+        let response = wasm_fetch(&self.base_url, path, &init, DEFAULT_REQUEST_TIMEOUT_MS).await?;
+        let text = js_future_string(
+            response
+                .text()
+                .map_err(|_| "failed to read backend response".to_string())?,
+        )
+        .await?;
+
+        if !response.ok() {
+            return Err(extract_backend_error(&text).unwrap_or_else(|| {
+                format!("backend request failed with status {}", response.status())
+            }));
+        }
+
+        serde_json::from_str(&text)
+            .map_err(|error| format!("failed to parse backend response: {error}"))
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    async fn post_json_with_timeout<Req, Res>(
+        &self,
+        path: &str,
+        body: &Req,
+        _timeout_ms: u32,
+    ) -> Result<Res, String>
+    where
+        Req: serde::Serialize,
+        Res: DeserializeOwned,
+    {
+        self.post_json(path, body).await
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -442,6 +521,26 @@ impl AppWebApi {
         }
         Ok(())
     }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    async fn patch_json<Req, Res>(&self, path: &str, body: &Req) -> Result<Res, String>
+    where
+        Req: serde::Serialize,
+        Res: DeserializeOwned,
+    {
+        let response = self
+            .client
+            .patch(format!("{}{}", self.base_url, path))
+            .json(body)
+            .send()
+            .await
+            .map_err(|error| format!("failed to reach backend: {error}"))?;
+
+        response
+            .json::<Res>()
+            .await
+            .map_err(|error| format!("failed to parse backend response: {error}"))
+    }
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -449,14 +548,32 @@ async fn wasm_fetch(
     base_url: &str,
     path: &str,
     init: &web_sys::RequestInit,
+    timeout_ms: u32,
 ) -> Result<web_sys::Response, String> {
+    let abort = web_sys::AbortController::new()
+        .map_err(|_| "failed to prepare browser abort controller".to_string())?;
+    init.set_signal(Some(&abort.signal()));
+
     let url = format!("{}{}", base_url, path);
     let request = web_sys::Request::new_with_str_and_init(&url, init)
         .map_err(|_| "failed to prepare browser request".to_string())?;
     let window = web_sys::window().ok_or_else(|| "window is unavailable".to_string())?;
-    let response = JsFuture::from(window.fetch_with_request(&request))
-        .await
-        .map_err(|e| format!("failed to reach backend: {}", js_error_message(e)))?;
+    let abort_signal = abort.signal();
+    let timeout = gloo_timers::future::TimeoutFuture::new(timeout_ms);
+    let fetch = JsFuture::from(window.fetch_with_request(&request));
+    let response = futures_util::future::select(Box::pin(fetch), Box::pin(timeout)).await;
+    let response = match response {
+        futures_util::future::Either::Left((result, _)) => {
+            result.map_err(|e| format!("failed to reach backend: {}", js_error_message(e)))?
+        }
+        futures_util::future::Either::Right((_elapsed, _)) => {
+            abort.abort();
+            return Err(timeout_error_message(timeout_ms));
+        }
+    };
+    if abort_signal.aborted() {
+        return Err(timeout_error_message(timeout_ms));
+    }
     response
         .dyn_into()
         .map_err(|_| "failed to read browser response".to_string())
@@ -487,6 +604,14 @@ fn extract_backend_error(text: &str) -> Option<String> {
     serde_json::from_str::<WorkshopErrorEnvelope>(text)
         .ok()
         .map(|payload| payload.error)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn timeout_error_message(timeout_ms: u32) -> String {
+    format!(
+        "backend request timed out after {}s; the operation may still complete on the server",
+        timeout_ms / 1_000
+    )
 }
 
 #[cfg(target_arch = "wasm32")]

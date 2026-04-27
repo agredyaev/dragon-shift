@@ -1,7 +1,7 @@
 use dioxus::prelude::*;
 use protocol::{ClientGameState, JudgeBundle, SessionCommand};
 
-use crate::flows::{leave_workshop, submit_workshop_command};
+use crate::flows::{leave_workshop, start_judge_bundle_request, start_workshop_command};
 use crate::helpers::*;
 use crate::state::{ConnectionStatus, IdentityState, OperationState};
 
@@ -45,8 +45,23 @@ pub fn EndView(
     let header_status = if is_end_screen { "Final" } else { "Scoring" };
 
     let commands_disabled = {
+        let id = identity.read();
         let o = ops.read();
-        o.pending_flow.is_some() || o.pending_command.is_some()
+        o.pending_flow.is_some()
+            || o.pending_command.is_some()
+            || o.pending_judge_bundle
+            || id.connection_status != ConnectionStatus::Connected
+    };
+    let scores_ready = !score_rows.is_empty();
+    let archive_built = judge_bundle.read().is_some();
+    let archive_disabled = commands_disabled
+        || archive_built
+        || !scores_ready
+        || (is_voting_screen && !results_revealed);
+    let archive_label = if archive_built {
+        "Archive ready"
+    } else {
+        "Archive workshop"
     };
     let connection_status = identity.read().connection_status;
     let connection_label = match connection_status {
@@ -159,7 +174,7 @@ pub fn EndView(
             {connection_label}
         }
         div { class: "sr-only", "data-testid": "controls-panel", if is_host { "visible" } else { "hidden" } }
-        div { "data-testid": "session-panel",
+        div { class: "scoring-screen", "data-testid": "session-panel",
         article { class: "roster__item roster__item--phase",
             div {
                 p { class: "roster__name", {header_title} }
@@ -167,8 +182,8 @@ pub fn EndView(
             }
             span { class: "roster__status roster__status--phase status-connected", {header_status} }
         }
-        if is_voting_screen {
-            div { class: "button-row",
+        if is_voting_screen || is_host {
+            div { class: "button-row button-row--session-controls",
                 if !results_revealed {
                     button {
                         class: if active_tab_key == "vote" { "button button--primary" } else { "button button--secondary" },
@@ -191,6 +206,53 @@ pub fn EndView(
                         "Design results"
                     }
                 }
+                if is_host {
+                    if is_voting_screen && !results_revealed {
+                        button {
+                            class: "button button--primary",
+                            "data-testid": "reveal-results-button",
+                            disabled: commands_disabled || !reveal_enabled,
+                            onclick: move |_| {
+                                if start_workshop_command(identity, ops, handover_tags_input, judge_bundle, SessionCommand::RevealVotingResults, None) {
+                                    active_tab.set("design".to_string());
+                                }
+                            },
+                            "Finish voting"
+                        }
+                    }
+                    if is_voting_screen {
+                        button {
+                            class: "button button--danger",
+                            "data-testid": "end-session-button",
+                            disabled: commands_disabled || !results_revealed,
+                            onclick: move |_| {
+                                let _ = start_workshop_command(identity, ops, handover_tags_input, judge_bundle, SessionCommand::EndSession, None);
+                            },
+                            "End game"
+                        }
+                    }
+                    if is_voting_screen || is_end_screen {
+                        button {
+                            class: if archive_built { "button button--primary" } else { "button button--secondary" },
+                            "data-testid": "archive-workshop-button",
+                            disabled: archive_disabled,
+                            onclick: move |_| {
+                                let _ = start_judge_bundle_request(identity, game_state, ops, judge_bundle);
+                            },
+                            {archive_label}
+                        }
+                    }
+                    if is_end_screen {
+                        button {
+                            class: "button button--secondary",
+                            "data-testid": "leave-workshop-button",
+                            onclick: move |_| {
+                                leave_workshop(identity, ops);
+                            },
+                            "Leave workshop"
+                        }
+                    }
+                }
             }
         }
 
@@ -198,7 +260,7 @@ pub fn EndView(
             article { class: "roster__item roster__item--phase",
                 div {
                     p { class: "roster__name", "Vote for the most creative dragon design" }
-                    p { class: "roster__meta", {voting_progress} }
+                    p { class: "roster__meta", role: "status", "aria-live": "polite", {voting_progress} }
                 }
                 span { class: "roster__status roster__status--phase status-connected", "Design vote" }
             }
@@ -213,12 +275,12 @@ pub fn EndView(
                         div { class: "voting-card__sprite-stack",
                             if let Some(ref sprites) = row.custom_sprites {
                                 div { class: "voting-card__emotion-row",
-                                    img { class: "voting-card__sprite-img", src: "data:image/png;base64,{sprites.neutral}", alt: "Neutral sprite" }
-                                    img { class: "voting-card__sprite-img", src: "data:image/png;base64,{sprites.happy}", alt: "Happy sprite" }
+                                    img { class: "voting-card__sprite-img", src: sprite_src(&sprites.neutral), alt: "Neutral sprite" }
+                                    img { class: "voting-card__sprite-img", src: sprite_src(&sprites.happy), alt: "Happy sprite" }
                                 }
                                 div { class: "voting-card__emotion-row",
-                                    img { class: "voting-card__sprite-img", src: "data:image/png;base64,{sprites.angry}", alt: "Angry sprite" }
-                                    img { class: "voting-card__sprite-img", src: "data:image/png;base64,{sprites.sleepy}", alt: "Sleepy sprite" }
+                                    img { class: "voting-card__sprite-img", src: sprite_src(&sprites.angry), alt: "Angry sprite" }
+                                    img { class: "voting-card__sprite-img", src: sprite_src(&sprites.sleepy), alt: "Sleepy sprite" }
                                 }
                             } else {
                                 div { class: "voting-card__sprite voting-card__sprite--fallback",
@@ -246,14 +308,14 @@ pub fn EndView(
                                     onclick: {
                                         let vote_target = row.dragon_id.clone();
                                         move |_| {
-                                            spawn(submit_workshop_command(
+                                            let _ = start_workshop_command(
                                                 identity,
                                                 ops,
                                                 handover_tags_input,
                                                 judge_bundle,
                                                 SessionCommand::SubmitVote,
                                                 Some(serde_json::json!({ "dragonId": vote_target.clone() })),
-                                            ));
+                                            );
                                         }
                                     },
                                     "Vote"
@@ -267,7 +329,7 @@ pub fn EndView(
 
         if active_tab_key == "score" {
             if !score_rows.is_empty() {
-                p { class: "meta", "Score leaderboard" }
+                p { class: "scoring-section-title", "Score leaderboard" }
                 div { class: "leaderboard",
                     div { class: "leaderboard__header",
                         span { class: "leaderboard__col leaderboard__col--rank", "#" }
@@ -278,39 +340,60 @@ pub fn EndView(
                         span { class: "leaderboard__col leaderboard__col--status", "Judge" }
                     }
                     for row in score_rows {
-                        div {
-                            class: format!("leaderboard__row{}", if row.is_winner { " leaderboard__row--winner" } else { "" }),
-                            span { class: "leaderboard__col leaderboard__col--rank", {row.placement_label.clone()} }
-                            span { class: "leaderboard__col leaderboard__col--name", {row.player_name.clone()} }
-                            span { class: "leaderboard__col leaderboard__col--score", {row.phase1_score_label.clone()} }
-                            span { class: "leaderboard__col leaderboard__col--score", {row.phase2_score_label.clone()} }
-                            span { class: "leaderboard__col leaderboard__col--total", {row.total_score_label.clone()} }
-                            span {
-                                class: format!(
-                                    "leaderboard__col leaderboard__col--status leaderboard__tooltip-anchor {}",
-                                    if row.judge_status == "Good" {
-                                        "leaderboard__status--good"
-                                    } else {
-                                        "leaderboard__status--bad"
-                                    },
-                                ),
-                                {row.judge_status}
+                        {
+                            let feedback_id = format!(
+                                "judge-feedback-{}",
+                                row.player_name
+                                    .chars()
+                                    .map(|ch| if ch.is_ascii_alphanumeric() { ch.to_ascii_lowercase() } else { '-' })
+                                    .collect::<String>(),
+                            );
+                            rsx! {
+                                div {
+                                    class: format!("leaderboard__row{}", if row.is_winner { " leaderboard__row--winner" } else { "" }),
+                                    span { class: "leaderboard__col leaderboard__col--rank", {row.placement_label.clone()} }
+                                    span { class: "leaderboard__col leaderboard__col--name", {row.player_name.clone()} }
+                                    span { class: "leaderboard__col leaderboard__col--score", {row.phase1_score_label.clone()} }
+                                    span { class: "leaderboard__col leaderboard__col--score", {row.phase2_score_label.clone()} }
+                                    span { class: "leaderboard__col leaderboard__col--total", {row.total_score_label.clone()} }
+                                    span {
+                                        class: format!(
+                                            "leaderboard__col leaderboard__col--status {}",
+                                            if row.judge_status == "Good" {
+                                                "leaderboard__status--good"
+                                            } else {
+                                                "leaderboard__status--bad"
+                                            },
+                                        ),
+                                        {row.judge_status}
+                                    }
+                                }
                                 if !row.judge_status_tooltip.is_empty() {
-                                    span { class: "leaderboard__tooltip", {row.judge_status_tooltip.clone()} }
+                                    details { class: "judge-feedback-disclosure",
+                                        summary {
+                                            class: "judge-feedback-disclosure__summary",
+                                            "aria-controls": "{feedback_id}",
+                                            span { class: "judge-feedback-disclosure__label", "Read judge feedback" }
+                                            span { class: "judge-feedback-disclosure__player", {row.player_name.clone()} }
+                                        }
+                                        div { id: "{feedback_id}", class: "judge-feedback-disclosure__body",
+                                            {row.judge_status_tooltip.clone()}
+                                        }
+                                    }
                                 }
                             }
                         }
                     }
                 }
             } else {
-                p { class: "meta", "Judge scores are still syncing." }
+                p { class: "scoring-status", role: "status", "aria-live": "polite", "Judge scores are still syncing." }
             }
         }
 
         if active_tab_key == "design" || is_end_screen {
             if !vote_rows.is_empty() {
-                p { class: "meta", {results_status.clone()} }
-                p { class: "meta", "Creativity leaderboard" }
+                p { class: "scoring-status", {results_status.clone()} }
+                p { class: "scoring-section-title", "Creativity leaderboard" }
                 div { class: "leaderboard leaderboard--creativity",
                     div { class: "leaderboard__header",
                         span { class: "leaderboard__col leaderboard__col--rank", "#" }
@@ -329,57 +412,12 @@ pub fn EndView(
                 }
             }
         }
-        // ---- Host controls ----
-        if is_host {
-            div { class: "button-row",
-                if is_voting_screen && !results_revealed {
-                    button {
-                        class: "button button--primary",
-                        "data-testid": "reveal-results-button",
-                        disabled: commands_disabled || !reveal_enabled,
-                        onclick: move |_| {
-                            spawn(submit_workshop_command(identity, ops, handover_tags_input, judge_bundle, SessionCommand::RevealVotingResults, None));
-                            active_tab.set("design".to_string());
-                        },
-                        "Finish voting"
-                    }
-                }
-                if is_voting_screen {
-                    button {
-                        class: "button button--danger",
-                        "data-testid": "end-session-button",
-                        disabled: commands_disabled || !results_revealed,
-                        onclick: move |_| {
-                            spawn(submit_workshop_command(identity, ops, handover_tags_input, judge_bundle, SessionCommand::EndSession, None));
-                        },
-                        "End game"
-                    }
-                }
-                button {
-                    class: "button button--secondary",
-                    "data-testid": "reset-game-button",
-                    disabled: commands_disabled,
-                    onclick: move |_| {
-                        spawn(submit_workshop_command(identity, ops, handover_tags_input, judge_bundle, SessionCommand::ResetGame, None));
-                    },
-                    "Reset workshop"
-                }
-                if is_end_screen {
-                    button {
-                        class: "button button--secondary",
-                        "data-testid": "leave-workshop-button",
-                        onclick: move |_| {
-                            leave_workshop(identity, ops);
-                        },
-                        "Leave workshop"
-                    }
-                }
-            }
-        } else {
+        // ---- Participant waiting / leave controls ----
+        if !is_host {
             p {
-                class: "meta",
+                class: "scoring-status scoring-status--muted",
                 if is_end_screen {
-                    "Waiting for the host to reset or archive this workshop."
+                    "Waiting for the host to archive this workshop."
                 } else if results_revealed {
                     "Waiting for the host to open the final game over screen."
                 } else {
@@ -399,8 +437,8 @@ pub fn EndView(
                 }
             }
         }
-        // ---- Workshop archive (End phase only) ----
-        if is_end_screen {
+        // ---- Workshop archive ----
+        if is_end_screen || archive_built {
             ArchivePanel { game_state, judge_bundle }
         }
         }

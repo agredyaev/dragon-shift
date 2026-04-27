@@ -760,6 +760,16 @@ impl SessionStore for FaultyStore {
             .delete_character_by_owner(character_id, owner_account_id)
     }
 
+    fn update_character_name_by_owner(
+        &self,
+        character_id: &str,
+        owner_account_id: &str,
+        name: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, PersistenceError>> + Send + '_>> {
+        self.inner
+            .update_character_name_by_owner(character_id, owner_account_id, name)
+    }
+
     fn delete_lobby_workshop_by_owner(
         &self,
         session_code: &str,
@@ -786,6 +796,7 @@ impl SessionStore for FaultyStore {
     fn list_open_workshops(
         &self,
         paging: persistence::OpenWorkshopsPaging,
+        viewer_account_id: Option<String>,
     ) -> Pin<
         Box<
             dyn Future<Output = Result<persistence::OpenWorkshopsPage, PersistenceError>>
@@ -793,7 +804,7 @@ impl SessionStore for FaultyStore {
                 + '_,
         >,
     > {
-        self.inner.list_open_workshops(paging)
+        self.inner.list_open_workshops(paging, viewer_account_id)
     }
 }
 
@@ -838,9 +849,12 @@ fn test_character_profile(
 ) -> protocol::CharacterProfile {
     protocol::CharacterProfile {
         id: id.to_string(),
+        name: None,
         description: description.to_string(),
         sprites,
         remaining_sprite_regenerations,
+        creator_account_id: None,
+        creator_name: None,
     }
 }
 
@@ -1189,10 +1203,6 @@ fn masked_ws_text_frame(payload: &str) -> Vec<u8> {
             .map(|(index, byte)| byte ^ mask[index % mask.len()]),
     );
     frame
-}
-
-async fn connect_raw_ws(addr: SocketAddr) -> tokio::net::TcpStream {
-    connect_raw_ws_with_cookie(addr, None).await
 }
 
 async fn connect_raw_ws_with_cookie(
@@ -3461,6 +3471,28 @@ async fn workshop_judge_bundle_returns_bundle_for_completed_session() {
     state
         .store
         .append_session_artifact(&SessionArtifactRecord {
+            id: "artifact-phase1-action".into(),
+            session_id: session_id.clone(),
+            phase: protocol::Phase::Phase1,
+            step: 1,
+            kind: SessionArtifactKind::ActionProcessed,
+            player_id: Some(create_success.player_id.clone()),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            payload: serde_json::json!({
+                "dragonId": bob_current_dragon_id,
+                "actionType": "play",
+                "actionValue": "music",
+                "hunger": 80,
+                "energy": 80,
+                "happiness": 80
+            }),
+        })
+        .await
+        .expect("append phase1 action artifact");
+
+    state
+        .store
+        .append_session_artifact(&SessionArtifactRecord {
             id: "artifact-action-1".into(),
             session_id: session_id.clone(),
             phase: protocol::Phase::Phase2,
@@ -3527,6 +3559,10 @@ async fn workshop_judge_bundle_returns_bundle_for_completed_session() {
     assert_eq!(judged_dragon.phase2_actions.len(), 1);
     assert_eq!(judged_dragon.phase2_actions[0].player_name, "Bob");
     assert_eq!(judged_dragon.phase2_actions[0].action_type, "feed");
+    assert_eq!(
+        judged_dragon.phase2_actions[0].phase,
+        protocol::Phase::Phase2
+    );
 }
 
 #[tokio::test]
@@ -3788,6 +3824,54 @@ async fn open_workshops_marks_legacy_reserved_lobby_as_deletable_for_owner() {
 }
 
 #[tokio::test]
+async fn open_workshops_keeps_joined_lobby_listed_after_all_players_leave() {
+    let state = test_state();
+    let app = build_app(state.clone());
+    let alice_cookie = test_auth_cookie(&app, "Alice").await;
+    let bob_cookie = test_auth_cookie(&app, "Bob").await;
+    let session_code = create_test_workshop_lobby(&app, &alice_cookie).await;
+
+    let _guest = join_workshop_success(&app, &bob_cookie, &session_code, "Bob").await;
+    let _creator = join_workshop_success(&app, &alice_cookie, &session_code, "Alice").await;
+
+    let offline_session = {
+        let mut sessions = state.sessions.lock().await;
+        let session = sessions
+            .get_mut(&session_code)
+            .expect("joined lobby is cached");
+        session.host_player_id = None;
+        for player in session.players.values_mut() {
+            player.is_connected = false;
+            player.is_host = false;
+        }
+        session.updated_at = Utc::now();
+        session.clone()
+    };
+    state
+        .store
+        .save_session(&offline_session)
+        .await
+        .expect("persist offline lobby");
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(session_code.clone(), offline_session);
+
+    let (status, value) = get_open_workshops_json(&app, &alice_cookie, "").await;
+    assert_eq!(status, StatusCode::OK);
+    let created = value["workshops"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["sessionCode"].as_str() == Some(session_code.as_str()))
+        .expect("offline joined lobby remains in open workshops");
+    assert_eq!(created["hostName"].as_str(), Some("Alice"));
+    assert_eq!(created["playerCount"].as_u64(), Some(2));
+    assert_eq!(created["canDelete"].as_bool(), Some(false));
+}
+
+#[tokio::test]
 async fn list_open_workshops_same_timestamp_orders_by_session_code_and_pages_without_gaps() {
     let state = test_state();
     let shared_created_at =
@@ -4022,61 +4106,49 @@ async fn workshop_judge_bundle_rejects_expired_reconnect_token() {
 async fn workshop_judge_bundle_rejects_non_host_requests() {
     let state = test_state();
     let app = build_app(state.clone());
-    let cookie = test_auth_cookie(&app, "Alice").await;
-    let cookie_bob = test_auth_cookie(&app, "Bob").await;
-
-    let create_response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/api/workshops")
-                .header("content-type", "application/json")
-                .header(axum::http::header::COOKIE, &cookie)
-                .body(Body::from(create_workshop_body("Alice")))
-                .expect("build create request"),
-        )
+    let created_at = Utc::now();
+    let mut session = WorkshopSession::new(
+        Uuid::new_v4(),
+        SessionCode("789125".to_string()),
+        created_at,
+        protocol::WorkshopCreateConfig::default(),
+    );
+    session.phase = protocol::Phase::End;
+    session.add_player(session_player_with_state(
+        "player-host",
+        "Alice",
+        created_at,
+        true,
+        false,
+    ));
+    session.add_player(session_player_with_state(
+        "player-bob",
+        "Bob",
+        created_at,
+        false,
+        false,
+    ));
+    state
+        .store
+        .save_session(&session)
         .await
-        .expect("call create workshop");
-    let create_body = to_bytes(create_response.into_body(), usize::MAX)
+        .expect("save completed session");
+    state
+        .store
+        .create_player_identity(&persistence::PlayerIdentity {
+            session_id: session.id.to_string(),
+            player_id: "player-bob".to_string(),
+            reconnect_token: "reconnect-bob-unbuilt".to_string(),
+            created_at: created_at.to_rfc3339(),
+            last_seen_at: created_at.to_rfc3339(),
+        })
         .await
-        .expect("read create body");
-    let create_result: WorkshopJoinResult =
-        serde_json::from_slice(&create_body).expect("parse create result");
-    let create_success = match create_result {
-        WorkshopJoinResult::Success(success) => success,
-        WorkshopJoinResult::Error(error) => {
-            panic!("expected create success, got error: {}", error.error)
-        }
-    };
-
-    let join_response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/api/workshops/join")
-                .header("content-type", "application/json")
-                .header(axum::http::header::COOKIE, &cookie_bob)
-                .body(Body::from(format!(
-                    r#"{{"sessionCode":"{}","name":"Bob"}}"#,
-                    create_success.session_code
-                )))
-                .expect("build join request"),
-        )
+        .expect("seed bob reconnect identity");
+    state
+        .sessions
+        .lock()
         .await
-        .expect("call join workshop");
-    let join_body = to_bytes(join_response.into_body(), usize::MAX)
-        .await
-        .expect("read join body");
-    let join_result: WorkshopJoinResult =
-        serde_json::from_slice(&join_body).expect("parse join result");
-    let join_success = match join_result {
-        WorkshopJoinResult::Success(success) => success,
-        WorkshopJoinResult::Error(error) => {
-            panic!("expected join success, got error: {}", error.error)
-        }
-    };
+        .insert(session.code.0.clone(), session);
 
     let response = app
         .oneshot(
@@ -4086,7 +4158,7 @@ async fn workshop_judge_bundle_rejects_non_host_requests() {
                 .header("content-type", "application/json")
                 .body(Body::from(format!(
                     r#"{{"sessionCode":"{}","reconnectToken":"{}"}}"#,
-                    create_success.session_code, join_success.reconnect_token
+                    "789125", "reconnect-bob-unbuilt"
                 )))
                 .expect("build judge bundle request"),
         )
@@ -4105,6 +4177,113 @@ async fn workshop_judge_bundle_rejects_non_host_requests() {
         }
         WorkshopJudgeBundleResult::Success(_) => panic!("expected error response"),
     }
+}
+
+#[tokio::test]
+async fn workshop_judge_bundle_allows_participant_to_fetch_existing_archive() {
+    let state = test_state();
+    let app = build_app(state.clone());
+    test_auth_cookie(&app, "AliceArchiveFetch").await;
+    let alice_account_id = state
+        .store
+        .find_account_by_name_lower("alicearchivefetch")
+        .await
+        .expect("load alice account")
+        .expect("alice account exists")
+        .id;
+    let bob_cookie = test_auth_cookie(&app, "BobArchiveFetch").await;
+    let bob_account_id = state
+        .store
+        .find_account_by_name_lower("bobarchivefetch")
+        .await
+        .expect("load bob account")
+        .expect("bob account exists")
+        .id;
+    let created_at = Utc::now();
+    let mut session = WorkshopSession::new(
+        Uuid::new_v4(),
+        SessionCode("789126".to_string()),
+        created_at,
+        protocol::WorkshopCreateConfig::default(),
+    );
+    session.phase = protocol::Phase::End;
+    session.owner_account_id = Some(alice_account_id.clone());
+    let mut host =
+        session_player_with_state("player-host", "AliceArchiveFetch", created_at, true, false);
+    host.account_id = Some(alice_account_id);
+    let mut participant =
+        session_player_with_state("player-bob", "BobArchiveFetch", created_at, false, false);
+    participant.account_id = Some(bob_account_id);
+    session.add_player(host);
+    session.add_player(participant);
+    let artifact = SessionArtifactRecord {
+        id: "existing-review-archive-artifact".to_string(),
+        session_id: session.id.to_string(),
+        phase: protocol::Phase::End,
+        step: 0,
+        kind: SessionArtifactKind::JudgeBundleGenerated,
+        player_id: Some("player-host".to_string()),
+        created_at: created_at.to_rfc3339(),
+        payload: serde_json::json!({ "dragonCount": 0, "artifactCount": 1 }),
+    };
+    state
+        .store
+        .save_session_with_artifact(&session, &artifact)
+        .await
+        .expect("seed existing archive");
+    state
+        .store
+        .create_player_identity(&persistence::PlayerIdentity {
+            session_id: session.id.to_string(),
+            player_id: "player-bob".to_string(),
+            reconnect_token: "reconnect-bob-archive".to_string(),
+            created_at: created_at.to_rfc3339(),
+            last_seen_at: created_at.to_rfc3339(),
+        })
+        .await
+        .expect("seed bob reconnect identity");
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(session.code.0.clone(), session);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops/judge-bundle")
+                .header("content-type", "application/json")
+                .header(axum::http::header::COOKIE, &bob_cookie)
+                .body(Body::from(
+                    serde_json::json!({
+                        "sessionCode": "789126",
+                        "reconnectToken": "reconnect-bob-archive"
+                    })
+                    .to_string(),
+                ))
+                .expect("build existing archive request"),
+        )
+        .await
+        .expect("fetch existing archive response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read judge bundle body");
+    let result: WorkshopJudgeBundleResult =
+        serde_json::from_slice(&body).expect("parse judge bundle result");
+    let WorkshopJudgeBundleResult::Success(success) = result else {
+        panic!("expected existing archive success");
+    };
+    assert_eq!(success.bundle.session_code, "789126");
+    assert_eq!(success.bundle.current_phase, protocol::Phase::End);
+    let artifacts = state
+        .store
+        .list_session_artifacts(&success.bundle.session_id)
+        .await
+        .expect("list archive artifacts");
+    assert_eq!(artifacts.len(), 1);
 }
 
 #[tokio::test]
@@ -4598,6 +4777,7 @@ async fn workshop_command_rejects_duplicate_starter_selection_in_lobby() {
 
     let starter = persistence::CharacterRecord {
         id: "starter_shared_001".to_string(),
+        name: None,
         description: "Shared starter dragon".to_string(),
         sprites: protocol::SpriteSet {
             neutral: "starter-neutral".to_string(),
@@ -11315,6 +11495,17 @@ fn to_client_game_state_includes_dragons_and_voting_details() {
         },
     ];
     seed_selected_characters_on_session(&mut session);
+    for player in session.players.values_mut() {
+        if let Some(character) = player.selected_character.as_mut() {
+            character.creator_name = Some(player.name.clone());
+        }
+    }
+    session
+        .players
+        .get_mut("p2")
+        .and_then(|player| player.selected_character.as_mut())
+        .expect("p2 selected character")
+        .creator_name = Some("External Artist".to_string());
     session.begin_phase1(&assignments).expect("begin phase1");
     session.record_discovery_observation("p1", "Calms down at dusk");
     session.record_discovery_observation("p2", "Rejects fruit at night");
@@ -11416,8 +11607,29 @@ fn to_client_game_state_includes_dragons_and_voting_details() {
         Some("p1")
     );
     assert_eq!(current_players_original_dragon.current_owner_id, None);
+    assert_eq!(
+        current_players_original_dragon
+            .design_creator_name
+            .as_deref(),
+        Some("Alice")
+    );
     assert_eq!(other_players_original_dragon.original_owner_id, None);
+    assert_eq!(other_players_original_dragon.design_creator_name, None);
     assert_eq!(other_players_original_dragon.current_owner_id, None);
+
+    session
+        .voting
+        .as_mut()
+        .expect("voting state")
+        .results_revealed = true;
+    let revealed_state = to_client_game_state(&session, "p1");
+    assert_eq!(
+        revealed_state
+            .dragons
+            .get("dragon-p2")
+            .and_then(|dragon| dragon.design_creator_name.as_deref()),
+        Some("External Artist")
+    );
 }
 
 #[test]
@@ -12286,6 +12498,159 @@ async fn delete_character_returns_404_for_nonexistent() {
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
 }
 
+#[tokio::test]
+async fn update_character_renames_owned() {
+    let state = test_state();
+    let app = build_app(state);
+    let cookie = signin_and_get_cookie(&app, "knight", "Alice", "correcthorse").await;
+
+    let body = serde_json::json!({
+        "description": "Rename me",
+        "sprites": {
+            "neutral": "base64neutral",
+            "happy": "base64happy",
+            "angry": "base64angry",
+            "sleepy": "base64sleepy"
+        }
+    })
+    .to_string();
+    let create_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/characters")
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .header(axum::http::header::COOKIE, &cookie)
+                .body(Body::from(body))
+                .expect("build create request"),
+        )
+        .await
+        .expect("create response");
+    assert_eq!(create_resp.status(), StatusCode::CREATED);
+    let bytes = to_bytes(create_resp.into_body(), 64 * 1024)
+        .await
+        .expect("read create body");
+    let created: serde_json::Value = serde_json::from_slice(&bytes).expect("body is json");
+    let character_id = created["id"].as_str().unwrap();
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri(format!("/api/characters/{character_id}"))
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .header(axum::http::header::COOKIE, &cookie)
+                .body(Body::from(
+                    serde_json::json!({ "name": "Sparky" }).to_string(),
+                ))
+                .expect("build update request"),
+        )
+        .await
+        .expect("update response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .expect("read update body");
+    let updated: serde_json::Value = serde_json::from_slice(&bytes).expect("body is json");
+    assert_eq!(updated["name"], "Sparky");
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/characters/mine")
+                .header(axum::http::header::COOKIE, &cookie)
+                .body(Body::empty())
+                .expect("build list request"),
+        )
+        .await
+        .expect("list response");
+    let bytes = to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .expect("read list body");
+    let value: serde_json::Value = serde_json::from_slice(&bytes).expect("body is json");
+    assert_eq!(value["characters"][0]["name"], "Sparky");
+}
+
+#[tokio::test]
+async fn update_character_rejects_blank_name() {
+    let state = test_state();
+    let app = build_app(state);
+    let cookie = signin_and_get_cookie(&app, "knight", "Alice", "correcthorse").await;
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri("/api/characters/character_1")
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .header(axum::http::header::COOKIE, &cookie)
+                .body(Body::from(serde_json::json!({ "name": "   " }).to_string()))
+                .expect("build update request"),
+        )
+        .await
+        .expect("update response");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn update_character_rejects_wrong_owner() {
+    let state = test_state();
+    let app = build_app(state);
+    let alice_cookie = signin_and_get_cookie(&app, "knight", "Alice", "correcthorse").await;
+    let bob_cookie = signin_and_get_cookie(&app, "knight", "Bob", "correcthorse").await;
+
+    let body = serde_json::json!({
+        "description": "Alice's dragon",
+        "sprites": {
+            "neutral": "base64neutral",
+            "happy": "base64happy",
+            "angry": "base64angry",
+            "sleepy": "base64sleepy"
+        }
+    })
+    .to_string();
+    let create_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/characters")
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .header(axum::http::header::COOKIE, &alice_cookie)
+                .body(Body::from(body))
+                .expect("build create request"),
+        )
+        .await
+        .expect("create response");
+    let bytes = to_bytes(create_resp.into_body(), 64 * 1024)
+        .await
+        .expect("read create body");
+    let created: serde_json::Value = serde_json::from_slice(&bytes).expect("body is json");
+    let character_id = created["id"].as_str().unwrap();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri(format!("/api/characters/{character_id}"))
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .header(axum::http::header::COOKIE, &bob_cookie)
+                .body(Body::from(
+                    serde_json::json!({ "name": "Stolen" }).to_string(),
+                ))
+                .expect("build update request"),
+        )
+        .await
+        .expect("update response");
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
 // ---------------------------------------------------------------------------
 // C2-b tests: open workshops list
 // ---------------------------------------------------------------------------
@@ -12318,6 +12683,367 @@ async fn list_open_workshops_returns_empty_when_none() {
     // click from an empty list would query with garbage cursor values.
     assert!(value.get("nextCursor").map(|v| v.is_null()).unwrap_or(true));
     assert!(value.get("prevCursor").map(|v| v.is_null()).unwrap_or(true));
+}
+
+#[tokio::test]
+async fn list_open_workshops_includes_archived_workshops_for_participants() {
+    let state = test_state();
+    let app = build_app(state.clone());
+    let alice_cookie = test_auth_cookie(&app, "AliceArchive").await;
+    let stranger_cookie = test_auth_cookie(&app, "StrangerArchive").await;
+    let alice_account_id = state
+        .store
+        .find_account_by_name_lower("alicearchive")
+        .await
+        .expect("load alice account")
+        .expect("alice account exists")
+        .id;
+    let created_at = Utc::now();
+    let mut session = WorkshopSession::new(
+        Uuid::new_v4(),
+        SessionCode("789123".to_string()),
+        created_at,
+        protocol::WorkshopCreateConfig::default(),
+    );
+    session.phase = protocol::Phase::End;
+    session.owner_account_id = Some(alice_account_id.clone());
+    let mut host = session_player_with_state("player-host", "AliceArchive", created_at, true, true);
+    host.account_id = Some(alice_account_id);
+    session.add_player(host);
+    let artifact = SessionArtifactRecord {
+        id: "archive-artifact".to_string(),
+        session_id: session.id.to_string(),
+        phase: protocol::Phase::End,
+        step: 0,
+        kind: SessionArtifactKind::JudgeBundleGenerated,
+        player_id: Some("player-host".to_string()),
+        created_at: created_at.to_rfc3339(),
+        payload: serde_json::json!({ "dragonCount": 0, "artifactCount": 1 }),
+    };
+    state
+        .store
+        .save_session_with_artifact(&session, &artifact)
+        .await
+        .expect("seed archived workshop");
+
+    let (status, value) = get_open_workshops_json(&app, &alice_cookie, "").await;
+    assert_eq!(status, StatusCode::OK);
+    let workshops = value["workshops"].as_array().unwrap();
+    assert_eq!(workshops.len(), 1);
+    assert_eq!(workshops[0]["sessionCode"], "789123");
+    assert_eq!(workshops[0]["archived"], true);
+    assert_eq!(workshops[0]["canDelete"], false);
+
+    let (status, value) = get_open_workshops_json(&app, &stranger_cookie, "").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(value["workshops"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn list_open_workshops_filters_archived_visibility_before_pagination() {
+    let state = test_state();
+    let app = build_app(state.clone());
+    let viewer_cookie = test_auth_cookie(&app, "ArchivePageViewer").await;
+    let viewer_account_id = state
+        .store
+        .find_account_by_name_lower("archivepageviewer")
+        .await
+        .expect("load viewer account")
+        .expect("viewer account exists")
+        .id;
+    let visible_at = Utc::now();
+
+    for i in 0..persistence::OPEN_WORKSHOPS_PAGE_SIZE {
+        let created_at = visible_at + ChronoDuration::seconds(10 + i as i64);
+        let owner_account_id = format!("foreign-archive-owner-{i}");
+        let code = format!("79010{i}");
+        let mut session = WorkshopSession::new(
+            Uuid::new_v4(),
+            SessionCode(code),
+            created_at,
+            protocol::WorkshopCreateConfig::default(),
+        );
+        session.phase = protocol::Phase::End;
+        session.owner_account_id = Some(owner_account_id.clone());
+        let player_id = format!("foreign-host-{i}");
+        let mut host = session_player_with_state(
+            &player_id,
+            &format!("ForeignHost{i}"),
+            created_at,
+            true,
+            false,
+        );
+        host.account_id = Some(owner_account_id);
+        session.add_player(host);
+        let artifact = SessionArtifactRecord {
+            id: format!("foreign-archive-artifact-{i}"),
+            session_id: session.id.to_string(),
+            phase: protocol::Phase::End,
+            step: 0,
+            kind: SessionArtifactKind::JudgeBundleGenerated,
+            player_id: Some(player_id),
+            created_at: created_at.to_rfc3339(),
+            payload: serde_json::json!({ "dragonCount": 0, "artifactCount": 1 }),
+        };
+        state
+            .store
+            .save_session_with_artifact(&session, &artifact)
+            .await
+            .expect("seed foreign archived workshop");
+    }
+
+    let mut visible = WorkshopSession::new(
+        Uuid::new_v4(),
+        SessionCode("790199".to_string()),
+        visible_at,
+        protocol::WorkshopCreateConfig::default(),
+    );
+    visible.phase = protocol::Phase::End;
+    visible.owner_account_id = Some(viewer_account_id.clone());
+    let mut host =
+        session_player_with_state("visible-host", "ArchivePageViewer", visible_at, true, false);
+    host.account_id = Some(viewer_account_id);
+    visible.add_player(host);
+    let artifact = SessionArtifactRecord {
+        id: "visible-archive-artifact".to_string(),
+        session_id: visible.id.to_string(),
+        phase: protocol::Phase::End,
+        step: 0,
+        kind: SessionArtifactKind::JudgeBundleGenerated,
+        player_id: Some("visible-host".to_string()),
+        created_at: visible_at.to_rfc3339(),
+        payload: serde_json::json!({ "dragonCount": 0, "artifactCount": 1 }),
+    };
+    state
+        .store
+        .save_session_with_artifact(&visible, &artifact)
+        .await
+        .expect("seed visible archived workshop");
+
+    let (status, value) = get_open_workshops_json(&app, &viewer_cookie, "").await;
+    assert_eq!(status, StatusCode::OK);
+    let workshops = value["workshops"].as_array().unwrap();
+    assert_eq!(workshops.len(), 1);
+    assert_eq!(workshops[0]["sessionCode"], "790199");
+    assert_eq!(workshops[0]["archived"], true);
+}
+
+#[tokio::test]
+async fn list_open_workshops_includes_in_progress_workshops_for_participants() {
+    let state = test_state();
+    let app = build_app(state.clone());
+    let alice_cookie = test_auth_cookie(&app, "AliceResumeList").await;
+    let stranger_cookie = test_auth_cookie(&app, "ResumeListStranger").await;
+    let alice_account_id = state
+        .store
+        .find_account_by_name_lower("aliceresumelist")
+        .await
+        .expect("load alice account")
+        .expect("alice account exists")
+        .id;
+    let created_at = Utc::now();
+    let mut session = WorkshopSession::new(
+        Uuid::new_v4(),
+        SessionCode("790200".to_string()),
+        created_at,
+        protocol::WorkshopCreateConfig::default(),
+    );
+    session.phase = protocol::Phase::Voting;
+    session.owner_account_id = Some(alice_account_id.clone());
+    let mut host =
+        session_player_with_state("resume-host", "AliceResumeList", created_at, true, false);
+    host.account_id = Some(alice_account_id);
+    session.add_player(host);
+    state
+        .store
+        .save_session(&session)
+        .await
+        .expect("seed in-progress workshop");
+
+    let (status, value) = get_open_workshops_json(&app, &alice_cookie, "").await;
+    assert_eq!(status, StatusCode::OK);
+    let workshops = value["workshops"].as_array().unwrap();
+    assert_eq!(workshops.len(), 1);
+    assert_eq!(workshops[0]["sessionCode"], "790200");
+    assert_eq!(workshops[0]["archived"], false);
+    assert_eq!(workshops[0]["canResume"], true);
+    assert_eq!(workshops[0]["canDelete"], false);
+
+    let (status, value) = get_open_workshops_json(&app, &stranger_cookie, "").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(value["workshops"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn join_workshop_restores_existing_account_player_for_archived_review() {
+    let state = test_state();
+    let app = build_app(state.clone());
+    let alice_cookie = test_auth_cookie(&app, "AliceReview").await;
+    let alice_account_id = state
+        .store
+        .find_account_by_name_lower("alicereview")
+        .await
+        .expect("load alice account")
+        .expect("alice account exists")
+        .id;
+    let created_at = Utc::now();
+    let mut session = WorkshopSession::new(
+        Uuid::new_v4(),
+        SessionCode("789124".to_string()),
+        created_at,
+        protocol::WorkshopCreateConfig::default(),
+    );
+    session.phase = protocol::Phase::End;
+    session.owner_account_id = Some(alice_account_id.clone());
+    let mut host = session_player_with_state("player-host", "AliceReview", created_at, true, false);
+    host.account_id = Some(alice_account_id);
+    session.add_player(host);
+    let artifact = SessionArtifactRecord {
+        id: "review-archive-artifact".to_string(),
+        session_id: session.id.to_string(),
+        phase: protocol::Phase::End,
+        step: 0,
+        kind: SessionArtifactKind::JudgeBundleGenerated,
+        player_id: Some("player-host".to_string()),
+        created_at: created_at.to_rfc3339(),
+        payload: serde_json::json!({ "dragonCount": 0, "artifactCount": 1 }),
+    };
+    state
+        .store
+        .save_session_with_artifact(&session, &artifact)
+        .await
+        .expect("seed ended workshop with archive artifact");
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(session.code.0.clone(), session);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops/join")
+                .header(axum::http::header::COOKIE, &alice_cookie)
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "sessionCode": "789124" }).to_string(),
+                ))
+                .expect("build review restore request"),
+        )
+        .await
+        .expect("review restore response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .expect("read body");
+    let result: WorkshopJoinResult = serde_json::from_slice(&bytes).expect("join result json");
+    let WorkshopJoinResult::Success(success) = result else {
+        panic!("expected review restore success");
+    };
+    assert_eq!(success.player_id, "player-host");
+    assert_eq!(success.state.phase, protocol::Phase::End);
+}
+
+#[tokio::test]
+async fn join_workshop_restores_archived_review_with_fallback_sprites() {
+    let state = test_state();
+    let app = build_app(state.clone());
+    let alice_cookie = test_auth_cookie(&app, "AliceReviewFallback").await;
+    let alice_account_id = state
+        .store
+        .find_account_by_name_lower("alicereviewfallback")
+        .await
+        .expect("load alice account")
+        .expect("alice account exists")
+        .id;
+    let created_at = Utc::now();
+    let mut session = WorkshopSession::new(
+        Uuid::new_v4(),
+        SessionCode("789125".to_string()),
+        created_at,
+        protocol::WorkshopCreateConfig::default(),
+    );
+    session.phase = protocol::Phase::End;
+    session.owner_account_id = Some(alice_account_id.clone());
+    let mut host = session_player_with_state(
+        "player-host",
+        "AliceReviewFallback",
+        created_at,
+        true,
+        false,
+    );
+    host.account_id = Some(alice_account_id);
+    let fallback_sprites = timeout_companion_defaults().sprites;
+    host.character_id = Some("fallback-character".to_string());
+    host.selected_character = Some(test_character_profile(
+        "fallback-character",
+        "A reviewed fallback dragon",
+        fallback_sprites.clone(),
+        0,
+    ));
+    host.is_ready = true;
+    session.add_player(host);
+    let artifact = SessionArtifactRecord {
+        id: "review-fallback-archive-artifact".to_string(),
+        session_id: session.id.to_string(),
+        phase: protocol::Phase::End,
+        step: 0,
+        kind: SessionArtifactKind::JudgeBundleGenerated,
+        player_id: Some("player-host".to_string()),
+        created_at: created_at.to_rfc3339(),
+        payload: serde_json::json!({ "dragonCount": 0, "artifactCount": 1 }),
+    };
+    state
+        .store
+        .save_session_with_artifact(&session, &artifact)
+        .await
+        .expect("seed fallback archived workshop");
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(session.code.0.clone(), session);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops/join")
+                .header(axum::http::header::COOKIE, &alice_cookie)
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "sessionCode": "789125" }).to_string(),
+                ))
+                .expect("build fallback review restore request"),
+        )
+        .await
+        .expect("fallback review restore response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .expect("read body");
+    let result: WorkshopJoinResult = serde_json::from_slice(&bytes).expect("join result json");
+    let WorkshopJoinResult::Success(success) = result else {
+        panic!("expected fallback review restore success");
+    };
+    assert_eq!(success.player_id, "player-host");
+    assert_eq!(success.state.phase, protocol::Phase::End);
+    let restored_player = success
+        .state
+        .players
+        .get("player-host")
+        .expect("restored player");
+    assert_eq!(
+        restored_player.character_id.as_deref(),
+        Some("fallback-character")
+    );
+    assert_eq!(
+        restored_player.pet_description.as_deref(),
+        Some("A reviewed fallback dragon")
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -13408,12 +14134,266 @@ async fn creator_claims_host_after_guest_joins_reserved_lobby() {
 }
 
 #[tokio::test]
+async fn creator_claims_host_after_guest_joined_lobby_with_consumed_reservation() {
+    let state = test_state();
+    let app = build_app(state.clone());
+    let alice_cookie = test_auth_cookie(&app, "Alice").await;
+    let bob_cookie = test_auth_cookie(&app, "Bob").await;
+    let session_code = create_test_workshop_lobby(&app, &alice_cookie).await;
+
+    let consumed_session = {
+        let mut sessions = state.sessions.lock().await;
+        let session = sessions
+            .get_mut(&session_code)
+            .expect("created lobby is cached");
+        session.reserved_host_account_id = None;
+        session.reserved_host_name = None;
+        session.updated_at = Utc::now();
+        session.clone()
+    };
+    state
+        .store
+        .save_session(&consumed_session)
+        .await
+        .expect("persist consumed reservation fixture");
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(session_code.clone(), consumed_session);
+
+    let guest_success = join_workshop_success(&app, &bob_cookie, &session_code, "Bob").await;
+    let guest_player = guest_success
+        .state
+        .players
+        .get(&guest_success.player_id)
+        .expect("guest player in state");
+    assert!(!guest_player.is_host);
+
+    let creator_success = join_workshop_success(&app, &alice_cookie, &session_code, "Alice").await;
+    let creator_player = creator_success
+        .state
+        .players
+        .get(&creator_success.player_id)
+        .expect("creator player in state");
+    assert!(creator_player.is_host);
+}
+
+#[tokio::test]
+async fn same_account_join_restores_existing_lobby_player_without_reconnect_token() {
+    let state = test_state();
+    let app = build_app(state.clone());
+    let alice_cookie = test_auth_cookie(&app, "Alice").await;
+    let session_code = create_test_workshop_lobby(&app, &alice_cookie).await;
+
+    let first_join = join_workshop_success(&app, &alice_cookie, &session_code, "Alice").await;
+
+    let offline_session = {
+        let mut sessions = state.sessions.lock().await;
+        let session = sessions
+            .get_mut(&session_code)
+            .expect("joined lobby is cached");
+        session
+            .players
+            .get_mut(&first_join.player_id)
+            .expect("player exists")
+            .is_connected = false;
+        session.updated_at = Utc::now();
+        session.clone()
+    };
+    state
+        .store
+        .save_session(&offline_session)
+        .await
+        .expect("persist offline player");
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(session_code.clone(), offline_session);
+
+    let restored = join_workshop_success(&app, &alice_cookie, &session_code, "Alice").await;
+
+    assert_eq!(restored.player_id, first_join.player_id);
+    assert_ne!(restored.reconnect_token, first_join.reconnect_token);
+    assert_eq!(restored.state.players.len(), 1);
+    assert!(
+        restored
+            .state
+            .players
+            .get(&restored.player_id)
+            .expect("restored player")
+            .is_connected
+    );
+    let session_id = restored.state.session.id.clone();
+    let artifacts = state
+        .store
+        .list_session_artifacts(&session_id)
+        .await
+        .expect("list artifacts");
+    assert!(artifacts.iter().any(|artifact| {
+        artifact.kind == SessionArtifactKind::PlayerReconnected
+            && artifact.player_id.as_deref() == Some(restored.player_id.as_str())
+    }));
+}
+
+#[tokio::test]
+async fn same_account_join_restores_existing_in_progress_player_without_character_pick() {
+    let state = test_state();
+    let app = build_app(state.clone());
+    let alice_cookie = test_auth_cookie(&app, "AliceResume").await;
+    let session_code = create_test_workshop_lobby(&app, &alice_cookie).await;
+
+    let first_join = join_workshop_success(&app, &alice_cookie, &session_code, "AliceResume").await;
+
+    let in_progress_session = {
+        let mut sessions = state.sessions.lock().await;
+        let session = sessions
+            .get_mut(&session_code)
+            .expect("joined workshop is cached");
+        session.phase = protocol::Phase::Voting;
+        session
+            .players
+            .get_mut(&first_join.player_id)
+            .expect("player exists")
+            .is_connected = false;
+        session.updated_at = Utc::now();
+        session.clone()
+    };
+    state
+        .store
+        .save_session(&in_progress_session)
+        .await
+        .expect("persist in-progress player");
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(session_code.clone(), in_progress_session);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops/join")
+                .header("content-type", "application/json")
+                .header(axum::http::header::COOKIE, &alice_cookie)
+                .body(Body::from(format!(
+                    r#"{{"sessionCode":"{}"}}"#,
+                    session_code
+                )))
+                .expect("build resume request"),
+        )
+        .await
+        .expect("resume response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read resume body");
+    let result: WorkshopJoinResult = serde_json::from_slice(&body).expect("parse resume result");
+    let restored = match result {
+        WorkshopJoinResult::Success(success) => success,
+        WorkshopJoinResult::Error(error) => panic!("expected resume success: {}", error.error),
+    };
+    assert_eq!(restored.player_id, first_join.player_id);
+    assert_ne!(restored.reconnect_token, first_join.reconnect_token);
+    assert_eq!(restored.state.phase, protocol::Phase::Voting);
+    assert!(
+        restored
+            .state
+            .players
+            .get(&restored.player_id)
+            .expect("restored player")
+            .is_connected
+    );
+}
+
+#[tokio::test]
+async fn same_account_restore_replaces_placeholder_starter_with_generated_sprites() {
+    let state = test_state();
+    let generated_sprites = protocol::SpriteSet {
+        neutral: "restore-generated-neutral".to_string(),
+        happy: "restore-generated-happy".to_string(),
+        angry: "restore-generated-angry".to_string(),
+        sleepy: "restore-generated-sleepy".to_string(),
+    };
+    state
+        .store
+        .save_character(&persistence::CharacterRecord {
+            id: "character_restore_generated_001".to_string(),
+            name: Some("Restore Borrowed Sprites".to_string()),
+            description: "A generated dragon for replacing placeholder restore slots".to_string(),
+            sprites: generated_sprites.clone(),
+            remaining_sprite_regenerations: 0,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+            owner_account_id: Some("account-existing-owner".to_string()),
+        })
+        .await
+        .expect("seed generated character");
+
+    let app = build_app(state.clone());
+    let alice_cookie = test_auth_cookie(&app, "AlicePlaceholder").await;
+    let session_code = create_test_workshop_lobby(&app, &alice_cookie).await;
+    let first_join = join_workshop_success(&app, &alice_cookie, &session_code, "Alice").await;
+
+    {
+        let mut sessions = state.sessions.lock().await;
+        let session = sessions
+            .get_mut(&session_code)
+            .expect("joined lobby is cached");
+        let player = session
+            .players
+            .get_mut(&first_join.player_id)
+            .expect("player exists");
+        let placeholder = timeout_companion_defaults().sprites;
+        player.character_id = Some("starter_placeholder".to_string());
+        player.selected_character = Some(protocol::CharacterProfile {
+            id: "starter_placeholder".to_string(),
+            name: None,
+            description: "Placeholder starter".to_string(),
+            sprites: placeholder,
+            remaining_sprite_regenerations: 0,
+            creator_account_id: None,
+            creator_name: None,
+        });
+        player.is_connected = false;
+        session.updated_at = Utc::now();
+        let session = session.clone();
+        drop(sessions);
+        state
+            .store
+            .save_session(&session)
+            .await
+            .expect("persist placeholder session");
+    }
+
+    let restored = join_workshop_success(&app, &alice_cookie, &session_code, "Alice").await;
+    let player = restored
+        .state
+        .players
+        .get(&restored.player_id)
+        .expect("restored player");
+    let expected_references = protocol::SpriteSet {
+        neutral: "/api/characters/character_restore_generated_001/sprites/neutral".to_string(),
+        happy: "/api/characters/character_restore_generated_001/sprites/happy".to_string(),
+        angry: "/api/characters/character_restore_generated_001/sprites/angry".to_string(),
+        sleepy: "/api/characters/character_restore_generated_001/sprites/sleepy".to_string(),
+    };
+
+    assert_eq!(restored.player_id, first_join.player_id);
+    assert_eq!(player.custom_sprites.as_ref(), Some(&expected_references));
+}
+
+#[tokio::test]
 async fn join_workshop_leases_starter_when_zero_owned_characters() {
     let state = test_state();
 
     // Seed a starter character in the store.
     let starter = persistence::CharacterRecord {
         id: "character_starter_001".to_string(),
+        name: None,
         description: "A friendly starter dragon".to_string(),
         sprites: protocol::SpriteSet {
             neutral: "sn".to_string(),
@@ -13472,6 +14452,122 @@ async fn join_workshop_leases_starter_when_zero_owned_characters() {
         }
         WorkshopJoinResult::Error(e) => panic!("expected success, got: {}", e.error),
     }
+}
+
+#[tokio::test]
+async fn join_workshop_random_starter_reuses_existing_generated_sprites() {
+    let state = test_state();
+    let generated_sprites = protocol::SpriteSet {
+        neutral: "generated-neutral".to_string(),
+        happy: "generated-happy".to_string(),
+        angry: "generated-angry".to_string(),
+        sleepy: "generated-sleepy".to_string(),
+    };
+    state
+        .store
+        .save_character(&persistence::CharacterRecord {
+            id: "character_generated_001".to_string(),
+            name: Some("Borrowed Sprites".to_string()),
+            description: "A generated dragon from the reusable sprite table".to_string(),
+            sprites: generated_sprites.clone(),
+            remaining_sprite_regenerations: 0,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+            owner_account_id: Some("account-existing-owner".to_string()),
+        })
+        .await
+        .expect("seed generated character");
+
+    let app = build_app(state);
+    let cookie = test_auth_cookie(&app, "SpriteBorrower").await;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops")
+                .header("content-type", "application/json")
+                .header(axum::http::header::COOKIE, &cookie)
+                .body(Body::from(create_workshop_body("SpriteBorrower")))
+                .expect("build request"),
+        )
+        .await
+        .expect("create response");
+
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let bytes = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    let result: WorkshopJoinResult = serde_json::from_slice(&bytes).expect("parse result");
+    let success = match result {
+        WorkshopJoinResult::Success(success) => success,
+        WorkshopJoinResult::Error(error) => panic!("expected success, got: {}", error.error),
+    };
+    let player = success
+        .state
+        .players
+        .get(&success.player_id)
+        .expect("player in state");
+
+    let expected_references = protocol::SpriteSet {
+        neutral: "/api/characters/character_generated_001/sprites/neutral".to_string(),
+        happy: "/api/characters/character_generated_001/sprites/happy".to_string(),
+        angry: "/api/characters/character_generated_001/sprites/angry".to_string(),
+        sleepy: "/api/characters/character_generated_001/sprites/sleepy".to_string(),
+    };
+
+    assert_eq!(player.custom_sprites.as_ref(), Some(&expected_references));
+    assert_eq!(
+        player.pet_description.as_deref(),
+        Some("A generated dragon from the reusable sprite table")
+    );
+}
+
+#[tokio::test]
+async fn character_sprite_endpoint_serves_referenced_character_sprite() {
+    use base64::Engine as _;
+
+    let state = test_state();
+    state
+        .store
+        .save_character(&persistence::CharacterRecord {
+            id: "character_sprite_ref_001".to_string(),
+            name: None,
+            description: "A referenced sprite dragon".to_string(),
+            sprites: protocol::SpriteSet {
+                neutral: base64::engine::general_purpose::STANDARD.encode(b"png-neutral"),
+                happy: base64::engine::general_purpose::STANDARD.encode(b"png-happy"),
+                angry: base64::engine::general_purpose::STANDARD.encode(b"png-angry"),
+                sleepy: base64::engine::general_purpose::STANDARD.encode(b"png-sleepy"),
+            },
+            remaining_sprite_regenerations: 0,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+            owner_account_id: None,
+        })
+        .await
+        .expect("seed referenced character");
+
+    let app = build_app(state);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/characters/character_sprite_ref_001/sprites/happy")
+                .body(Body::empty())
+                .expect("build sprite request"),
+        )
+        .await
+        .expect("sprite response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get(axum::http::header::CONTENT_TYPE),
+        Some(&HeaderValue::from_static("image/png"))
+    );
+    let bytes = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read sprite body");
+    assert_eq!(&bytes[..], b"png-happy");
 }
 
 #[tokio::test]
