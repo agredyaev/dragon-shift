@@ -3,6 +3,7 @@ import { expect, test, type Browser, type BrowserContext, type Page, type Respon
 import { getProjectContextOptions } from '../project-profiles'
 
 const SESSION_SNAPSHOT_STORAGE_KEY = 'dragon-switch/platform/session-snapshot'
+const SESSION_GAME_STATE_STORAGE_KEY = 'dragon-switch/platform/session-game-state'
 
 type SessionSnapshot = {
   sessionCode: string
@@ -31,6 +32,26 @@ export async function readSessionSnapshot(page: Page): Promise<SessionSnapshot> 
 export async function readReconnectToken(page: Page) {
   const snapshot = await readSessionSnapshot(page)
   return snapshot.reconnectToken
+}
+
+export async function readSessionGameState(page: Page) {
+  const state = await page.evaluate(storageKey => {
+    const raw = window.sessionStorage.getItem(storageKey)
+    if (!raw) {
+      return null
+    }
+
+    return JSON.parse(raw)
+  }, SESSION_GAME_STATE_STORAGE_KEY)
+
+  if (!state) {
+    throw new Error('session game state is missing from browser sessionStorage')
+  }
+
+  return state as {
+    phase?: string
+    session?: { code?: string }
+  }
 }
 
 export async function newPlayerContext(
@@ -89,6 +110,71 @@ export async function expectPhaseVisible(pages: Page[], text: string, timeout = 
   for (const page of pages) {
     await expect(page.locator('body')).toContainText(text, { timeout })
   }
+}
+
+export async function installUnexpectedPreSessionObserver(page: Page) {
+  await page.addInitScript(() => {
+    const windowWithFlag = window as Window & {
+      __unexpectedPreSessionPanels?: string[]
+      __unexpectedPreSessionObserverInstalled?: boolean
+      __unexpectedBootstrapPanels?: string[]
+    }
+
+    if (windowWithFlag.__unexpectedPreSessionObserverInstalled) {
+      return
+    }
+
+    windowWithFlag.__unexpectedPreSessionObserverInstalled = true
+    windowWithFlag.__unexpectedPreSessionPanels = []
+    windowWithFlag.__unexpectedBootstrapPanels = []
+
+    const collect = () => {
+      const matches = [
+        ['signin-panel', '[data-testid="signin-panel"]'],
+        ['open-workshops-panel', '[data-testid="open-workshops-panel"]'],
+        ['pick-character-panel', '[data-testid="pick-character-panel"]'],
+      ] as const
+
+      for (const [name, selector] of matches) {
+        if (document.querySelector(selector)) {
+          windowWithFlag.__unexpectedPreSessionPanels?.push(name)
+        }
+      }
+
+      if (document.querySelector('[data-testid="session-bootstrap-panel"]')) {
+        windowWithFlag.__unexpectedBootstrapPanels?.push('session-bootstrap-panel')
+      }
+    }
+
+    collect()
+    new MutationObserver(collect).observe(document.documentElement, {
+      childList: true,
+      subtree: true,
+      attributes: true,
+    })
+  })
+}
+
+export async function expectNoUnexpectedPreSessionPanels(page: Page) {
+  const panels = await page.evaluate(() => {
+    const windowWithFlag = window as Window & {
+      __unexpectedPreSessionPanels?: string[]
+    }
+    return windowWithFlag.__unexpectedPreSessionPanels ?? []
+  })
+
+  expect(panels, `unexpected pre-session panels appeared: ${panels.join(', ')}`).toEqual([])
+}
+
+export async function expectNoUnexpectedBootstrapPanels(page: Page) {
+  const panels = await page.evaluate(() => {
+    const windowWithFlag = window as Window & {
+      __unexpectedBootstrapPanels?: string[]
+    }
+    return windowWithFlag.__unexpectedBootstrapPanels ?? []
+  })
+
+  expect(panels, `unexpected bootstrap panels appeared: ${panels.join(', ')}`).toEqual([])
 }
 
 export async function extractWorkshopCode(page: Page) {
@@ -223,13 +309,14 @@ export async function saveDragonProfile(page: Page, description: string) {
 export async function bootstrapSessionFromSnapshot(
   page: Page,
   snapshot: SessionSnapshot,
+  sessionGameState: { phase?: string; session?: { code?: string } },
   accountName: string,
   password = 'password-1234',
 ) {
-  await page.goto('/')
-  await page.evaluate(
-    ([sessionStorageKey, accountStorageKey, sessionSnapshot, name, hero, pwd]) => {
+  await page.context().addInitScript(
+    ([sessionStorageKey, sessionGameStateStorageKey, accountStorageKey, sessionSnapshot, gameState, name, hero, pwd]) => {
       window.sessionStorage.setItem(sessionStorageKey, JSON.stringify(sessionSnapshot))
+      window.sessionStorage.setItem(sessionGameStateStorageKey, JSON.stringify(gameState))
       window.localStorage.setItem(accountStorageKey, JSON.stringify({
         id: `e2e-${name}`,
         hero,
@@ -239,15 +326,22 @@ export async function bootstrapSessionFromSnapshot(
     },
     [
       SESSION_SNAPSHOT_STORAGE_KEY,
+      SESSION_GAME_STATE_STORAGE_KEY,
       'dragon-switch/platform/account-snapshot',
       snapshot,
+      sessionGameState,
       accountName,
       accountName,
       password,
     ] as const,
   )
-  await page.reload()
+  await installUnexpectedPreSessionObserver(page)
+  await page.goto('/')
+  await expect(page.getByTestId('connection-badge')).toContainText('Connected', { timeout: 15_000 })
+  await expect(page.getByTestId('session-bootstrap-panel')).toHaveCount(0)
   await expect(page.getByTestId('session-panel')).toBeVisible({ timeout: 15_000 })
+  await expectNoUnexpectedPreSessionPanels(page)
+  await expectNoUnexpectedBootstrapPanels(page)
 }
 
 export async function cloneSignedInSession(
@@ -258,6 +352,7 @@ export async function cloneSignedInSession(
 ) {
   const storage = await sourcePage.evaluate(() => ({
     account: window.localStorage.getItem('dragon-switch/platform/account-snapshot'),
+    gameState: window.sessionStorage.getItem('dragon-switch/platform/session-game-state'),
   }))
 
   if (!storage.account) {
@@ -269,18 +364,24 @@ export async function cloneSignedInSession(
     await targetContext.addCookies(sourceCookies)
   }
 
-  await targetPage.goto('/')
-  await targetPage.evaluate(
-    ([accountSnapshot, sessionSnapshot]) => {
+  await targetContext.addInitScript(
+    ([accountSnapshot, sessionSnapshot, gameState]) => {
       window.localStorage.setItem('dragon-switch/platform/account-snapshot', accountSnapshot)
       window.sessionStorage.setItem(
         'dragon-switch/platform/session-snapshot',
         JSON.stringify(sessionSnapshot),
       )
+      if (gameState) {
+        window.sessionStorage.setItem('dragon-switch/platform/session-game-state', gameState)
+      }
     },
-    [storage.account, snapshot] as const,
+    [storage.account, snapshot, storage.gameState] as const,
   )
-  await targetPage.reload()
+  await installUnexpectedPreSessionObserver(targetPage)
+  await targetPage.goto('/')
+  await expect(targetPage.getByTestId('connection-badge')).toContainText('Connected', { timeout: 15_000 })
+  await expectNoUnexpectedPreSessionPanels(targetPage)
+  await expectNoUnexpectedBootstrapPanels(targetPage)
 }
 
 export async function saveCharacter(page: Page) {

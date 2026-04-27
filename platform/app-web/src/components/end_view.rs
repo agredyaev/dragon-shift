@@ -45,8 +45,12 @@ pub fn EndView(
     let header_status = if is_end_screen { "Final" } else { "Scoring" };
 
     let commands_disabled = {
+        let id = identity.read();
         let o = ops.read();
-        o.pending_flow.is_some() || o.pending_command.is_some() || o.pending_judge_bundle
+        o.pending_flow.is_some()
+            || o.pending_command.is_some()
+            || o.pending_judge_bundle
+            || id.connection_status != ConnectionStatus::Connected
     };
     let scores_ready = !score_rows.is_empty();
     let archive_built = judge_bundle.read().is_some();
@@ -271,12 +275,12 @@ pub fn EndView(
                         div { class: "voting-card__sprite-stack",
                             if let Some(ref sprites) = row.custom_sprites {
                                 div { class: "voting-card__emotion-row",
-                                    img { class: "voting-card__sprite-img", src: "data:image/png;base64,{sprites.neutral}", alt: "Neutral sprite" }
-                                    img { class: "voting-card__sprite-img", src: "data:image/png;base64,{sprites.happy}", alt: "Happy sprite" }
+                                    img { class: "voting-card__sprite-img", src: sprite_src(&sprites.neutral), alt: "Neutral sprite" }
+                                    img { class: "voting-card__sprite-img", src: sprite_src(&sprites.happy), alt: "Happy sprite" }
                                 }
                                 div { class: "voting-card__emotion-row",
-                                    img { class: "voting-card__sprite-img", src: "data:image/png;base64,{sprites.angry}", alt: "Angry sprite" }
-                                    img { class: "voting-card__sprite-img", src: "data:image/png;base64,{sprites.sleepy}", alt: "Sleepy sprite" }
+                                    img { class: "voting-card__sprite-img", src: sprite_src(&sprites.angry), alt: "Angry sprite" }
+                                    img { class: "voting-card__sprite-img", src: sprite_src(&sprites.sleepy), alt: "Sleepy sprite" }
                                 }
                             } else {
                                 div { class: "voting-card__sprite voting-card__sprite--fallback",
@@ -336,25 +340,46 @@ pub fn EndView(
                         span { class: "leaderboard__col leaderboard__col--status", "Judge" }
                     }
                     for row in score_rows {
-                        div {
-                            class: format!("leaderboard__row{}", if row.is_winner { " leaderboard__row--winner" } else { "" }),
-                            span { class: "leaderboard__col leaderboard__col--rank", {row.placement_label.clone()} }
-                            span { class: "leaderboard__col leaderboard__col--name", {row.player_name.clone()} }
-                            span { class: "leaderboard__col leaderboard__col--score", {row.phase1_score_label.clone()} }
-                            span { class: "leaderboard__col leaderboard__col--score", {row.phase2_score_label.clone()} }
-                            span { class: "leaderboard__col leaderboard__col--total", {row.total_score_label.clone()} }
-                            span {
-                                class: format!(
-                                    "leaderboard__col leaderboard__col--status leaderboard__tooltip-anchor {}",
-                                    if row.judge_status == "Good" {
-                                        "leaderboard__status--good"
-                                    } else {
-                                        "leaderboard__status--bad"
-                                    },
-                                ),
-                                {row.judge_status}
+                        {
+                            let feedback_id = format!(
+                                "judge-feedback-{}",
+                                row.player_name
+                                    .chars()
+                                    .map(|ch| if ch.is_ascii_alphanumeric() { ch.to_ascii_lowercase() } else { '-' })
+                                    .collect::<String>(),
+                            );
+                            rsx! {
+                                div {
+                                    class: format!("leaderboard__row{}", if row.is_winner { " leaderboard__row--winner" } else { "" }),
+                                    span { class: "leaderboard__col leaderboard__col--rank", {row.placement_label.clone()} }
+                                    span { class: "leaderboard__col leaderboard__col--name", {row.player_name.clone()} }
+                                    span { class: "leaderboard__col leaderboard__col--score", {row.phase1_score_label.clone()} }
+                                    span { class: "leaderboard__col leaderboard__col--score", {row.phase2_score_label.clone()} }
+                                    span { class: "leaderboard__col leaderboard__col--total", {row.total_score_label.clone()} }
+                                    span {
+                                        class: format!(
+                                            "leaderboard__col leaderboard__col--status {}",
+                                            if row.judge_status == "Good" {
+                                                "leaderboard__status--good"
+                                            } else {
+                                                "leaderboard__status--bad"
+                                            },
+                                        ),
+                                        {row.judge_status}
+                                    }
+                                }
                                 if !row.judge_status_tooltip.is_empty() {
-                                    span { class: "leaderboard__tooltip", {row.judge_status_tooltip.clone()} }
+                                    details { class: "judge-feedback-disclosure",
+                                        summary {
+                                            class: "judge-feedback-disclosure__summary",
+                                            "aria-controls": "{feedback_id}",
+                                            span { class: "judge-feedback-disclosure__label", "Read judge feedback" }
+                                            span { class: "judge-feedback-disclosure__player", {row.player_name.clone()} }
+                                        }
+                                        div { id: "{feedback_id}", class: "judge-feedback-disclosure__body",
+                                            {row.judge_status_tooltip.clone()}
+                                        }
+                                    }
                                 }
                             }
                         }

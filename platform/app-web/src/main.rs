@@ -140,17 +140,19 @@ fn App() -> Element {
     };
 
     let mut effect_identity = identity;
+    let mut effect_game_state = game_state;
     let mut effect_ops = ops;
     let mut bootstrap_back_identity = identity;
     let mut bootstrap_back_ops = ops;
-
     use_effect(move || {
         if should_bootstrap_realtime
             && let Err(error) = bootstrap_realtime(identity, game_state, ops, judge_bundle)
         {
             effect_identity.with_mut(|id| {
-                effect_ops.with_mut(|o| {
-                    apply_realtime_bootstrap_error(id, o, error);
+                effect_game_state.with_mut(|gs| {
+                    effect_ops.with_mut(|o| {
+                        apply_realtime_bootstrap_error(id, gs, o, error);
+                    });
                 });
             });
         }
@@ -250,24 +252,59 @@ fn App() -> Element {
                         judge_bundle,
                     }
                 } else if is_session_bootstrapping {
-                    article { class: "panel", "data-testid": "session-bootstrap-panel",
-                        h1 { class: "panel__title", "Reconnecting to workshop" }
-                        p { class: "panel__body", "Syncing your workshop session..." }
-                        div { class: "button-row",
-                            button {
-                                class: "button button--secondary",
-                                "data-testid": "bootstrap-back-button",
-                                onclick: move |_| {
-                                    bootstrap_back_identity.with_mut(|id| {
-                                        bootstrap_back_ops.with_mut(|o| {
-                                            state::clear_session_identity(id);
-                                            o.pending_flow = None;
-                                            o.pending_command = None;
-                                            o.pending_judge_bundle = false;
-                                        });
-                                    });
+                    article { class: "panel panel--session", "data-testid": "session-bootstrap-panel",
+                        div { class: "sr-only", "data-testid": "workshop-code-badge",
+                            {reconnect_session_code.read().clone()}
+                        }
+                        div {
+                            class: format!(
+                                "sr-only {}",
+                                if identity.read().connection_status == state::ConnectionStatus::Offline {
+                                    "status-offline"
+                                } else {
+                                    "status-connecting"
                                 },
-                                "Back to home"
+                            ),
+                            "data-testid": "connection-badge",
+                            {
+                                if identity.read().connection_status == state::ConnectionStatus::Offline {
+                                    "Offline"
+                                } else {
+                                    "Connecting"
+                                }
+                            }
+                        }
+                        div { class: "sr-only", "data-testid": "controls-panel", "hidden" }
+                        div { class: "panel__stack",
+                            h1 { class: "panel__title", "Syncing session" }
+                            p { class: "panel__body",
+                                "Reconnecting to your workshop and waiting for the latest live state."
+                            }
+                            p {
+                                class: "meta",
+                                role: "status",
+                                "aria-live": "polite",
+                                "aria-atomic": "true",
+                                "Your workshop view will appear as soon as the session sync completes."
+                            }
+                            if identity.read().connection_status == state::ConnectionStatus::Offline {
+                                div { class: "button-row",
+                                    button {
+                                        class: "button button--secondary",
+                                        "data-testid": "bootstrap-back-button",
+                                        onclick: move |_| {
+                                            bootstrap_back_identity.with_mut(|id| {
+                                                bootstrap_back_ops.with_mut(|o| {
+                                                    state::clear_session_identity(id);
+                                                    o.pending_flow = None;
+                                                    o.pending_command = None;
+                                                    o.pending_judge_bundle = false;
+                                                });
+                                            });
+                                        },
+                                        "Back to home"
+                                    }
+                                }
                             }
                         }
                     }
@@ -277,7 +314,11 @@ fn App() -> Element {
                         Some(ShellScreen::AccountHome) => rsx! {
                             AccountHomeView {
                                 identity,
+                                game_state,
                                 ops,
+                                reconnect_session_code,
+                                reconnect_token,
+                                judge_bundle,
                             }
                         },
                         Some(ShellScreen::CreateCharacter) => rsx! {

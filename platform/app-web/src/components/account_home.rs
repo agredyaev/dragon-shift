@@ -3,11 +3,20 @@ use dioxus::prelude::*;
 use crate::flows::{
     OpenWorkshopsPaging, begin_load_open_workshops, load_open_workshops_flow,
     request_open_workshops_flow, start_create_workshop_flow, start_delete_workshop_flow,
+    start_resume_workshop_flow, start_review_workshop_flow,
 };
 use crate::state::{IdentityState, OperationState, PendingFlow, ShellScreen, navigate_to_screen};
+use protocol::{ClientGameState, JudgeBundle};
 
 #[component]
-pub fn AccountHomeView(identity: Signal<IdentityState>, ops: Signal<OperationState>) -> Element {
+pub fn AccountHomeView(
+    identity: Signal<IdentityState>,
+    game_state: Signal<Option<ClientGameState>>,
+    ops: Signal<OperationState>,
+    reconnect_session_code: Signal<String>,
+    reconnect_token: Signal<String>,
+    judge_bundle: Signal<Option<JudgeBundle>>,
+) -> Element {
     let mut refreshed_on_mount = use_signal(|| false);
     if !*refreshed_on_mount.read() {
         ops.with_mut(begin_load_open_workshops);
@@ -171,7 +180,7 @@ pub fn AccountHomeView(identity: Signal<IdentityState>, ops: Signal<OperationSta
 
         section { class: "panel panel--wide", "data-testid": "open-workshops-panel",
                 div { class: "panel__header",
-                    h2 { class: "panel__title", "Open Workshops" }
+                    h2 { class: "panel__title", "Workshops" }
                     if show_pager {
                         div { class: "button-row button-row--workshop-pager",
                             button {
@@ -211,28 +220,73 @@ pub fn AccountHomeView(identity: Signal<IdentityState>, ops: Signal<OperationSta
                 }
                 div { class: "panel__stack",
                     if open_workshops_loading && open_workshops.is_empty() {
-                        p { class: "meta", role: "status", "aria-live": "polite", "aria-atomic": "true", "Loading open workshops..." }
+                        p { class: "meta", role: "status", "aria-live": "polite", "aria-atomic": "true", "Loading workshops..." }
                     } else if open_workshops_load_failed && open_workshops.is_empty() {
-                        p { class: "meta", role: "alert", "Could not load open workshops right now." }
+                        p { class: "meta", role: "alert", "Could not load workshops right now." }
                     } else if open_workshops.is_empty() && open_workshops_loaded {
-                        p { class: "meta", role: "status", "aria-live": "polite", "aria-atomic": "true", "No open workshops at the moment." }
+                        p { class: "meta", role: "status", "aria-live": "polite", "aria-atomic": "true", "No workshops at the moment." }
                     } else {
                         div { class: "roster",
                             for workshop in open_workshops.iter() {
                                 {
                                     let code = workshop.session_code.clone();
+                                    let resume_code = workshop.session_code.clone();
+                                    let review_code = workshop.session_code.clone();
                                     let delete_code = workshop.session_code.clone();
                                     let can_delete = workshop.can_delete;
+                                    let is_archived = workshop.archived;
+                                    let can_resume = workshop.can_resume;
                                     rsx! {
                                         article { class: "roster__item", key: "{workshop.session_code}",
                                             div {
                                                 p { class: "roster__name", "{workshop.host_name}'s workshop" }
                                                 p { class: "roster__meta",
                                                     "{workshop.player_count} player(s) \u{2014} Code: {workshop.session_code}"
+                                                    if is_archived {
+                                                        span { class: "workshop-status-badge workshop-status-badge--archived", "Archived" }
+                                                    } else if can_resume {
+                                                        span { class: "workshop-status-badge workshop-status-badge--active", "In progress" }
+                                                    }
                                                 }
                                             }
                                             div { class: "button-row button-row--workshop-actions",
-                                                if can_delete {
+                                                if is_archived {
+                                                    button {
+                                                        class: "button button--secondary button--small",
+                                                        "data-testid": "review-workshop-button",
+                                                        disabled: pending,
+                                                        onclick: move |_| {
+                                                            let _ = start_review_workshop_flow(
+                                                                identity,
+                                                                game_state,
+                                                                ops,
+                                                                reconnect_session_code,
+                                                                reconnect_token,
+                                                                judge_bundle,
+                                                                review_code.clone(),
+                                                            );
+                                                        },
+                                                        "Review"
+                                                    }
+                                                } else if can_resume {
+                                                    button {
+                                                        class: "button button--primary button--small",
+                                                        "data-testid": "resume-workshop-button",
+                                                        disabled: pending,
+                                                        onclick: move |_| {
+                                                            let _ = start_resume_workshop_flow(
+                                                                identity,
+                                                                game_state,
+                                                                ops,
+                                                                reconnect_session_code,
+                                                                reconnect_token,
+                                                                judge_bundle,
+                                                                resume_code.clone(),
+                                                            );
+                                                        },
+                                                        "Resume"
+                                                    }
+                                                } else if can_delete {
                                                     button {
                                                         class: "button button--danger button--small",
                                                         "data-testid": "delete-workshop-button",
@@ -244,25 +298,27 @@ pub fn AccountHomeView(identity: Signal<IdentityState>, ops: Signal<OperationSta
                                                         if delete_workshop_pending { "Deleting..." } else { "Delete" }
                                                     }
                                                 }
-                                                button {
-                                                    class: "button button--primary button--small",
-                                                    "data-testid": "join-workshop-button",
-                                                    disabled: pending,
-                                                    onclick: move |_| {
-                                                        let c = code.clone();
-                                                        identity.with_mut(|id| {
-                                                            ops.with_mut(|o| {
-                                                                navigate_to_screen(
-                                                                    id,
-                                                                    o,
-                                                                    ShellScreen::PickCharacter {
-                                                                        workshop_code: c,
-                                                                    },
-                                                                );
+                                                if !is_archived && !can_resume {
+                                                    button {
+                                                        class: "button button--primary button--small",
+                                                        "data-testid": "join-workshop-button",
+                                                        disabled: pending,
+                                                        onclick: move |_| {
+                                                            let c = code.clone();
+                                                            identity.with_mut(|id| {
+                                                                ops.with_mut(|o| {
+                                                                    navigate_to_screen(
+                                                                        id,
+                                                                        o,
+                                                                        ShellScreen::PickCharacter {
+                                                                            workshop_code: c,
+                                                                        },
+                                                                    );
+                                                                });
                                                             });
-                                                        });
-                                                    },
-                                                    "Join"
+                                                        },
+                                                        "Join"
+                                                    }
                                                 }
                                             }
                                         }

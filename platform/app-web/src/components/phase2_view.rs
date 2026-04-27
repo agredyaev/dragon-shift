@@ -27,6 +27,7 @@ pub fn Phase2View(
             || o.pending_command.is_some()
             || o.pending_judge_bundle
             || id.session_snapshot.is_none()
+            || id.connection_status != ConnectionStatus::Connected
     };
 
     let dragon_name = current_dragon(state)

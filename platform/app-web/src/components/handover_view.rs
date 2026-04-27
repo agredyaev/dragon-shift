@@ -51,6 +51,7 @@ pub fn HandoverView(
             || o.pending_command.is_some()
             || o.pending_judge_bundle
             || id.session_snapshot.is_none()
+            || id.connection_status != ConnectionStatus::Connected
     };
 
     let rule1_val = rule1.read().clone();

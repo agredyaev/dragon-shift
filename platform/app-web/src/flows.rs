@@ -1,12 +1,15 @@
 #![allow(clippy::too_many_arguments)]
 
+use dioxus::dioxus_core::spawn_forever;
 use dioxus::prelude::*;
 use protocol::{
     AuthRequest, ClientGameState, JoinWorkshopRequest, JudgeBundle, ListOpenWorkshopsResponse,
     OpenWorkshopCursor, Phase, SessionCommand, SpriteSet, UpdateCharacterRequest,
 };
 
-use crate::api::{AppWebApi, build_command_request, build_judge_bundle_request};
+use crate::api::{
+    AppWebApi, build_client_session_snapshot, build_command_request, build_judge_bundle_request,
+};
 use crate::helpers::{parse_tags_input, pending_command_label};
 use crate::realtime::{bootstrap_realtime, disconnect_realtime};
 use crate::state::{
@@ -19,8 +22,8 @@ use crate::state::{
     error_notice, info_notice, navigate_to_screen, notice_scope_for_screen,
     pending_command_ticket_is_current, pending_flow_ticket_is_current,
     pending_judge_bundle_ticket_is_current, persist_browser_account_snapshot,
-    persist_browser_session_snapshot, reserve_pending_command, reserve_pending_flow,
-    reserve_pending_judge_bundle, scoped_notice, success_notice,
+    persist_browser_session_game_state, persist_browser_session_snapshot, reserve_pending_command,
+    reserve_pending_flow, reserve_pending_judge_bundle, scoped_notice, success_notice,
 };
 
 fn try_reserve_pending_flow(
@@ -139,18 +142,30 @@ pub async fn submit_reconnect_flow(
                     });
                 });
             });
-            let persistence_warning =
-                { identity.read().session_snapshot.clone() }.and_then(|snapshot| {
-                    persist_browser_session_snapshot(&snapshot)
+            let persistence_warning = {
+                let snapshot_warning =
+                    { identity.read().session_snapshot.clone() }.and_then(|snapshot| {
+                        persist_browser_session_snapshot(&snapshot)
+                            .err()
+                            .map(|error| {
+                                format!("Reconnected, but session persistence failed: {error}")
+                            })
+                    });
+                let game_state_warning = { game_state.read().clone() }.and_then(|state| {
+                    persist_browser_session_game_state(&state)
                         .err()
                         .map(|error| {
-                            format!("Reconnected, but session persistence failed: {error}")
+                            format!("Reconnected, but session state persistence failed: {error}")
                         })
                 });
+                snapshot_warning.or(game_state_warning)
+            };
             if let Err(error) = bootstrap_realtime(identity, game_state, ops, judge_bundle) {
                 identity.with_mut(|id| {
-                    ops.with_mut(|o| {
-                        apply_realtime_bootstrap_error(id, o, error);
+                    game_state.with_mut(|gs| {
+                        ops.with_mut(|o| {
+                            apply_realtime_bootstrap_error(id, gs, o, error);
+                        });
                     });
                 });
             } else if let Some(warning) = persistence_warning {
@@ -178,12 +193,21 @@ pub async fn submit_reconnect_flow(
 
 pub fn start_workshop_command(
     identity: Signal<IdentityState>,
-    ops: Signal<OperationState>,
+    mut ops: Signal<OperationState>,
     handover_tags_input: Signal<String>,
     judge_bundle: Signal<Option<JudgeBundle>>,
     command: SessionCommand,
     payload: Option<serde_json::Value>,
 ) -> bool {
+    if identity.read().connection_status != ConnectionStatus::Connected {
+        ops.with_mut(|o| {
+            o.notice = Some(scoped_notice(
+                NoticeScope::Session,
+                error_notice("Wait for the session to finish syncing before sending commands."),
+            ));
+        });
+        return false;
+    }
     let Some(ticket) = try_reserve_pending_command(ops, command) else {
         return false;
     };
@@ -237,6 +261,20 @@ async fn submit_workshop_command_reserved(
         let id = identity.read();
         (id.api_base_url.clone(), id.session_snapshot.clone())
     };
+
+    if identity.read().connection_status != ConnectionStatus::Connected {
+        ops.with_mut(|o| {
+            if !pending_command_ticket_is_current(o, &ticket) {
+                return;
+            }
+            clear_pending_command_if_current(o, &ticket);
+            o.notice = Some(scoped_notice(
+                NoticeScope::Session,
+                error_notice("Wait for the session to finish syncing before sending commands."),
+            ));
+        });
+        return;
+    }
 
     let Some(snapshot) = snapshot else {
         ops.with_mut(|o| {
@@ -821,6 +859,73 @@ pub fn start_join_with_character_flow(
     true
 }
 
+/// Restore an already-participated workshop directly from AccountHome. Used for
+/// archived workshops where the account owns an existing player slot and only
+/// needs a fresh reconnect token to review the final screen.
+pub fn start_review_workshop_flow(
+    identity: Signal<IdentityState>,
+    game_state: Signal<Option<ClientGameState>>,
+    ops: Signal<OperationState>,
+    reconnect_session_code: Signal<String>,
+    reconnect_token: Signal<String>,
+    judge_bundle: Signal<Option<JudgeBundle>>,
+    workshop_code: String,
+) -> bool {
+    let Some(ticket) = try_reserve_pending_flow(
+        ops,
+        PendingFlow::Review,
+        scoped_notice(
+            NoticeScope::AccountHome,
+            info_notice("Opening workshop review…"),
+        ),
+    ) else {
+        return false;
+    };
+    spawn_forever(submit_review_workshop_flow_reserved(
+        identity,
+        game_state,
+        ops,
+        reconnect_session_code,
+        reconnect_token,
+        judge_bundle,
+        workshop_code,
+        ticket,
+    ));
+    true
+}
+
+/// Resume an in-progress workshop where this account already owns a player
+/// slot. This skips character picking because non-lobby joins can only restore
+/// an existing participant.
+pub fn start_resume_workshop_flow(
+    identity: Signal<IdentityState>,
+    game_state: Signal<Option<ClientGameState>>,
+    ops: Signal<OperationState>,
+    reconnect_session_code: Signal<String>,
+    reconnect_token: Signal<String>,
+    judge_bundle: Signal<Option<JudgeBundle>>,
+    workshop_code: String,
+) -> bool {
+    let Some(ticket) = try_reserve_pending_flow(
+        ops,
+        PendingFlow::Resume,
+        scoped_notice(NoticeScope::AccountHome, info_notice("Resuming workshop…")),
+    ) else {
+        return false;
+    };
+    spawn(submit_resume_workshop_flow_reserved(
+        identity,
+        game_state,
+        ops,
+        reconnect_session_code,
+        reconnect_token,
+        judge_bundle,
+        workshop_code,
+        ticket,
+    ));
+    true
+}
+
 #[allow(dead_code)]
 pub async fn submit_join_with_character_flow(
     identity: Signal<IdentityState>,
@@ -893,6 +998,127 @@ async fn submit_join_with_character_flow_reserved(
                 success,
                 PendingFlow::Join,
                 "Joined workshop, but session persistence failed",
+                &ticket,
+            );
+        }
+        Err(error) => {
+            if !pending_flow_ticket_is_current(&ops.read(), &ticket) {
+                return;
+            }
+            identity.with_mut(|id| {
+                ops.with_mut(|o| {
+                    if !pending_flow_ticket_is_current(o, &ticket) {
+                        return;
+                    }
+                    apply_request_error(id, o, error);
+                });
+            });
+        }
+    }
+}
+
+async fn submit_review_workshop_flow_reserved(
+    mut identity: Signal<IdentityState>,
+    mut game_state: Signal<Option<ClientGameState>>,
+    mut ops: Signal<OperationState>,
+    mut reconnect_session_code: Signal<String>,
+    mut reconnect_token: Signal<String>,
+    mut judge_bundle: Signal<Option<JudgeBundle>>,
+    workshop_code: String,
+    ticket: PendingFlowTicket,
+) {
+    let base_url = { identity.read().api_base_url.clone() };
+    identity.with_mut(|id| {
+        id.connection_status = ConnectionStatus::Connecting;
+    });
+
+    let api = AppWebApi::new(base_url);
+    let request = JoinWorkshopRequest {
+        session_code: workshop_code,
+        name: None,
+        character_id: None,
+        reconnect_token: None,
+    };
+    match api.join_workshop_with_character(&request).await {
+        Ok(success) => {
+            if !pending_flow_ticket_is_current(&ops.read(), &ticket) {
+                return;
+            }
+            let review_snapshot = build_client_session_snapshot(&success);
+            apply_join_and_bootstrap(
+                &mut identity,
+                &mut game_state,
+                &mut ops,
+                &mut reconnect_session_code,
+                &mut reconnect_token,
+                &mut judge_bundle,
+                success,
+                PendingFlow::Review,
+                "Opened review, but session persistence failed",
+                &ticket,
+            );
+            if let Ok(bundle) = api
+                .fetch_judge_bundle(build_judge_bundle_request(&review_snapshot))
+                .await
+            {
+                if identity.read().session_snapshot.as_ref() == Some(&review_snapshot) {
+                    judge_bundle.set(Some(bundle));
+                }
+            }
+        }
+        Err(error) => {
+            if !pending_flow_ticket_is_current(&ops.read(), &ticket) {
+                return;
+            }
+            identity.with_mut(|id| {
+                ops.with_mut(|o| {
+                    if !pending_flow_ticket_is_current(o, &ticket) {
+                        return;
+                    }
+                    apply_request_error(id, o, error);
+                });
+            });
+        }
+    }
+}
+
+async fn submit_resume_workshop_flow_reserved(
+    mut identity: Signal<IdentityState>,
+    mut game_state: Signal<Option<ClientGameState>>,
+    mut ops: Signal<OperationState>,
+    mut reconnect_session_code: Signal<String>,
+    mut reconnect_token: Signal<String>,
+    mut judge_bundle: Signal<Option<JudgeBundle>>,
+    workshop_code: String,
+    ticket: PendingFlowTicket,
+) {
+    let base_url = { identity.read().api_base_url.clone() };
+    identity.with_mut(|id| {
+        id.connection_status = ConnectionStatus::Connecting;
+    });
+
+    let api = AppWebApi::new(base_url);
+    let request = JoinWorkshopRequest {
+        session_code: workshop_code,
+        name: None,
+        character_id: None,
+        reconnect_token: None,
+    };
+    match api.join_workshop_with_character(&request).await {
+        Ok(success) => {
+            if !pending_flow_ticket_is_current(&ops.read(), &ticket) {
+                return;
+            }
+            apply_join_and_bootstrap(
+                &mut identity,
+                &mut game_state,
+                &mut ops,
+                &mut reconnect_session_code,
+                &mut reconnect_token,
+                &mut judge_bundle,
+                success,
+                PendingFlow::Resume,
+                "Resumed workshop, but session persistence failed",
                 &ticket,
             );
         }
@@ -1598,15 +1824,25 @@ fn apply_join_and_bootstrap(
             });
         });
     });
-    let persistence_warning = { identity.read().session_snapshot.clone() }.and_then(|snapshot| {
-        persist_browser_session_snapshot(&snapshot)
-            .err()
-            .map(|error| format!("{persistence_error_prefix}: {error}"))
-    });
+    let persistence_warning = {
+        let snapshot_warning = { identity.read().session_snapshot.clone() }.and_then(|snapshot| {
+            persist_browser_session_snapshot(&snapshot)
+                .err()
+                .map(|error| format!("{persistence_error_prefix}: {error}"))
+        });
+        let game_state_warning = { game_state.read().clone() }.and_then(|state| {
+            persist_browser_session_game_state(&state)
+                .err()
+                .map(|error| format!("{persistence_error_prefix}: {error}"))
+        });
+        snapshot_warning.or(game_state_warning)
+    };
     if let Err(error) = bootstrap_realtime(*identity, *game_state, *ops, *judge_bundle) {
         identity.with_mut(|id| {
-            ops.with_mut(|o| {
-                apply_realtime_bootstrap_error(id, o, error);
+            game_state.with_mut(|gs| {
+                ops.with_mut(|o| {
+                    apply_realtime_bootstrap_error(id, gs, o, error);
+                });
             });
         });
     } else if let Some(warning) = persistence_warning {
@@ -1729,6 +1965,8 @@ mod tests {
                 sleepy: "sleepy".to_string(),
             },
             remaining_sprite_regenerations: 1,
+            creator_account_id: None,
+            creator_name: None,
         }
     }
 
@@ -1781,7 +2019,9 @@ mod tests {
                     host_name: "Alice".to_string(),
                     player_count: 0,
                     created_at: "2026-01-01T00:00:00Z".to_string(),
+                    archived: false,
                     can_delete: true,
+                    can_resume: false,
                 }],
                 next_cursor: None,
                 prev_cursor: None,
@@ -1832,7 +2072,9 @@ mod tests {
                     host_name: "Alice".to_string(),
                     player_count: 0,
                     created_at: "2026-01-03T00:00:00Z".to_string(),
+                    archived: false,
                     can_delete: true,
+                    can_resume: false,
                 }],
                 next_cursor: None,
                 prev_cursor: None,
@@ -2070,7 +2312,9 @@ mod tests {
             host_name: "Alice".to_string(),
             player_count: 1,
             created_at: "2026-01-01T00:00:00Z".to_string(),
+            archived: false,
             can_delete: true,
+            can_resume: false,
         }];
 
         let applied = apply_open_workshops_response_if_current(
@@ -2082,7 +2326,9 @@ mod tests {
                     host_name: "Bob".to_string(),
                     player_count: 2,
                     created_at: "2026-01-02T00:00:00Z".to_string(),
+                    archived: false,
                     can_delete: false,
+                    can_resume: false,
                 }],
                 next_cursor: None,
                 prev_cursor: None,

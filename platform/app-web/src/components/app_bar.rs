@@ -9,6 +9,7 @@ use crate::flows::{
     begin_load_my_characters, load_my_characters_flow, start_delete_character_flow,
     start_logout_flow, start_rename_character_flow,
 };
+use crate::helpers::sprite_src;
 use crate::state::{IdentityState, OperationState, PendingFlow, ShellScreen, navigate_to_screen};
 use protocol::SpriteSet;
 
@@ -413,7 +414,7 @@ pub fn AppBar(identity: Signal<IdentityState>, ops: Signal<OperationState>) -> E
                                                             div { class: "pick-character-row__sprite-frame",
                                                                 img {
                                                                     class: "pick-character-row__sprite",
-                                                                    src: "data:image/png;base64,{sprite_for_index(&character.sprites, sprite_index)}",
+                                                                    src: sprite_src(sprite_for_index(&character.sprites, sprite_index)),
                                                                     alt: "{character_name}: {label} sprite",
                                                                 }
                                                             }

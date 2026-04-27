@@ -76,7 +76,7 @@
 - `database.url` - inline database URL
 - `database.existingSecretName` - Kubernetes secret name for `DATABASE_URL`
 - `database.existingSecretKey` - Kubernetes secret key name
-- `sessionCookieKey.existingSecretName` - Kubernetes secret name holding `SESSION_COOKIE_KEY`; required in production
+- `sessionCookieKey.existingSecretName` - Kubernetes secret name holding `SESSION_COOKIE_KEY`; in production this is wired from the foundation-managed Secret Manager secret
 - `sessionCookieKey.existingSecretKey` - Kubernetes secret key name, default `SESSION_COOKIE_KEY`
 
 ## Notes

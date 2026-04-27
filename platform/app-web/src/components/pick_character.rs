@@ -3,6 +3,7 @@ use dioxus::prelude::*;
 use crate::flows::{
     begin_load_eligible_characters, load_eligible_characters_flow, start_join_with_character_flow,
 };
+use crate::helpers::sprite_src;
 use crate::state::{IdentityState, OperationState, ShellScreen, navigate_to_screen};
 use protocol::{ClientGameState, JudgeBundle, SpriteSet};
 
@@ -111,7 +112,7 @@ pub fn PickCharacterView(
                                                     div { class: "pick-character-row__sprite-frame",
                                                         img {
                                                             class: "pick-character-row__sprite",
-                                                            src: "data:image/png;base64,{sprite_for_index(&character.sprites, sprite_index)}",
+                                                            src: sprite_src(sprite_for_index(&character.sprites, sprite_index)),
                                                             alt: "{character_name}: {label} sprite",
                                                         }
                                                     }

@@ -2,6 +2,7 @@ use dioxus::prelude::*;
 use protocol::{CharacterSpritePreviewRequest, CreateCharacterRequest, SpriteSet};
 
 use crate::api::AppWebApi;
+use crate::helpers::sprite_src;
 use crate::state::{
     IdentityState, NoticeScope, OperationState, PendingFlow, ShellScreen, error_notice,
     info_notice, navigate_to_screen, pending_flow_ticket_is_current, reserve_pending_flow,
@@ -320,7 +321,7 @@ pub fn CreateCharacterView(
                                         div { class: "sprite-grid__image-wrap phase0-sprite-frame",
                                             img {
                                                 class: "sprite-grid__image",
-                                                src: "data:image/png;base64,{sprite_for_index(sp, i)}",
+                                                src: sprite_src(sprite_for_index(sp, i)),
                                                 alt: "Dragon emotion: {label}",
                                             }
                                         }

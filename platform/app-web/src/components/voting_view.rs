@@ -3,7 +3,7 @@ use protocol::{ClientGameState, JudgeBundle, SessionCommand};
 
 use crate::flows::start_workshop_command;
 use crate::helpers::*;
-use crate::state::{IdentityState, OperationState};
+use crate::state::{ConnectionStatus, IdentityState, OperationState};
 
 #[component]
 pub fn VotingView(
@@ -25,6 +25,7 @@ pub fn VotingView(
             || o.pending_command.is_some()
             || o.pending_judge_bundle
             || id.session_snapshot.is_none()
+            || id.connection_status != ConnectionStatus::Connected
     };
 
     let progress = voting_progress_label(state);
@@ -58,7 +59,7 @@ pub fn VotingView(
                         if let Some(ref sprites) = row.custom_sprites {
                             img {
                                 class: "voting-card__sprite-img",
-                                src: "data:image/png;base64,{sprites.neutral}",
+                                src: sprite_src(&sprites.neutral),
                                 alt: "Dragon sprite",
                             }
                         } else {

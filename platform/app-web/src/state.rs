@@ -34,6 +34,8 @@ pub enum PendingFlow {
     SignIn,
     Create,
     Join,
+    Resume,
+    Review,
     Reconnect,
     DeleteCharacter,
     RenameCharacter,
@@ -97,6 +99,7 @@ pub struct IdentityState {
     pub session_snapshot: Option<ClientSessionSnapshot>,
     pub api_base_url: String,
     pub realtime_bootstrap_attempted: bool,
+    pub restored_session_needs_realtime: bool,
 }
 
 /// Transient operation state — changes on command send/receive.
@@ -172,6 +175,14 @@ pub fn info_notice(message: &str) -> ShellNotice {
 pub fn success_notice(message: &str) -> ShellNotice {
     ShellNotice {
         tone: NoticeTone::Success,
+        message: message.to_string(),
+        scope: NoticeScope::Session,
+    }
+}
+
+pub fn warning_notice(message: &str) -> ShellNotice {
+    ShellNotice {
+        tone: NoticeTone::Warning,
         message: message.to_string(),
         scope: NoticeScope::Session,
     }
@@ -354,6 +365,7 @@ pub fn default_identity_state() -> IdentityState {
         session_snapshot: None,
         api_base_url: default_api_base_url(),
         realtime_bootstrap_attempted: false,
+        restored_session_needs_realtime: false,
     }
 }
 
@@ -399,7 +411,8 @@ pub fn hydrate_from_snapshot(
     snapshot: &ClientSessionSnapshot,
 ) {
     identity.screen = ShellScreen::Session;
-    identity.connection_status = ConnectionStatus::Offline;
+    identity.connection_status = ConnectionStatus::Connecting;
+    identity.restored_session_needs_realtime = true;
     identity.coordinator = snapshot.coordinator_type;
     identity.identity = Some(SessionIdentity {
         session_code: snapshot.session_code.clone(),
@@ -425,12 +438,14 @@ pub struct BootstrapResult {
 pub fn restore_bootstrap(
     account: Option<AccountProfile>,
     snapshot: Option<ClientSessionSnapshot>,
+    restored_game_state: Option<ClientGameState>,
 ) -> BootstrapResult {
     let mut identity = default_identity_state();
     let mut reconnect_session_code = String::new();
     let mut reconnect_token = String::new();
     let handover_tags_input = String::new();
     let mut ops = default_operation_state();
+    let mut game_state = None;
 
     match (&account, &snapshot) {
         (Some(_), Some(snapshot)) => {
@@ -441,9 +456,13 @@ pub fn restore_bootstrap(
                 &mut reconnect_token,
                 snapshot,
             );
+            game_state = restored_game_state.filter(|state| {
+                state.session.code == snapshot.session_code
+                    && state.current_player_id.as_deref() == Some(snapshot.player_id.as_str())
+            });
             ops.notice = Some(scoped_notice(
                 NoticeScope::Session,
-                info_notice("Restored reconnect session from browser storage."),
+                info_notice("Syncing session…"),
             ));
         }
         (Some(_), None) => {
@@ -457,7 +476,7 @@ pub fn restore_bootstrap(
 
     BootstrapResult {
         identity,
-        game_state: None,
+        game_state,
         reconnect_session_code,
         reconnect_token,
         handover_tags_input,
@@ -466,14 +485,52 @@ pub fn restore_bootstrap(
     }
 }
 
+fn resolve_bootstrap_api_base_url(
+    current_origin_api_base_url: &str,
+    query_api_base_url: Option<&str>,
+    saved_api_base_url: Option<&str>,
+) -> String {
+    if let Some(api_base_url) = query_api_base_url
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return api_base_url.to_string();
+    }
+
+    if current_origin_api_base_url.trim().is_empty()
+        && let Some(api_base_url) = saved_api_base_url
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    {
+        return api_base_url.to_string();
+    }
+
+    current_origin_api_base_url.trim().to_string()
+}
+
 pub fn bootstrap_state() -> BootstrapResult {
     let account = load_browser_account_snapshot().ok().flatten();
     let session = load_browser_session_snapshot();
+    let (restored_game_state, restored_game_state_warning) = match load_browser_session_game_state()
+    {
+        Ok(state) => (state, None),
+        Err(error) => {
+            let _ = clear_browser_session_game_state();
+            (
+                None,
+                Some(warning_notice(&format!(
+                    "Failed to restore browser session state: {error}"
+                ))),
+            )
+        }
+    };
+    let had_restored_game_state = restored_game_state.is_some();
 
     let mut result = match session {
-        Ok(snapshot) => restore_bootstrap(account, snapshot),
+        Ok(snapshot) => restore_bootstrap(account, snapshot, restored_game_state),
         Err(error) => {
-            let mut result = restore_bootstrap(account, None);
+            let _ = clear_browser_session_snapshot();
+            let mut result = restore_bootstrap(account, None, None);
             result.ops.notice = Some(scoped_notice(
                 notice_scope_for_screen(&result.identity.screen),
                 error_notice(&format!("Failed to restore browser session: {error}")),
@@ -482,14 +539,33 @@ pub fn bootstrap_state() -> BootstrapResult {
         }
     };
 
-    if let Ok(Some(api_base_url)) = load_browser_query_api_base_url() {
-        result.identity.api_base_url = api_base_url;
-        let _ = persist_browser_api_base_url(&result.identity.api_base_url);
-        return result;
+    if had_restored_game_state && result.game_state.is_none() {
+        let _ = clear_browser_session_game_state();
     }
 
-    if let Ok(Some(api_base_url)) = load_browser_api_base_url() {
-        result.identity.api_base_url = api_base_url;
+    // Hidden localStorage overrides made the served page and API target drift
+    // apart. Only an explicit `?apiBaseUrl=` override should cross origins.
+    let current_origin_api_base_url = result.identity.api_base_url.clone();
+    let query_api_base_url = load_browser_query_api_base_url().ok().flatten();
+    let saved_api_base_url = load_browser_api_base_url().ok().flatten();
+
+    result.identity.api_base_url = resolve_bootstrap_api_base_url(
+        &current_origin_api_base_url,
+        query_api_base_url.as_deref(),
+        saved_api_base_url.as_deref(),
+    );
+
+    if query_api_base_url.is_some() {
+        let _ = persist_browser_api_base_url(&result.identity.api_base_url);
+    }
+
+    if result.ops.notice.is_none()
+        && let Some(warning) = restored_game_state_warning
+    {
+        result.ops.notice = Some(scoped_notice(
+            notice_scope_for_screen(&result.identity.screen),
+            warning,
+        ));
     }
 
     result
@@ -501,6 +577,9 @@ pub fn bootstrap_state() -> BootstrapResult {
 
 #[allow(dead_code)]
 pub const SESSION_SNAPSHOT_STORAGE_KEY: &str = "dragon-switch/platform/session-snapshot";
+
+#[allow(dead_code)]
+pub const SESSION_GAME_STATE_STORAGE_KEY: &str = "dragon-switch/platform/session-game-state";
 
 #[allow(dead_code)]
 pub const API_BASE_URL_STORAGE_KEY: &str = "dragon-switch/platform/api-base-url";
@@ -515,6 +594,18 @@ pub fn encode_session_snapshot(snapshot: &ClientSessionSnapshot) -> Result<Strin
 pub fn decode_session_snapshot(value: &str) -> Result<ClientSessionSnapshot, String> {
     serde_json::from_str(value)
         .map_err(|error| format!("failed to decode session snapshot: {error}"))
+}
+
+#[allow(dead_code)]
+pub fn encode_session_game_state(state: &ClientGameState) -> Result<String, String> {
+    serde_json::to_string(state)
+        .map_err(|error| format!("failed to encode session game state: {error}"))
+}
+
+#[allow(dead_code)]
+pub fn decode_session_game_state(value: &str) -> Result<ClientGameState, String> {
+    serde_json::from_str(value)
+        .map_err(|error| format!("failed to decode session game state: {error}"))
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -539,6 +630,31 @@ pub fn load_browser_session_snapshot() -> Result<Option<ClientSessionSnapshot>, 
 
 #[cfg(not(target_arch = "wasm32"))]
 pub fn load_browser_session_snapshot() -> Result<Option<ClientSessionSnapshot>, String> {
+    Ok(None)
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn load_browser_session_game_state() -> Result<Option<ClientGameState>, String> {
+    let Some(window) = web_sys::window() else {
+        return Err("window is unavailable".to_string());
+    };
+    let storage = window
+        .session_storage()
+        .map_err(|_| "failed to access browser storage".to_string())?
+        .ok_or_else(|| "browser storage is unavailable".to_string())?;
+
+    let Some(encoded) = storage
+        .get_item(SESSION_GAME_STATE_STORAGE_KEY)
+        .map_err(|_| "failed to read browser storage".to_string())?
+    else {
+        return Ok(None);
+    };
+
+    decode_session_game_state(&encoded).map(Some)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn load_browser_session_game_state() -> Result<Option<ClientGameState>, String> {
     Ok(None)
 }
 
@@ -623,6 +739,27 @@ pub fn persist_browser_session_snapshot(snapshot: &ClientSessionSnapshot) -> Res
 }
 
 #[cfg(target_arch = "wasm32")]
+pub fn persist_browser_session_game_state(state: &ClientGameState) -> Result<(), String> {
+    let Some(window) = web_sys::window() else {
+        return Err("window is unavailable".to_string());
+    };
+    let storage = window
+        .session_storage()
+        .map_err(|_| "failed to access browser storage".to_string())?
+        .ok_or_else(|| "browser storage is unavailable".to_string())?;
+    let encoded = encode_session_game_state(state)?;
+    storage
+        .set_item(SESSION_GAME_STATE_STORAGE_KEY, &encoded)
+        .map_err(|_| "failed to persist browser session state".to_string())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn persist_browser_session_game_state(state: &ClientGameState) -> Result<(), String> {
+    let _ = state;
+    Ok(())
+}
+
+#[cfg(target_arch = "wasm32")]
 pub fn clear_browser_session_snapshot() -> Result<(), String> {
     let Some(window) = web_sys::window() else {
         return Err("window is unavailable".to_string());
@@ -638,6 +775,25 @@ pub fn clear_browser_session_snapshot() -> Result<(), String> {
 
 #[cfg(not(target_arch = "wasm32"))]
 pub fn clear_browser_session_snapshot() -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn clear_browser_session_game_state() -> Result<(), String> {
+    let Some(window) = web_sys::window() else {
+        return Err("window is unavailable".to_string());
+    };
+    let storage = window
+        .session_storage()
+        .map_err(|_| "failed to access browser storage".to_string())?
+        .ok_or_else(|| "browser storage is unavailable".to_string())?;
+    storage
+        .remove_item(SESSION_GAME_STATE_STORAGE_KEY)
+        .map_err(|_| "failed to clear browser session state".to_string())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn clear_browser_session_game_state() -> Result<(), String> {
     Ok(())
 }
 
@@ -770,6 +926,8 @@ pub fn apply_join_success(
     let success_message = match flow {
         PendingFlow::Create => "Workshop created.",
         PendingFlow::Join => "Joined workshop.",
+        PendingFlow::Resume => "Resumed workshop.",
+        PendingFlow::Review => "Workshop review opened.",
         PendingFlow::Reconnect => "Reconnected to workshop.",
         PendingFlow::DeleteCharacter => "Character deleted.",
         PendingFlow::RenameCharacter => "Character renamed.",
@@ -798,7 +956,7 @@ pub fn apply_join_success(
             .and_then(|player_id| state.players.get(player_id))
             .and_then(|player| player.character_id.clone())
     });
-    if flow != PendingFlow::Reconnect {
+    if !matches!(flow, PendingFlow::Reconnect | PendingFlow::Resume) {
         ops.my_characters.clear();
     }
 
@@ -812,7 +970,7 @@ pub fn apply_join_success(
         success_notice(success_message),
     ));
     ops.pending_realtime_notice = match flow {
-        PendingFlow::Reconnect => Some(scoped_notice(
+        PendingFlow::Resume | PendingFlow::Review | PendingFlow::Reconnect => Some(scoped_notice(
             NoticeScope::Session,
             success_notice(success_message),
         )),
@@ -923,11 +1081,16 @@ pub fn apply_judge_bundle_error(
 #[allow(dead_code)]
 pub fn apply_realtime_bootstrap_error(
     identity: &mut IdentityState,
+    game_state: &mut Option<ClientGameState>,
     ops: &mut OperationState,
     error: String,
 ) {
     identity.realtime_bootstrap_attempted = true;
     identity.connection_status = ConnectionStatus::Offline;
+    if identity.restored_session_needs_realtime {
+        *game_state = None;
+        let _ = clear_browser_session_game_state();
+    }
     if should_clear_session_snapshot(&error) {
         clear_session_identity(identity);
     }
@@ -960,7 +1123,9 @@ pub fn clear_session_identity(identity: &mut IdentityState) {
     identity.identity = None;
     identity.session_snapshot = None;
     identity.realtime_bootstrap_attempted = false;
+    identity.restored_session_needs_realtime = false;
     let _ = clear_browser_session_snapshot();
+    let _ = clear_browser_session_game_state();
 }
 
 pub fn clear_pre_session_caches(ops: &mut OperationState) {
@@ -1038,7 +1203,11 @@ pub fn apply_server_ws_message(
                 .filter(|command| command_completed_by_state_update(*command, &client_state));
             identity.screen = ShellScreen::Session;
             *game_state = Some(client_state);
+            if let Some(state) = game_state.as_ref() {
+                let _ = persist_browser_session_game_state(state);
+            }
             identity.connection_status = ConnectionStatus::Connected;
+            identity.restored_session_needs_realtime = false;
             ops.selected_character_id = game_state.as_ref().and_then(|state| {
                 state
                     .current_player_id
@@ -1101,13 +1270,17 @@ pub fn apply_server_ws_message(
             });
         }
         ServerWsMessage::Error { message } => {
-            identity.connection_status = ConnectionStatus::Offline;
-            ops.sprite_generation_request_pending = false;
-            ops.sprite_generation_stage = None;
-            if should_clear_session_snapshot(&message) {
-                clear_session_identity(identity);
+            if identity.restored_session_needs_realtime {
+                apply_realtime_bootstrap_error(identity, game_state, ops, message);
+            } else {
+                identity.connection_status = ConnectionStatus::Offline;
+                ops.sprite_generation_request_pending = false;
+                ops.sprite_generation_stage = None;
+                if should_clear_session_snapshot(&message) {
+                    clear_session_identity(identity);
+                }
+                ops.notice = Some(scope_notice_for_identity(identity, error_notice(&message)));
             }
-            ops.notice = Some(scope_notice_for_identity(identity, error_notice(&message)));
         }
         ServerWsMessage::Pong => {
             identity.connection_status = ConnectionStatus::Connected;
@@ -1199,11 +1372,21 @@ mod tests {
             player_id: "player-9".to_string(),
             coordinator_type: CoordinatorType::Rust,
         };
+        let mut restored_game_state = mock_join_success().state;
+        restored_game_state.session.code = "654321".to_string();
+        restored_game_state.current_player_id = Some("player-9".to_string());
 
-        let result = restore_bootstrap(Some(account.clone()), Some(snapshot.clone()));
+        let result = restore_bootstrap(
+            Some(account.clone()),
+            Some(snapshot.clone()),
+            Some(restored_game_state.clone()),
+        );
 
         assert_eq!(result.identity.screen, ShellScreen::Session);
-        assert_eq!(result.identity.connection_status, ConnectionStatus::Offline);
+        assert_eq!(
+            result.identity.connection_status,
+            ConnectionStatus::Connecting
+        );
         assert_eq!(result.identity.account, Some(account));
         assert_eq!(
             result
@@ -1216,10 +1399,34 @@ mod tests {
         assert_eq!(result.reconnect_session_code, "654321");
         assert_eq!(result.reconnect_token, "reconnect-9");
         assert_eq!(result.identity.session_snapshot, Some(snapshot));
+        assert_eq!(result.game_state, Some(restored_game_state));
         assert_eq!(
             result.ops.notice.as_ref().map(|n| n.message.as_str()),
-            Some("Restored reconnect session from browser storage.")
+            Some("Syncing session…")
         );
+        assert!(!result.identity.realtime_bootstrap_attempted);
+    }
+
+    #[test]
+    fn restore_bootstrap_discards_restored_game_state_for_different_session_code() {
+        let account = AccountProfile {
+            id: "acct-9".to_string(),
+            hero: "hero-9".to_string(),
+            name: "TestUser".to_string(),
+        };
+        let snapshot = ClientSessionSnapshot {
+            session_code: "654321".to_string(),
+            reconnect_token: "reconnect-9".to_string(),
+            player_id: "player-9".to_string(),
+            coordinator_type: CoordinatorType::Rust,
+        };
+        let mut restored_game_state = mock_join_success().state;
+        restored_game_state.session.code = "123456".to_string();
+
+        let result = restore_bootstrap(Some(account), Some(snapshot), Some(restored_game_state));
+
+        assert_eq!(result.identity.screen, ShellScreen::Session);
+        assert_eq!(result.game_state, None);
     }
 
     #[test]
@@ -1230,7 +1437,7 @@ mod tests {
             name: "Alice".to_string(),
         };
 
-        let result = restore_bootstrap(Some(account.clone()), None);
+        let result = restore_bootstrap(Some(account.clone()), None, None);
 
         assert_eq!(result.identity.screen, ShellScreen::AccountHome);
         assert_eq!(result.identity.account, Some(account));
@@ -1240,10 +1447,42 @@ mod tests {
 
     #[test]
     fn restore_bootstrap_without_account_goes_to_signin() {
-        let result = restore_bootstrap(None, None);
+        let result = restore_bootstrap(None, None, None);
 
         assert_eq!(result.identity.screen, ShellScreen::SignIn);
         assert_eq!(result.identity.account, None);
+    }
+
+    #[test]
+    fn resolve_bootstrap_api_base_url_prefers_explicit_query_override() {
+        assert_eq!(
+            resolve_bootstrap_api_base_url(
+                "http://127.0.0.1:4100",
+                Some(" https://api.example.test/alt "),
+                Some("http://127.0.0.1:32000"),
+            ),
+            "https://api.example.test/alt"
+        );
+    }
+
+    #[test]
+    fn resolve_bootstrap_api_base_url_ignores_saved_override_when_origin_exists() {
+        assert_eq!(
+            resolve_bootstrap_api_base_url(
+                "http://127.0.0.1:4100",
+                None,
+                Some("http://127.0.0.1:32000"),
+            ),
+            "http://127.0.0.1:4100"
+        );
+    }
+
+    #[test]
+    fn resolve_bootstrap_api_base_url_uses_saved_override_when_origin_missing() {
+        assert_eq!(
+            resolve_bootstrap_api_base_url("", None, Some(" http://127.0.0.1:32000/ ")),
+            "http://127.0.0.1:32000/"
+        );
     }
 
     #[test]
@@ -1287,6 +1526,16 @@ mod tests {
         let decoded = decode_session_snapshot(&encoded).expect("decode snapshot");
 
         assert_eq!(decoded, snapshot);
+    }
+
+    #[test]
+    fn session_game_state_round_trips_through_json_encoding() {
+        let state = mock_join_success().state;
+
+        let encoded = encode_session_game_state(&state).expect("encode session game state");
+        let decoded = decode_session_game_state(&encoded).expect("decode session game state");
+
+        assert_eq!(decoded, state);
     }
 
     #[test]
@@ -1586,10 +1835,12 @@ mod tests {
     #[test]
     fn realtime_bootstrap_error_marks_attempted_even_when_connect_fails_early() {
         let mut identity = default_identity_state();
+        let mut game_state = None;
         let mut ops = default_operation_state();
 
         apply_realtime_bootstrap_error(
             &mut identity,
+            &mut game_state,
             &mut ops,
             "failed to open session connection".to_string(),
         );
@@ -1599,6 +1850,32 @@ mod tests {
         assert_eq!(
             ops.notice.as_ref().map(|n| n.message.as_str()),
             Some("failed to open session connection")
+        );
+    }
+
+    #[test]
+    fn realtime_bootstrap_error_clears_restored_session_state_until_reconnect_succeeds() {
+        let mut identity = default_identity_state();
+        identity.screen = ShellScreen::Session;
+        identity.connection_status = ConnectionStatus::Connecting;
+        identity.restored_session_needs_realtime = true;
+        let mut game_state = Some(mock_join_success().state);
+        let mut ops = default_operation_state();
+
+        apply_realtime_bootstrap_error(
+            &mut identity,
+            &mut game_state,
+            &mut ops,
+            "Could not sync the session.".to_string(),
+        );
+
+        assert!(identity.realtime_bootstrap_attempted);
+        assert_eq!(identity.connection_status, ConnectionStatus::Offline);
+        assert!(identity.restored_session_needs_realtime);
+        assert_eq!(game_state, None);
+        assert_eq!(
+            ops.notice.as_ref().map(|n| n.message.as_str()),
+            Some("Could not sync the session.")
         );
     }
 
@@ -1852,6 +2129,37 @@ mod tests {
         assert!(
             ops.pending_realtime_notice.is_none(),
             "pending realtime notice must be consumed after first attach"
+        );
+    }
+
+    #[test]
+    fn server_ws_error_during_restored_bootstrap_clears_stale_game_state() {
+        let mut identity = default_identity_state();
+        identity.screen = ShellScreen::Session;
+        identity.connection_status = ConnectionStatus::Connecting;
+        identity.restored_session_needs_realtime = true;
+        let mut game_state = Some(mock_join_success().state);
+        let mut ops = default_operation_state();
+        let mut judge_bundle = None;
+
+        apply_server_ws_message(
+            &mut identity,
+            &mut game_state,
+            &mut ops,
+            &mut judge_bundle,
+            ServerWsMessage::Error {
+                message: "Workshop not found.".to_string(),
+            },
+        );
+
+        assert_eq!(identity.connection_status, ConnectionStatus::Offline);
+        assert_eq!(game_state, None);
+        assert_eq!(identity.screen, ShellScreen::AccountHome);
+        assert_eq!(identity.identity, None);
+        assert_eq!(identity.session_snapshot, None);
+        assert_eq!(
+            ops.notice.as_ref().map(|n| n.message.as_str()),
+            Some("Workshop not found.")
         );
     }
 

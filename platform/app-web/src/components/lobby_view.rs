@@ -36,8 +36,12 @@ pub fn LobbyView(
         ConnectionStatus::Connected => "status-connected",
     };
     let commands_disabled = {
+        let id = identity.read();
         let o = ops.read();
-        o.pending_flow.is_some() || o.pending_command.is_some() || o.pending_judge_bundle
+        o.pending_flow.is_some()
+            || o.pending_command.is_some()
+            || o.pending_judge_bundle
+            || id.connection_status != ConnectionStatus::Connected
     };
     let leave_disabled = ops.read().pending_flow.is_some();
 
