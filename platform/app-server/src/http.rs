@@ -1643,6 +1643,14 @@ pub(crate) async fn workshop_command(
                 };
 
                 let character_id = payload.character_id.trim();
+                if character_id.starts_with("starter_")
+                    && session.players.values().any(|player| {
+                        player.id != identity.player_id
+                            && player.character_id.as_deref() == Some(character_id)
+                    })
+                {
+                    return bad_command_request("That starter is already taken in this workshop.");
+                }
                 let record = match state.store.load_character(character_id).await {
                     Ok(Some(r)) => r,
                     Ok(None) => return bad_command_request("Selected character was not found."),

@@ -2112,11 +2112,12 @@ mod tests {
         let user = build_judge_user_prompt(&bundle);
 
         assert!(system.contains("Evaluate EVERY dragon in the input exactly once"));
-        assert!(system.contains("Judge only care evidence"));
+        assert!(system.contains("Judge the player cycle, not the visual character design"));
         assert!(system.contains("Ignore visual appearance and popularity"));
         assert!(user.contains("Return exactly 2 dragonEvaluations"));
         assert!(user.contains("Preserve each dragonId exactly"));
-        assert!(user.contains("compare documented habits/recommendations"));
+        assert!(user.contains("evaluate only how creator_name discovered hidden habits"));
+        assert!(user.contains("evaluate only how current_owner_name followed or adapted"));
     }
 
     #[test]
