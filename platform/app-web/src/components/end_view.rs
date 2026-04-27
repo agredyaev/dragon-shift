@@ -170,7 +170,7 @@ pub fn EndView(
             {connection_label}
         }
         div { class: "sr-only", "data-testid": "controls-panel", if is_host { "visible" } else { "hidden" } }
-        div { "data-testid": "session-panel",
+        div { class: "scoring-screen", "data-testid": "session-panel",
         article { class: "roster__item roster__item--phase",
             div {
                 p { class: "roster__name", {header_title} }
@@ -256,7 +256,7 @@ pub fn EndView(
             article { class: "roster__item roster__item--phase",
                 div {
                     p { class: "roster__name", "Vote for the most creative dragon design" }
-                    p { class: "roster__meta", {voting_progress} }
+                    p { class: "roster__meta", role: "status", "aria-live": "polite", {voting_progress} }
                 }
                 span { class: "roster__status roster__status--phase status-connected", "Design vote" }
             }
@@ -325,7 +325,7 @@ pub fn EndView(
 
         if active_tab_key == "score" {
             if !score_rows.is_empty() {
-                p { class: "meta", "Score leaderboard" }
+                p { class: "scoring-section-title", "Score leaderboard" }
                 div { class: "leaderboard",
                     div { class: "leaderboard__header",
                         span { class: "leaderboard__col leaderboard__col--rank", "#" }
@@ -361,14 +361,14 @@ pub fn EndView(
                     }
                 }
             } else {
-                p { class: "meta", "Judge scores are still syncing." }
+                p { class: "scoring-status", role: "status", "aria-live": "polite", "Judge scores are still syncing." }
             }
         }
 
         if active_tab_key == "design" || is_end_screen {
             if !vote_rows.is_empty() {
-                p { class: "meta", {results_status.clone()} }
-                p { class: "meta", "Creativity leaderboard" }
+                p { class: "scoring-status", {results_status.clone()} }
+                p { class: "scoring-section-title", "Creativity leaderboard" }
                 div { class: "leaderboard leaderboard--creativity",
                     div { class: "leaderboard__header",
                         span { class: "leaderboard__col leaderboard__col--rank", "#" }
@@ -390,7 +390,7 @@ pub fn EndView(
         // ---- Participant waiting / leave controls ----
         if !is_host {
             p {
-                class: "meta",
+                class: "scoring-status scoring-status--muted",
                 if is_end_screen {
                     "Waiting for the host to archive this workshop."
                 } else if results_revealed {
