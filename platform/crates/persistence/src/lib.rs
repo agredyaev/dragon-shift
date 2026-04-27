@@ -114,6 +114,8 @@ impl CharacterRecord {
             description: self.description.clone(),
             sprites: self.sprites.clone(),
             remaining_sprite_regenerations: self.remaining_sprite_regenerations,
+            creator_account_id: self.owner_account_id.clone(),
+            creator_name: None,
         }
     }
 }
@@ -130,6 +132,9 @@ pub struct OpenWorkshopRecord {
     pub created_at: String,
     pub owner_account_id: Option<String>,
     pub has_non_owner_players: bool,
+    pub archived: bool,
+    pub resumable: bool,
+    pub participant_account_ids: Vec<String>,
 }
 
 /// Paging direction for `SessionStore::list_open_workshops`. Cursors reuse
@@ -141,6 +146,22 @@ pub enum OpenWorkshopsPaging {
     First,
     After(protocol::OpenWorkshopCursor),
     Before(protocol::OpenWorkshopCursor),
+}
+
+fn open_workshop_is_visible_to_account(
+    row: &OpenWorkshopRecord,
+    viewer_account_id: Option<&str>,
+) -> bool {
+    if !row.archived && !row.resumable {
+        return true;
+    }
+    viewer_account_id.is_some_and(|viewer| {
+        row.owner_account_id.as_deref() == Some(viewer)
+            || row
+                .participant_account_ids
+                .iter()
+                .any(|participant| participant == viewer)
+    })
 }
 
 /// Page returned by `SessionStore::list_open_workshops`. `rows` is already
@@ -330,9 +351,41 @@ impl SessionUpdateNotification {
     }
 }
 
+fn sprite_set_uses_references(sprites: &SpriteSet) -> bool {
+    [
+        &sprites.neutral,
+        &sprites.happy,
+        &sprites.angry,
+        &sprites.sleepy,
+    ]
+    .iter()
+    .all(|sprite| sprite.starts_with("/api/characters/"))
+}
+
+fn sprite_reference_set(character_id: &str) -> SpriteSet {
+    SpriteSet {
+        neutral: format!("/api/characters/{character_id}/sprites/neutral"),
+        happy: format!("/api/characters/{character_id}/sprites/happy"),
+        angry: format!("/api/characters/{character_id}/sprites/angry"),
+        sleepy: format!("/api/characters/{character_id}/sprites/sleepy"),
+    }
+}
+
+fn can_reference_character_sprites(character_id: &str) -> bool {
+    !character_id.starts_with("starter_")
+}
+
 fn sanitize_runtime_presence(mut session: WorkshopSession) -> WorkshopSession {
     for player in session.players.values_mut() {
         player.is_connected = false;
+        if let Some(character) = player.selected_character.as_mut() {
+            if character.sprites != timeout_companion_defaults().sprites
+                && can_reference_character_sprites(&character.id)
+                && !sprite_set_uses_references(&character.sprites)
+            {
+                character.sprites = sprite_reference_set(&character.id);
+            }
+        }
     }
     session
 }
@@ -362,16 +415,34 @@ fn active_realtime_connection_cutoff() -> DateTime<Utc> {
 /// `list_open_workshops`. Empty lobbies are allowed before the reserved
 /// creator explicitly joins, so the summary falls back to the reserved host
 /// name when no concrete host player exists yet.
-fn open_workshop_summary_from_session(session: &WorkshopSession) -> Option<OpenWorkshopRecord> {
+fn open_workshop_summary_from_session(
+    session: &WorkshopSession,
+    archived: bool,
+) -> Option<OpenWorkshopRecord> {
+    let resumable = !matches!(session.phase, protocol::Phase::Lobby | protocol::Phase::End);
     let host_name = session
         .host_player_id
         .as_ref()
         .and_then(|id| session.players.get(id))
         .map(|player| player.name.clone())
-        .or_else(|| session.reserved_host_name().map(str::to_string))?;
+        .or_else(|| session.reserved_host_name().map(str::to_string))
+        .or_else(|| {
+            session.owner_account_id().and_then(|owner_account_id| {
+                session
+                    .players
+                    .values()
+                    .find(|player| player.account_id.as_deref() == Some(owner_account_id))
+                    .map(|player| player.name.clone())
+            })
+        })?;
     let owner_account_id = session
         .owner_account_id()
         .or_else(|| session.reserved_host_account_id());
+    let participant_account_ids = session
+        .players
+        .values()
+        .filter_map(|player| player.account_id.clone())
+        .collect::<Vec<_>>();
     let has_non_owner_players = session
         .players
         .values()
@@ -383,6 +454,9 @@ fn open_workshop_summary_from_session(session: &WorkshopSession) -> Option<OpenW
         created_at: session.created_at.to_rfc3339(),
         owner_account_id: owner_account_id.map(str::to_string),
         has_non_owner_players,
+        archived,
+        resumable,
+        participant_account_ids,
     })
 }
 
@@ -662,9 +736,10 @@ pub trait SessionStore: Send + Sync {
         >,
     >;
 
-    /// List sessions currently in `Phase::Lobby` for AccountHome's "open
-    /// workshops" list. Ordered DESC by `created_at` with `session_code ASC`
-    /// as a stable tie-breaker so the UI surfaces the freshest lobbies.
+    /// List sessions for AccountHome's workshop list. Returns open lobbies,
+    /// resumable in-progress workshops visible to their participants, and
+    /// archived workshops, ordered DESC by `created_at` with `session_code ASC`
+    /// as a stable tie-breaker so the UI surfaces the freshest entries.
     /// Paginated via a bidirectional keyset cursor on `(created_at,
     /// session_code)`; callers pass `OpenWorkshopsPaging::First` for the
     /// initial page, `After(cursor)` to move to older rows, or
@@ -674,6 +749,7 @@ pub trait SessionStore: Send + Sync {
     fn list_open_workshops(
         &self,
         paging: OpenWorkshopsPaging,
+        viewer_account_id: Option<String>,
     ) -> Pin<Box<dyn Future<Output = Result<OpenWorkshopsPage, PersistenceError>> + Send + '_>>;
 }
 
@@ -2126,6 +2202,7 @@ impl SessionStore for PostgresSessionStore {
     fn list_open_workshops(
         &self,
         paging: OpenWorkshopsPaging,
+        viewer_account_id: Option<String>,
     ) -> Pin<Box<dyn Future<Output = Result<OpenWorkshopsPage, PersistenceError>> + Send + '_>>
     {
         Box::pin(async move {
@@ -2152,13 +2229,40 @@ impl SessionStore for PostgresSessionStore {
                 OpenWorkshopsPaging::First => {
                     let rows = sqlx::query(
                         "
-                            SELECT payload
-                            FROM workshop_sessions
-                            WHERE payload->>'phase' = 'lobby'
-                            ORDER BY payload->>'created_at' DESC, session_code ASC
-                            LIMIT $1
+                            SELECT ws.payload,
+                                   ws.payload->>'phase' = 'end' AND EXISTS (
+                                       SELECT 1
+                                       FROM session_artifacts sa
+                                       WHERE sa.session_id = ws.session_id
+                                         AND sa.payload->>'kind' = 'judge_bundle_generated'
+                                   ) AS archived,
+                                   ws.payload->>'phase' NOT IN ('lobby', 'end') AS resumable
+                            FROM workshop_sessions ws
+                            WHERE ws.payload->>'phase' = 'lobby'
+                                OR (ws.payload->>'phase' NOT IN ('lobby', 'end') AND (ws.payload->>'owner_account_id' = $1
+                                    OR ws.payload->>'reserved_host_account_id' = $1
+                                    OR EXISTS (
+                                        SELECT 1
+                                        FROM jsonb_each(ws.payload->'players') AS players(player_id, player)
+                                        WHERE players.player->>'account_id' = $1
+                                    )))
+                                OR (ws.payload->>'phase' = 'end' AND EXISTS (
+                                    SELECT 1
+                                    FROM session_artifacts sa
+                                   WHERE sa.session_id = ws.session_id
+                                     AND sa.payload->>'kind' = 'judge_bundle_generated'
+                               ) AND (ws.payload->>'owner_account_id' = $1
+                                     OR ws.payload->>'reserved_host_account_id' = $1
+                                     OR EXISTS (
+                                        SELECT 1
+                                        FROM jsonb_each(ws.payload->'players') AS players(player_id, player)
+                                        WHERE players.player->>'account_id' = $1
+                                    )))
+                            ORDER BY ws.payload->>'created_at' DESC, ws.session_code ASC
+                            LIMIT $2
                         ",
                     )
+                    .bind(&viewer_account_id)
                     .bind(fetch_limit)
                     .fetch_all(&self.pool)
                     .await?;
@@ -2171,19 +2275,46 @@ impl SessionStore for PostgresSessionStore {
                     // `(created_at DESC, session_code ASC)`.
                     let rows = sqlx::query(
                         "
-                            SELECT payload
-                            FROM workshop_sessions
-                            WHERE payload->>'phase' = 'lobby'
-                              AND (
-                                    payload->>'created_at' < $1
-                                 OR (payload->>'created_at' = $1 AND session_code > $2)
+                            SELECT ws.payload,
+                                   ws.payload->>'phase' = 'end' AND EXISTS (
+                                       SELECT 1
+                                       FROM session_artifacts sa
+                                       WHERE sa.session_id = ws.session_id
+                                         AND sa.payload->>'kind' = 'judge_bundle_generated'
+                                   ) AS archived,
+                                   ws.payload->>'phase' NOT IN ('lobby', 'end') AS resumable
+                            FROM workshop_sessions ws
+                            WHERE (ws.payload->>'phase' = 'lobby'
+                               OR (ws.payload->>'phase' NOT IN ('lobby', 'end') AND (ws.payload->>'owner_account_id' = $3
+                                    OR ws.payload->>'reserved_host_account_id' = $3
+                                    OR EXISTS (
+                                        SELECT 1
+                                        FROM jsonb_each(ws.payload->'players') AS players(player_id, player)
+                                        WHERE players.player->>'account_id' = $3
+                                    )))
+                               OR (ws.payload->>'phase' = 'end' AND EXISTS (
+                                    SELECT 1
+                                    FROM session_artifacts sa
+                                   WHERE sa.session_id = ws.session_id
+                                     AND sa.payload->>'kind' = 'judge_bundle_generated'
+                               ) AND (ws.payload->>'owner_account_id' = $3
+                                     OR ws.payload->>'reserved_host_account_id' = $3
+                                     OR EXISTS (
+                                        SELECT 1
+                                        FROM jsonb_each(ws.payload->'players') AS players(player_id, player)
+                                        WHERE players.player->>'account_id' = $3
+                                    ))))
+                               AND (
+                                    ws.payload->>'created_at' < $1
+                                 OR (ws.payload->>'created_at' = $1 AND ws.session_code > $2)
                               )
-                            ORDER BY payload->>'created_at' DESC, session_code ASC
-                            LIMIT $3
+                            ORDER BY ws.payload->>'created_at' DESC, ws.session_code ASC
+                            LIMIT $4
                         ",
                     )
                     .bind(&cursor_created_at)
                     .bind(&cursor.session_code)
+                    .bind(&viewer_account_id)
                     .bind(fetch_limit)
                     .fetch_all(&self.pool)
                     .await?;
@@ -2198,19 +2329,46 @@ impl SessionStore for PostgresSessionStore {
                     // the canonical DESC form.
                     let rows = sqlx::query(
                         "
-                            SELECT payload
-                            FROM workshop_sessions
-                            WHERE payload->>'phase' = 'lobby'
-                              AND (
-                                    payload->>'created_at' > $1
-                                 OR (payload->>'created_at' = $1 AND session_code < $2)
+                            SELECT ws.payload,
+                                   ws.payload->>'phase' = 'end' AND EXISTS (
+                                       SELECT 1
+                                       FROM session_artifacts sa
+                                       WHERE sa.session_id = ws.session_id
+                                         AND sa.payload->>'kind' = 'judge_bundle_generated'
+                                   ) AS archived,
+                                   ws.payload->>'phase' NOT IN ('lobby', 'end') AS resumable
+                            FROM workshop_sessions ws
+                            WHERE (ws.payload->>'phase' = 'lobby'
+                               OR (ws.payload->>'phase' NOT IN ('lobby', 'end') AND (ws.payload->>'owner_account_id' = $3
+                                    OR ws.payload->>'reserved_host_account_id' = $3
+                                    OR EXISTS (
+                                        SELECT 1
+                                        FROM jsonb_each(ws.payload->'players') AS players(player_id, player)
+                                        WHERE players.player->>'account_id' = $3
+                                    )))
+                               OR (ws.payload->>'phase' = 'end' AND EXISTS (
+                                    SELECT 1
+                                    FROM session_artifacts sa
+                                   WHERE sa.session_id = ws.session_id
+                                     AND sa.payload->>'kind' = 'judge_bundle_generated'
+                               ) AND (ws.payload->>'owner_account_id' = $3
+                                     OR ws.payload->>'reserved_host_account_id' = $3
+                                     OR EXISTS (
+                                        SELECT 1
+                                        FROM jsonb_each(ws.payload->'players') AS players(player_id, player)
+                                        WHERE players.player->>'account_id' = $3
+                                    ))))
+                               AND (
+                                    ws.payload->>'created_at' > $1
+                                 OR (ws.payload->>'created_at' = $1 AND ws.session_code < $2)
                               )
-                            ORDER BY payload->>'created_at' ASC, session_code DESC
-                            LIMIT $3
+                            ORDER BY ws.payload->>'created_at' ASC, ws.session_code DESC
+                            LIMIT $4
                         ",
                     )
                     .bind(&cursor_created_at)
                     .bind(&cursor.session_code)
+                    .bind(&viewer_account_id)
                     .bind(fetch_limit)
                     .fetch_all(&self.pool)
                     .await?;
@@ -2228,7 +2386,14 @@ impl SessionStore for PostgresSessionStore {
                         continue;
                     }
                 };
-                if let Some(summary) = open_workshop_summary_from_session(&session) {
+                let archived: bool = row.get("archived");
+                let resumable: bool = row.get("resumable");
+                if let Some(summary) = open_workshop_summary_from_session(&session, archived) {
+                    debug_assert_eq!(summary.resumable, resumable);
+                    if !open_workshop_is_visible_to_account(&summary, viewer_account_id.as_deref())
+                    {
+                        continue;
+                    }
                     summaries.push(summary);
                 }
             }
@@ -3363,6 +3528,7 @@ impl SessionStore for InMemorySessionStore {
     fn list_open_workshops(
         &self,
         paging: OpenWorkshopsPaging,
+        viewer_account_id: Option<String>,
     ) -> Pin<Box<dyn Future<Output = Result<OpenWorkshopsPage, PersistenceError>> + Send + '_>>
     {
         Box::pin(async move {
@@ -3370,12 +3536,36 @@ impl SessionStore for InMemorySessionStore {
                 .sessions_by_code
                 .read()
                 .map_err(|_| PersistenceError::LockPoisoned)?;
-            // Collect candidate lobbies and sort DESC by `created_at` with
-            // `session_code` ASC as tie-breaker. Matches the Postgres impl.
+            // Collect candidate lobbies/resumable sessions/archives and sort DESC by `created_at`
+            // with `session_code` ASC as tie-breaker. Matches the Postgres impl.
+            let artifacts_by_session_id = self
+                .artifacts_by_session_id
+                .read()
+                .map_err(|_| PersistenceError::LockPoisoned)?;
             let mut summaries: Vec<OpenWorkshopRecord> = guard
                 .values()
-                .filter(|session| session.phase == protocol::Phase::Lobby)
-                .filter_map(open_workshop_summary_from_session)
+                .filter(|session| {
+                    session.phase != protocol::Phase::End || !session.players.is_empty()
+                })
+                .filter_map(|session| {
+                    let archived = session.phase == protocol::Phase::End
+                        && artifacts_by_session_id
+                            .get(&session.id.to_string())
+                            .is_some_and(|artifacts| {
+                                artifacts.iter().any(|artifact| {
+                                    artifact.kind
+                                        == protocol::SessionArtifactKind::JudgeBundleGenerated
+                                })
+                            });
+                    if session.phase == protocol::Phase::End && !archived {
+                        None
+                    } else {
+                        open_workshop_summary_from_session(session, archived)
+                    }
+                })
+                .filter(|summary| {
+                    open_workshop_is_visible_to_account(summary, viewer_account_id.as_deref())
+                })
                 .collect();
             summaries.sort_by(|left, right| {
                 right
@@ -3607,6 +3797,8 @@ mod tests {
                     sleepy: "sleepy".to_string(),
                 },
                 remaining_sprite_regenerations: 1,
+                creator_account_id: None,
+                creator_name: None,
             }),
             is_host: true,
             is_connected: true,
@@ -3695,6 +3887,84 @@ mod tests {
         assert!(
             loaded.players.values().all(|player| !player.is_connected),
             "persisted sessions must not round-trip runtime connection presence"
+        );
+    }
+
+    #[tokio::test]
+    async fn save_and_load_session_stores_character_sprite_references() {
+        let store = InMemorySessionStore::new();
+        let saved = connected_session("123456", 1);
+
+        store.save_session(&saved).await.expect("save session");
+        let loaded = store
+            .load_session_by_code("123456")
+            .await
+            .expect("load session")
+            .expect("session exists");
+        let character = loaded
+            .players
+            .get("player-1")
+            .and_then(|player| player.selected_character.as_ref())
+            .expect("selected character persisted");
+
+        assert_eq!(
+            character.sprites.neutral,
+            "/api/characters/character-1/sprites/neutral"
+        );
+        assert_eq!(
+            character.sprites.happy,
+            "/api/characters/character-1/sprites/happy"
+        );
+        assert_eq!(
+            character.sprites.angry,
+            "/api/characters/character-1/sprites/angry"
+        );
+        assert_eq!(
+            character.sprites.sleepy,
+            "/api/characters/character-1/sprites/sleepy"
+        );
+    }
+
+    #[tokio::test]
+    async fn save_and_load_session_keeps_legacy_starter_inline_sprites() {
+        let store = InMemorySessionStore::new();
+        let mut saved = connected_session("123456", 1);
+        let sprites = SpriteSet {
+            neutral: "neutral-png".to_string(),
+            happy: "happy-png".to_string(),
+            angry: "angry-png".to_string(),
+            sleepy: "sleepy-png".to_string(),
+        };
+        let player = saved.players.get_mut("player-1").expect("player");
+        player.character_id = Some("starter-lease-1".to_string());
+        player.selected_character = Some(protocol::CharacterProfile {
+            id: "starter_lease_1".to_string(),
+            name: None,
+            description: "Leased starter with legacy inline sprites".to_string(),
+            sprites: sprites.clone(),
+            remaining_sprite_regenerations: 0,
+            creator_account_id: None,
+            creator_name: None,
+        });
+
+        store.save_session(&saved).await.expect("save session");
+        let loaded = store
+            .load_session_by_code("123456")
+            .await
+            .expect("load session")
+            .expect("session exists");
+        let character = loaded
+            .players
+            .get("player-1")
+            .and_then(|player| player.selected_character.as_ref())
+            .expect("selected character persisted");
+
+        assert_eq!(character.sprites, sprites);
+        assert!(
+            !character
+                .sprites
+                .neutral
+                .starts_with("/api/characters/starter_")
         );
     }
 
@@ -4466,7 +4736,7 @@ mod tests {
         seed_lobbies(&store, 120, 1_000).await;
 
         let page = store
-            .list_open_workshops(OpenWorkshopsPaging::First)
+            .list_open_workshops(OpenWorkshopsPaging::First, None)
             .await
             .expect("first page");
 
@@ -4490,7 +4760,7 @@ mod tests {
         seed_lobbies(&store, 120, 1_000).await;
 
         let first = store
-            .list_open_workshops(OpenWorkshopsPaging::First)
+            .list_open_workshops(OpenWorkshopsPaging::First, None)
             .await
             .expect("first page");
         let cursor = {
@@ -4502,7 +4772,7 @@ mod tests {
         };
 
         let page2 = store
-            .list_open_workshops(OpenWorkshopsPaging::After(cursor.clone()))
+            .list_open_workshops(OpenWorkshopsPaging::After(cursor.clone()), None)
             .await
             .expect("after page");
 
@@ -4524,7 +4794,7 @@ mod tests {
             }
         };
         let page3 = store
-            .list_open_workshops(OpenWorkshopsPaging::After(cursor3))
+            .list_open_workshops(OpenWorkshopsPaging::After(cursor3), None)
             .await
             .expect("page 3");
         assert_eq!(page3.rows.len(), OPEN_WORKSHOPS_PAGE_SIZE);
@@ -4540,33 +4810,42 @@ mod tests {
         // Walk forward to page 3, then Prev back: the returned slice must
         // match page 2 exactly.
         let page1 = store
-            .list_open_workshops(OpenWorkshopsPaging::First)
+            .list_open_workshops(OpenWorkshopsPaging::First, None)
             .await
             .expect("page 1");
         let p1_last = page1.rows.last().unwrap();
         let page2 = store
-            .list_open_workshops(OpenWorkshopsPaging::After(OpenWorkshopCursor {
-                created_at: p1_last.created_at.clone(),
-                session_code: p1_last.session_code.clone(),
-            }))
+            .list_open_workshops(
+                OpenWorkshopsPaging::After(OpenWorkshopCursor {
+                    created_at: p1_last.created_at.clone(),
+                    session_code: p1_last.session_code.clone(),
+                }),
+                None,
+            )
             .await
             .expect("page 2");
         let p2_last = page2.rows.last().unwrap();
         let page3 = store
-            .list_open_workshops(OpenWorkshopsPaging::After(OpenWorkshopCursor {
-                created_at: p2_last.created_at.clone(),
-                session_code: p2_last.session_code.clone(),
-            }))
+            .list_open_workshops(
+                OpenWorkshopsPaging::After(OpenWorkshopCursor {
+                    created_at: p2_last.created_at.clone(),
+                    session_code: p2_last.session_code.clone(),
+                }),
+                None,
+            )
             .await
             .expect("page 3");
 
         // Now Prev from page 3's first row.
         let p3_first = page3.rows.first().unwrap();
         let prev = store
-            .list_open_workshops(OpenWorkshopsPaging::Before(OpenWorkshopCursor {
-                created_at: p3_first.created_at.clone(),
-                session_code: p3_first.session_code.clone(),
-            }))
+            .list_open_workshops(
+                OpenWorkshopsPaging::Before(OpenWorkshopCursor {
+                    created_at: p3_first.created_at.clone(),
+                    session_code: p3_first.session_code.clone(),
+                }),
+                None,
+            )
             .await
             .expect("prev page");
 
@@ -4585,7 +4864,7 @@ mod tests {
         store.save_session(&b).await.expect("save b");
 
         let page = store
-            .list_open_workshops(OpenWorkshopsPaging::First)
+            .list_open_workshops(OpenWorkshopsPaging::First, None)
             .await
             .expect("first page");
 
@@ -4607,10 +4886,13 @@ mod tests {
         }
 
         let page = store
-            .list_open_workshops(OpenWorkshopsPaging::After(OpenWorkshopCursor {
-                created_at: "1970-01-01T00:33:20+00:00".to_string(),
-                session_code: "BBBBBB".to_string(),
-            }))
+            .list_open_workshops(
+                OpenWorkshopsPaging::After(OpenWorkshopCursor {
+                    created_at: "1970-01-01T00:33:20+00:00".to_string(),
+                    session_code: "BBBBBB".to_string(),
+                }),
+                None,
+            )
             .await
             .expect("after page");
 
@@ -4629,10 +4911,13 @@ mod tests {
         }
 
         let page = store
-            .list_open_workshops(OpenWorkshopsPaging::Before(OpenWorkshopCursor {
-                created_at: "1970-01-01T00:33:20+00:00".to_string(),
-                session_code: "BBBBBB".to_string(),
-            }))
+            .list_open_workshops(
+                OpenWorkshopsPaging::Before(OpenWorkshopCursor {
+                    created_at: "1970-01-01T00:33:20+00:00".to_string(),
+                    session_code: "BBBBBB".to_string(),
+                }),
+                None,
+            )
             .await
             .expect("before page");
 
@@ -4648,7 +4933,7 @@ mod tests {
         seed_lobbies(&store, OPEN_WORKSHOPS_PAGE_SIZE, 1_000).await;
 
         let page = store
-            .list_open_workshops(OpenWorkshopsPaging::First)
+            .list_open_workshops(OpenWorkshopsPaging::First, None)
             .await
             .expect("first page");
 
@@ -4669,7 +4954,7 @@ mod tests {
         seed_lobbies(&store, OPEN_WORKSHOPS_PAGE_SIZE + 1, 1_000).await;
 
         let page = store
-            .list_open_workshops(OpenWorkshopsPaging::First)
+            .list_open_workshops(OpenWorkshopsPaging::First, None)
             .await
             .expect("first page");
         assert_eq!(page.rows.len(), OPEN_WORKSHOPS_PAGE_SIZE);
@@ -4677,10 +4962,13 @@ mod tests {
 
         let last = page.rows.last().unwrap();
         let next = store
-            .list_open_workshops(OpenWorkshopsPaging::After(OpenWorkshopCursor {
-                created_at: last.created_at.clone(),
-                session_code: last.session_code.clone(),
-            }))
+            .list_open_workshops(
+                OpenWorkshopsPaging::After(OpenWorkshopCursor {
+                    created_at: last.created_at.clone(),
+                    session_code: last.session_code.clone(),
+                }),
+                None,
+            )
             .await
             .expect("after page");
         assert_eq!(next.rows.len(), 1);
@@ -4688,32 +4976,69 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_open_workshops_excludes_non_lobby_sessions() {
-        // Regression lock: a typo in the phase filter would silently return
-        // Playing/Finished sessions in the open-workshops feed.
+    async fn list_open_workshops_includes_in_progress_sessions_for_participants_only() {
+        // In-progress workshops are resumable for existing participants but
+        // must stay hidden from unrelated accounts.
         let store = InMemorySessionStore::new();
-        // 3 lobby sessions at ts 1000..1003.
+        let viewer_account_id = "viewer-account".to_string();
+        // 3 lobby sessions at ts 1000..1003 remain public.
         for i in 0..3 {
             let code = format!("LBBY{:02}", i);
             let session = lobby_session_at(&code, 1_000 + i);
             store.save_session(&session).await.expect("save lobby");
         }
-        // 2 non-lobby sessions at later ts (so they would sort first if
-        // erroneously included).
-        for i in 0..2 {
-            let code = format!("PLAY{:02}", i);
-            let mut session = lobby_session_at(&code, 2_000 + i);
-            session.phase = Phase::Phase1;
-            store.save_session(&session).await.expect("save non-lobby");
-        }
+
+        let mut visible = lobby_session_at("PLAY01", 2_000);
+        visible.phase = Phase::Voting;
+        let participant = SessionPlayer {
+            id: "viewer-player".to_string(),
+            name: "Viewer".to_string(),
+            account_id: Some(viewer_account_id.clone()),
+            character_id: None,
+            selected_character: None,
+            is_host: true,
+            is_connected: false,
+            is_ready: true,
+            score: 0,
+            current_dragon_id: None,
+            achievements: Vec::new(),
+            joined_at: visible.created_at,
+        };
+        visible.add_player(participant.clone());
+        visible.owner_account_id = participant.account_id.clone();
+        store.save_session(&visible).await.expect("save resumable");
+
+        let mut hidden = lobby_session_at("PLAY02", 2_001);
+        hidden.phase = Phase::Phase1;
+        let participant = SessionPlayer {
+            id: "foreign-player".to_string(),
+            name: "Foreign".to_string(),
+            account_id: Some("foreign-account".to_string()),
+            character_id: None,
+            selected_character: None,
+            is_host: true,
+            is_connected: false,
+            is_ready: true,
+            score: 0,
+            current_dragon_id: None,
+            achievements: Vec::new(),
+            joined_at: hidden.created_at,
+        };
+        hidden.add_player(participant);
+        hidden.owner_account_id = Some("foreign-account".to_string());
+        store
+            .save_session(&hidden)
+            .await
+            .expect("save foreign resumable");
 
         let page = store
-            .list_open_workshops(OpenWorkshopsPaging::First)
+            .list_open_workshops(OpenWorkshopsPaging::First, Some(viewer_account_id))
             .await
             .expect("first page");
-        assert_eq!(page.rows.len(), 3);
-        for row in &page.rows {
-            assert!(row.session_code.starts_with("LBBY"));
-        }
+        assert_eq!(page.rows.len(), 4);
+        assert_eq!(page.rows[0].session_code, "PLAY01");
+        assert!(page.rows[0].resumable);
+        assert!(!page.rows[0].archived);
+        assert!(!page.rows.iter().any(|row| row.session_code == "PLAY02"));
     }
 }
