@@ -26,10 +26,11 @@ use protocol::{
     SPRITE_ATELIER_FALLBACK_NOTICE_MESSAGE, SPRITE_ATELIER_NOTICE_TITLE,
     SPRITE_ATELIER_QUEUED_NOTICE_MESSAGE, SelectCharacterRequest, SessionArtifactKind,
     SessionArtifactRecord, SessionCommand, SessionNoticeCode, SpriteSheetRequest,
-    SpriteSheetResult, SpriteSheetSuccess, UpdateCharacterRequest, VotePayload,
-    WorkshopCommandRequest, WorkshopCommandResult, WorkshopCommandSuccess, WorkshopCreateResult,
-    WorkshopCreateSuccess, WorkshopError, WorkshopJoinResult, WorkshopJoinSuccess,
-    WorkshopJudgeBundleRequest, WorkshopJudgeBundleResult, WorkshopJudgeBundleSuccess,
+    SpriteSheetResult, SpriteSheetSuccess, UpdateCharacterRequest, UpdateWorkshopRequest,
+    VotePayload, WorkshopCommandRequest, WorkshopCommandResult, WorkshopCommandSuccess,
+    WorkshopCreateResult, WorkshopCreateSuccess, WorkshopError, WorkshopJoinResult,
+    WorkshopJoinSuccess, WorkshopJudgeBundleRequest, WorkshopJudgeBundleResult,
+    WorkshopJudgeBundleSuccess,
 };
 use security::{FixedWindowRateLimiter, OriginPolicy};
 use serde_json::json;
@@ -1109,7 +1110,7 @@ pub(crate) async fn join_workshop(
             };
             player.is_connected = true;
             session.ensure_host_assigned(true);
-            session.updated_at = timestamp;
+            session.touch();
             (session_before, session.clone())
         };
 
@@ -1275,7 +1276,7 @@ pub(crate) async fn join_workshop(
                 player.is_ready = true;
             }
             session.ensure_host_assigned(true);
-            session.updated_at = timestamp;
+            session.touch();
             (session_before, session.clone(), reconnect_token, timestamp)
         };
 
@@ -1568,7 +1569,7 @@ pub(crate) async fn workshop_command(
         return internal_command_error(format!("lost session lease before command load: {error}"));
     }
 
-    match reload_cached_session(&state, session_code).await {
+    match ensure_session_cached(&state, session_code).await {
         Ok(true) => {}
         Ok(false) => return bad_command_request("Workshop not found."),
         Err(error) => return internal_command_error(format!("failed to load session: {error}")),
@@ -3748,6 +3749,134 @@ pub(crate) async fn delete_workshop(
     }
 }
 
+/// `PATCH /api/workshops/:code` — update phase settings for an owned empty lobby workshop.
+pub(crate) async fn update_workshop(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    session: AccountSession,
+    Path(session_code): Path<String>,
+    Json(request): Json<UpdateWorkshopRequest>,
+) -> Response {
+    if let Some((status, payload)) = reject_disallowed_origin(&headers, &state.config.origin_policy)
+    {
+        let error = match payload.0 {
+            WorkshopJoinResult::Success(_) => "Origin is not allowed.".to_string(),
+            WorkshopJoinResult::Error(error) => error.error,
+        };
+        return (status, Json(json!({ "error": error }))).into_response();
+    }
+
+    let defaults = protocol::WorkshopCreateConfig::default();
+    let phase1_minutes = request.phase1_minutes.unwrap_or(defaults.phase1_minutes);
+    let phase2_minutes = request.phase2_minutes.unwrap_or(defaults.phase2_minutes);
+    if phase1_minutes == 0 || phase2_minutes == 0 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "phase lengths must be at least 1 minute" })),
+        )
+            .into_response();
+    }
+
+    let (_, _write_guard, write_lease) =
+        match SessionWriteLease::acquire(&state, &session_code).await {
+            Ok(guard) => guard,
+            Err(error) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "error": format!("failed to acquire session lease: {error}") })),
+                )
+                    .into_response();
+            }
+        };
+    if let Err(error) = write_lease.ensure_active() {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("lost session lease before update: {error}") })),
+        )
+            .into_response();
+    }
+
+    match reload_cached_session(&state, &session_code).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": "Workshop not found, already started, not empty, or not owned by your account." })),
+            )
+                .into_response();
+        }
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(
+                    json!({ "error": format!("failed to reload session before update: {error}") }),
+                ),
+            )
+                .into_response();
+        }
+    }
+    if let Err(error) = write_lease.ensure_active() {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("lost session lease before update mutate: {error}") })),
+        )
+            .into_response();
+    }
+
+    let (session_before, session_clone) = {
+        let mut sessions = state.sessions.lock().await;
+        let Some(workshop) = sessions.get_mut(&session_code) else {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": "Workshop not found, already started, not empty, or not owned by your account." })),
+            )
+                .into_response();
+        };
+        let owner_matches = workshop.owner_account_id.as_deref()
+            == Some(session.account.id.as_str())
+            || workshop.reserved_host_account_id.as_deref() == Some(session.account.id.as_str());
+        let can_update = workshop.phase == protocol::Phase::Lobby
+            && workshop.players.is_empty()
+            && owner_matches;
+        if !can_update {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": "Workshop not found, already started, not empty, or not owned by your account." })),
+            )
+                .into_response();
+        }
+
+        let session_before = workshop.clone();
+        workshop.config.phase1_minutes = phase1_minutes;
+        workshop.config.phase2_minutes = phase2_minutes;
+        workshop.touch();
+        (session_before, workshop.clone())
+    };
+
+    if let Err(error) = write_lease.ensure_active() {
+        let mut sessions = state.sessions.lock().await;
+        sessions.insert(session_code.clone(), session_before);
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("lost session lease before update persist: {error}") })),
+        )
+            .into_response();
+    }
+
+    if let Err(error) = state.store.save_session(&session_clone).await {
+        let mut sessions = state.sessions.lock().await;
+        sessions.insert(session_code.clone(), session_before);
+        tracing::error!(%error, %session_code, "save_session failed during workshop update");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "internal error" })),
+        )
+            .into_response();
+    }
+
+    (StatusCode::OK, Json(json!({ "ok": true }))).into_response()
+}
+
 // ---------------------------------------------------------------------------
 // Open workshops list (C2-b)
 // ---------------------------------------------------------------------------
@@ -3900,6 +4029,8 @@ pub(crate) async fn list_open_workshops(
             host_name: r.host_name,
             player_count: r.player_count,
             created_at: r.created_at,
+            phase1_minutes: r.phase1_minutes,
+            phase2_minutes: r.phase2_minutes,
             archived: r.archived,
             can_delete: !r.archived
                 && !r.resumable

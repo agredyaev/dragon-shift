@@ -207,6 +207,8 @@ pub struct WorkshopSession {
     pub voting: Option<VotingState>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    #[serde(default)]
+    pub state_revision: u64,
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -268,6 +270,7 @@ impl WorkshopSession {
             voting: None,
             created_at,
             updated_at: created_at,
+            state_revision: 0,
         }
     }
 
@@ -1393,8 +1396,9 @@ impl WorkshopSession {
         }
     }
 
-    fn touch(&mut self) {
+    pub fn touch(&mut self) {
         self.updated_at = Utc::now();
+        self.state_revision = self.state_revision.saturating_add(1);
     }
 
     pub fn record_discovery_observation(&mut self, player_id: &str, text: impl Into<String>) {

@@ -281,6 +281,7 @@ pub(crate) fn to_client_game_state(
             code: session.code.0.clone(),
             created_at: session.created_at.to_rfc3339(),
             updated_at: session.updated_at.to_rfc3339(),
+            state_revision: session.state_revision,
             phase_started_at: session.phase_started_at.to_rfc3339(),
             host_player_id: session.host_player_id.clone(),
             settings: create_session_settings(&session.config),

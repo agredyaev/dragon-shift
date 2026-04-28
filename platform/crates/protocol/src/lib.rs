@@ -322,6 +322,8 @@ pub struct SessionMeta {
     pub code: String,
     pub created_at: String,
     pub updated_at: String,
+    #[serde(default)]
+    pub state_revision: u64,
     pub phase_started_at: String,
     pub host_player_id: Option<String>,
     pub settings: SessionSettings,
@@ -421,17 +423,32 @@ pub struct ClientSessionSnapshot {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkshopCreateConfig {
+    #[serde(default = "default_phase0_minutes")]
     pub phase0_minutes: u32,
+    #[serde(default = "default_phase1_minutes")]
     pub phase1_minutes: u32,
+    #[serde(default = "default_phase2_minutes")]
     pub phase2_minutes: u32,
+}
+
+fn default_phase0_minutes() -> u32 {
+    8
+}
+
+fn default_phase1_minutes() -> u32 {
+    8
+}
+
+fn default_phase2_minutes() -> u32 {
+    5
 }
 
 impl Default for WorkshopCreateConfig {
     fn default() -> Self {
         Self {
-            phase0_minutes: 8,
-            phase1_minutes: 8,
-            phase2_minutes: 5,
+            phase0_minutes: default_phase0_minutes(),
+            phase1_minutes: default_phase1_minutes(),
+            phase2_minutes: default_phase2_minutes(),
         }
     }
 }
@@ -1028,6 +1045,15 @@ pub struct UpdateCharacterRequest {
     pub name: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateWorkshopRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase1_minutes: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase2_minutes: Option<u32>,
+}
+
 /// Request body for `POST /api/characters/preview-sprites`.
 ///
 /// Account-scoped sprite-sheet preview. Unlike the workshop-scoped
@@ -1071,6 +1097,10 @@ pub struct OpenWorkshopSummary {
     pub host_name: String,
     pub player_count: u32,
     pub created_at: String,
+    #[serde(default = "default_phase1_minutes")]
+    pub phase1_minutes: u32,
+    #[serde(default = "default_phase2_minutes")]
+    pub phase2_minutes: u32,
     #[serde(default)]
     pub archived: bool,
     #[serde(default)]

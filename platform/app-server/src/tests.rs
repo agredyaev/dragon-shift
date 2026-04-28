@@ -26,8 +26,9 @@ use persistence::{
 use protocol::{
     ClientWsMessage, CoordinatorType, DragonStats, JoinWorkshopRequest, LlmJudgeResult,
     LlmProviderKind, NoticeLevel, ServerWsMessage, SessionArtifactKind, SessionArtifactRecord,
-    SessionCommand, SessionEnvelope, SpriteSheetResult, WorkshopCommandRequest,
-    WorkshopCommandResult, WorkshopCreateResult, WorkshopJoinResult, WorkshopJudgeBundleResult,
+    SessionCommand, SessionEnvelope, SpriteSheetResult, UpdateWorkshopRequest,
+    WorkshopCommandRequest, WorkshopCommandResult, WorkshopCreateResult, WorkshopJoinResult,
+    WorkshopJudgeBundleResult,
 };
 use security::{DEFAULT_RUST_SESSION_CODE_PREFIX, OriginPolicyOptions, create_origin_policy};
 use sqlx::PgPool;
@@ -3656,6 +3657,58 @@ async fn create_workshop_lobby_endpoint_creates_empty_reserved_lobby() {
 }
 
 #[tokio::test]
+async fn create_workshop_lobby_endpoint_applies_custom_phase_config() {
+    let state = test_state();
+    let app = build_app(state.clone());
+    let cookie = test_auth_cookie(&app, "Alice").await;
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops/lobby")
+                .header("content-type", "application/json")
+                .header(axum::http::header::COOKIE, &cookie)
+                .body(Body::from(
+                    serde_json::json!({
+                        "config": {
+                            "phase1Minutes": 2,
+                            "phase2Minutes": 3
+                        }
+                    })
+                    .to_string(),
+                ))
+                .expect("build create lobby request"),
+        )
+        .await
+        .expect("call create workshop lobby");
+
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read create lobby body");
+    let result: WorkshopCreateResult =
+        serde_json::from_slice(&body).expect("parse create lobby result");
+    let success = match result {
+        WorkshopCreateResult::Success(success) => success,
+        WorkshopCreateResult::Error(error) => {
+            panic!("expected create lobby success, got error: {}", error.error)
+        }
+    };
+
+    let session = state
+        .store
+        .load_session_by_code(&success.session_code)
+        .await
+        .expect("load created lobby")
+        .expect("created lobby exists");
+    assert_eq!(session.config.phase0_minutes, 8);
+    assert_eq!(session.config.phase1_minutes, 2);
+    assert_eq!(session.config.phase2_minutes, 3);
+}
+
+#[tokio::test]
 async fn create_workshop_lobby_appears_in_open_workshops_with_zero_players() {
     let state = test_state();
     let app = build_app(state.clone());
@@ -3695,7 +3748,111 @@ async fn create_workshop_lobby_appears_in_open_workshops_with_zero_players() {
         .expect("created lobby appears in open workshops");
     assert_eq!(created["hostName"].as_str(), Some("Alice"));
     assert_eq!(created["playerCount"].as_u64(), Some(0));
+    assert_eq!(created["phase1Minutes"].as_u64(), Some(10));
+    assert_eq!(created["phase2Minutes"].as_u64(), Some(10));
     assert_eq!(created["canDelete"].as_bool(), Some(true));
+}
+
+#[tokio::test]
+async fn update_workshop_updates_owned_empty_reserved_lobby_config() {
+    let state = test_state();
+    let app = build_app(state.clone());
+    let cookie = test_auth_cookie(&app, "Alice").await;
+
+    let session_code = create_test_workshop_lobby(&app, &cookie).await;
+
+    let update_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri(format!("/api/workshops/{session_code}"))
+                .header("content-type", "application/json")
+                .header(axum::http::header::COOKIE, &cookie)
+                .body(Body::from(
+                    serde_json::to_string(&UpdateWorkshopRequest {
+                        phase1_minutes: Some(2),
+                        phase2_minutes: Some(3),
+                    })
+                    .expect("encode update workshop request"),
+                ))
+                .expect("build update workshop request"),
+        )
+        .await
+        .expect("update workshop response");
+    assert_eq!(update_response.status(), StatusCode::OK);
+
+    let session = state
+        .store
+        .load_session_by_code(&session_code)
+        .await
+        .expect("load updated session")
+        .expect("updated session exists");
+    assert_eq!(session.config.phase1_minutes, 2);
+    assert_eq!(session.config.phase2_minutes, 3);
+
+    let (status, value) = get_open_workshops_json(&app, &cookie, "").await;
+    assert_eq!(status, StatusCode::OK);
+    let created = value["workshops"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["sessionCode"].as_str() == Some(session_code.as_str()))
+        .expect("updated lobby appears in open workshops");
+    assert_eq!(created["phase1Minutes"].as_u64(), Some(2));
+    assert_eq!(created["phase2Minutes"].as_u64(), Some(3));
+}
+
+#[tokio::test]
+async fn update_workshop_rejects_owner_after_owner_joins_lobby() {
+    let state = test_state();
+    let app = build_app(state.clone());
+    let cookie = test_auth_cookie(&app, "Alice").await;
+
+    let session_code = create_test_workshop_lobby(&app, &cookie).await;
+
+    let join_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops/join")
+                .header("content-type", "application/json")
+                .header(axum::http::header::COOKIE, &cookie)
+                .body(Body::from(
+                    serde_json::json!({
+                        "sessionCode": session_code,
+                        "characterId": null,
+                        "reconnectToken": null
+                    })
+                    .to_string(),
+                ))
+                .expect("build join request"),
+        )
+        .await
+        .expect("join workshop response");
+    assert_eq!(join_response.status(), StatusCode::OK);
+
+    let update_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri(format!("/api/workshops/{session_code}"))
+                .header("content-type", "application/json")
+                .header(axum::http::header::COOKIE, &cookie)
+                .body(Body::from(
+                    serde_json::to_string(&UpdateWorkshopRequest {
+                        phase1_minutes: Some(2),
+                        phase2_minutes: Some(3),
+                    })
+                    .expect("encode update workshop request"),
+                ))
+                .expect("build update workshop request"),
+        )
+        .await
+        .expect("update workshop response");
+    assert_eq!(update_response.status(), StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
@@ -9500,6 +9657,7 @@ async fn advance_game_ticks_updates_cached_session_without_persisting_each_tick(
         .unwrap();
 
     let original_time = session.time;
+    let original_revision = session.state_revision;
     state
         .store
         .save_session(&session)
@@ -9520,6 +9678,13 @@ async fn advance_game_ticks_updates_cached_session_without_persisting_each_tick(
     let updated = cached.get("955555").expect("cached session after tick");
     assert_eq!(updated.phase, protocol::Phase::Phase1);
     assert_eq!(updated.time, (original_time + 1) % 48);
+    assert_eq!(updated.state_revision, original_revision + 1);
+    assert_eq!(
+        to_client_game_state(updated, "player-1")
+            .session
+            .state_revision,
+        updated.state_revision
+    );
     assert_eq!(
         store.save_session_calls(),
         baseline_save_calls,
@@ -9543,6 +9708,124 @@ async fn advance_game_ticks_updates_cached_session_without_persisting_each_tick(
         store.save_session_calls(),
         before_persist + 1,
         "multiple-of-5 ticks must persist so command-handler reloads pick up decayed stats"
+    );
+}
+
+#[tokio::test]
+async fn workshop_command_preserves_cached_tick_state_before_tick_persist() {
+    let store = Arc::new(FaultyStore::new());
+    let state = test_state_with_store(store.clone());
+    let session_code = "955557";
+    let player_id = "player-1".to_string();
+    let reconnect_token = "token-1".to_string();
+    let timestamp = Utc::now();
+
+    let mut session = WorkshopSession::new(
+        Uuid::new_v4(),
+        SessionCode(session_code.into()),
+        timestamp,
+        protocol::WorkshopCreateConfig::default(),
+    );
+    let mut host = session_player_with_state(&player_id, "Alice", timestamp, true, true);
+    host.character_id = Some("character-1".into());
+    host.selected_character = Some(test_character_profile(
+        "character-1",
+        "Coral dragon",
+        protocol::SpriteSet {
+            neutral: "neutral_b64".into(),
+            happy: "happy_b64".into(),
+            angry: "angry_b64".into(),
+            sleepy: "sleepy_b64".into(),
+        },
+        1,
+    ));
+    host.is_ready = true;
+    session.add_player(host);
+    session
+        .begin_phase1(&[domain::Phase1Assignment {
+            player_id: player_id.clone(),
+            dragon_id: "dragon-1".into(),
+        }])
+        .expect("begin phase1");
+    {
+        let dragon = session.dragons.get_mut("dragon-1").expect("dragon-1");
+        dragon.active_time = protocol::ActiveTime::Day;
+        dragon.favorite_food = protocol::FoodType::Meat;
+        dragon.sleep_rate = 1;
+        dragon.hunger = 80;
+        dragon.energy = 80;
+        dragon.happiness = 80;
+    }
+
+    store
+        .inner
+        .save_session(&session)
+        .await
+        .expect("persist initial session");
+    store
+        .inner
+        .create_player_identity(&persistence::PlayerIdentity {
+            session_id: session.id.to_string(),
+            player_id: player_id.clone(),
+            reconnect_token: reconnect_token.clone(),
+            created_at: timestamp.to_rfc3339(),
+            last_seen_at: timestamp.to_rfc3339(),
+        })
+        .await
+        .expect("seed identity");
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(session_code.to_string(), session);
+
+    advance_game_ticks(&state).await;
+    {
+        let sessions = state.sessions.lock().await;
+        let cached = sessions
+            .get(session_code)
+            .expect("cached session after tick");
+        let dragon = cached.dragons.get("dragon-1").expect("dragon-1");
+        assert_eq!(cached.time, 17);
+        assert_eq!(dragon.hunger, 79);
+        assert_eq!(dragon.happiness, 79);
+    }
+
+    let app = build_app(state.clone());
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops/command")
+                .header("origin", "http://localhost:5173")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&WorkshopCommandRequest {
+                        session_code: session_code.to_string(),
+                        reconnect_token,
+                        coordinator_type: Some(CoordinatorType::Rust),
+                        command: SessionCommand::Action,
+                        payload: Some(serde_json::json!({"type": "feed", "value": "meat"})),
+                    })
+                    .expect("encode command request"),
+                ))
+                .expect("build command request"),
+        )
+        .await
+        .expect("call command endpoint");
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let sessions = state.sessions.lock().await;
+    let cached = sessions
+        .get(session_code)
+        .expect("cached session after command");
+    let dragon = cached.dragons.get("dragon-1").expect("dragon-1");
+    assert_eq!(cached.time, 17, "command must not reload stale DB time");
+    assert_eq!(dragon.hunger, 100);
+    assert_eq!(
+        dragon.happiness, 99,
+        "action must apply on tick-decayed stats"
     );
 }
 
@@ -9591,6 +9874,73 @@ async fn advance_overdue_phases_moves_handover_to_phase2_with_fallback_tags() {
     assert_eq!(session.phase, protocol::Phase::Phase2);
     let dragon = session.dragons.get("dragon-1").expect("dragon-1");
     assert_eq!(dragon.handover_tags.len(), domain::HANDOVER_TAG_COUNT);
+}
+
+#[tokio::test]
+async fn advance_overdue_phases_preserves_cached_phase1_revision_before_tick_persist() {
+    let store = Arc::new(FaultyStore::new());
+    let state = test_state_with_store(store.clone());
+    let mut session = WorkshopSession::new(
+        Uuid::new_v4(),
+        SessionCode("955558".into()),
+        Utc::now(),
+        protocol::WorkshopCreateConfig {
+            phase0_minutes: 1,
+            phase1_minutes: 1,
+            phase2_minutes: 1,
+        },
+    );
+    session.add_player(session_player("player-1", "Alice", 1));
+    seed_selected_characters_on_session(&mut session);
+    session
+        .begin_phase1(&[domain::Phase1Assignment {
+            player_id: "player-1".into(),
+            dragon_id: "dragon-1".into(),
+        }])
+        .expect("start phase1");
+
+    state
+        .store
+        .save_session(&session)
+        .await
+        .expect("persist initial phase1 session");
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(session.code.0.clone(), session);
+
+    advance_game_ticks(&state).await;
+    let (cached_time, cached_revision) = {
+        let mut sessions = state.sessions.lock().await;
+        let cached = sessions.get_mut("955558").expect("cached session");
+        cached.phase_started_at = Utc::now() - ChronoDuration::seconds(60);
+        (cached.time, cached.state_revision)
+    };
+
+    assert_eq!(
+        store.load_calls(),
+        0,
+        "test setup should not load from store"
+    );
+    advance_overdue_phases(&state).await;
+
+    let sessions = state.sessions.lock().await;
+    let session = sessions.get("955558").expect("cached session");
+    assert_eq!(session.phase, protocol::Phase::Handover);
+    assert_eq!(
+        session.time, cached_time,
+        "auto-advance must not reload stale DB time"
+    );
+    assert_eq!(
+        store.load_calls(),
+        0,
+        "auto-advance must use cached active state"
+    );
+    assert!(
+        session.state_revision > cached_revision,
+        "auto-advance must keep revision monotonic after unpersisted ticks"
+    );
 }
 
 #[tokio::test]

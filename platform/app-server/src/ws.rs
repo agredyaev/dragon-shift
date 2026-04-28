@@ -19,7 +19,9 @@ use tracing::info;
 
 use crate::app::AppState;
 use crate::auth::SESSION_COOKIE_NAME;
-use crate::cache::{SessionWriteLease, ensure_session_cached, reload_cached_session};
+use crate::cache::{
+    SessionWriteLease, ensure_session_cached, reload_cached_session, session_write_lock,
+};
 use crate::helpers::{phase_label, phase_step, random_prefixed_id, to_client_game_state};
 use crate::http::{
     MaybeConnectInfo, authorize_reconnect_identity, client_key, is_rate_limited,
@@ -104,7 +106,7 @@ async fn advance_overdue_phase(
     write_lease
         .ensure_active()
         .map_err(|error| format!("lost session lease before auto-advance load: {error}"))?;
-    if !reload_cached_session(state, session_code).await? {
+    if !ensure_session_cached(state, session_code).await? {
         return Ok(());
     }
     write_lease
@@ -837,7 +839,7 @@ pub(crate) async fn sync_ws_disconnect(state: &AppState, connection_id: &str) {
                     player.is_connected = false;
                 }
                 session.ensure_host_assigned(true);
-                session.updated_at = timestamp;
+                session.touch();
                 Some((session_before, session.clone(), step))
             }
             None => None,
@@ -994,7 +996,7 @@ async fn attach_ws_session(
                 .expect("player checked above")
                 .is_connected = true;
             session.ensure_host_assigned(true);
-            session.updated_at = Utc::now();
+            session.touch();
             reconnect_artifact = Some(SessionArtifactRecord {
                 id: random_prefixed_id("artifact"),
                 session_id: session.id.to_string(),
@@ -1242,6 +1244,8 @@ pub(crate) async fn advance_game_ticks(state: &AppState) {
     };
 
     for session_code in session_codes {
+        let write_lock = session_write_lock(state, &session_code).await;
+        let _write_guard = write_lock.lock().await;
         let session_snapshot = {
             let mut sessions = state.sessions.lock().await;
             if let Some(session) = sessions.get_mut(&session_code) {
@@ -1262,6 +1266,8 @@ pub(crate) async fn advance_game_ticks(state: &AppState) {
                 }
             }
         }
+
+        drop(_write_guard);
 
         // Broadcast updated state to all connected players
         broadcast_session_state(state, &session_code, None).await;
