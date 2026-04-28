@@ -25,6 +25,9 @@ use crate::state::default_api_base_url;
 const DEFAULT_REQUEST_TIMEOUT_MS: u32 = 10_000;
 
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+const COMMAND_REQUEST_TIMEOUT_MS: u32 = 30_000;
+
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 const SPRITE_PREVIEW_TIMEOUT_MS: u32 = 75_000;
 
 /// Minimal RFC3986 `application/x-www-form-urlencoded` percent-encoder for
@@ -124,8 +127,13 @@ impl AppWebApi {
     }
 
     pub async fn send_command(&self, request: WorkshopCommandRequest) -> Result<(), String> {
-        let payload: WorkshopCommandResult =
-            self.post_json("/api/workshops/command", &request).await?;
+        let payload: WorkshopCommandResult = self
+            .post_json_with_timeout(
+                "/api/workshops/command",
+                &request,
+                COMMAND_REQUEST_TIMEOUT_MS,
+            )
+            .await?;
 
         match payload {
             WorkshopCommandResult::Success(_) => Ok(()),
@@ -785,5 +793,11 @@ mod tests {
             build_ws_url("https://dragon-switch.dev"),
             "wss://dragon-switch.dev/api/workshops/ws"
         );
+    }
+
+    #[test]
+    fn command_request_timeout_allows_longer_workshop_commands() {
+        assert_eq!(DEFAULT_REQUEST_TIMEOUT_MS, 10_000);
+        assert_eq!(COMMAND_REQUEST_TIMEOUT_MS, 30_000);
     }
 }

@@ -431,7 +431,7 @@ impl Default for WorkshopCreateConfig {
         Self {
             phase0_minutes: 8,
             phase1_minutes: 8,
-            phase2_minutes: 8,
+            phase2_minutes: 5,
         }
     }
 }
@@ -1240,6 +1240,14 @@ mod tests {
                 .expect("voting phase")
                 .allowed_commands
                 .contains(&SessionCommand::SubmitVote)
+        );
+        assert_eq!(
+            settings
+                .phases
+                .get(&Phase::Phase2)
+                .expect("phase2 phase")
+                .duration_seconds,
+            5 * 60
         );
     }
 

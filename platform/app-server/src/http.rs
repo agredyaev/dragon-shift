@@ -605,7 +605,7 @@ fn deterministic_local_judge_evaluation(bundle: &JudgeBundle) -> LlmJudgeEvaluat
     }
 }
 
-async fn run_judge_for_session(
+pub(crate) async fn run_judge_for_session(
     state: &AppState,
     session_code: &str,
     actor_player_id: &str,
@@ -1930,7 +1930,12 @@ pub(crate) async fn workshop_command(
                 if session.phase != protocol::Phase::Handover {
                     return conflict_command_request("Phase 2 can only begin from handover.");
                 }
-                if let Err(error) = session.enter_phase2() {
+                let phase2_result = if session.remaining_phase_seconds(Utc::now()) == Some(0) {
+                    session.enter_phase2_after_deadline()
+                } else {
+                    session.enter_phase2()
+                };
+                if let Err(error) = phase2_result {
                     return match error {
                         DomainError::MissingHandoverTags { players } => conflict_command_request(
                             &format!("Still waiting on: {}.", players.join(", ")),

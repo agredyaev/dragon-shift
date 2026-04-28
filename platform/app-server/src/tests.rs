@@ -8,7 +8,7 @@ use crate::{
     http::allocate_session_code,
     llm::{LlmClient, LlmPoolConfig, ResolvedProvider},
     parse_session_update_notification,
-    ws::{advance_game_ticks, emit_phase_warning_notices},
+    ws::{advance_game_ticks, advance_overdue_phases, emit_phase_warning_notices},
 };
 use axum::{
     Router,
@@ -3960,8 +3960,8 @@ async fn create_workshop_endpoint_applies_default_config_when_omitted() {
             .get(&protocol::Phase::Phase2)
             .expect("phase2 settings")
             .duration_seconds,
-        8 * 60,
-        "phase2 should default to 8 minutes",
+        5 * 60,
+        "phase2 should default to 5 minutes",
     );
 }
 
@@ -7723,6 +7723,82 @@ async fn workshop_command_rejects_start_phase2_when_tags_are_missing() {
 }
 
 #[tokio::test]
+async fn workshop_command_starts_phase2_after_handover_deadline_with_missing_tags() {
+    let state = test_state();
+    let app = build_app(state.clone());
+    let cookie = test_auth_cookie(&app, "Alice").await;
+    let create_success = create_workshop_success(&app, &cookie, "Alice").await;
+
+    state
+        .store
+        .claim_realtime_connection(&RealtimeConnectionRegistration {
+            session_code: create_success.session_code.clone(),
+            player_id: create_success.player_id.clone(),
+            connection_id: "conn-host-deadline".to_string(),
+            replica_id: state.replica_id.clone(),
+        })
+        .await
+        .expect("seed host realtime registration");
+
+    send_command_ok(
+        &app,
+        setup_phase1_body(
+            &create_success.session_code,
+            &create_success.reconnect_token,
+        ),
+    )
+    .await;
+    send_command_ok(
+        &app,
+        format!(
+            r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"startHandover"}}"#,
+            create_success.session_code, create_success.reconnect_token
+        ),
+    )
+    .await;
+
+    let expired_session = {
+        let mut sessions = state.sessions.lock().await;
+        let session = sessions
+            .get_mut(&create_success.session_code)
+            .expect("cached session");
+        session.phase_started_at =
+            Utc::now() - ChronoDuration::seconds(i64::from(session.config.phase2_minutes) * 60);
+        session.updated_at = Utc::now();
+        session.clone()
+    };
+    state
+        .store
+        .save_session(&expired_session)
+        .await
+        .expect("persist expired handover session");
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops/command")
+                .header("content-type", "application/json")
+                .body(Body::from(format!(
+                    r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"startPhase2"}}"#,
+                    create_success.session_code, create_success.reconnect_token
+                )))
+                .expect("build command request"),
+        )
+        .await
+        .expect("call command endpoint");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let sessions = state.sessions.lock().await;
+    let session = sessions
+        .get(&create_success.session_code)
+        .expect("session exists");
+    assert_eq!(session.phase, protocol::Phase::Phase2);
+    let dragon = session.dragons.values().next().expect("dragon exists");
+    assert_eq!(dragon.handover_tags.len(), domain::HANDOVER_TAG_COUNT);
+}
+
+#[tokio::test]
 async fn workshop_command_starts_phase2_when_handover_is_complete() {
     let state = test_state();
     let app = build_app(state.clone());
@@ -9468,6 +9544,103 @@ async fn advance_game_ticks_updates_cached_session_without_persisting_each_tick(
         before_persist + 1,
         "multiple-of-5 ticks must persist so command-handler reloads pick up decayed stats"
     );
+}
+
+#[tokio::test]
+async fn advance_overdue_phases_moves_handover_to_phase2_with_fallback_tags() {
+    let state = test_state();
+    let mut session = WorkshopSession::new(
+        Uuid::new_v4(),
+        SessionCode("955556".into()),
+        Utc::now(),
+        protocol::WorkshopCreateConfig {
+            phase0_minutes: 1,
+            phase1_minutes: 1,
+            phase2_minutes: 1,
+        },
+    );
+    session.add_player(session_player("player-1", "Alice", 1));
+    seed_selected_characters_on_session(&mut session);
+    session
+        .begin_phase1(&[domain::Phase1Assignment {
+            player_id: "player-1".into(),
+            dragon_id: "dragon-1".into(),
+        }])
+        .expect("start phase1");
+    session
+        .transition_to(protocol::Phase::Handover)
+        .expect("to handover");
+    session.phase_started_at = Utc::now() - ChronoDuration::seconds(60);
+    session.updated_at = Utc::now();
+
+    state
+        .store
+        .save_session(&session)
+        .await
+        .expect("persist session");
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(session.code.0.clone(), session);
+
+    advance_overdue_phases(&state).await;
+
+    let sessions = state.sessions.lock().await;
+    let session = sessions.get("955556").expect("cached session");
+    assert_eq!(session.phase, protocol::Phase::Phase2);
+    let dragon = session.dragons.get("dragon-1").expect("dragon-1");
+    assert_eq!(dragon.handover_tags.len(), domain::HANDOVER_TAG_COUNT);
+}
+
+#[tokio::test]
+async fn advance_overdue_phases_moves_phase2_to_voting() {
+    let state = test_state();
+    let mut session = WorkshopSession::new(
+        Uuid::new_v4(),
+        SessionCode("955557".into()),
+        Utc::now(),
+        protocol::WorkshopCreateConfig {
+            phase0_minutes: 1,
+            phase1_minutes: 1,
+            phase2_minutes: 1,
+        },
+    );
+    session.add_player(session_player("player-1", "Alice", 1));
+    seed_selected_characters_on_session(&mut session);
+    session
+        .begin_phase1(&[domain::Phase1Assignment {
+            player_id: "player-1".into(),
+            dragon_id: "dragon-1".into(),
+        }])
+        .expect("start phase1");
+    session
+        .transition_to(protocol::Phase::Handover)
+        .expect("to handover");
+    session
+        .save_handover_tags("player-1", vec!["a".into(), "b".into(), "c".into()])
+        .expect("save tags");
+    session.enter_phase2().expect("enter phase2");
+    session.phase_started_at = Utc::now() - ChronoDuration::seconds(60);
+    session.updated_at = Utc::now();
+
+    state
+        .store
+        .save_session(&session)
+        .await
+        .expect("persist session");
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(session.code.0.clone(), session);
+
+    advance_overdue_phases(&state).await;
+
+    let sessions = state.sessions.lock().await;
+    let session = sessions.get("955557").expect("cached session");
+    assert_eq!(session.phase, protocol::Phase::Voting);
+    assert!(session.voting.is_some());
 }
 
 #[tokio::test]

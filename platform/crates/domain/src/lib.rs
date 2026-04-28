@@ -515,6 +515,17 @@ impl WorkshopSession {
     }
 
     pub fn enter_phase2(&mut self) -> Result<Phase2TransitionResult, DomainError> {
+        self.enter_phase2_with_missing_handover(false)
+    }
+
+    pub fn enter_phase2_after_deadline(&mut self) -> Result<Phase2TransitionResult, DomainError> {
+        self.enter_phase2_with_missing_handover(true)
+    }
+
+    fn enter_phase2_with_missing_handover(
+        &mut self,
+        allow_missing_handover: bool,
+    ) -> Result<Phase2TransitionResult, DomainError> {
         let mut auto_filled_players = Vec::new();
         for player in self.players.values() {
             let Some(dragon_id) = player.current_dragon_id.clone() else {
@@ -523,7 +534,9 @@ impl WorkshopSession {
             let Some(dragon) = self.dragons.get_mut(&dragon_id) else {
                 continue;
             };
-            if !player.is_connected && dragon.handover_tags.len() < HANDOVER_TAG_COUNT {
+            if (!player.is_connected || allow_missing_handover)
+                && dragon.handover_tags.len() < HANDOVER_TAG_COUNT
+            {
                 dragon.handover_tags = fallback_handover_tags();
                 auto_filled_players.push(player.name.clone());
             }
@@ -535,7 +548,10 @@ impl WorkshopSession {
             .filter_map(|player| {
                 let dragon_id = player.current_dragon_id.as_ref()?;
                 let dragon = self.dragons.get(dragon_id)?;
-                if player.is_connected && dragon.handover_tags.len() < HANDOVER_TAG_COUNT {
+                if player.is_connected
+                    && !allow_missing_handover
+                    && dragon.handover_tags.len() < HANDOVER_TAG_COUNT
+                {
                     Some(player.name.clone())
                 } else {
                     None
@@ -1426,7 +1442,7 @@ pub fn can_transition(current: Phase, next: Phase) -> bool {
 
 fn fallback_handover_tags() -> Vec<String> {
     let tags = vec![
-        "Auto handover: teammate went offline before finishing notes.".to_string(),
+        "Auto handover: notes were not finished before the deadline.".to_string(),
         "Start with safe observations and watch how the dragon reacts.".to_string(),
         "Pay attention to food and play preferences — they stay the same.".to_string(),
     ];
@@ -2046,6 +2062,34 @@ mod tests {
             })
         );
         assert_eq!(session.phase, Phase::Handover);
+    }
+
+    #[test]
+    fn enter_phase2_after_deadline_autofills_connected_players_with_missing_tags() {
+        let mut session = WorkshopSession::new(
+            Uuid::new_v4(),
+            SessionCode("123456".into()),
+            ts(1),
+            config(),
+        );
+        session.add_player(player("p1", true, 10));
+
+        session
+            .begin_phase1(&[Phase1Assignment {
+                player_id: "p1".into(),
+                dragon_id: "dragon-a".into(),
+            }])
+            .expect("start phase1");
+        session.transition_to(Phase::Handover).expect("to handover");
+
+        let result = session
+            .enter_phase2_after_deadline()
+            .expect("enter phase2 after deadline");
+
+        assert_eq!(result.auto_filled_players, vec!["player-p1".to_string()]);
+        let dragon = session.dragons.get("dragon-a").expect("dragon-a");
+        assert_eq!(dragon.handover_tags.len(), HANDOVER_TAG_COUNT);
+        assert_eq!(session.phase, Phase::Phase2);
     }
 
     #[test]

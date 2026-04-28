@@ -23,7 +23,7 @@ use crate::cache::{SessionWriteLease, ensure_session_cached, reload_cached_sessi
 use crate::helpers::{phase_label, phase_step, random_prefixed_id, to_client_game_state};
 use crate::http::{
     MaybeConnectInfo, authorize_reconnect_identity, client_key, is_rate_limited,
-    refresh_reconnect_identity,
+    refresh_reconnect_identity, run_judge_for_session,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -73,6 +73,144 @@ pub(crate) async fn emit_phase_warning_notices(state: &AppState) {
         )
         .await;
     }
+}
+
+pub(crate) async fn advance_overdue_phases(state: &AppState) {
+    let now = Utc::now();
+    let session_codes = {
+        let sessions = state.sessions.lock().await;
+        sessions
+            .iter()
+            .filter(|(_, session)| session.remaining_phase_seconds(now) == Some(0))
+            .map(|(code, _)| code.clone())
+            .collect::<Vec<_>>()
+    };
+
+    for session_code in session_codes {
+        if let Err(error) = advance_overdue_phase(state, &session_code, now).await {
+            tracing::warn!(session_code = %session_code, %error, "failed to auto-advance overdue phase");
+        }
+    }
+}
+
+async fn advance_overdue_phase(
+    state: &AppState,
+    session_code: &str,
+    now: chrono::DateTime<Utc>,
+) -> Result<(), String> {
+    let (_, _write_guard, write_lease) = SessionWriteLease::acquire(state, session_code)
+        .await
+        .map_err(|error| format!("failed to acquire session lease: {error}"))?;
+    write_lease
+        .ensure_active()
+        .map_err(|error| format!("lost session lease before auto-advance load: {error}"))?;
+    if !reload_cached_session(state, session_code).await? {
+        return Ok(());
+    }
+    write_lease
+        .ensure_active()
+        .map_err(|error| format!("lost session lease before auto-advance mutation: {error}"))?;
+
+    let (session_before, session_snapshot, artifact, from_phase, host_player_id) = {
+        let mut sessions = state.sessions.lock().await;
+        let Some(session) = sessions.get_mut(session_code) else {
+            return Ok(());
+        };
+        if session.remaining_phase_seconds(now) != Some(0) {
+            return Ok(());
+        }
+
+        let session_before = session.clone();
+        let from_phase = session.phase;
+        match session.phase {
+            protocol::Phase::Phase1 => session
+                .transition_to(protocol::Phase::Handover)
+                .map_err(|error| error.to_string())?,
+            protocol::Phase::Handover => {
+                session
+                    .enter_phase2_after_deadline()
+                    .map_err(|error| error.to_string())?;
+            }
+            protocol::Phase::Phase2 => {
+                session.award_phase_end_achievements();
+                session.enter_voting().map_err(|error| error.to_string())?;
+            }
+            _ => return Ok(()),
+        }
+
+        let session_snapshot = session.clone();
+        let host_player_id = session.host_player_id.clone();
+        let artifact = SessionArtifactRecord {
+            id: random_prefixed_id("artifact"),
+            session_id: session.id.to_string(),
+            phase: session.phase,
+            step: phase_step(session.phase),
+            kind: SessionArtifactKind::PhaseChanged,
+            player_id: None,
+            created_at: Utc::now().to_rfc3339(),
+            payload: json!({
+                "auto": true,
+                "fromPhase": from_phase,
+                "toPhase": session.phase,
+            }),
+        };
+        (
+            session_before,
+            session_snapshot,
+            artifact,
+            from_phase,
+            host_player_id,
+        )
+    };
+
+    if let Err(error) = write_lease.ensure_active() {
+        state
+            .sessions
+            .lock()
+            .await
+            .insert(session_code.to_string(), session_before);
+        return Err(format!(
+            "lost session lease before auto-advance persist: {error}"
+        ));
+    }
+    if let Err(error) = state
+        .store
+        .save_session_with_artifact(&session_snapshot, &artifact)
+        .await
+    {
+        state
+            .sessions
+            .lock()
+            .await
+            .insert(session_code.to_string(), session_before);
+        return Err(format!("failed to persist auto-advanced phase: {error}"));
+    }
+
+    drop(_write_guard);
+    drop(write_lease);
+    broadcast_session_state(state, session_code, None).await;
+    if from_phase == protocol::Phase::Phase2 {
+        let background_state = state.clone();
+        let background_session_code = session_code.to_string();
+        let background_player_id = host_player_id.unwrap_or_else(|| "server".to_string());
+        tokio::spawn(async move {
+            if let Err(error) = run_judge_for_session(
+                &background_state,
+                &background_session_code,
+                &background_player_id,
+            )
+            .await
+            {
+                tracing::error!(
+                    session_code = %background_session_code,
+                    player_id = %background_player_id,
+                    %error,
+                    "background judge run failed after auto phase advance"
+                );
+            }
+        });
+    }
+    Ok(())
 }
 
 async fn broadcast_notice(
@@ -1090,11 +1228,14 @@ async fn send_ws_message(
 
 pub(crate) async fn advance_game_ticks(state: &AppState) {
     let session_codes: Vec<String> = {
+        let now = Utc::now();
         let sessions = state.sessions.lock().await;
         sessions
             .iter()
             .filter(|(_, session)| {
-                session.phase == protocol::Phase::Phase1 || session.phase == protocol::Phase::Phase2
+                (session.phase == protocol::Phase::Phase1
+                    || session.phase == protocol::Phase::Phase2)
+                    && session.remaining_phase_seconds(now) != Some(0)
             })
             .map(|(code, _)| code.clone())
             .collect()
