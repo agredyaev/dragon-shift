@@ -298,6 +298,14 @@ pub fn format_remaining_duration(total_seconds: i32) -> String {
     format!("{minutes:02}:{seconds:02}")
 }
 
+pub fn clock_display_hour(time: i32) -> i32 {
+    time.rem_euclid(48) / 2
+}
+
+pub fn clock_is_daytime(time: i32) -> bool {
+    (12..36).contains(&time.rem_euclid(48))
+}
+
 pub fn current_player(state: &ClientGameState) -> Option<&Player> {
     let player_id = state.current_player_id.as_ref()?;
     state.players.get(player_id)
@@ -1078,6 +1086,7 @@ pub mod tests {
                     code: "123456".to_string(),
                     created_at: "2026-01-01T00:00:00Z".to_string(),
                     updated_at: "2026-01-01T00:00:00Z".to_string(),
+                    state_revision: 0,
                     phase_started_at: "2026-01-01T00:00:00Z".to_string(),
                     host_player_id: Some("player-1".to_string()),
                     settings: create_default_session_settings(),
@@ -2123,5 +2132,21 @@ pub mod tests {
             parse_rfc3339_epoch_seconds(&state.session.phase_started_at).expect("fractional");
 
         assert_eq!(phase_remaining_seconds(&state, started_at + 1), Some(479));
+    }
+
+    #[test]
+    fn clock_display_uses_domain_48_tick_cycle() {
+        assert_eq!(clock_display_hour(16), 8);
+        assert_eq!(clock_display_hour(24), 12);
+        assert_eq!(clock_display_hour(47), 23);
+        assert_eq!(clock_display_hour(48), 0);
+    }
+
+    #[test]
+    fn clock_daytime_uses_domain_day_ticks() {
+        assert!(!clock_is_daytime(11));
+        assert!(clock_is_daytime(12));
+        assert!(clock_is_daytime(35));
+        assert!(!clock_is_daytime(36));
     }
 }

@@ -19,7 +19,7 @@ use components::phase2_view::Phase2View;
 use components::pick_character::PickCharacterView;
 use components::sign_in::SignInView;
 
-use helpers::poke_icon_url;
+use helpers::{clock_display_hour, clock_is_daytime, poke_icon_url};
 use protocol::Phase;
 use realtime::bootstrap_realtime;
 use state::{NoticeScope, ShellScreen, apply_realtime_bootstrap_error, bootstrap_state};
@@ -67,15 +67,12 @@ fn App() -> Element {
     let (current_phase, is_daytime, game_time, is_clock_phase) = {
         let gs = game_state.read();
         match gs.as_ref() {
-            Some(s) => {
-                let t = s.time.rem_euclid(24);
-                (
-                    Some(s.phase),
-                    (6..18).contains(&t),
-                    s.time,
-                    matches!(s.phase, Phase::Phase1 | Phase::Phase2),
-                )
-            }
+            Some(s) => (
+                Some(s.phase),
+                clock_is_daytime(s.time),
+                clock_display_hour(s.time),
+                matches!(s.phase, Phase::Phase1 | Phase::Phase2),
+            ),
             None => (None, false, 0, false),
         }
     };
@@ -90,7 +87,7 @@ fn App() -> Element {
     let is_session_bootstrapping = render_session_panels_first && current_phase.is_none();
     let show_clock = render_session_panels_first && is_clock_phase;
 
-    let time_string = format!("{:02}:00", game_time.rem_euclid(24));
+    let time_string = format!("{game_time:02}:00");
     let clock_icon = if is_daytime { "sun" } else { "moon" };
     let clock_icon_url = poke_icon_url(clock_icon);
 

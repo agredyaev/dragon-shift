@@ -3,9 +3,9 @@ use protocol::{
     CharacterSpritePreviewResponse, ClientSessionSnapshot, CreateCharacterRequest,
     CreateWorkshopRequest, EligibleCharactersResponse, JoinWorkshopRequest, JudgeBundle,
     ListOpenWorkshopsResponse, MyCharactersResponse, SessionCommand, SessionEnvelope,
-    UpdateCharacterRequest, WorkshopCommandRequest, WorkshopCommandResult, WorkshopCreateResult,
-    WorkshopCreateSuccess, WorkshopJoinResult, WorkshopJoinSuccess, WorkshopJudgeBundleRequest,
-    WorkshopJudgeBundleResult,
+    UpdateCharacterRequest, UpdateWorkshopRequest, WorkshopCommandRequest, WorkshopCommandResult,
+    WorkshopCreateResult, WorkshopCreateSuccess, WorkshopJoinResult, WorkshopJoinSuccess,
+    WorkshopJudgeBundleRequest, WorkshopJudgeBundleResult,
 };
 
 use serde::de::DeserializeOwned;
@@ -92,13 +92,16 @@ impl AppWebApi {
         )
     }
 
-    pub async fn create_workshop_lobby(&self) -> Result<WorkshopCreateSuccess, String> {
+    pub async fn create_workshop_lobby_with_config(
+        &self,
+        config: Option<protocol::WorkshopCreateConfig>,
+    ) -> Result<WorkshopCreateSuccess, String> {
         let payload: WorkshopCreateResult = self
             .post_json(
                 "/api/workshops/lobby",
                 &CreateWorkshopRequest {
                     name: None,
-                    config: None,
+                    config,
                     character_id: None,
                 },
             )
@@ -213,6 +216,15 @@ impl AppWebApi {
 
     pub async fn delete_workshop(&self, session_code: &str) -> Result<(), String> {
         self.delete_empty(&format!("/api/workshops/{session_code}"))
+            .await
+    }
+
+    pub async fn update_workshop(
+        &self,
+        session_code: &str,
+        request: &UpdateWorkshopRequest,
+    ) -> Result<(), String> {
+        self.patch_empty(&format!("/api/workshops/{session_code}"), request)
             .await
     }
 
@@ -438,6 +450,43 @@ impl AppWebApi {
             .map_err(|error| format!("failed to parse backend response: {error}"))
     }
 
+    #[cfg(target_arch = "wasm32")]
+    async fn patch_empty<Req>(&self, path: &str, body: &Req) -> Result<(), String>
+    where
+        Req: serde::Serialize,
+    {
+        let body_json = serde_json::to_string(body)
+            .map_err(|error| format!("failed to encode request body: {error}"))?;
+
+        let init = web_sys::RequestInit::new();
+        init.set_method("PATCH");
+        init.set_body(&JsValue::from_str(&body_json));
+        init.set_credentials(web_sys::RequestCredentials::SameOrigin);
+
+        let headers =
+            web_sys::Headers::new().map_err(|_| "failed to prepare request headers".to_string())?;
+        headers
+            .set("Content-Type", "application/json")
+            .map_err(|_| "failed to set request headers".to_string())?;
+        init.set_headers_headers(&headers);
+
+        let response = wasm_fetch(&self.base_url, path, &init, DEFAULT_REQUEST_TIMEOUT_MS).await?;
+        let text = js_future_string(
+            response
+                .text()
+                .map_err(|_| "failed to read backend response".to_string())?,
+        )
+        .await?;
+
+        if !response.ok() {
+            return Err(extract_backend_error(&text).unwrap_or_else(|| {
+                format!("backend request failed with status {}", response.status())
+            }));
+        }
+
+        Ok(())
+    }
+
     #[cfg(not(target_arch = "wasm32"))]
     async fn post_json_with_timeout<Req, Res>(
         &self,
@@ -470,6 +519,31 @@ impl AppWebApi {
             .json::<Res>()
             .await
             .map_err(|error| format!("failed to parse backend response: {error}"))
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    async fn patch_empty<Req>(&self, path: &str, body: &Req) -> Result<(), String>
+    where
+        Req: serde::Serialize,
+    {
+        let response = self
+            .client
+            .patch(format!("{}{}", self.base_url, path))
+            .json(body)
+            .send()
+            .await
+            .map_err(|error| format!("failed to reach backend: {error}"))?;
+
+        let status = response.status();
+        let text = response
+            .text()
+            .await
+            .map_err(|error| format!("failed to read backend response: {error}"))?;
+        if !status.is_success() {
+            return Err(extract_backend_error(&text)
+                .unwrap_or_else(|| format!("backend request failed with status {status}")));
+        }
+        Ok(())
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -607,7 +681,6 @@ fn js_error_message(error: JsValue) -> String {
         .unwrap_or_else(|| "failed to reach backend".to_string())
 }
 
-#[cfg(target_arch = "wasm32")]
 fn extract_backend_error(text: &str) -> Option<String> {
     serde_json::from_str::<WorkshopErrorEnvelope>(text)
         .ok()
@@ -622,7 +695,6 @@ fn timeout_error_message(timeout_ms: u32) -> String {
     )
 }
 
-#[cfg(target_arch = "wasm32")]
 #[derive(serde::Deserialize)]
 struct WorkshopErrorEnvelope {
     error: String,

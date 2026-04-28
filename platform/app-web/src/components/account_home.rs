@@ -3,10 +3,41 @@ use dioxus::prelude::*;
 use crate::flows::{
     OpenWorkshopsPaging, begin_load_open_workshops, load_open_workshops_flow,
     request_open_workshops_flow, start_create_workshop_flow, start_delete_workshop_flow,
-    start_resume_workshop_flow, start_review_workshop_flow,
+    start_resume_workshop_flow, start_review_workshop_flow, start_update_workshop_flow,
 };
 use crate::state::{IdentityState, OperationState, PendingFlow, ShellScreen, navigate_to_screen};
-use protocol::{ClientGameState, JudgeBundle};
+use protocol::{ClientGameState, JudgeBundle, UpdateWorkshopRequest, WorkshopCreateConfig};
+
+fn parse_minutes_input(value: &str) -> Option<u32> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    trimmed.parse::<u32>().ok().filter(|minutes| *minutes > 0)
+}
+
+fn build_update_workshop_request(phase1_input: &str, phase2_input: &str) -> UpdateWorkshopRequest {
+    UpdateWorkshopRequest {
+        phase1_minutes: parse_minutes_input(phase1_input),
+        phase2_minutes: parse_minutes_input(phase2_input),
+    }
+}
+
+fn pager_button_disabled(open_workshops_loading: bool, has_cursor: bool) -> bool {
+    open_workshops_loading || !has_cursor
+}
+
+#[cfg(test)]
+mod tests {
+    use super::pager_button_disabled;
+
+    #[test]
+    fn pager_buttons_only_disable_for_loading_or_missing_cursor() {
+        assert!(!pager_button_disabled(false, true));
+        assert!(pager_button_disabled(true, true));
+        assert!(pager_button_disabled(false, false));
+    }
+}
 
 #[component]
 pub fn AccountHomeView(
@@ -30,6 +61,7 @@ pub fn AccountHomeView(
     // trigger; no need to read it here any more.
     let pending = ops.read().pending_flow.is_some();
     let delete_workshop_pending = ops.read().pending_flow == Some(PendingFlow::DeleteWorkshop);
+    let update_workshop_pending = ops.read().pending_flow == Some(PendingFlow::UpdateWorkshop);
     let open_workshops_loading = ops.read().open_workshops_loading;
     let open_workshops_loaded = ops.read().open_workshops_loaded;
     let open_workshops_load_failed = ops.read().open_workshops_load_failed;
@@ -42,6 +74,10 @@ pub fn AccountHomeView(
     let pager_prev_cursor = prev_cursor.clone();
     let pager_next_cursor = next_cursor.clone();
     let mut pending_delete_workshop_code = use_signal(|| None::<String>);
+    let mut pending_settings_workshop = use_signal(|| None::<String>);
+    let mut phase1_minutes_input = use_signal(String::new);
+    let mut phase2_minutes_input = use_signal(String::new);
+    let defaults = WorkshopCreateConfig::default();
 
     // Tracks the paging direction of the last user-initiated pager click
     // (or the initial mount). The 5s poll re-uses this instead of
@@ -62,7 +98,11 @@ pub fn AccountHomeView(
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                 if matches!(
                     ops.read().pending_flow,
-                    Some(PendingFlow::DeleteWorkshop | PendingFlow::Create)
+                    Some(
+                        PendingFlow::DeleteWorkshop
+                            | PendingFlow::Create
+                            | PendingFlow::UpdateWorkshop
+                    )
                 ) || ops.read().open_workshops_loading
                 {
                     continue;
@@ -130,6 +170,114 @@ pub fn AccountHomeView(
             }
         }
 
+        if let Some(settings_code) = pending_settings_workshop.read().clone() {
+            {
+                let reset_settings_code = settings_code.clone();
+                let save_settings_code = settings_code.clone();
+                rsx! {
+                    div {
+                        class: "modal-backdrop",
+                        role: "presentation",
+                        onclick: move |_| pending_settings_workshop.set(None),
+                        div {
+                            class: "modal-card",
+                            role: "dialog",
+                            "aria-modal": "true",
+                            "aria-labelledby": "workshop-settings-modal-title",
+                            "aria-describedby": "workshop-settings-modal-body",
+                            onclick: move |event| event.stop_propagation(),
+                            h2 {
+                                id: "workshop-settings-modal-title",
+                                class: "panel__title modal-card__title",
+                                "Workshop Settings"
+                            }
+                            p {
+                                id: "workshop-settings-modal-body",
+                                class: "panel__body modal-card__body",
+                                "Set phase lengths in minutes. Leave a field blank to use the default."
+                            }
+                            div { class: "panel__stack",
+                                label { class: "form-label", r#for: "phase1-minutes-input", "Phase 1 minutes" }
+                                input {
+                                    id: "phase1-minutes-input",
+                                    class: "input",
+                                    "data-testid": "phase1-minutes-input",
+                                    r#type: "number",
+                                    min: "1",
+                                    step: "1",
+                                    placeholder: "{defaults.phase1_minutes}",
+                                    value: "{phase1_minutes_input.read()}",
+                                    oninput: move |event| phase1_minutes_input.set(event.value()),
+                                }
+                                label { class: "form-label", r#for: "phase2-minutes-input", "Handover and Phase 2 minutes" }
+                                input {
+                                    id: "phase2-minutes-input",
+                                    class: "input",
+                                    "data-testid": "phase2-minutes-input",
+                                    r#type: "number",
+                                    min: "1",
+                                    step: "1",
+                                    placeholder: "{defaults.phase2_minutes}",
+                                    value: "{phase2_minutes_input.read()}",
+                                    oninput: move |event| phase2_minutes_input.set(event.value()),
+                                }
+                            }
+                            div { class: "button-row modal-card__actions",
+                                button {
+                                    class: "button button--secondary",
+                                    disabled: update_workshop_pending,
+                                    onclick: move |_| pending_settings_workshop.set(None),
+                                    "Cancel"
+                                }
+                                button {
+                                    class: "button button--secondary",
+                                    "data-testid": "reset-workshop-settings-button",
+                                    disabled: update_workshop_pending,
+                                    onclick: move |_| {
+                                        let request = UpdateWorkshopRequest {
+                                            phase1_minutes: None,
+                                            phase2_minutes: None,
+                                        };
+                                        if start_update_workshop_flow(
+                                            identity,
+                                            ops,
+                                            current_paging,
+                                            reset_settings_code.clone(),
+                                            request,
+                                        ) {
+                                            pending_settings_workshop.set(None);
+                                        }
+                                    },
+                                    if update_workshop_pending { "Saving..." } else { "Reset to defaults" }
+                                }
+                                button {
+                                    class: "button button--primary",
+                                    "data-testid": "save-workshop-settings-button",
+                                    disabled: update_workshop_pending,
+                                    onclick: move |_| {
+                                        let request = build_update_workshop_request(
+                                            &phase1_minutes_input.read(),
+                                            &phase2_minutes_input.read(),
+                                        );
+                                        if start_update_workshop_flow(
+                                            identity,
+                                            ops,
+                                            current_paging,
+                                            save_settings_code.clone(),
+                                            request,
+                                        ) {
+                                            pending_settings_workshop.set(None);
+                                        }
+                                    },
+                                    if update_workshop_pending { "Saving..." } else { "Save" }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         section { class: "grid",
             // ---- Create Workshop ----
             article { class: "panel",
@@ -144,7 +292,7 @@ pub fn AccountHomeView(
                             "data-testid": "create-workshop-button",
                             disabled: pending,
                             onclick: move |_| {
-                                let _ = start_create_workshop_flow(identity, ops, current_paging);
+                                let _ = start_create_workshop_flow(identity, ops, current_paging, None);
                             },
                             "Create Workshop"
                         }
@@ -186,7 +334,7 @@ pub fn AccountHomeView(
                             button {
                                 class: "button button--secondary button--small",
                                 "data-testid": "open-workshops-prev-button",
-                                disabled: pending || !has_prev,
+                                disabled: pager_button_disabled(open_workshops_loading, has_prev),
                                 onclick: move |_| {
                                     if let Some(cursor) = pager_prev_cursor.clone() {
                                         let paging = OpenWorkshopsPaging::Before(cursor);
@@ -202,7 +350,7 @@ pub fn AccountHomeView(
                             button {
                                 class: "button button--secondary button--small",
                                 "data-testid": "open-workshops-next-button",
-                                disabled: pending || !has_next,
+                                disabled: pager_button_disabled(open_workshops_loading, has_next),
                                 onclick: move |_| {
                                     if let Some(cursor) = pager_next_cursor.clone() {
                                         let paging = OpenWorkshopsPaging::After(cursor);
@@ -231,13 +379,16 @@ pub fn AccountHomeView(
                                 {
                                     let code = workshop.session_code.clone();
                                     let resume_code = workshop.session_code.clone();
-                                    let review_code = workshop.session_code.clone();
-                                    let delete_code = workshop.session_code.clone();
-                                    let can_delete = workshop.can_delete;
-                                    let is_archived = workshop.archived;
-                                    let can_resume = workshop.can_resume;
-                                    rsx! {
-                                        article { class: "roster__item", key: "{workshop.session_code}",
+                                     let review_code = workshop.session_code.clone();
+                                     let delete_code = workshop.session_code.clone();
+                                     let settings_code = workshop.session_code.clone();
+                                     let can_delete = workshop.can_delete;
+                                     let is_archived = workshop.archived;
+                                     let can_resume = workshop.can_resume;
+                                     let phase1_minutes = workshop.phase1_minutes;
+                                     let phase2_minutes = workshop.phase2_minutes;
+                                     rsx! {
+                                         article { class: "roster__item", key: "{workshop.session_code}",
                                             div {
                                                 p { class: "roster__name", "{workshop.host_name}'s workshop" }
                                                 p { class: "roster__meta",
@@ -286,18 +437,29 @@ pub fn AccountHomeView(
                                                         },
                                                         "Resume"
                                                     }
-                                                } else if can_delete {
-                                                    button {
-                                                        class: "button button--danger button--small",
-                                                        "data-testid": "delete-workshop-button",
+                                                 } else if can_delete {
+                                                     button {
+                                                         class: "button button--danger button--small",
+                                                         "data-testid": "delete-workshop-button",
                                                         disabled: pending,
                                                         onclick: move |_| {
                                                             pending_delete_workshop_code
                                                                 .set(Some(delete_code.clone()));
-                                                        },
-                                                        if delete_workshop_pending { "Deleting..." } else { "Delete" }
-                                                    }
-                                                }
+                                                         },
+                                                         if delete_workshop_pending { "Deleting..." } else { "Delete" }
+                                                     }
+                                                     button {
+                                                         class: "button button--secondary button--small",
+                                                         "data-testid": "workshop-settings-button",
+                                                         disabled: pending,
+                                                         onclick: move |_| {
+                                                             phase1_minutes_input.set(phase1_minutes.to_string());
+                                                             phase2_minutes_input.set(phase2_minutes.to_string());
+                                                             pending_settings_workshop.set(Some(settings_code.clone()));
+                                                         },
+                                                         "Settings"
+                                                     }
+                                                 }
                                                 if !is_archived && !can_resume {
                                                     button {
                                                         class: "button button--primary button--small",

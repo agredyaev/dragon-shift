@@ -39,6 +39,7 @@ pub enum PendingFlow {
     Reconnect,
     DeleteCharacter,
     RenameCharacter,
+    UpdateWorkshop,
     DeleteWorkshop,
     Logout,
 }
@@ -932,6 +933,7 @@ pub fn apply_join_success(
         PendingFlow::DeleteCharacter => "Character deleted.",
         PendingFlow::RenameCharacter => "Character renamed.",
         PendingFlow::DeleteWorkshop => "Workshop deleted.",
+        PendingFlow::UpdateWorkshop => "Workshop updated.",
         PendingFlow::SignIn => "Workshop created.",
         PendingFlow::Logout => "Signed out.",
     };
@@ -1018,6 +1020,31 @@ fn command_completed_by_state_update(command: SessionCommand, state: &ClientGame
         SessionCommand::ResetGame => state.phase == Phase::Lobby,
         _ => false,
     }
+}
+
+fn should_apply_state_update(
+    identity: &IdentityState,
+    current_state: Option<&ClientGameState>,
+    next_state: &ClientGameState,
+) -> bool {
+    if let Some(snapshot) = identity.session_snapshot.as_ref() {
+        if next_state.session.code != snapshot.session_code
+            || next_state.current_player_id.as_deref() != Some(snapshot.player_id.as_str())
+        {
+            return false;
+        }
+    }
+
+    if let Some(current_state) = current_state {
+        if current_state.session.code == next_state.session.code
+            && current_state.current_player_id == next_state.current_player_id
+            && next_state.session.state_revision < current_state.session.state_revision
+        {
+            return false;
+        }
+    }
+
+    true
 }
 
 pub fn apply_successful_command(
@@ -1196,6 +1223,9 @@ pub fn apply_server_ws_message(
 ) {
     match message {
         ServerWsMessage::StateUpdate(client_state) => {
+            if !should_apply_state_update(identity, game_state.as_ref(), &client_state) {
+                return;
+            }
             let first_attach = identity.connection_status != ConnectionStatus::Connected;
             let phase = client_state.phase;
             let completed_pending_command = ops
@@ -1333,6 +1363,7 @@ mod tests {
                     code: "123456".to_string(),
                     created_at: "2026-01-01T00:00:00Z".to_string(),
                     updated_at: "2026-01-01T00:00:00Z".to_string(),
+                    state_revision: 0,
                     phase_started_at: "2026-01-01T00:00:00Z".to_string(),
                     host_player_id: Some("player-1".to_string()),
                     settings: create_default_session_settings(),
@@ -1915,6 +1946,118 @@ mod tests {
             ops.notice.as_ref().map(|n| n.message.as_str()),
             Some("Session synced.")
         );
+    }
+
+    #[test]
+    fn server_ws_state_update_rejects_wrong_session_or_player() {
+        let mut identity = default_identity_state();
+        let mut game_state = None;
+        let mut ops = default_operation_state();
+        let mut reconnect_session_code = String::new();
+        let mut reconnect_token = String::new();
+        let mut judge_bundle = None;
+
+        apply_join_success(
+            &mut identity,
+            &mut game_state,
+            &mut ops,
+            &mut reconnect_session_code,
+            &mut reconnect_token,
+            &mut judge_bundle,
+            mock_join_success(),
+            PendingFlow::Join,
+        );
+
+        let mut wrong_session = mock_join_success().state;
+        wrong_session.session.code = "654321".to_string();
+        apply_server_ws_message(
+            &mut identity,
+            &mut game_state,
+            &mut ops,
+            &mut judge_bundle,
+            ServerWsMessage::StateUpdate(wrong_session),
+        );
+        assert_eq!(
+            game_state.as_ref().map(|state| state.session.code.as_str()),
+            Some("123456")
+        );
+
+        let mut wrong_player = mock_join_success().state;
+        wrong_player.current_player_id = Some("player-2".to_string());
+        apply_server_ws_message(
+            &mut identity,
+            &mut game_state,
+            &mut ops,
+            &mut judge_bundle,
+            ServerWsMessage::StateUpdate(wrong_player),
+        );
+        assert_eq!(
+            game_state
+                .as_ref()
+                .and_then(|state| state.current_player_id.as_deref()),
+            Some("player-1")
+        );
+    }
+
+    #[test]
+    fn server_ws_state_update_orders_by_revision_not_updated_at() {
+        let mut identity = default_identity_state();
+        let mut game_state = None;
+        let mut ops = default_operation_state();
+        let mut reconnect_session_code = String::new();
+        let mut reconnect_token = String::new();
+        let mut judge_bundle = None;
+
+        apply_join_success(
+            &mut identity,
+            &mut game_state,
+            &mut ops,
+            &mut reconnect_session_code,
+            &mut reconnect_token,
+            &mut judge_bundle,
+            mock_join_success(),
+            PendingFlow::Join,
+        );
+
+        let mut newer = mock_join_success().state;
+        newer.session.updated_at = "2026-01-01T00:00:00Z".to_string();
+        newer.session.state_revision = 10;
+        newer.time = 18;
+        apply_server_ws_message(
+            &mut identity,
+            &mut game_state,
+            &mut ops,
+            &mut judge_bundle,
+            ServerWsMessage::StateUpdate(newer),
+        );
+
+        let mut older = mock_join_success().state;
+        older.session.updated_at = "2026-01-01T00:00:10Z".to_string();
+        older.session.state_revision = 9;
+        older.time = 16;
+        apply_server_ws_message(
+            &mut identity,
+            &mut game_state,
+            &mut ops,
+            &mut judge_bundle,
+            ServerWsMessage::StateUpdate(older),
+        );
+
+        assert_eq!(game_state.as_ref().map(|state| state.time), Some(18));
+
+        let mut later_revision_with_older_timestamp = mock_join_success().state;
+        later_revision_with_older_timestamp.session.updated_at = "2026-01-01T00:00:01Z".to_string();
+        later_revision_with_older_timestamp.session.state_revision = 11;
+        later_revision_with_older_timestamp.time = 19;
+        apply_server_ws_message(
+            &mut identity,
+            &mut game_state,
+            &mut ops,
+            &mut judge_bundle,
+            ServerWsMessage::StateUpdate(later_revision_with_older_timestamp),
+        );
+
+        assert_eq!(game_state.as_ref().map(|state| state.time), Some(19));
     }
 
     #[test]
