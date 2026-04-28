@@ -359,10 +359,10 @@ pub fn EndView(
                                     span {
                                         class: format!(
                                             "leaderboard__col leaderboard__col--status {}",
-                                            if row.judge_status == "Good" {
+                                            if row.judge_status == "Scored" {
                                                 "leaderboard__status--good"
                                             } else {
-                                                "leaderboard__status--bad"
+                                                "leaderboard__status--notes"
                                             },
                                         ),
                                         {row.judge_status}

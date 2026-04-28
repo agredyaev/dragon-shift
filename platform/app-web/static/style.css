@@ -1180,8 +1180,8 @@
     .leaderboard__status--good {
         color: #166534;
     }
-    .leaderboard__status--bad {
-        color: #991b1b;
+    .leaderboard__status--notes {
+        color: #92400e;
         cursor: default;
     }
     .judge-feedback-disclosure {

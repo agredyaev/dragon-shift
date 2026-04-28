@@ -1795,16 +1795,6 @@ pub(crate) async fn workshop_command(
                     "actionType": action_type,
                     "actionValue": action_value,
                 });
-                // Persist achievement before borrowing dragon immutably
-                if let domain::ActionOutcome::Applied {
-                    awarded_achievement: Some(achievement),
-                    ..
-                } = &outcome
-                {
-                    if let Some(player) = session.players.get_mut(&identity.player_id) {
-                        player.achievements.push(achievement.to_string());
-                    }
-                }
                 if let Some(dragon) = session.dragons.get(&dragon_id)
                     && let Some(payload_map) = artifact_payload.as_object_mut()
                 {

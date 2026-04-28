@@ -64,9 +64,10 @@ pub fn Phase2View(
         .unwrap_or_default();
     let session_code = state.session.code.clone();
 
-    let achievements: Vec<String> = current_player(state)
+    let achievements = current_player(state)
         .map(|p| p.achievements.clone())
         .unwrap_or_default();
+    let achievements = unique_achievement_ids(&achievements);
 
     let is_host = current_player(state).map(|p| p.is_host).unwrap_or(false);
     let connection_status = identity.read().connection_status;

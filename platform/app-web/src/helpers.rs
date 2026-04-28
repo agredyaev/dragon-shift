@@ -2,6 +2,7 @@ use protocol::{
     ClientDragon, ClientGameState, DragonAction, DragonEmotion, JudgeBundle, Phase, Player,
     SessionCommand, SpriteSet,
 };
+use std::collections::BTreeSet;
 
 use crate::state::{ConnectionStatus, NoticeTone, ShellScreen};
 
@@ -400,6 +401,21 @@ pub fn achievement_def(id: &str) -> Option<(&'static str, &'static str, &'static
         .iter()
         .find(|(aid, _, _, _)| *aid == id)
         .map(|(_, name, desc, icon)| (*name, *desc, *icon))
+}
+
+pub fn unique_achievement_ids<'a>(achievements: &'a [String]) -> Vec<&'a str> {
+    let mut seen = BTreeSet::new();
+    achievements
+        .iter()
+        .filter_map(|achievement| {
+            let achievement = achievement.as_str();
+            seen.insert(achievement).then_some(achievement)
+        })
+        .collect()
+}
+
+fn achievement_count(achievements: &[String]) -> usize {
+    unique_achievement_ids(achievements).len()
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -835,7 +851,9 @@ pub fn end_player_score_rows(state: &ClientGameState) -> Vec<EndPlayerScoreRow> 
         right
             .score
             .cmp(&left.score)
-            .then_with(|| right.achievements.len().cmp(&left.achievements.len()))
+            .then_with(|| {
+                achievement_count(&right.achievements).cmp(&achievement_count(&left.achievements))
+            })
             .then_with(|| {
                 left.name
                     .to_ascii_lowercase()
@@ -849,19 +867,14 @@ pub fn end_player_score_rows(state: &ClientGameState) -> Vec<EndPlayerScoreRow> 
         .enumerate()
         .map(|(index, player)| {
             let (obs, care, issues) = player_phase_scores(state, &player.id);
-            let is_good = issues.is_empty();
             EndPlayerScoreRow {
                 placement_label: format!("#{}", index + 1),
                 player_name: player.name.clone(),
                 phase1_score_label: format!("{}", obs),
                 phase2_score_label: format!("{}", care),
                 total_score_label: format!("{} pts", player.score),
-                judge_status: if is_good { "Good" } else { "Bad" },
-                judge_status_tooltip: if is_good {
-                    String::new()
-                } else {
-                    issues.join(" | ")
-                },
+                judge_status: if issues.is_empty() { "Scored" } else { "Notes" },
+                judge_status_tooltip: issues.join(" | "),
                 is_winner: index == 0,
             }
         })
@@ -878,7 +891,9 @@ pub fn game_over_player_rows(state: &ClientGameState) -> Vec<GameOverPlayerRow> 
         right
             .score
             .cmp(&left.score)
-            .then_with(|| right.achievements.len().cmp(&left.achievements.len()))
+            .then_with(|| {
+                achievement_count(&right.achievements).cmp(&achievement_count(&left.achievements))
+            })
             .then_with(|| {
                 left.name
                     .to_ascii_lowercase()
@@ -892,9 +907,8 @@ pub fn game_over_player_rows(state: &ClientGameState) -> Vec<GameOverPlayerRow> 
         .take(3)
         .enumerate()
         .map(|(index, player)| {
-            let badges: Vec<(&str, &str)> = player
-                .achievements
-                .iter()
+            let badges: Vec<(&str, &str)> = unique_achievement_ids(&player.achievements)
+                .into_iter()
                 .filter_map(|id| achievement_def(id).map(|(name, _desc, icon)| (name, icon)))
                 .collect();
             GameOverPlayerRow {
@@ -982,7 +996,9 @@ pub fn judge_bundle_player_rows(bundle: &JudgeBundle) -> Vec<JudgeBundlePlayerRo
         right
             .score
             .cmp(&left.score)
-            .then_with(|| right.achievements.len().cmp(&left.achievements.len()))
+            .then_with(|| {
+                achievement_count(&right.achievements).cmp(&achievement_count(&left.achievements))
+            })
             .then_with(|| {
                 left.name
                     .to_ascii_lowercase()
@@ -997,10 +1013,10 @@ pub fn judge_bundle_player_rows(bundle: &JudgeBundle) -> Vec<JudgeBundlePlayerRo
         .map(|(index, player)| JudgeBundlePlayerRow {
             player_name: player.name.clone(),
             score_label: format!("{} pts", player.score),
-            achievements_label: if player.achievements.is_empty() {
+            achievements_label: if achievement_count(&player.achievements) == 0 {
                 "No achievements yet".to_string()
             } else {
-                format!("{} achievement(s)", player.achievements.len())
+                format!("{} achievement(s)", achievement_count(&player.achievements))
             },
             is_top_score: index == 0,
         })
@@ -1818,6 +1834,7 @@ pub mod tests {
         assert_eq!(vote_rows[0].votes_label, "2 votes");
         assert_eq!(score_rows[0].player_name, "Bob");
         assert_eq!(score_rows[0].total_score_label, "18 pts");
+        assert_eq!(score_rows[0].judge_status, "Notes");
         assert!(score_rows[0].is_winner);
         assert!(
             score_rows[0]
@@ -1886,10 +1903,56 @@ pub mod tests {
         );
         assert_eq!(players[0].player_name, "Bob");
         assert_eq!(players[0].score_label, "18 pts");
+        assert_eq!(players[0].achievements_label, "2 achievement(s)");
         assert!(players[0].is_top_score);
         assert_eq!(dragons[0].dragon_name, "Nova");
         assert_eq!(dragons[0].votes_label, "2 creative vote(s)");
         assert_eq!(dragons[0].actions_label, "1 phase 2 action(s) captured");
+    }
+
+    #[test]
+    fn end_helpers_deduplicate_achievements_for_ranking_and_badges() {
+        let mut state = mock_end_state();
+        state.players.get_mut("player-1").expect("player-1").score = 18;
+        state
+            .players
+            .get_mut("player-1")
+            .expect("player-1")
+            .achievements = vec![
+            "master_chef".to_string(),
+            "master_chef".to_string(),
+            "playful_spirit".to_string(),
+        ];
+        state
+            .players
+            .get_mut("player-2")
+            .expect("player-2")
+            .achievements = vec!["playful_spirit".to_string(), "playful_spirit".to_string()];
+
+        let score_rows = end_player_score_rows(&state);
+        let game_over_rows = game_over_player_rows(&state);
+
+        assert_eq!(score_rows[0].player_name, "Alice");
+        assert_eq!(game_over_rows[0].player_name, "Alice");
+        assert_eq!(game_over_rows[0].achievement_badges.len(), 2);
+    }
+
+    #[test]
+    fn judge_bundle_helpers_deduplicate_achievement_counts() {
+        let mut bundle = mock_judge_bundle();
+        bundle.players[0].score = 18;
+        bundle.players[0].achievements = vec![
+            "master_chef".to_string(),
+            "master_chef".to_string(),
+            "playful_spirit".to_string(),
+        ];
+        bundle.players[1].achievements = vec!["playful_spirit".to_string()];
+
+        let rows = judge_bundle_player_rows(&bundle);
+
+        assert_eq!(rows[0].player_name, "Alice");
+        assert_eq!(rows[0].achievements_label, "2 achievement(s)");
+        assert_eq!(rows[1].achievements_label, "1 achievement(s)");
     }
 
     // -----------------------------------------------------------------------

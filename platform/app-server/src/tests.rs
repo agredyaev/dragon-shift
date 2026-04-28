@@ -6780,6 +6780,152 @@ async fn workshop_command_records_action_artifact_during_phase2() {
 }
 
 #[tokio::test]
+async fn workshop_command_does_not_duplicate_inline_achievement_on_repeated_correct_first_try_patterns()
+ {
+    let state = test_state();
+    let app = build_app(state.clone());
+    let cookie = test_auth_cookie(&app, "Alice").await;
+    let create_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops")
+                .header("content-type", "application/json")
+                .header(axum::http::header::COOKIE, &cookie)
+                .body(Body::from(create_workshop_body("Alice")))
+                .expect("build create request"),
+        )
+        .await
+        .expect("call create workshop");
+    let create_body = to_bytes(create_response.into_body(), usize::MAX)
+        .await
+        .expect("read create body");
+    let create_result: WorkshopJoinResult =
+        serde_json::from_slice(&create_body).expect("parse create result");
+    let create_success = match create_result {
+        WorkshopJoinResult::Success(success) => success,
+        WorkshopJoinResult::Error(error) => {
+            panic!("expected create success, got error: {}", error.error)
+        }
+    };
+
+    seed_selected_characters(&state, &create_success.session_code).await;
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops/command")
+                .header("content-type", "application/json")
+                .body(Body::from(setup_phase1_body(
+                    &create_success.session_code,
+                    &create_success.reconnect_token,
+                )))
+                .expect("build setup request"),
+        )
+        .await
+        .expect("call setup command");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    {
+        let mut sessions = state.sessions.lock().await;
+        let session = sessions
+            .get_mut(&create_success.session_code)
+            .expect("session exists in cache");
+        let dragon_id = session
+            .players
+            .get(&create_success.player_id)
+            .and_then(|player| player.current_dragon_id.clone())
+            .expect("current dragon id");
+        let dragon = session.dragons.get_mut(&dragon_id).expect("dragon exists");
+        dragon.favorite_food = protocol::FoodType::Meat;
+        dragon.hunger = 50;
+    }
+
+    let first_action = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops/command")
+                .header("content-type", "application/json")
+                .body(Body::from(format!(
+                    r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"action","payload":{{"type":"feed","value":"meat"}}}}"#,
+                    create_success.session_code, create_success.reconnect_token
+                )))
+                .expect("build action request"),
+        )
+        .await
+        .expect("call first action command");
+    assert_eq!(first_action.status(), StatusCode::OK);
+
+    {
+        let sessions = state.sessions.lock().await;
+        let session = sessions
+            .get(&create_success.session_code)
+            .expect("session exists after first action");
+        let player = session
+            .players
+            .get(&create_success.player_id)
+            .expect("player exists");
+        let master_chef_count = player
+            .achievements
+            .iter()
+            .filter(|achievement| *achievement == "master_chef")
+            .count();
+        assert_eq!(master_chef_count, 1);
+    }
+
+    {
+        let mut sessions = state.sessions.lock().await;
+        let session = sessions
+            .get_mut(&create_success.session_code)
+            .expect("session exists for reset");
+        let dragon_id = session
+            .players
+            .get(&create_success.player_id)
+            .and_then(|player| player.current_dragon_id.clone())
+            .expect("current dragon id");
+        let dragon = session.dragons.get_mut(&dragon_id).expect("dragon exists");
+        dragon.action_cooldown = 0;
+        dragon.food_tries = 0;
+        dragon.hunger = 50;
+    }
+
+    let second_action = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops/command")
+                .header("content-type", "application/json")
+                .body(Body::from(format!(
+                    r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"action","payload":{{"type":"feed","value":"meat"}}}}"#,
+                    create_success.session_code, create_success.reconnect_token
+                )))
+                .expect("build second action request"),
+        )
+        .await
+        .expect("call second action command");
+    assert_eq!(second_action.status(), StatusCode::OK);
+
+    let sessions = state.sessions.lock().await;
+    let session = sessions
+        .get(&create_success.session_code)
+        .expect("session exists after second action");
+    let player = session
+        .players
+        .get(&create_success.player_id)
+        .expect("player exists after second action");
+    let master_chef_count = player
+        .achievements
+        .iter()
+        .filter(|achievement| *achievement == "master_chef")
+        .count();
+    assert_eq!(master_chef_count, 1);
+}
+
+#[tokio::test]
 async fn workshop_command_rejects_invalid_credentials() {
     let app = build_app(test_state());
 

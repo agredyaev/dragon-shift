@@ -247,6 +247,12 @@ pub enum DomainError {
 }
 
 impl WorkshopSession {
+    fn player_has_achievement(&self, player_id: &str, achievement: &str) -> bool {
+        self.players
+            .get(player_id)
+            .is_some_and(|player| player.achievements.iter().any(|a| a == achievement))
+    }
+
     pub fn new(
         id: Uuid,
         code: SessionCode,
@@ -674,6 +680,9 @@ impl WorkshopSession {
             .get(player_id)
             .and_then(|player| player.current_dragon_id.clone())
             .ok_or(DomainError::DragonNotAssigned)?;
+        let has_master_chef = self.player_has_achievement(player_id, "master_chef");
+        let has_playful_spirit = self.player_has_achievement(player_id, "playful_spirit");
+        let has_speed_learner = self.player_has_achievement(player_id, "speed_learner");
 
         let dragon = self
             .dragons
@@ -697,7 +706,7 @@ impl WorkshopSession {
                     }
                 } else {
                     dragon.last_action = DragonAction::Feed;
-                    dragon.action_cooldown = 2;
+                    dragon.action_cooldown = 3;
                     dragon.sleep_shield_ticks = 0;
                     dragon.food_tries += 1;
                     dragon.total_actions += 1;
@@ -708,13 +717,14 @@ impl WorkshopSession {
                         was_correct = true;
                         dragon.correct_actions += 1;
                         dragon.found_correct_food = true;
-                        if dragon.food_tries == 1 {
+                        if dragon.food_tries == 1 && !has_master_chef {
                             awarded = Some("master_chef");
                         }
                         // speed_learner: found both correct food & play within 3 actions
                         if awarded.is_none()
                             && dragon.found_correct_play
                             && dragon.total_actions <= 3
+                            && !has_speed_learner
                         {
                             awarded = Some("speed_learner");
                         }
@@ -762,7 +772,7 @@ impl WorkshopSession {
                     }
                 } else {
                     dragon.last_action = DragonAction::Play;
-                    dragon.action_cooldown = 2;
+                    dragon.action_cooldown = 3;
                     dragon.sleep_shield_ticks = 0;
                     dragon.play_tries += 1;
                     dragon.total_actions += 1;
@@ -773,13 +783,14 @@ impl WorkshopSession {
                         was_correct = true;
                         dragon.correct_actions += 1;
                         dragon.found_correct_play = true;
-                        if dragon.play_tries == 1 {
+                        if dragon.play_tries == 1 && !has_playful_spirit {
                             awarded = Some("playful_spirit");
                         }
                         // speed_learner: found both correct food & play within 3 actions
                         if awarded.is_none()
                             && dragon.found_correct_food
                             && dragon.total_actions <= 3
+                            && !has_speed_learner
                         {
                             awarded = Some("speed_learner");
                         }
@@ -818,7 +829,7 @@ impl WorkshopSession {
                     }
                 } else {
                     dragon.last_action = DragonAction::Sleep;
-                    dragon.action_cooldown = 2;
+                    dragon.action_cooldown = 3;
                     dragon.total_actions += 1;
                     dragon.energy = (dragon.energy + 50).min(100);
                     let is_correct_time = (dragon.active_time == ActiveTime::Day
@@ -841,6 +852,19 @@ impl WorkshopSession {
                 }
             }
         };
+
+        if let ActionOutcome::Applied {
+            awarded_achievement: Some(achievement),
+            ..
+        } = &outcome
+            && let Some(player) = self.players.get_mut(player_id)
+            && !player
+                .achievements
+                .iter()
+                .any(|existing| existing == achievement)
+        {
+            player.achievements.push((*achievement).to_string());
+        }
 
         self.touch();
         Ok(outcome)
@@ -3564,7 +3588,7 @@ mod tests {
         s.apply_action("p1", PlayerAction::Feed(FoodType::Meat))
             .unwrap();
         let d = s.dragons.get("d1").unwrap();
-        assert_eq!(d.action_cooldown, 2);
+        assert_eq!(d.action_cooldown, 3);
 
         // Second action during cooldown
         let out = s
@@ -3596,7 +3620,7 @@ mod tests {
     }
 
     #[test]
-    fn validator5_cooldown_expires_after_two_ticks() {
+    fn validator5_cooldown_expires_after_three_ticks() {
         let mut s = setup_deterministic_session();
         let d = s.dragons.get_mut("d1").unwrap();
         d.active_time = ActiveTime::Day;
@@ -3608,8 +3632,10 @@ mod tests {
 
         s.apply_action("p1", PlayerAction::Feed(FoodType::Meat))
             .unwrap();
-        assert_eq!(s.dragons.get("d1").unwrap().action_cooldown, 2);
+        assert_eq!(s.dragons.get("d1").unwrap().action_cooldown, 3);
 
+        s.advance_tick();
+        assert_eq!(s.dragons.get("d1").unwrap().action_cooldown, 2);
         s.advance_tick();
         assert_eq!(s.dragons.get("d1").unwrap().action_cooldown, 1);
         s.advance_tick();
@@ -4643,6 +4669,115 @@ mod tests {
         // First call awards, second should not duplicate
         assert!(!awards1.is_empty());
         assert!(awards2.is_empty());
+    }
+
+    #[test]
+    fn validator10_inline_master_chef_is_not_reawarded_if_player_already_has_it() {
+        let mut s = setup_deterministic_session();
+        s.players
+            .get_mut("p1")
+            .expect("player p1")
+            .achievements
+            .push("master_chef".to_string());
+
+        let out = s
+            .apply_action("p1", PlayerAction::Feed(FoodType::Meat))
+            .unwrap();
+
+        match out {
+            ActionOutcome::Applied {
+                awarded_achievement,
+                was_correct,
+            } => {
+                assert!(was_correct);
+                assert_eq!(awarded_achievement, None);
+            }
+            _ => panic!("expected Applied"),
+        }
+
+        let master_chef_count = s
+            .players
+            .get("p1")
+            .expect("player p1")
+            .achievements
+            .iter()
+            .filter(|achievement| *achievement == "master_chef")
+            .count();
+        assert_eq!(master_chef_count, 1);
+    }
+
+    #[test]
+    fn validator10_inline_playful_spirit_is_not_reawarded_if_player_already_has_it() {
+        let mut s = setup_deterministic_session();
+        s.players
+            .get_mut("p1")
+            .expect("player p1")
+            .achievements
+            .push("playful_spirit".to_string());
+
+        let out = s
+            .apply_action("p1", PlayerAction::Play(PlayType::Fetch))
+            .unwrap();
+
+        match out {
+            ActionOutcome::Applied {
+                awarded_achievement,
+                was_correct,
+            } => {
+                assert!(was_correct);
+                assert_eq!(awarded_achievement, None);
+            }
+            _ => panic!("expected Applied"),
+        }
+
+        let playful_spirit_count = s
+            .players
+            .get("p1")
+            .expect("player p1")
+            .achievements
+            .iter()
+            .filter(|achievement| *achievement == "playful_spirit")
+            .count();
+        assert_eq!(playful_spirit_count, 1);
+    }
+
+    #[test]
+    fn validator10_inline_speed_learner_is_not_reawarded_if_player_already_has_it() {
+        let mut s = setup_deterministic_session();
+        s.players
+            .get_mut("p1")
+            .expect("player p1")
+            .achievements
+            .push("speed_learner".to_string());
+
+        s.apply_action("p1", PlayerAction::Feed(FoodType::Meat))
+            .unwrap();
+        s.dragons.get_mut("d1").unwrap().action_cooldown = 0;
+
+        let out = s
+            .apply_action("p1", PlayerAction::Play(PlayType::Fetch))
+            .unwrap();
+
+        match out {
+            ActionOutcome::Applied {
+                awarded_achievement,
+                was_correct,
+            } => {
+                assert!(was_correct);
+                assert_eq!(awarded_achievement, Some("playful_spirit"));
+            }
+            _ => panic!("expected Applied"),
+        }
+
+        let speed_learner_count = s
+            .players
+            .get("p1")
+            .expect("player p1")
+            .achievements
+            .iter()
+            .filter(|achievement| *achievement == "speed_learner")
+            .count();
+        assert_eq!(speed_learner_count, 1);
     }
 
     #[test]
