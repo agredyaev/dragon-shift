@@ -39,12 +39,12 @@ app:
   staticDir: /app/static
   rustLog: "info,tower_http=debug"
   rustSessionCodePrefix: "9"
-  trustForwardedFor: false
+  trustForwardedFor: true
   databasePoolSize: 10
   createRateLimitMax: 20
   joinRateLimitMax: 40
   signupRateLimitMax: 5
-  loginRateLimitMax: 10
+  loginRateLimitMax: 100
   commandRateLimitMax: 120
   socketRateLimitMax: 300
   spriteQueueTimeoutSeconds: 1200
