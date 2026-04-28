@@ -1,4 +1,5 @@
 use axum::{
+    body::Bytes,
     Router,
     extract::FromRef,
     http::HeaderValue,
@@ -110,6 +111,26 @@ impl std::fmt::Debug for AppConfig {
 }
 
 #[derive(Clone)]
+pub(crate) struct CharacterSpriteCacheEntry {
+    pub(crate) neutral: Bytes,
+    pub(crate) happy: Bytes,
+    pub(crate) angry: Bytes,
+    pub(crate) sleepy: Bytes,
+}
+
+impl CharacterSpriteCacheEntry {
+    pub(crate) fn for_emotion(&self, emotion: &str) -> Option<Bytes> {
+        match emotion {
+            "neutral" => Some(self.neutral.clone()),
+            "happy" => Some(self.happy.clone()),
+            "angry" => Some(self.angry.clone()),
+            "sleepy" => Some(self.sleepy.clone()),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone)]
 pub(crate) struct AppState {
     pub(crate) config: Arc<AppConfig>,
     pub(crate) replica_id: String,
@@ -118,6 +139,8 @@ pub(crate) struct AppState {
     pub(crate) fallback_companion_sprites: Arc<SpriteSet>,
     pub(crate) image_job_queue: Arc<Semaphore>,
     pub(crate) sessions: Arc<Mutex<BTreeMap<String, WorkshopSession>>>,
+    pub(crate) character_sprite_cache: Arc<Mutex<BTreeMap<String, CharacterSpriteCacheEntry>>>,
+    pub(crate) character_sprite_load_locks: Arc<Mutex<BTreeMap<String, Arc<Mutex<()>>>>>,
     pub(crate) session_cache_load_locks: Arc<Mutex<BTreeMap<String, Arc<Mutex<()>>>>>,
     pub(crate) session_write_locks: Arc<Mutex<BTreeMap<String, Arc<Mutex<()>>>>>,
     pub(crate) create_limiter: Arc<Mutex<FixedWindowRateLimiter>>,
@@ -159,6 +182,8 @@ impl AppState {
             fallback_companion_sprites: Arc::new(fallback_companion_sprites),
             image_job_queue: Arc::new(Semaphore::new(image_job_max_concurrency)),
             sessions: Arc::new(Mutex::new(BTreeMap::new())),
+            character_sprite_cache: Arc::new(Mutex::new(BTreeMap::new())),
+            character_sprite_load_locks: Arc::new(Mutex::new(BTreeMap::new())),
             session_cache_load_locks: Arc::new(Mutex::new(BTreeMap::new())),
             session_write_locks: Arc::new(Mutex::new(BTreeMap::new())),
             create_limiter: Arc::new(Mutex::new(FixedWindowRateLimiter::new(

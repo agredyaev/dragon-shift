@@ -499,6 +499,8 @@ pub(crate) fn build_judge_bundle(
                 correct_actions: dragon.correct_actions,
                 wrong_food_count: dragon.wrong_food_count,
                 wrong_play_count: dragon.wrong_play_count,
+                wrong_sleep_count: dragon.wrong_sleep_count,
+                correct_sleep_count: dragon.correct_sleep_count,
                 cooldown_violations: dragon.cooldown_violations,
                 penalty_stacks_at_end: dragon.penalty_stacks,
                 phase2_lowest_happiness: dragon.phase2_lowest_happiness,

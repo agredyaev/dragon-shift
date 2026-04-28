@@ -1249,8 +1249,8 @@ pub(crate) async fn advance_game_ticks(state: &AppState) {
         let session_snapshot = {
             let mut sessions = state.sessions.lock().await;
             if let Some(session) = sessions.get_mut(&session_code) {
-                session.advance_tick();
-                Some(session.clone())
+                let awarded_achievements = session.advance_tick();
+                Some((session.clone(), !awarded_achievements.is_empty()))
             } else {
                 None
             }
@@ -1259,8 +1259,8 @@ pub(crate) async fn advance_game_ticks(state: &AppState) {
         // Persist tick-decayed state periodically so that command-handler reloads
         // (reload_cached_session) pick up recent stats. Throttled to every 5 ticks
         // to reduce write pressure on Postgres (was OOM-killed at 1 write/sec).
-        if let Some(snapshot) = &session_snapshot {
-            if snapshot.time % 5 == 0 {
+        if let Some((snapshot, has_awards)) = &session_snapshot {
+            if *has_awards || snapshot.time % 5 == 0 {
                 if let Err(error) = state.store.save_session(snapshot).await {
                     info!(session_code = %session_code, error = %error, "failed to persist tick state");
                 }

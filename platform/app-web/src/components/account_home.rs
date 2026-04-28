@@ -2,8 +2,9 @@ use dioxus::prelude::*;
 
 use crate::flows::{
     OpenWorkshopsPaging, begin_load_open_workshops, load_open_workshops_flow,
-    request_open_workshops_flow, start_create_workshop_flow, start_delete_workshop_flow,
-    start_resume_workshop_flow, start_review_workshop_flow, start_update_workshop_flow,
+    request_open_workshops_flow_and_sync_paging, start_create_workshop_flow,
+    start_delete_workshop_flow, start_resume_workshop_flow, start_review_workshop_flow,
+    start_update_workshop_flow,
 };
 use crate::state::{IdentityState, OperationState, PendingFlow, ShellScreen, navigate_to_screen};
 use protocol::{ClientGameState, JudgeBundle, UpdateWorkshopRequest, WorkshopCreateConfig};
@@ -25,6 +26,26 @@ fn build_update_workshop_request(phase1_input: &str, phase2_input: &str) -> Upda
 
 fn pager_button_disabled(open_workshops_loading: bool, has_cursor: bool) -> bool {
     open_workshops_loading || !has_cursor
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn sleep_open_workshops_poll(delay_ms: u32) {
+    gloo_timers::future::TimeoutFuture::new(delay_ms).await;
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+async fn sleep_open_workshops_poll(delay_ms: u32) {
+    tokio::time::sleep(std::time::Duration::from_millis(delay_ms as u64)).await;
+}
+
+#[cfg(target_arch = "wasm32")]
+fn open_workshops_poll_jitter_ms() -> u32 {
+    (js_sys::Math::random() * 2_000.0) as u32
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn open_workshops_poll_jitter_ms() -> u32 {
+    0
 }
 
 #[cfg(test)]
@@ -53,6 +74,7 @@ pub fn AccountHomeView(
         ops.with_mut(begin_load_open_workshops);
         refreshed_on_mount.set(true);
         spawn(async move {
+            sleep_open_workshops_poll(open_workshops_poll_jitter_ms()).await;
             let _ = load_open_workshops_flow(identity, ops, OpenWorkshopsPaging::First).await;
         });
     }
@@ -79,11 +101,10 @@ pub fn AccountHomeView(
     let mut phase2_minutes_input = use_signal(String::new);
     let defaults = WorkshopCreateConfig::default();
 
-    // Tracks the paging direction of the last user-initiated pager click
-    // (or the initial mount). The 5s poll re-uses this instead of
-    // resetting to `First` so an already-paginated view isn't yanked
-    // back to page 1 on every tick.
-    let mut current_paging = use_signal(|| OpenWorkshopsPaging::First);
+    // Tracks the paging direction of the last applied pager response. The 5s
+    // poll reuses this instead of resetting to `First` so an already-paginated
+    // view isn't yanked back to page 1 on every tick.
+    let current_paging = use_signal(|| OpenWorkshopsPaging::First);
 
     // Poll open workshops every 5 seconds. Re-issues whichever paging
     // direction the user last selected so pagination isn't clobbered.
@@ -91,11 +112,11 @@ pub fn AccountHomeView(
         let identity = identity;
         let ops = ops;
         async move {
+            let mut consecutive_failures = 0u32;
             loop {
-                #[cfg(target_arch = "wasm32")]
-                gloo_timers::future::TimeoutFuture::new(5_000).await;
-                #[cfg(not(target_arch = "wasm32"))]
-                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                let backoff_ms = consecutive_failures.saturating_mul(5_000).min(20_000);
+                sleep_open_workshops_poll(5_000 + backoff_ms + open_workshops_poll_jitter_ms())
+                    .await;
                 if matches!(
                     ops.read().pending_flow,
                     Some(
@@ -108,7 +129,18 @@ pub fn AccountHomeView(
                     continue;
                 }
                 let paging = current_paging.read().clone();
-                let _ = request_open_workshops_flow(identity, ops, paging).await;
+                if request_open_workshops_flow_and_sync_paging(
+                    identity,
+                    ops,
+                    current_paging,
+                    paging,
+                )
+                .await
+                {
+                    consecutive_failures = 0;
+                } else {
+                    consecutive_failures = consecutive_failures.saturating_add(1);
+                }
             }
         }
     });
@@ -338,10 +370,14 @@ pub fn AccountHomeView(
                                 onclick: move |_| {
                                     if let Some(cursor) = pager_prev_cursor.clone() {
                                         let paging = OpenWorkshopsPaging::Before(cursor);
-                                        current_paging.set(paging.clone());
                                         spawn(async move {
-                                            let _ = request_open_workshops_flow(identity, ops, paging)
-                                                .await;
+                                            let _ = request_open_workshops_flow_and_sync_paging(
+                                                identity,
+                                                ops,
+                                                current_paging,
+                                                paging,
+                                            )
+                                            .await;
                                         });
                                     }
                                 },
@@ -354,10 +390,14 @@ pub fn AccountHomeView(
                                 onclick: move |_| {
                                     if let Some(cursor) = pager_next_cursor.clone() {
                                         let paging = OpenWorkshopsPaging::After(cursor);
-                                        current_paging.set(paging.clone());
                                         spawn(async move {
-                                            let _ = request_open_workshops_flow(identity, ops, paging)
-                                                .await;
+                                            let _ = request_open_workshops_flow_and_sync_paging(
+                                                identity,
+                                                ops,
+                                                current_paging,
+                                                paging,
+                                            )
+                                            .await;
                                         });
                                     }
                                 },

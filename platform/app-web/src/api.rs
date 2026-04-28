@@ -22,13 +22,13 @@ use wasm_bindgen_futures::JsFuture;
 use crate::state::default_api_base_url;
 
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
-const DEFAULT_REQUEST_TIMEOUT_MS: u32 = 10_000;
+const DEFAULT_REQUEST_TIMEOUT_MS: u32 = 20_000;
 
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 const COMMAND_REQUEST_TIMEOUT_MS: u32 = 30_000;
 
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
-const SPRITE_PREVIEW_TIMEOUT_MS: u32 = 75_000;
+const SPRITE_PREVIEW_TIMEOUT_MS: u32 = 120_000;
 
 /// Minimal RFC3986 `application/x-www-form-urlencoded` percent-encoder for
 /// query-param values. Kept local to avoid pulling in a dedicated crate —
@@ -869,7 +869,7 @@ mod tests {
 
     #[test]
     fn command_request_timeout_allows_longer_workshop_commands() {
-        assert_eq!(DEFAULT_REQUEST_TIMEOUT_MS, 10_000);
+        assert_eq!(DEFAULT_REQUEST_TIMEOUT_MS, 20_000);
         assert_eq!(COMMAND_REQUEST_TIMEOUT_MS, 30_000);
     }
 }

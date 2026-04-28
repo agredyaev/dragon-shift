@@ -43,8 +43,8 @@ app:
   databasePoolSize: 10
   createRateLimitMax: 20
   joinRateLimitMax: 100
-  signupRateLimitMax: 100
-  loginRateLimitMax: 100
+  signupRateLimitMax: 80
+  loginRateLimitMax: 80
   commandRateLimitMax: 120
   socketRateLimitMax: 300
   spriteQueueTimeoutSeconds: 1200

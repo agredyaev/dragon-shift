@@ -1262,6 +1262,33 @@ pub async fn request_open_workshops_flow(
     load_open_workshops_flow(identity, ops, paging).await
 }
 
+pub async fn request_open_workshops_flow_and_sync_paging(
+    identity: Signal<IdentityState>,
+    ops: Signal<OperationState>,
+    mut current_paging: Signal<OpenWorkshopsPaging>,
+    paging: OpenWorkshopsPaging,
+) -> bool {
+    let requested_paging = paging.clone();
+    let applied = request_open_workshops_flow(identity, ops, paging).await;
+    if !applied {
+        return false;
+    }
+
+    let next_paging = {
+        let current = ops.read();
+        normalize_open_workshops_paging_after_response(
+            &requested_paging,
+            current.open_workshops_prev_cursor.as_ref(),
+        )
+    };
+    current_paging.set(next_paging.clone());
+    if next_paging != requested_paging {
+        return request_open_workshops_flow(identity, ops, next_paging).await;
+    }
+
+    true
+}
+
 pub async fn refresh_open_workshops_after_delete(
     identity: Signal<IdentityState>,
     ops: Signal<OperationState>,
@@ -1271,9 +1298,17 @@ pub async fn refresh_open_workshops_after_delete(
     if !applied {
         return None;
     }
+
+    let next_paging = {
+        let current = ops.read();
+        normalize_open_workshops_paging_after_response(
+            &paging,
+            current.open_workshops_prev_cursor.as_ref(),
+        )
+    };
     let should_fallback = {
         let current = ops.read();
-        !matches!(paging, OpenWorkshopsPaging::First) && current.open_workshops.is_empty()
+        !matches!(next_paging, OpenWorkshopsPaging::First) && current.open_workshops.is_empty()
     };
     if should_fallback {
         if request_open_workshops_flow(identity, ops, OpenWorkshopsPaging::First).await {
@@ -1282,16 +1317,28 @@ pub async fn refresh_open_workshops_after_delete(
             None
         }
     } else {
-        Some(paging)
+        Some(next_paging)
     }
 }
 
 pub async fn refresh_open_workshops_after_workshop_update(
     identity: Signal<IdentityState>,
     ops: Signal<OperationState>,
+    current_paging: Signal<OpenWorkshopsPaging>,
     paging: OpenWorkshopsPaging,
 ) -> bool {
-    request_open_workshops_flow(identity, ops, paging).await
+    request_open_workshops_flow_and_sync_paging(identity, ops, current_paging, paging).await
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn normalize_open_workshops_paging_after_response(
+    requested_paging: &OpenWorkshopsPaging,
+    prev_cursor: Option<&OpenWorkshopCursor>,
+) -> OpenWorkshopsPaging {
+    match requested_paging {
+        OpenWorkshopsPaging::Before(_) if prev_cursor.is_none() => OpenWorkshopsPaging::First,
+        _ => requested_paging.clone(),
+    }
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -1769,7 +1816,8 @@ async fn submit_update_workshop_flow_reserved(
             }
             let paging = current_paging.read().clone();
             let refresh_applied =
-                refresh_open_workshops_after_workshop_update(identity, ops, paging).await;
+                refresh_open_workshops_after_workshop_update(identity, ops, current_paging, paging)
+                    .await;
             if !pending_flow_ticket_is_current(&ops.read(), &ticket) {
                 return;
             }
@@ -2283,6 +2331,132 @@ mod tests {
         (format!("http://{address}"), handle)
     }
 
+    fn spawn_before_page_server() -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind before-page test server");
+        let address = listener
+            .local_addr()
+            .expect("read before-page test server address");
+
+        let handle = thread::spawn(move || {
+            let (mut page_stream, _) = listener.accept().expect("accept before page request");
+            let page_request = read_http_request(&mut page_stream);
+            assert!(
+                page_request.starts_with(
+                    "GET /api/workshops/open?before_created_at=2026-01-02T00%3A00%3A00Z&before_session_code=654321 HTTP/1.1"
+                ),
+                "unexpected before page request: {page_request}"
+            );
+            let refreshed_page = serde_json::to_string(&ListOpenWorkshopsResponse {
+                workshops: vec![OpenWorkshopSummary {
+                    session_code: "123456".to_string(),
+                    host_name: "Alice".to_string(),
+                    player_count: 0,
+                    created_at: "2026-01-03T00:00:00Z".to_string(),
+                    phase1_minutes: 8,
+                    phase2_minutes: 5,
+                    archived: false,
+                    can_delete: true,
+                    can_resume: false,
+                }],
+                next_cursor: Some(OpenWorkshopCursor {
+                    created_at: "2026-01-03T00:00:00Z".to_string(),
+                    session_code: "123456".to_string(),
+                }),
+                prev_cursor: None,
+            })
+            .expect("encode before page response");
+            page_stream
+                .write_all(json_response(&refreshed_page).as_bytes())
+                .expect("write before page response");
+
+            let (mut first_stream, _) = listener.accept().expect("accept canonical first request");
+            let first_request = read_http_request(&mut first_stream);
+            assert!(
+                first_request.starts_with("GET /api/workshops/open HTTP/1.1"),
+                "unexpected canonical first request: {first_request}"
+            );
+            first_stream
+                .write_all(json_response(&refreshed_page).as_bytes())
+                .expect("write canonical first response");
+        });
+
+        (format!("http://{address}"), handle)
+    }
+
+    fn spawn_shrunken_before_page_server() -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind shrunken-page test server");
+        let address = listener
+            .local_addr()
+            .expect("read shrunken-page test server address");
+
+        let handle = thread::spawn(move || {
+            let (mut before_stream, _) = listener.accept().expect("accept before page request");
+            let before_request = read_http_request(&mut before_stream);
+            assert!(
+                before_request.starts_with(
+                    "GET /api/workshops/open?before_created_at=2026-01-02T00%3A00%3A00Z&before_session_code=654321 HTTP/1.1"
+                ),
+                "unexpected before page request: {before_request}"
+            );
+            let shrunken_page = serde_json::to_string(&ListOpenWorkshopsResponse {
+                workshops: vec![
+                    mock_open_workshop("111111", "2026-01-05T00:00:00Z"),
+                    mock_open_workshop("222222", "2026-01-04T00:00:00Z"),
+                    mock_open_workshop("333333", "2026-01-03T00:00:00Z"),
+                ],
+                next_cursor: Some(OpenWorkshopCursor {
+                    created_at: "2026-01-03T00:00:00Z".to_string(),
+                    session_code: "333333".to_string(),
+                }),
+                prev_cursor: None,
+            })
+            .expect("encode shrunken before page");
+            before_stream
+                .write_all(json_response(&shrunken_page).as_bytes())
+                .expect("write shrunken before page");
+
+            let (mut first_stream, _) = listener.accept().expect("accept canonical first request");
+            let first_request = read_http_request(&mut first_stream);
+            assert!(
+                first_request.starts_with("GET /api/workshops/open HTTP/1.1"),
+                "unexpected canonical first request: {first_request}"
+            );
+            let first_page = serde_json::to_string(&ListOpenWorkshopsResponse {
+                workshops: vec![
+                    mock_open_workshop("111111", "2026-01-05T00:00:00Z"),
+                    mock_open_workshop("222222", "2026-01-04T00:00:00Z"),
+                    mock_open_workshop("333333", "2026-01-03T00:00:00Z"),
+                    mock_open_workshop("444444", "2026-01-02T00:00:00Z"),
+                ],
+                next_cursor: Some(OpenWorkshopCursor {
+                    created_at: "2026-01-02T00:00:00Z".to_string(),
+                    session_code: "444444".to_string(),
+                }),
+                prev_cursor: None,
+            })
+            .expect("encode canonical first page");
+            first_stream
+                .write_all(json_response(&first_page).as_bytes())
+                .expect("write canonical first page");
+        });
+
+        (format!("http://{address}"), handle)
+    }
+
+    fn mock_open_workshop(session_code: &str, created_at: &str) -> OpenWorkshopSummary {
+        OpenWorkshopSummary {
+            session_code: session_code.to_string(),
+            host_name: "Alice".to_string(),
+            player_count: 0,
+            created_at: created_at.to_string(),
+            phase1_minutes: 8,
+            phase2_minutes: 5,
+            archived: false,
+            can_delete: true,
+            can_resume: false,
+        }
+    }
+
     fn spawn_archive_from_voting_server() -> (String, thread::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind archive test server");
         let address = listener
@@ -2617,6 +2791,93 @@ mod tests {
         assert!(!applied);
         assert_eq!(ops.eligible_characters.len(), 1);
         assert_eq!(ops.eligible_characters[0].id, "current");
+    }
+
+    #[test]
+    fn before_page_without_prev_cursor_normalizes_to_first() {
+        let (base_url, server) = spawn_before_page_server();
+
+        let mut dom = VirtualDom::new(|| rsx! { div {} });
+        dom.rebuild_in_place();
+
+        dom.in_scope(ScopeId::ROOT, || {
+            let runtime = tokio::runtime::Runtime::new().expect("create tokio runtime");
+
+            let mut initial_identity = default_identity_state();
+            initial_identity.api_base_url = base_url;
+            initial_identity.screen = ShellScreen::AccountHome;
+
+            let identity = Signal::new(initial_identity);
+            let ops = Signal::new(default_operation_state());
+            let current_paging = Signal::new(OpenWorkshopsPaging::Before(OpenWorkshopCursor {
+                created_at: "2026-01-02T00:00:00Z".to_string(),
+                session_code: "654321".to_string(),
+            }));
+
+            runtime.block_on(async move {
+                let requested_paging = current_paging.read().clone();
+                let applied = request_open_workshops_flow_and_sync_paging(
+                    identity,
+                    ops,
+                    current_paging,
+                    requested_paging,
+                )
+                .await;
+                assert!(applied, "paging request should apply");
+            });
+
+            server.join().expect("join before-page server thread");
+
+            assert_eq!(ops.read().open_workshops.len(), 1);
+            assert_eq!(ops.read().open_workshops[0].session_code, "123456");
+            assert_eq!(*current_paging.read(), OpenWorkshopsPaging::First);
+        });
+    }
+
+    #[test]
+    fn before_page_without_prev_cursor_reloads_canonical_first_page() {
+        let (base_url, server) = spawn_shrunken_before_page_server();
+
+        let mut dom = VirtualDom::new(|| rsx! { div {} });
+        dom.rebuild_in_place();
+
+        dom.in_scope(ScopeId::ROOT, || {
+            let runtime = tokio::runtime::Runtime::new().expect("create tokio runtime");
+
+            let mut initial_identity = default_identity_state();
+            initial_identity.api_base_url = base_url;
+            initial_identity.screen = ShellScreen::AccountHome;
+
+            let identity = Signal::new(initial_identity);
+            let ops = Signal::new(default_operation_state());
+            let current_paging = Signal::new(OpenWorkshopsPaging::Before(OpenWorkshopCursor {
+                created_at: "2026-01-02T00:00:00Z".to_string(),
+                session_code: "654321".to_string(),
+            }));
+
+            runtime.block_on(async move {
+                let requested_paging = current_paging.read().clone();
+                let applied = request_open_workshops_flow_and_sync_paging(
+                    identity,
+                    ops,
+                    current_paging,
+                    requested_paging,
+                )
+                .await;
+                assert!(applied, "paging request should apply");
+            });
+
+            server.join().expect("join shrunken-page server thread");
+
+            let codes = ops
+                .read()
+                .open_workshops
+                .iter()
+                .map(|workshop| workshop.session_code.clone())
+                .collect::<Vec<_>>();
+            assert_eq!(codes, ["111111", "222222", "333333", "444444"]);
+            assert_eq!(*current_paging.read(), OpenWorkshopsPaging::First);
+        });
     }
 
     #[test]

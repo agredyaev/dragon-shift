@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::RwLock;
+use std::time::Duration;
 use thiserror::Error;
 
 #[cfg(test)]
@@ -828,6 +829,7 @@ impl PostgresSessionStore {
     ) -> Result<Self, PersistenceError> {
         let pool = sqlx::postgres::PgPoolOptions::new()
             .max_connections(max_connections)
+            .acquire_timeout(Duration::from_secs(5))
             .connect(database_url)
             .await?;
         Ok(Self { pool })
@@ -2276,7 +2278,7 @@ impl SessionStore for PostgresSessionStore {
                                         FROM jsonb_each(ws.payload->'players') AS players(player_id, player)
                                         WHERE players.player->>'account_id' = $1
                                     )))
-                            ORDER BY COALESCE(latest_archive.created_at, ws.payload->>'created_at') DESC, ws.session_code ASC
+                            ORDER BY (COALESCE(latest_archive.created_at, ws.payload->>'created_at'))::timestamptz DESC, ws.session_code ASC
                             LIMIT $2
                         ",
                     )
@@ -2323,10 +2325,10 @@ impl SessionStore for PostgresSessionStore {
                                         WHERE players.player->>'account_id' = $3
                                     ))))
                                AND (
-                                    COALESCE(latest_archive.created_at, ws.payload->>'created_at') < $1
-                                 OR (COALESCE(latest_archive.created_at, ws.payload->>'created_at') = $1 AND ws.session_code > $2)
+                                     (COALESCE(latest_archive.created_at, ws.payload->>'created_at'))::timestamptz < $1::timestamptz
+                                  OR ((COALESCE(latest_archive.created_at, ws.payload->>'created_at'))::timestamptz = $1::timestamptz AND ws.session_code > $2)
                               )
-                            ORDER BY COALESCE(latest_archive.created_at, ws.payload->>'created_at') DESC, ws.session_code ASC
+                            ORDER BY (COALESCE(latest_archive.created_at, ws.payload->>'created_at'))::timestamptz DESC, ws.session_code ASC
                             LIMIT $4
                         ",
                     )
@@ -2377,10 +2379,10 @@ impl SessionStore for PostgresSessionStore {
                                         WHERE players.player->>'account_id' = $3
                                     ))))
                                AND (
-                                    COALESCE(latest_archive.created_at, ws.payload->>'created_at') > $1
-                                 OR (COALESCE(latest_archive.created_at, ws.payload->>'created_at') = $1 AND ws.session_code < $2)
+                                     (COALESCE(latest_archive.created_at, ws.payload->>'created_at'))::timestamptz > $1::timestamptz
+                                  OR ((COALESCE(latest_archive.created_at, ws.payload->>'created_at'))::timestamptz = $1::timestamptz AND ws.session_code < $2)
                               )
-                            ORDER BY COALESCE(latest_archive.created_at, ws.payload->>'created_at') ASC, ws.session_code DESC
+                            ORDER BY (COALESCE(latest_archive.created_at, ws.payload->>'created_at'))::timestamptz ASC, ws.session_code DESC
                             LIMIT $4
                         ",
                     )

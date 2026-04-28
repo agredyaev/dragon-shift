@@ -331,6 +331,7 @@ struct FaultyStore {
     fail_renew_session_lease: AtomicBool,
     fail_claim_realtime_connection: AtomicBool,
     load_session_by_code_calls: AtomicUsize,
+    load_character_calls: AtomicUsize,
     save_session_calls: AtomicUsize,
 }
 
@@ -389,6 +390,10 @@ impl FaultyStore {
 
     fn save_session_calls(&self) -> usize {
         self.save_session_calls.load(Ordering::SeqCst)
+    }
+
+    fn load_character_calls(&self) -> usize {
+        self.load_character_calls.load(Ordering::SeqCst)
     }
 }
 
@@ -664,6 +669,7 @@ impl SessionStore for FaultyStore {
                 + '_,
         >,
     > {
+        self.load_character_calls.fetch_add(1, Ordering::SeqCst);
         self.inner.load_character(character_id)
     }
 
@@ -8592,6 +8598,212 @@ async fn workshop_command_enters_voting_and_runs_judge_in_background_when_host_e
 }
 
 #[tokio::test]
+async fn workshop_command_start_voting_awards_phase_end_achievements() {
+    let state = test_state();
+    let app = build_app(state.clone());
+    let cookie = test_auth_cookie(&app, "Alice").await;
+    let create_success = create_workshop_success(&app, &cookie, "Alice").await;
+    let session_code = create_success.session_code.clone();
+
+    seed_selected_characters(&state, &session_code).await;
+    for request_body in [
+        setup_phase1_body(&session_code, &create_success.reconnect_token),
+        format!(
+            r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"startHandover"}}"#,
+            session_code, create_success.reconnect_token
+        ),
+        format!(
+            r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"submitTags","payload":["one","two","three"]}}"#,
+            session_code, create_success.reconnect_token
+        ),
+        format!(
+            r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"startPhase2"}}"#,
+            session_code, create_success.reconnect_token
+        ),
+    ] {
+        send_command_ok(&app, request_body).await;
+    }
+
+    {
+        let mut sessions = state.sessions.lock().await;
+        let session = sessions
+            .get_mut(&session_code)
+            .expect("cached session after phase2 start");
+        let dragon_id = session
+            .players
+            .get(&create_success.player_id)
+            .and_then(|player| player.current_dragon_id.clone())
+            .expect("host current dragon id");
+        let dragon = session.dragons.get_mut(&dragon_id).expect("current dragon");
+        dragon.wrong_food_count = 0;
+        dragon.wrong_play_count = 0;
+        dragon.wrong_sleep_count = 0;
+        dragon.correct_sleep_count = 2;
+        dragon.total_actions = 10;
+        dragon.correct_actions = 10;
+        dragon.found_correct_food = true;
+        dragon.penalty_stacks = 0;
+        dragon.phase2_lowest_happiness = 80;
+        dragon.happiness = 90;
+    }
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops/command")
+                .header("content-type", "application/json")
+                .body(Body::from(format!(
+                    r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"startVoting"}}"#,
+                    session_code, create_success.reconnect_token
+                )))
+                .expect("build startVoting command"),
+        )
+        .await
+        .expect("call startVoting command");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let sessions = state.sessions.lock().await;
+    let session = sessions
+        .get(&session_code)
+        .expect("cached session after startVoting");
+    assert_eq!(session.phase, protocol::Phase::Voting);
+    let player = session
+        .players
+        .get(&create_success.player_id)
+        .expect("host player");
+    for expected in [
+        "no_mistakes",
+        "zen_master",
+        "restful_rhythm",
+        "perfectionist",
+    ] {
+        let count = player
+            .achievements
+            .iter()
+            .filter(|achievement| achievement.as_str() == expected)
+            .count();
+        assert_eq!(count, 1, "cached achievement count for {expected}");
+    }
+    drop(sessions);
+
+    let persisted = state
+        .store
+        .load_session_by_code(&session_code)
+        .await
+        .expect("load persisted session")
+        .expect("persisted session exists");
+    let persisted_player = persisted
+        .players
+        .get(&create_success.player_id)
+        .expect("persisted host player");
+    for expected in [
+        "no_mistakes",
+        "zen_master",
+        "restful_rhythm",
+        "perfectionist",
+    ] {
+        let count = persisted_player
+            .achievements
+            .iter()
+            .filter(|achievement| achievement.as_str() == expected)
+            .count();
+        assert_eq!(count, 1, "persisted achievement count for {expected}");
+    }
+}
+
+#[tokio::test]
+async fn workshop_command_start_voting_from_judge_does_not_rerun_judge() {
+    let state = test_state();
+    let app = build_app(state.clone());
+    let cookie = test_auth_cookie(&app, "Alice").await;
+    let create_success = create_workshop_success(&app, &cookie, "Alice").await;
+    let session_code = create_success.session_code.clone();
+
+    {
+        let mut sessions = state.sessions.lock().await;
+        let session = sessions
+            .get_mut(&session_code)
+            .expect("cached session after create");
+        session.host_player_id = Some(create_success.player_id.clone());
+        session.phase = protocol::Phase::Judge;
+    }
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops/command")
+                .header("content-type", "application/json")
+                .body(Body::from(format!(
+                    r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"startVoting"}}"#,
+                    session_code, create_success.reconnect_token
+                )))
+                .expect("build startVoting command"),
+        )
+        .await
+        .expect("call startVoting command");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let sessions = state.sessions.lock().await;
+    let session = sessions
+        .get(&session_code)
+        .expect("cached session after startVoting");
+    assert_eq!(session.phase, protocol::Phase::Voting);
+    let session_id = session.id.to_string();
+    drop(sessions);
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let artifacts = state
+        .store
+        .list_session_artifacts(&session_id)
+        .await
+        .expect("list session artifacts after startVoting");
+    assert_eq!(
+        artifacts
+            .iter()
+            .filter(|artifact| artifact.kind == SessionArtifactKind::JudgeBundleGenerated)
+            .count(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn workshop_command_end_game_rejects_judge_phase() {
+    let state = test_state();
+    let app = build_app(state.clone());
+    let cookie = test_auth_cookie(&app, "Alice").await;
+    let create_success = create_workshop_success(&app, &cookie, "Alice").await;
+    let session_code = create_success.session_code.clone();
+
+    {
+        let mut sessions = state.sessions.lock().await;
+        let session = sessions
+            .get_mut(&session_code)
+            .expect("cached session after create");
+        session.host_player_id = Some(create_success.player_id.clone());
+        session.phase = protocol::Phase::Judge;
+    }
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops/command")
+                .header("content-type", "application/json")
+                .body(Body::from(format!(
+                    r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"endGame"}}"#,
+                    session_code, create_success.reconnect_token
+                )))
+                .expect("build endGame command"),
+        )
+        .await
+        .expect("call endGame command");
+
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+}
+
+#[tokio::test]
 async fn workshop_command_rejects_submit_vote_outside_voting() {
     let app = build_app(test_state());
     let cookie = test_auth_cookie(&app, "Alice").await;
@@ -9854,6 +10066,104 @@ async fn advance_game_ticks_updates_cached_session_without_persisting_each_tick(
         store.save_session_calls(),
         before_persist + 1,
         "multiple-of-5 ticks must persist so command-handler reloads pick up decayed stats"
+    );
+}
+
+#[tokio::test]
+async fn advance_game_ticks_persists_tick_awarded_achievements_immediately() {
+    let store = Arc::new(FaultyStore::new());
+    let state = test_state_with_store(store.clone());
+
+    let mut session = WorkshopSession::new(
+        Uuid::new_v4(),
+        SessionCode("955559".into()),
+        Utc::now(),
+        protocol::WorkshopCreateConfig::default(),
+    );
+    let mut host = session_player("player-1", "Alice", 1);
+    host.is_host = true;
+    host.character_id = Some("character-1".into());
+    host.selected_character = Some(test_character_profile(
+        "character-1",
+        "Coral dragon",
+        protocol::SpriteSet {
+            neutral: "neutral_b64".into(),
+            happy: "happy_b64".into(),
+            angry: "angry_b64".into(),
+            sleepy: "sleepy_b64".into(),
+        },
+        1,
+    ));
+    host.is_ready = true;
+    session.add_player(host);
+    session
+        .begin_phase1(&[domain::Phase1Assignment {
+            player_id: "player-1".into(),
+            dragon_id: "dragon-1".into(),
+        }])
+        .expect("begin phase1");
+    session.time = 16;
+    {
+        let dragon = session.dragons.get_mut("dragon-1").expect("dragon-1");
+        dragon.active_time = protocol::ActiveTime::Day;
+        dragon.sleep_rate = 1;
+        dragon.hunger = 100;
+        dragon.energy = 100;
+        dragon.happiness = 1;
+    }
+
+    state
+        .store
+        .save_session(&session)
+        .await
+        .expect("persist initial session");
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(session.code.0.clone(), session);
+    let before_tick = store.save_session_calls();
+
+    // time 16 -> 17 is not a multiple of 5, so only the achievement award should force persistence.
+    advance_game_ticks(&state).await;
+
+    assert_eq!(
+        store.save_session_calls(),
+        before_tick + 1,
+        "tick-awarded achievements must be persisted immediately even between throttled tick saves"
+    );
+    let cached = state.sessions.lock().await;
+    let cached_player = cached
+        .get("955559")
+        .and_then(|session| session.players.get("player-1"))
+        .expect("cached player after tick");
+    assert_eq!(
+        cached_player
+            .achievements
+            .iter()
+            .filter(|achievement| achievement.as_str() == "rock_bottom")
+            .count(),
+        1
+    );
+    drop(cached);
+
+    let persisted = state
+        .store
+        .load_session_by_code("955559")
+        .await
+        .expect("load persisted tick session")
+        .expect("persisted tick session exists");
+    let persisted_player = persisted
+        .players
+        .get("player-1")
+        .expect("persisted player after tick");
+    assert_eq!(
+        persisted_player
+            .achievements
+            .iter()
+            .filter(|achievement| achievement.as_str() == "rock_bottom")
+            .count(),
+        1
     );
 }
 
@@ -15237,6 +15547,129 @@ async fn character_sprite_endpoint_serves_referenced_character_sprite() {
         .await
         .expect("read sprite body");
     assert_eq!(&bytes[..], b"png-happy");
+}
+
+#[tokio::test]
+async fn character_sprite_endpoint_uses_cached_character_bytes_after_first_load() {
+    use base64::Engine as _;
+
+    let store = Arc::new(FaultyStore::new());
+    store
+        .save_character(&persistence::CharacterRecord {
+            id: "character_sprite_cache_hit_001".to_string(),
+            name: None,
+            description: "A cached sprite dragon".to_string(),
+            sprites: protocol::SpriteSet {
+                neutral: base64::engine::general_purpose::STANDARD.encode(b"png-neutral"),
+                happy: base64::engine::general_purpose::STANDARD.encode(b"png-happy"),
+                angry: base64::engine::general_purpose::STANDARD.encode(b"png-angry"),
+                sleepy: base64::engine::general_purpose::STANDARD.encode(b"png-sleepy"),
+            },
+            remaining_sprite_regenerations: 0,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+            owner_account_id: None,
+        })
+        .await
+        .expect("seed cached character");
+
+    let app = build_app(test_state_with_store(store.clone()));
+    for _ in 0..2 {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/characters/character_sprite_cache_hit_001/sprites/happy")
+                    .body(Body::empty())
+                    .expect("build cached sprite request"),
+            )
+            .await
+            .expect("cached sprite response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read cached sprite body");
+        assert_eq!(&bytes[..], b"png-happy");
+    }
+
+    assert_eq!(store.load_character_calls(), 1);
+}
+
+#[tokio::test]
+async fn delete_character_evicts_cached_sprite_bytes() {
+    use base64::Engine as _;
+
+    let store = Arc::new(FaultyStore::new());
+    let state = test_state_with_store(store.clone());
+    let app = build_app(state);
+    let cookie = signin_and_get_cookie(&app, "dragon", "SpriteOwner", "sprite-owner-password").await;
+    let owner_account_id = store
+        .find_account_by_name_lower("spriteowner")
+        .await
+        .expect("lookup sprite owner")
+        .expect("sprite owner account exists")
+        .id;
+
+    store
+        .save_character(&persistence::CharacterRecord {
+            id: "character_sprite_delete_001".to_string(),
+            name: None,
+            description: "A deletable sprite dragon".to_string(),
+            sprites: protocol::SpriteSet {
+                neutral: base64::engine::general_purpose::STANDARD.encode(b"png-neutral"),
+                happy: base64::engine::general_purpose::STANDARD.encode(b"png-happy"),
+                angry: base64::engine::general_purpose::STANDARD.encode(b"png-angry"),
+                sleepy: base64::engine::general_purpose::STANDARD.encode(b"png-sleepy"),
+            },
+            remaining_sprite_regenerations: 0,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+            owner_account_id: Some(owner_account_id),
+        })
+        .await
+        .expect("seed deletable character");
+
+    let first = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/characters/character_sprite_delete_001/sprites/happy")
+                .body(Body::empty())
+                .expect("build first sprite request"),
+        )
+        .await
+        .expect("first sprite response");
+    assert_eq!(first.status(), StatusCode::OK);
+
+    let delete = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/api/characters/character_sprite_delete_001")
+                .header(axum::http::header::COOKIE, &cookie)
+                .body(Body::empty())
+                .expect("build delete character request"),
+        )
+        .await
+        .expect("delete character response");
+    assert_eq!(delete.status(), StatusCode::NO_CONTENT);
+
+    let second = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/characters/character_sprite_delete_001/sprites/happy")
+                .body(Body::empty())
+                .expect("build second sprite request"),
+        )
+        .await
+        .expect("second sprite response");
+    assert_eq!(second.status(), StatusCode::NOT_FOUND);
+    assert_eq!(store.load_character_calls(), 2);
 }
 
 #[tokio::test]

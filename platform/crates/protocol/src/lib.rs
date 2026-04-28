@@ -247,6 +247,10 @@ pub struct Dragon {
     pub phase2_lowest_happiness: i32,
     pub wrong_food_count: i32,
     pub wrong_play_count: i32,
+    #[serde(default)]
+    pub wrong_sleep_count: i32,
+    #[serde(default)]
+    pub correct_sleep_count: i32,
     pub cooldown_violations: i32,
     pub total_actions: i32,
     pub correct_actions: i32,
@@ -538,7 +542,7 @@ pub struct JudgeActionTrace {
     pub created_at: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resulting_stats: Option<DragonStats>,
-    /// Whether the action matched the dragon's preference (None = blocked/sleep).
+    /// Whether the action matched the dragon's preference (None = blocked).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub was_correct: Option<bool>,
     /// If the action was blocked, the reason (e.g. "already_full", "cooldown_violation").
@@ -587,6 +591,10 @@ pub struct JudgeDragonBundle {
     pub correct_actions: i32,
     pub wrong_food_count: i32,
     pub wrong_play_count: i32,
+    #[serde(default)]
+    pub wrong_sleep_count: i32,
+    #[serde(default)]
+    pub correct_sleep_count: i32,
     pub cooldown_violations: i32,
     pub penalty_stacks_at_end: i32,
     pub phase2_lowest_happiness: i32,
@@ -952,6 +960,7 @@ pub fn create_session_settings(config: &WorkshopCreateConfig) -> SessionSettings
             allowed_commands: vec![
                 SessionCommand::Action,
                 SessionCommand::EndGame,
+                SessionCommand::StartVoting,
                 SessionCommand::ResetGame,
             ],
         },
@@ -1278,6 +1287,14 @@ mod tests {
                 .expect("phase2 phase")
                 .duration_seconds,
             5 * 60
+        );
+        assert!(
+            settings
+                .phases
+                .get(&Phase::Phase2)
+                .expect("phase2 phase")
+                .allowed_commands
+                .contains(&SessionCommand::StartVoting)
         );
     }
 

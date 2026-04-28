@@ -100,7 +100,7 @@ variable "trust_forwarded_for" {
 variable "database_pool_size" {
   description = "Postgres connection pool size."
   type        = number
-  default     = 10
+  default     = 30
 }
 
 variable "app_cpu_request" {
@@ -136,13 +136,13 @@ variable "rust_session_code_prefix" {
 variable "create_rate_limit_max" {
   description = "Per-minute create workshop limit."
   type        = number
-  default     = 20
+  default     = 80
 }
 
 variable "join_rate_limit_max" {
   description = "Per-minute join/reconnect limit."
   type        = number
-  default     = 60
+  default     = 80
 }
 
 variable "command_rate_limit_max" {
@@ -166,7 +166,7 @@ variable "sprite_queue_timeout_seconds" {
 variable "image_job_max_concurrency" {
   description = "Maximum number of queued image jobs admitted concurrently by the backend runtime."
   type        = number
-  default     = 2
+  default     = 4
 }
 
 variable "cloud_armor_rate_limit_count" {

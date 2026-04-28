@@ -70,6 +70,10 @@ pub struct SessionDragon {
     /// Counters for wrong/correct actions and penalty tracking.
     pub wrong_food_count: i32,
     pub wrong_play_count: i32,
+    #[serde(default)]
+    pub wrong_sleep_count: i32,
+    #[serde(default)]
+    pub correct_sleep_count: i32,
     pub cooldown_violations: i32,
     pub total_actions: i32,
     pub correct_actions: i32,
@@ -476,6 +480,8 @@ impl WorkshopSession {
                         phase2_lowest_happiness: 100,
                         wrong_food_count: 0,
                         wrong_play_count: 0,
+                        wrong_sleep_count: 0,
+                        correct_sleep_count: 0,
                         cooldown_violations: 0,
                         total_actions: 0,
                         correct_actions: 0,
@@ -609,6 +615,8 @@ impl WorkshopSession {
                         dragon.phase2_lowest_happiness = 100;
                         dragon.wrong_food_count = 0;
                         dragon.wrong_play_count = 0;
+                        dragon.wrong_sleep_count = 0;
+                        dragon.correct_sleep_count = 0;
                         dragon.cooldown_violations = 0;
                         dragon.total_actions = 0;
                         dragon.correct_actions = 0;
@@ -642,6 +650,8 @@ impl WorkshopSession {
             dragon.phase2_lowest_happiness = 100;
             dragon.wrong_food_count = 0;
             dragon.wrong_play_count = 0;
+            dragon.wrong_sleep_count = 0;
+            dragon.correct_sleep_count = 0;
             dragon.cooldown_violations = 0;
             dragon.total_actions = 0;
             dragon.correct_actions = 0;
@@ -706,7 +716,7 @@ impl WorkshopSession {
                     }
                 } else {
                     dragon.last_action = DragonAction::Feed;
-                    dragon.action_cooldown = 3;
+                    dragon.action_cooldown = 2;
                     dragon.sleep_shield_ticks = 0;
                     dragon.food_tries += 1;
                     dragon.total_actions += 1;
@@ -772,7 +782,7 @@ impl WorkshopSession {
                     }
                 } else {
                     dragon.last_action = DragonAction::Play;
-                    dragon.action_cooldown = 3;
+                    dragon.action_cooldown = 2;
                     dragon.sleep_shield_ticks = 0;
                     dragon.play_tries += 1;
                     dragon.total_actions += 1;
@@ -829,7 +839,7 @@ impl WorkshopSession {
                     }
                 } else {
                     dragon.last_action = DragonAction::Sleep;
-                    dragon.action_cooldown = 3;
+                    dragon.action_cooldown = 2;
                     dragon.total_actions += 1;
                     dragon.energy = (dragon.energy + 50).min(100);
                     let is_correct_time = (dragon.active_time == ActiveTime::Day
@@ -837,9 +847,16 @@ impl WorkshopSession {
                         || (dragon.active_time == ActiveTime::Night && current_is_day);
                     let was_correct = is_correct_time;
                     if is_correct_time {
+                        dragon.correct_sleep_count += 1;
                         dragon.correct_actions += 1;
                         dragon.happiness = (dragon.happiness + 15).min(100);
                         dragon.penalty_stacks = (dragon.penalty_stacks - 1).max(0);
+                    } else {
+                        dragon.wrong_sleep_count += 1;
+                        dragon.penalty_stacks += 1;
+                        if dragon.penalty_stacks > dragon.peak_penalty_stacks {
+                            dragon.peak_penalty_stacks = dragon.penalty_stacks;
+                        }
                     }
                     dragon.sleep_shield_ticks = 1;
                     dragon.last_emotion = DragonEmotion::Sleepy;
@@ -864,6 +881,20 @@ impl WorkshopSession {
                 .any(|existing| existing == achievement)
         {
             player.achievements.push((*achievement).to_string());
+        }
+
+        if let ActionOutcome::Applied { .. } = &outcome
+            && let Some(dragon) = self.dragons.get(&dragon_id)
+            && dragon.found_correct_food
+            && dragon.found_correct_play
+            && dragon.total_actions <= 3
+            && let Some(player) = self.players.get_mut(player_id)
+            && !player
+                .achievements
+                .iter()
+                .any(|achievement| achievement == "speed_learner")
+        {
+            player.achievements.push("speed_learner".to_string());
         }
 
         self.touch();
@@ -1034,9 +1065,11 @@ impl WorkshopSession {
             let owner_id = &dragon.current_owner_id;
             let creator_id = &dragon.original_owner_id;
 
-            // "no_mistakes" — 0 wrong actions and >= 5 total actions (Phase 2 sitter)
+            // "no_mistakes" — 0 wrong food/play/sleep actions and >= 5 total actions.
             if dragon.wrong_food_count == 0
                 && dragon.wrong_play_count == 0
+                && dragon.wrong_sleep_count == 0
+                && (dragon.found_correct_food || dragon.found_correct_play)
                 && dragon.total_actions >= 5
             {
                 if let Some(player) = self.players.get(owner_id) {
@@ -1060,6 +1093,18 @@ impl WorkshopSession {
                 if let Some(player) = self.players.get(owner_id) {
                     if !player.achievements.iter().any(|a| a == "button_masher") {
                         result.push((owner_id.clone(), "button_masher"));
+                    }
+                }
+            }
+
+            // "restful_rhythm" — timed sleep correctly and avoided wrong-time sleep.
+            if dragon.correct_sleep_count >= 2
+                && dragon.wrong_sleep_count == 0
+                && dragon.total_actions >= 5
+            {
+                if let Some(player) = self.players.get(owner_id) {
+                    if !player.achievements.iter().any(|a| a == "restful_rhythm") {
+                        result.push((owner_id.clone(), "restful_rhythm"));
                     }
                 }
             }
@@ -2000,7 +2045,7 @@ mod tests {
         {
             let player = session.players.get_mut("p1").expect("player p1");
             player.score = 77;
-            player.achievements = vec!["smooth_transition".into()];
+            player.achievements = vec!["master_chef".into()];
             player.character_id = Some("character-1".into());
             player.selected_character = Some(CharacterProfile {
                 id: "character-1".into(),
@@ -2880,10 +2925,45 @@ mod tests {
         let d = s.dragons.get("d1").unwrap();
         assert_eq!(d.energy, 90); // 40 + 50 (energy always recovers)
         assert_eq!(d.happiness, 50); // No happiness bonus for wrong time
+        assert_eq!(d.wrong_sleep_count, 1);
+        assert_eq!(d.penalty_stacks, 1);
+        assert_eq!(d.peak_penalty_stacks, 1);
+    }
+
+    #[test]
+    fn wrong_time_sleep_blocks_no_mistakes_phase_end_award() {
+        let mut s = setup_deterministic_session();
+        s.transition_to(Phase::Handover).unwrap();
+        s.save_handover_tags("p1", vec!["a".into(), "b".into(), "c".into()])
+            .expect("save handover tags");
+        s.enter_phase2().unwrap();
+        {
+            let d = s.dragons.get_mut("d1").unwrap();
+            d.active_time = ActiveTime::Day;
+            d.energy = 40;
+            d.happiness = 70;
+        }
+        s.time = 20; // Day: wrong sleep time for a day-active dragon.
+        s.apply_action("p1", PlayerAction::Sleep).unwrap();
+        for _ in 0..4 {
+            let d = s.dragons.get_mut("d1").unwrap();
+            d.action_cooldown = 0;
+            d.hunger = 50;
+            s.apply_action("p1", PlayerAction::Feed(FoodType::Meat))
+                .unwrap();
+        }
+
+        s.award_phase_end_achievements();
+
+        let d = s.dragons.get("d1").unwrap();
+        assert_eq!(d.wrong_sleep_count, 1);
+        assert!(d.total_actions >= 5);
+        let p = s.players.get("p1").unwrap();
+        assert!(!p.achievements.contains(&"no_mistakes".to_string()));
     }
 
     // =========================================================================
-    // VALIDATOR 2: Achievement System (all 12 achievements)
+    // VALIDATOR 2: Achievement System (all 13 achievements)
     // =========================================================================
 
     #[test]
@@ -2961,10 +3041,8 @@ mod tests {
                 awarded_achievement,
                 ..
             } => {
-                // playful_spirit takes priority on first play try,
-                // but speed_learner check: found_correct_food is true, total_actions <= 3
-                // Actually playful_spirit is checked first; speed_learner only if awarded.is_none()
-                // Since playful_spirit fires, speed_learner doesn't
+                // The response keeps the primary first-try award, while the
+                // player still earns speed_learner in stored achievements.
                 assert_eq!(awarded_achievement, Some("playful_spirit"));
             }
             _ => panic!("expected Applied"),
@@ -2974,6 +3052,10 @@ mod tests {
         assert!(d.found_correct_food);
         assert!(d.found_correct_play);
         assert_eq!(d.total_actions, 2); // Within 3
+        let p = s.players.get("p1").unwrap();
+        assert!(p.achievements.contains(&"master_chef".to_string()));
+        assert!(p.achievements.contains(&"playful_spirit".to_string()));
+        assert!(p.achievements.contains(&"speed_learner".to_string()));
     }
 
     #[test]
@@ -3160,6 +3242,66 @@ mod tests {
         s.award_phase_end_achievements();
         let p = s.players.get("p1").unwrap();
         assert!(p.achievements.contains(&"button_masher".to_string()));
+    }
+
+    #[test]
+    fn validator2_restful_rhythm_correct_time_sleep_phase_end() {
+        let mut s = setup_deterministic_session();
+        s.transition_to(Phase::Handover).unwrap();
+        s.save_handover_tags("p1", vec!["a".into(), "b".into(), "c".into()])
+            .expect("save handover tags");
+        s.enter_phase2().unwrap();
+        {
+            let d = s.dragons.get_mut("d1").unwrap();
+            d.active_time = ActiveTime::Day;
+            d.favorite_food = FoodType::Meat;
+            d.energy = 40;
+        }
+        s.time = 40; // Night: correct sleep time for a day-active dragon.
+
+        for _ in 0..2 {
+            s.apply_action("p1", PlayerAction::Sleep).unwrap();
+            let d = s.dragons.get_mut("d1").unwrap();
+            d.action_cooldown = 0;
+            d.energy = 40;
+        }
+        for _ in 0..3 {
+            let d = s.dragons.get_mut("d1").unwrap();
+            d.action_cooldown = 0;
+            d.hunger = 50;
+            s.apply_action("p1", PlayerAction::Feed(FoodType::Meat))
+                .unwrap();
+        }
+
+        s.award_phase_end_achievements();
+
+        let d = s.dragons.get("d1").unwrap();
+        assert_eq!(d.correct_sleep_count, 2);
+        assert_eq!(d.wrong_sleep_count, 0);
+        assert!(d.total_actions >= 5);
+        let p = s.players.get("p1").unwrap();
+        assert!(p.achievements.contains(&"restful_rhythm".to_string()));
+    }
+
+    #[test]
+    fn validator2_restful_rhythm_rejects_wrong_time_sleep() {
+        let mut s = setup_deterministic_session();
+        s.transition_to(Phase::Handover).unwrap();
+        s.save_handover_tags("p1", vec!["a".into(), "b".into(), "c".into()])
+            .expect("save handover tags");
+        s.enter_phase2().unwrap();
+        let d = s.dragons.get_mut("d1").unwrap();
+        d.correct_sleep_count = 2;
+        d.wrong_sleep_count = 1;
+        d.total_actions = 5;
+
+        let awards = s.award_phase_end_achievements();
+
+        assert!(
+            !awards
+                .iter()
+                .any(|(_, achievement)| *achievement == "restful_rhythm")
+        );
     }
 
     #[test]
@@ -3588,7 +3730,7 @@ mod tests {
         s.apply_action("p1", PlayerAction::Feed(FoodType::Meat))
             .unwrap();
         let d = s.dragons.get("d1").unwrap();
-        assert_eq!(d.action_cooldown, 3);
+        assert_eq!(d.action_cooldown, 2);
 
         // Second action during cooldown
         let out = s
@@ -3620,7 +3762,7 @@ mod tests {
     }
 
     #[test]
-    fn validator5_cooldown_expires_after_three_ticks() {
+    fn validator5_cooldown_expires_after_two_ticks() {
         let mut s = setup_deterministic_session();
         let d = s.dragons.get_mut("d1").unwrap();
         d.active_time = ActiveTime::Day;
@@ -3632,10 +3774,8 @@ mod tests {
 
         s.apply_action("p1", PlayerAction::Feed(FoodType::Meat))
             .unwrap();
-        assert_eq!(s.dragons.get("d1").unwrap().action_cooldown, 3);
-
-        s.advance_tick();
         assert_eq!(s.dragons.get("d1").unwrap().action_cooldown, 2);
+
         s.advance_tick();
         assert_eq!(s.dragons.get("d1").unwrap().action_cooldown, 1);
         s.advance_tick();
@@ -4781,13 +4921,20 @@ mod tests {
     }
 
     #[test]
-    fn validator10_no_mistakes_requires_both_zero_wrong() {
+    fn validator10_no_mistakes_requires_zero_wrong_actions() {
         let mut s = setup_deterministic_session();
         let d = s.dragons.get_mut("d1").unwrap();
         d.total_actions = 6;
         d.wrong_food_count = 0;
         d.wrong_play_count = 1; // has wrong plays
         d.correct_actions = 5;
+
+        let awards = s.award_phase_end_achievements();
+        assert!(!awards.iter().any(|(_, ach)| *ach == "no_mistakes"));
+
+        let d = s.dragons.get_mut("d1").unwrap();
+        d.wrong_play_count = 0;
+        d.wrong_sleep_count = 1; // has wrong sleep
 
         let awards = s.award_phase_end_achievements();
         assert!(!awards.iter().any(|(_, ach)| *ach == "no_mistakes"));
@@ -4803,6 +4950,23 @@ mod tests {
         d.correct_actions = 4;
 
         let awards = s.award_phase_end_achievements();
+        assert!(!awards.iter().any(|(_, ach)| *ach == "no_mistakes"));
+    }
+
+    #[test]
+    fn validator10_no_mistakes_requires_correct_food_or_play() {
+        let mut s = setup_deterministic_session();
+        let d = s.dragons.get_mut("d1").unwrap();
+        d.total_actions = 5;
+        d.correct_actions = 5;
+        d.wrong_food_count = 0;
+        d.wrong_play_count = 0;
+        d.wrong_sleep_count = 0;
+        d.found_correct_food = false;
+        d.found_correct_play = false;
+
+        let awards = s.award_phase_end_achievements();
+
         assert!(!awards.iter().any(|(_, ach)| *ach == "no_mistakes"));
     }
 
@@ -4915,16 +5079,20 @@ mod tests {
     }
 
     #[test]
-    fn validator11_wrong_time_sleep_does_not_reduce_penalty() {
+    fn validator11_wrong_time_sleep_adds_penalty() {
         let mut s = setup_deterministic_session();
         let d = s.dragons.get_mut("d1").unwrap();
         d.penalty_stacks = 3;
+        d.peak_penalty_stacks = 3;
         d.energy = 40;
         d.active_time = ActiveTime::Day;
         s.time = 20; // daytime → wrong sleep time for Day dragon
 
         s.apply_action("p1", PlayerAction::Sleep).unwrap();
-        assert_eq!(s.dragons.get("d1").unwrap().penalty_stacks, 3);
+        let d = s.dragons.get("d1").unwrap();
+        assert_eq!(d.penalty_stacks, 4);
+        assert_eq!(d.peak_penalty_stacks, 4);
+        assert_eq!(d.wrong_sleep_count, 1);
     }
 
     #[test]
@@ -4937,6 +5105,8 @@ mod tests {
         d.peak_penalty_stacks = 3;
         d.wrong_food_count = 2;
         d.wrong_play_count = 1;
+        d.wrong_sleep_count = 1;
+        d.correct_sleep_count = 1;
         d.cooldown_violations = 3;
         d.total_actions = 10;
         d.correct_actions = 5;
@@ -4966,6 +5136,8 @@ mod tests {
         assert_eq!(d.peak_penalty_stacks, 0);
         assert_eq!(d.wrong_food_count, 0);
         assert_eq!(d.wrong_play_count, 0);
+        assert_eq!(d.wrong_sleep_count, 0);
+        assert_eq!(d.correct_sleep_count, 0);
         assert_eq!(d.cooldown_violations, 0);
         assert_eq!(d.total_actions, 0);
         assert_eq!(d.correct_actions, 0);
@@ -4990,6 +5162,8 @@ mod tests {
         d.peak_penalty_stacks = 5;
         d.wrong_food_count = 4;
         d.wrong_play_count = 2;
+        d.wrong_sleep_count = 3;
+        d.correct_sleep_count = 2;
         d.cooldown_violations = 7;
         d.total_actions = 15;
         d.correct_actions = 8;
@@ -5006,6 +5180,8 @@ mod tests {
         assert_eq!(d.peak_penalty_stacks, 0);
         assert_eq!(d.wrong_food_count, 0);
         assert_eq!(d.wrong_play_count, 0);
+        assert_eq!(d.wrong_sleep_count, 0);
+        assert_eq!(d.correct_sleep_count, 0);
         assert_eq!(d.cooldown_violations, 0);
         assert_eq!(d.total_actions, 0);
         assert_eq!(d.correct_actions, 0);

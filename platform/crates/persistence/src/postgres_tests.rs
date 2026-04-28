@@ -1424,6 +1424,72 @@ mod postgres_tests {
 
     #[tokio::test]
     #[ignore]
+    async fn list_open_workshops_postgres_archived_boundary_round_trip_handles_z_cursor() {
+        let store = setup_store(
+            "list_open_workshops_postgres_archived_boundary_round_trip_handles_z_cursor",
+        )
+        .await;
+        let viewer_account_id = "viewer-account";
+
+        for (code, seconds) in [
+            ("ARCH01", 2_000),
+            ("ARCH02", 1_999),
+            ("ARCH03", 1_998),
+            ("ARCH04", 1_997),
+            ("ARCH05", 1_996),
+            ("ARCH06", 1_995),
+        ] {
+            let (session, artifact) = pg_archived_session_at(code, seconds, viewer_account_id);
+            assert!(
+                artifact.created_at.ends_with("+00:00"),
+                "test requires archived artifact timestamp to use an offset form"
+            );
+            store.save_session(&session).await.expect("save archive");
+            store
+                .append_session_artifact(&artifact)
+                .await
+                .expect("save archive artifact");
+        }
+
+        let page1 = store
+            .list_open_workshops(
+                OpenWorkshopsPaging::First,
+                Some(viewer_account_id.to_string()),
+            )
+            .await
+            .expect("page 1");
+        let p1_last = page1.rows.last().unwrap().clone();
+        let page2 = store
+            .list_open_workshops(
+                OpenWorkshopsPaging::After(OpenWorkshopCursor {
+                    created_at: p1_last.created_at.replace("+00:00", "Z"),
+                    session_code: p1_last.session_code.clone(),
+                }),
+                Some(viewer_account_id.to_string()),
+            )
+            .await
+            .expect("page 2");
+        let p2_first = page2.rows.first().unwrap().clone();
+        let back = store
+            .list_open_workshops(
+                OpenWorkshopsPaging::Before(OpenWorkshopCursor {
+                    created_at: p2_first.created_at.replace("+00:00", "Z"),
+                    session_code: p2_first.session_code.clone(),
+                }),
+                Some(viewer_account_id.to_string()),
+            )
+            .await
+            .expect("prev page");
+
+        assert_eq!(
+            back.rows, page1.rows,
+            "archived timestamp cursors must round-trip when the cursor uses Z but rows store +00:00"
+        );
+        store.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore]
     async fn list_open_workshops_postgres_tie_breaks_by_session_code_asc() {
         let store =
             setup_store("list_open_workshops_postgres_tie_breaks_by_session_code_asc").await;

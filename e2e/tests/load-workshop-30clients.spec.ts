@@ -19,6 +19,7 @@ const ALLOW_ACCOUNT_CREATION = (process.env.E2E_ALLOW_ACCOUNT_CREATION ?? 'false
 const ALLOW_STARTER_FALLBACK = (process.env.E2E_ALLOW_STARTER_FALLBACK ?? 'false').trim().toLowerCase() === 'true'
 const EXTERNAL_WORKSHOP_CODE = process.env.E2E_EXTERNAL_WORKSHOP_CODE ?? ''
 const HOST_ACCOUNT_NAME = process.env.E2E_HOST_ACCOUNT_NAME ?? 'test1'
+const AUTO_HOST_PROGRESS = (process.env.E2E_AUTO_HOST_PROGRESS ?? 'false').trim().toLowerCase() === 'true'
 const PHASE_DURATION_MS = 5 * 60_000
 const PHASE1_ACTION_INTERVAL_MS = 22_000
 const PHASE1_OBSERVATION_INTERVAL_MS = 70_000
@@ -831,6 +832,120 @@ test.describe.serial('live ui load test - guest workshop accounts', () => {
       await waitForScoreReadyForClient(client)
     }
 
+    async function runAutoHostProgress(host: ClientCtx, clients: ClientCtx[]) {
+      if (COVERAGE_TARGET !== 'phase2') {
+        throw new Error('auto host progress currently supports only E2E_COVERAGE_TARGET=phase2')
+      }
+
+      log(host, 'info', 'manual', 'auto host progress enabled', `host=${host.name}`)
+
+      host.currentStage = 'phase1'
+      await expect(host.page.getByTestId('start-phase1-button')).toBeVisible({ timeout: RESPONSE_TIMEOUT_MS })
+      await host.page.getByTestId('start-phase1-button').click()
+      await waitForNotice(host.page, 'Phase 1 started.')
+      await waitForPhase1(host)
+
+      let phase1ActionCursor = host.index % phase1ActionIds.length
+      let nextPhase1ActionAt = Date.now() + (host.index % 10) * 900
+      let nextPhase1ObservationAt = Date.now() + (host.index % 7) * 1_700
+      const phase1Deadline = Date.now() + SESSION_PROGRESS_TIMEOUT_MS
+
+      while (Date.now() < phase1Deadline) {
+        await sampleConnected(host, 'phase1')
+
+        const now = Date.now()
+        if (now >= nextPhase1ObservationAt && await host.page.getByTestId('observation-input').count().catch(() => 0)) {
+          await submitObservation(host, createObservation(host, host.phase1Observations)).catch(error => {
+            log(host, 'warn', 'phase1', 'host observation failed', String(error))
+          })
+          nextPhase1ObservationAt += PHASE1_OBSERVATION_INTERVAL_MS
+          continue
+        }
+
+        if (now >= nextPhase1ActionAt) {
+          const actionId = phase1ActionIds[phase1ActionCursor % phase1ActionIds.length]
+          const clicked = await clickAction(host, 'phase1', actionId).catch(error => {
+            log(host, 'warn', 'phase1', 'host phase1 action failed', `${actionId} :: ${String(error)}`)
+            return false
+          })
+          if (clicked) {
+            host.phase1Actions++
+          }
+          phase1ActionCursor++
+          nextPhase1ActionAt += PHASE1_ACTION_INTERVAL_MS
+          continue
+        }
+
+        if (clients.every(client => client.phase1Actions > 0 && client.phase1Observations > 0)) {
+          break
+        }
+
+        await host.page.waitForTimeout(500)
+      }
+
+      if (!clients.every(client => client.phase1Actions > 0 && client.phase1Observations > 0)) {
+        throw new Error(`phase1 coverage wait timed out for auto host ${host.name} | ${await buildClientSnapshot(host)}`)
+      }
+
+      host.currentStage = 'handover'
+      await expect(host.page.getByTestId('start-handover-button')).toBeVisible({ timeout: RESPONSE_TIMEOUT_MS })
+      await host.page.getByTestId('start-handover-button').click()
+      await waitForNotice(host.page, 'Handover started.')
+      await waitForHandover(host)
+      await saveHandover(host)
+
+      const handoverDeadline = Date.now() + SESSION_PROGRESS_TIMEOUT_MS
+      while (Date.now() < handoverDeadline) {
+        await sampleConnected(host, 'handover')
+        if (clients.every(client => client.handoverSaved)) {
+          break
+        }
+        await delay(500)
+      }
+
+      if (!clients.every(client => client.handoverSaved)) {
+        throw new Error(`handover coverage wait timed out for auto host ${host.name} | ${await buildClientSnapshot(host)}`)
+      }
+
+      host.currentStage = 'phase2'
+      await expect(host.page.getByTestId('start-phase2-button')).toBeVisible({ timeout: RESPONSE_TIMEOUT_MS })
+      await host.page.getByTestId('start-phase2-button').click()
+      await waitForNotice(host.page, 'Phase 2 started.')
+      await waitForPhase2(host)
+
+      let phase2ActionCursor = (host.index * 2) % phase2ActionIds.length
+      let nextPhase2ActionAt = Date.now() + (host.index % 9) * 1_200
+      const phase2Deadline = Date.now() + SESSION_PROGRESS_TIMEOUT_MS
+
+      while (Date.now() < phase2Deadline) {
+        await sampleConnected(host, 'phase2')
+
+        const now = Date.now()
+        if (now >= nextPhase2ActionAt) {
+          const actionId = phase2ActionIds[phase2ActionCursor % phase2ActionIds.length]
+          const clicked = await clickAction(host, 'phase2', actionId).catch(error => {
+            log(host, 'warn', 'phase2', 'host phase2 action failed', `${actionId} :: ${String(error)}`)
+            return false
+          })
+          if (clicked) {
+            host.phase2Actions++
+          }
+          phase2ActionCursor++
+          nextPhase2ActionAt += PHASE2_ACTION_INTERVAL_MS
+          continue
+        }
+
+        if (clients.every(client => client.phase2Actions > 0)) {
+          phase2CoverageSignal = 'all-clients-covered-phase2'
+          return
+        }
+
+        await host.page.waitForTimeout(500)
+      }
+
+      throw new Error(`phase2 coverage wait timed out for auto host ${host.name} | ${await buildClientSnapshot(host)}`)
+    }
+
     async function waitForManualArchive(clients: ClientCtx[], timeout = MANUAL_ARCHIVE_WAIT_MS) {
       const deadline = Date.now() + timeout
 
@@ -973,6 +1088,7 @@ test.describe.serial('live ui load test - guest workshop accounts', () => {
         `- Client name offset: ${CLIENT_NAME_OFFSET}`,
         `- Allow account creation: ${ALLOW_ACCOUNT_CREATION}`,
         `- Allow starter fallback: ${ALLOW_STARTER_FALLBACK}`,
+        `- Auto host progress: ${AUTO_HOST_PROGRESS}`,
         `- External workshop code: ${EXTERNAL_WORKSHOP_CODE || 'none'}`,
         `- Requested clients: ${CLIENT_COUNT}`,
         `- Authenticated accounts: ${loggedInCount}/${CLIENT_COUNT}`,
@@ -1027,7 +1143,7 @@ test.describe.serial('live ui load test - guest workshop accounts', () => {
 
     try {
       workshopCode = EXTERNAL_WORKSHOP_CODE || workshopCode
-      log(null, 'info', 'setup', 'starting 30-client guest load test', `baseUrl=${BASE_URL} | accountPrefix=${CLIENT_NAME_PREFIX} | accountOffset=${CLIENT_NAME_OFFSET} | externalWorkshop=${EXTERNAL_WORKSHOP_CODE || 'none'}`)
+      log(null, 'info', 'setup', 'starting 30-client guest load test', `baseUrl=${BASE_URL} | accountPrefix=${CLIENT_NAME_PREFIX} | accountOffset=${CLIENT_NAME_OFFSET} | externalWorkshop=${EXTERNAL_WORKSHOP_CODE || 'none'} | autoHost=${AUTO_HOST_PROGRESS}`)
 
       const signInResults = await Promise.allSettled(clients.map(client => signIn(client)))
       signInResults.forEach((result, index) => {
@@ -1062,21 +1178,43 @@ test.describe.serial('live ui load test - guest workshop accounts', () => {
       await waitForAllClientsText(joinedClients, lobbyTitlePattern, RESPONSE_TIMEOUT_MS)
       await waitForAllClientsConnected(joinedClients, RESPONSE_TIMEOUT_MS)
       log(null, 'info', 'lobby', 'all guest clients joined and connected', `${joinedClients.length}/${CLIENT_COUNT}`)
-      log(null, 'info', 'manual', 'waiting for manual host progress', `Workshop ${code} is ready. Continue manually as ${HOST_ACCOUNT_NAME}, then drive Phase 1, Handover, and Phase 2.${COVERAGE_TARGET === 'archive' ? ' Continue through scoring and archive as well.' : ''}`)
+      if (!AUTO_HOST_PROGRESS) {
+        log(null, 'info', 'manual', 'waiting for manual host progress', `Workshop ${code} is ready. Continue manually as ${HOST_ACCOUNT_NAME}, then drive Phase 1, Handover, and Phase 2.${COVERAGE_TARGET === 'archive' ? ' Continue through scoring and archive as well.' : ''}`)
+      }
 
-      const guestFlowResults = await Promise.allSettled([
-        ...joinedClients.map(client => runGuestWorkshopFlow(client)),
-        ...(COVERAGE_TARGET === 'archive'
-          ? [waitForManualArchive(joinedClients, MANUAL_ARCHIVE_WAIT_MS)]
-          : [waitForPhase2Coverage(joinedClients, SCORE_SYNC_TIMEOUT_MS)]),
-      ])
+      const autoHostClient = AUTO_HOST_PROGRESS ? joinedClients[0] : null
+      const guestParticipants = autoHostClient ? joinedClients.slice(1) : joinedClients
+      const backgroundTasks = [
+        ...(autoHostClient ? [{
+          label: 'host flow',
+          client: autoHostClient,
+          promise: runAutoHostProgress(autoHostClient, joinedClients),
+        }] : []),
+        ...guestParticipants.map(client => ({
+          label: 'guest flow',
+          client,
+          promise: runGuestWorkshopFlow(client),
+        })),
+        ...(!AUTO_HOST_PROGRESS
+          ? [{
+            label: COVERAGE_TARGET === 'archive' ? 'manual archive wait' : 'manual phase2 wait',
+            client: null,
+            promise: COVERAGE_TARGET === 'archive'
+              ? waitForManualArchive(joinedClients, MANUAL_ARCHIVE_WAIT_MS)
+              : waitForPhase2Coverage(joinedClients, SCORE_SYNC_TIMEOUT_MS),
+          }]
+          : []),
+      ]
+
+      const guestFlowResults = await Promise.allSettled(backgroundTasks.map(task => task.promise))
       guestFlowResults.forEach((result, index) => {
+        const task = backgroundTasks[index]
         if (result.status === 'rejected') {
-          const client = joinedClients[index]
+          const client = task?.client ?? null
           if (client) {
-            log(client, 'blocker', client.currentStage, 'guest flow failed', String(result.reason))
+            log(client, 'blocker', client.currentStage, task.label, String(result.reason))
           } else {
-            log(null, 'blocker', 'manual', 'manual archive wait failed', String(result.reason))
+            log(null, 'blocker', 'manual', task?.label ?? 'background task failed', String(result.reason))
           }
         }
       })

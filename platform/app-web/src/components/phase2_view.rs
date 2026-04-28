@@ -338,6 +338,7 @@ pub fn Phase2View(
                         }
                         // Rest section
                         p { class: "action-section-label", style: "margin-top:16px;", "Rest" }
+                        p { class: "meta", "Sleep works best when the dragon is tired during its off-cycle; avoid successful sleep during its active time." }
                         div { class: "action-grid",
                             button {
                                 class: "action-btn action-btn--sleep",
