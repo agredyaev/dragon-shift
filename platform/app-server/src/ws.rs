@@ -222,10 +222,18 @@ async fn broadcast_notice(
     title: &str,
     message: &str,
 ) {
-    let registrations = match state.store.list_realtime_connections(session_code).await {
-        Ok(registrations) => registrations,
-        Err(_) => return,
-    };
+    // perf: read registrations from in-memory `SessionRegistry` instead of
+    // `state.store.list_realtime_connections(...)`, which on every broadcast
+    // ran `DELETE FROM realtime_connections WHERE updated_at <= ...` and
+    // serialized 30 concurrent broadcasts on a single Postgres row.
+    // TODO(perf-step-2): if the WS task panics without calling `detach`, the
+    // in-memory entry leaks (the previous Postgres-driven path swept stale
+    // rows after 5 minutes). Add a periodic registry sweep in the janitor.
+    let registrations = state
+        .realtime
+        .lock()
+        .await
+        .session_registrations(session_code);
     if registrations.is_empty() {
         return;
     }
@@ -241,7 +249,6 @@ async fn broadcast_notice(
         let senders = state.realtime_senders.lock().await;
         registrations
             .into_iter()
-            .filter(|registration| registration.replica_id == state.replica_id)
             .filter_map(|registration| {
                 senders.get(&registration.connection_id).and_then(|sender| {
                     sender
@@ -270,10 +277,11 @@ pub(crate) async fn send_player_notice_with_code(
     message: &str,
     code: Option<SessionNoticeCode>,
 ) {
-    let registrations = match state.store.list_realtime_connections(session_code).await {
-        Ok(registrations) => registrations,
-        Err(_) => return,
-    };
+    let registrations = state
+        .realtime
+        .lock()
+        .await
+        .session_registrations(session_code);
     if registrations.is_empty() {
         return;
     }
@@ -290,7 +298,7 @@ pub(crate) async fn send_player_notice_with_code(
         registrations
             .into_iter()
             .filter(|registration| {
-                registration.replica_id == state.replica_id && registration.player_id == player_id
+                registration.player_id == player_id
             })
             .filter_map(|registration| {
                 senders.get(&registration.connection_id).and_then(|sender| {
@@ -689,10 +697,11 @@ pub(crate) async fn broadcast_session_state(
         return;
     }
 
-    let registrations = match state.store.list_realtime_connections(session_code).await {
-        Ok(registrations) => registrations,
-        Err(_) => return,
-    };
+    let registrations = state
+        .realtime
+        .lock()
+        .await
+        .session_registrations(session_code);
     if registrations.is_empty() {
         return;
     }
@@ -706,8 +715,7 @@ pub(crate) async fn broadcast_session_state(
         registrations
             .into_iter()
             .filter(|registration| {
-                registration.replica_id == state.replica_id
-                    && Some(registration.connection_id.as_str()) != excluded_connection_id
+                Some(registration.connection_id.as_str()) != excluded_connection_id
             })
             .map(|registration| {
                 (
