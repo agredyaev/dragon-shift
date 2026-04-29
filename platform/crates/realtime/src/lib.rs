@@ -79,6 +79,10 @@ impl SessionRegistry {
         self.connections_by_id.get(connection_id).cloned()
     }
 
+    pub fn contains_connection(&self, connection_id: &str) -> bool {
+        self.connections_by_id.contains_key(connection_id)
+    }
+
     pub fn detach(&mut self, connection_id: &str) -> Option<ConnectionRegistration> {
         let registration = self.connections_by_id.remove(connection_id)?;
 

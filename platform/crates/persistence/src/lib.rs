@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::RwLock;
+use std::time::Duration;
 use thiserror::Error;
 
 #[cfg(test)]
@@ -130,6 +131,8 @@ pub struct OpenWorkshopRecord {
     pub host_name: String,
     pub player_count: u32,
     pub created_at: String,
+    pub phase1_minutes: u32,
+    pub phase2_minutes: u32,
     pub owner_account_id: Option<String>,
     pub has_non_owner_players: bool,
     pub archived: bool,
@@ -418,6 +421,7 @@ fn active_realtime_connection_cutoff() -> DateTime<Utc> {
 fn open_workshop_summary_from_session(
     session: &WorkshopSession,
     archived: bool,
+    archive_created_at: Option<&str>,
 ) -> Option<OpenWorkshopRecord> {
     let resumable = !matches!(session.phase, protocol::Phase::Lobby | protocol::Phase::End);
     let host_name = session
@@ -451,13 +455,28 @@ fn open_workshop_summary_from_session(
         session_code: session.code.0.clone(),
         host_name,
         player_count: session.players.len() as u32,
-        created_at: session.created_at.to_rfc3339(),
+        created_at: archive_created_at
+            .map(str::to_string)
+            .unwrap_or_else(|| session.created_at.to_rfc3339()),
+        phase1_minutes: session.config.phase1_minutes,
+        phase2_minutes: session.config.phase2_minutes,
         owner_account_id: owner_account_id.map(str::to_string),
         has_non_owner_players,
         archived,
         resumable,
         participant_account_ids,
     })
+}
+
+fn latest_archive_artifact_created_at<'a>(
+    artifacts: Option<&'a Vec<SessionArtifactRecord>>,
+) -> Option<&'a str> {
+    artifacts
+        .into_iter()
+        .flat_map(|artifacts| artifacts.iter())
+        .filter(|artifact| artifact.kind == protocol::SessionArtifactKind::JudgeBundleGenerated)
+        .map(|artifact| artifact.created_at.as_str())
+        .max()
 }
 
 fn is_older_open_workshop_cursor(
@@ -810,6 +829,7 @@ impl PostgresSessionStore {
     ) -> Result<Self, PersistenceError> {
         let pool = sqlx::postgres::PgPoolOptions::new()
             .max_connections(max_connections)
+            .acquire_timeout(Duration::from_secs(5))
             .connect(database_url)
             .await?;
         Ok(Self { pool })
@@ -2206,19 +2226,19 @@ impl SessionStore for PostgresSessionStore {
     ) -> Pin<Box<dyn Future<Output = Result<OpenWorkshopsPage, PersistenceError>> + Send + '_>>
     {
         Box::pin(async move {
-            // Ordering: DESC by `payload->>'created_at'` with `session_code`
-            // ASC as tie-breaker. Stored payload timestamps are canonical
-            // RFC3339 UTC strings; normalize cursor timestamps to the same
-            // representation before doing TEXT keyset compares so equivalent
-            // `Z` / `+00:00` forms do not shift page boundaries. `player_count`
-            // and `host_name` are still derived from the JSON payload because
-            // the lobby set is expected to be small; this query is cold
-            // relative to the command-handler hot paths.
+            // Ordering: DESC by the visible row timestamp with `session_code`
+            // ASC as tie-breaker. Normal lobbies/in-progress rows use the
+            // session `created_at`; archived rows use the latest archive
+            // artifact timestamp so a just-archived workshop surfaces on the
+            // first page instead of staying buried at its original creation
+            // position. Stored timestamps are canonical RFC3339 UTC strings;
+            // normalize cursor timestamps to the same representation before
+            // doing TEXT keyset compares so equivalent `Z` / `+00:00` forms do
+            // not shift page boundaries.
             //
             // Keyset predicate uses Postgres's native tuple `<` / `>`
-            // operators on `(payload->>'created_at', session_code)`. We fetch
-            // `PAGE_SIZE + 1` rows to detect whether another page exists on
-            // the requested side without a second query.
+            // operators on `(visible_created_at, session_code)`. We fetch
+            // `PAGE_SIZE + 1` rows to detect whether another page exists.
             use sqlx::Row;
             let fetch_limit = (OPEN_WORKSHOPS_PAGE_SIZE + 1) as i64;
 
@@ -2230,14 +2250,18 @@ impl SessionStore for PostgresSessionStore {
                     let rows = sqlx::query(
                         "
                             SELECT ws.payload,
-                                   ws.payload->>'phase' = 'end' AND EXISTS (
-                                       SELECT 1
-                                       FROM session_artifacts sa
-                                       WHERE sa.session_id = ws.session_id
-                                         AND sa.payload->>'kind' = 'judge_bundle_generated'
-                                   ) AS archived,
+                                   ws.payload->>'phase' = 'end' AND latest_archive.created_at IS NOT NULL AS archived,
+                                   latest_archive.created_at AS archive_created_at,
                                    ws.payload->>'phase' NOT IN ('lobby', 'end') AS resumable
                             FROM workshop_sessions ws
+                            LEFT JOIN LATERAL (
+                                SELECT sa.created_at
+                                FROM session_artifacts sa
+                                WHERE sa.session_id = ws.session_id
+                                  AND sa.payload->>'kind' = 'judge_bundle_generated'
+                                ORDER BY sa.created_at DESC, sa.id DESC
+                                LIMIT 1
+                            ) latest_archive ON TRUE
                             WHERE ws.payload->>'phase' = 'lobby'
                                 OR (ws.payload->>'phase' NOT IN ('lobby', 'end') AND (ws.payload->>'owner_account_id' = $1
                                     OR ws.payload->>'reserved_host_account_id' = $1
@@ -2246,19 +2270,15 @@ impl SessionStore for PostgresSessionStore {
                                         FROM jsonb_each(ws.payload->'players') AS players(player_id, player)
                                         WHERE players.player->>'account_id' = $1
                                     )))
-                                OR (ws.payload->>'phase' = 'end' AND EXISTS (
-                                    SELECT 1
-                                    FROM session_artifacts sa
-                                   WHERE sa.session_id = ws.session_id
-                                     AND sa.payload->>'kind' = 'judge_bundle_generated'
-                               ) AND (ws.payload->>'owner_account_id' = $1
+                                OR (ws.payload->>'phase' = 'end' AND latest_archive.created_at IS NOT NULL
+                                    AND (ws.payload->>'owner_account_id' = $1
                                      OR ws.payload->>'reserved_host_account_id' = $1
                                      OR EXISTS (
                                         SELECT 1
                                         FROM jsonb_each(ws.payload->'players') AS players(player_id, player)
                                         WHERE players.player->>'account_id' = $1
                                     )))
-                            ORDER BY ws.payload->>'created_at' DESC, ws.session_code ASC
+                            ORDER BY (COALESCE(latest_archive.created_at, ws.payload->>'created_at'))::timestamptz DESC, ws.session_code ASC
                             LIMIT $2
                         ",
                     )
@@ -2276,14 +2296,18 @@ impl SessionStore for PostgresSessionStore {
                     let rows = sqlx::query(
                         "
                             SELECT ws.payload,
-                                   ws.payload->>'phase' = 'end' AND EXISTS (
-                                       SELECT 1
-                                       FROM session_artifacts sa
-                                       WHERE sa.session_id = ws.session_id
-                                         AND sa.payload->>'kind' = 'judge_bundle_generated'
-                                   ) AS archived,
+                                   ws.payload->>'phase' = 'end' AND latest_archive.created_at IS NOT NULL AS archived,
+                                   latest_archive.created_at AS archive_created_at,
                                    ws.payload->>'phase' NOT IN ('lobby', 'end') AS resumable
                             FROM workshop_sessions ws
+                            LEFT JOIN LATERAL (
+                                SELECT sa.created_at
+                                FROM session_artifacts sa
+                                WHERE sa.session_id = ws.session_id
+                                  AND sa.payload->>'kind' = 'judge_bundle_generated'
+                                ORDER BY sa.created_at DESC, sa.id DESC
+                                LIMIT 1
+                            ) latest_archive ON TRUE
                             WHERE (ws.payload->>'phase' = 'lobby'
                                OR (ws.payload->>'phase' NOT IN ('lobby', 'end') AND (ws.payload->>'owner_account_id' = $3
                                     OR ws.payload->>'reserved_host_account_id' = $3
@@ -2292,23 +2316,19 @@ impl SessionStore for PostgresSessionStore {
                                         FROM jsonb_each(ws.payload->'players') AS players(player_id, player)
                                         WHERE players.player->>'account_id' = $3
                                     )))
-                               OR (ws.payload->>'phase' = 'end' AND EXISTS (
-                                    SELECT 1
-                                    FROM session_artifacts sa
-                                   WHERE sa.session_id = ws.session_id
-                                     AND sa.payload->>'kind' = 'judge_bundle_generated'
-                               ) AND (ws.payload->>'owner_account_id' = $3
-                                     OR ws.payload->>'reserved_host_account_id' = $3
-                                     OR EXISTS (
+                               OR (ws.payload->>'phase' = 'end' AND latest_archive.created_at IS NOT NULL
+                                    AND (ws.payload->>'owner_account_id' = $3
+                                      OR ws.payload->>'reserved_host_account_id' = $3
+                                      OR EXISTS (
                                         SELECT 1
                                         FROM jsonb_each(ws.payload->'players') AS players(player_id, player)
                                         WHERE players.player->>'account_id' = $3
                                     ))))
                                AND (
-                                    ws.payload->>'created_at' < $1
-                                 OR (ws.payload->>'created_at' = $1 AND ws.session_code > $2)
+                                     (COALESCE(latest_archive.created_at, ws.payload->>'created_at'))::timestamptz < $1::timestamptz
+                                  OR ((COALESCE(latest_archive.created_at, ws.payload->>'created_at'))::timestamptz = $1::timestamptz AND ws.session_code > $2)
                               )
-                            ORDER BY ws.payload->>'created_at' DESC, ws.session_code ASC
+                            ORDER BY (COALESCE(latest_archive.created_at, ws.payload->>'created_at'))::timestamptz DESC, ws.session_code ASC
                             LIMIT $4
                         ",
                     )
@@ -2330,14 +2350,18 @@ impl SessionStore for PostgresSessionStore {
                     let rows = sqlx::query(
                         "
                             SELECT ws.payload,
-                                   ws.payload->>'phase' = 'end' AND EXISTS (
-                                       SELECT 1
-                                       FROM session_artifacts sa
-                                       WHERE sa.session_id = ws.session_id
-                                         AND sa.payload->>'kind' = 'judge_bundle_generated'
-                                   ) AS archived,
+                                   ws.payload->>'phase' = 'end' AND latest_archive.created_at IS NOT NULL AS archived,
+                                   latest_archive.created_at AS archive_created_at,
                                    ws.payload->>'phase' NOT IN ('lobby', 'end') AS resumable
                             FROM workshop_sessions ws
+                            LEFT JOIN LATERAL (
+                                SELECT sa.created_at
+                                FROM session_artifacts sa
+                                WHERE sa.session_id = ws.session_id
+                                  AND sa.payload->>'kind' = 'judge_bundle_generated'
+                                ORDER BY sa.created_at DESC, sa.id DESC
+                                LIMIT 1
+                            ) latest_archive ON TRUE
                             WHERE (ws.payload->>'phase' = 'lobby'
                                OR (ws.payload->>'phase' NOT IN ('lobby', 'end') AND (ws.payload->>'owner_account_id' = $3
                                     OR ws.payload->>'reserved_host_account_id' = $3
@@ -2346,23 +2370,19 @@ impl SessionStore for PostgresSessionStore {
                                         FROM jsonb_each(ws.payload->'players') AS players(player_id, player)
                                         WHERE players.player->>'account_id' = $3
                                     )))
-                               OR (ws.payload->>'phase' = 'end' AND EXISTS (
-                                    SELECT 1
-                                    FROM session_artifacts sa
-                                   WHERE sa.session_id = ws.session_id
-                                     AND sa.payload->>'kind' = 'judge_bundle_generated'
-                               ) AND (ws.payload->>'owner_account_id' = $3
-                                     OR ws.payload->>'reserved_host_account_id' = $3
-                                     OR EXISTS (
+                               OR (ws.payload->>'phase' = 'end' AND latest_archive.created_at IS NOT NULL
+                                    AND (ws.payload->>'owner_account_id' = $3
+                                      OR ws.payload->>'reserved_host_account_id' = $3
+                                      OR EXISTS (
                                         SELECT 1
                                         FROM jsonb_each(ws.payload->'players') AS players(player_id, player)
                                         WHERE players.player->>'account_id' = $3
                                     ))))
                                AND (
-                                    ws.payload->>'created_at' > $1
-                                 OR (ws.payload->>'created_at' = $1 AND ws.session_code < $2)
+                                     (COALESCE(latest_archive.created_at, ws.payload->>'created_at'))::timestamptz > $1::timestamptz
+                                  OR ((COALESCE(latest_archive.created_at, ws.payload->>'created_at'))::timestamptz = $1::timestamptz AND ws.session_code < $2)
                               )
-                            ORDER BY ws.payload->>'created_at' ASC, ws.session_code DESC
+                            ORDER BY (COALESCE(latest_archive.created_at, ws.payload->>'created_at'))::timestamptz ASC, ws.session_code DESC
                             LIMIT $4
                         ",
                     )
@@ -2388,7 +2408,12 @@ impl SessionStore for PostgresSessionStore {
                 };
                 let archived: bool = row.get("archived");
                 let resumable: bool = row.get("resumable");
-                if let Some(summary) = open_workshop_summary_from_session(&session, archived) {
+                let archive_created_at: Option<String> = row.try_get("archive_created_at")?;
+                if let Some(summary) = open_workshop_summary_from_session(
+                    &session,
+                    archived,
+                    archive_created_at.as_deref(),
+                ) {
                     debug_assert_eq!(summary.resumable, resumable);
                     if !open_workshop_is_visible_to_account(&summary, viewer_account_id.as_deref())
                     {
@@ -3548,19 +3573,15 @@ impl SessionStore for InMemorySessionStore {
                     session.phase != protocol::Phase::End || !session.players.is_empty()
                 })
                 .filter_map(|session| {
-                    let archived = session.phase == protocol::Phase::End
-                        && artifacts_by_session_id
-                            .get(&session.id.to_string())
-                            .is_some_and(|artifacts| {
-                                artifacts.iter().any(|artifact| {
-                                    artifact.kind
-                                        == protocol::SessionArtifactKind::JudgeBundleGenerated
-                                })
-                            });
+                    let archive_created_at = latest_archive_artifact_created_at(
+                        artifacts_by_session_id.get(&session.id.to_string()),
+                    );
+                    let archived =
+                        session.phase == protocol::Phase::End && archive_created_at.is_some();
                     if session.phase == protocol::Phase::End && !archived {
                         None
                     } else {
-                        open_workshop_summary_from_session(session, archived)
+                        open_workshop_summary_from_session(session, archived, archive_created_at)
                     }
                 })
                 .filter(|summary| {
@@ -4973,6 +4994,39 @@ mod tests {
             .expect("after page");
         assert_eq!(next.rows.len(), 1);
         assert!(!next.has_more_after);
+    }
+
+    #[tokio::test]
+    async fn list_open_workshops_orders_archives_by_archive_artifact_time() {
+        let store = InMemorySessionStore::new();
+        let viewer_account_id = "archive-owner".to_string();
+        seed_lobbies(&store, OPEN_WORKSHOPS_PAGE_SIZE + 1, 2_000).await;
+
+        let mut archived = lobby_session_at("ARCH01", 1_000);
+        archived.phase = Phase::End;
+        archived.owner_account_id = Some(viewer_account_id.clone());
+        for player in archived.players.values_mut() {
+            player.account_id = Some(viewer_account_id.clone());
+        }
+        let mut archive_artifact = artifact(
+            &archived.id.to_string(),
+            "archive-artifact",
+            "1970-01-01T01:23:20+00:00",
+        );
+        archive_artifact.kind = SessionArtifactKind::JudgeBundleGenerated;
+        store
+            .save_session_with_artifact(&archived, &archive_artifact)
+            .await
+            .expect("save archived session");
+
+        let page = store
+            .list_open_workshops(OpenWorkshopsPaging::First, Some(viewer_account_id))
+            .await
+            .expect("first page");
+
+        assert_eq!(page.rows[0].session_code, "ARCH01");
+        assert!(page.rows[0].archived);
+        assert_eq!(page.rows[0].created_at, "1970-01-01T01:23:20+00:00");
     }
 
     #[tokio::test]

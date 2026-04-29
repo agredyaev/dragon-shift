@@ -1,5 +1,6 @@
 use axum::{
     Router,
+    body::Bytes,
     extract::FromRef,
     http::HeaderValue,
     http::header::CACHE_CONTROL,
@@ -22,11 +23,16 @@ use security::{
 #[cfg(test)]
 use std::sync::atomic::AtomicBool;
 use std::{
-    collections::BTreeMap, env, net::SocketAddr, path::PathBuf, str::FromStr, sync::Arc,
+    collections::{BTreeMap, BTreeSet},
+    env,
+    net::SocketAddr,
+    path::PathBuf,
+    str::FromStr,
+    sync::Arc,
     time::Duration,
 };
 use tokio::{
-    sync::{Mutex, Semaphore, mpsc},
+    sync::{Mutex, Semaphore, mpsc, oneshot},
     task::JoinHandle,
 };
 use tower_http::{
@@ -41,7 +47,7 @@ use crate::http::{
     eligible_characters, generate_character_sprite_preview, generate_character_sprite_sheet,
     generate_sprite_sheet, get_character_sprite, join_workshop, list_character_catalog,
     list_my_characters, list_open_workshops, live, llm_generate_image, llm_judge, ready,
-    update_character, workshop_command, workshop_judge_bundle,
+    update_character, update_workshop, workshop_command, workshop_judge_bundle,
 };
 use crate::llm::{LlmClient, LlmPoolConfig, load_llm_pool_config};
 use crate::ws::{WsOutbound, workshop_ws};
@@ -110,6 +116,26 @@ impl std::fmt::Debug for AppConfig {
 }
 
 #[derive(Clone)]
+pub(crate) struct CharacterSpriteCacheEntry {
+    pub(crate) neutral: Bytes,
+    pub(crate) happy: Bytes,
+    pub(crate) angry: Bytes,
+    pub(crate) sleepy: Bytes,
+}
+
+impl CharacterSpriteCacheEntry {
+    pub(crate) fn for_emotion(&self, emotion: &str) -> Option<Bytes> {
+        match emotion {
+            "neutral" => Some(self.neutral.clone()),
+            "happy" => Some(self.happy.clone()),
+            "angry" => Some(self.angry.clone()),
+            "sleepy" => Some(self.sleepy.clone()),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone)]
 pub(crate) struct AppState {
     pub(crate) config: Arc<AppConfig>,
     pub(crate) replica_id: String,
@@ -118,6 +144,8 @@ pub(crate) struct AppState {
     pub(crate) fallback_companion_sprites: Arc<SpriteSet>,
     pub(crate) image_job_queue: Arc<Semaphore>,
     pub(crate) sessions: Arc<Mutex<BTreeMap<String, WorkshopSession>>>,
+    pub(crate) character_sprite_cache: Arc<Mutex<BTreeMap<String, CharacterSpriteCacheEntry>>>,
+    pub(crate) character_sprite_load_locks: Arc<Mutex<BTreeMap<String, Arc<Mutex<()>>>>>,
     pub(crate) session_cache_load_locks: Arc<Mutex<BTreeMap<String, Arc<Mutex<()>>>>>,
     pub(crate) session_write_locks: Arc<Mutex<BTreeMap<String, Arc<Mutex<()>>>>>,
     pub(crate) create_limiter: Arc<Mutex<FixedWindowRateLimiter>>,
@@ -128,10 +156,12 @@ pub(crate) struct AppState {
     pub(crate) login_limiter: Arc<Mutex<FixedWindowRateLimiter>>,
     pub(crate) character_create_limiter: Arc<Mutex<FixedWindowRateLimiter>>,
     pub(crate) realtime: Arc<Mutex<SessionRegistry>>,
-    pub(crate) realtime_senders: Arc<Mutex<BTreeMap<String, mpsc::UnboundedSender<WsOutbound>>>>,
+    pub(crate) realtime_senders: Arc<Mutex<BTreeMap<String, mpsc::Sender<WsOutbound>>>>,
+    pub(crate) realtime_close_signals: Arc<Mutex<BTreeMap<String, oneshot::Sender<()>>>>,
     pub(crate) realtime_heartbeats: Arc<Mutex<BTreeMap<String, JoinHandle<()>>>>,
     pub(crate) retired_realtime_connections: Arc<Mutex<BTreeMap<String, ()>>>,
     pub(crate) recent_session_notifications: Arc<Mutex<BTreeMap<String, String>>>,
+    pub(crate) dirty_sessions: Arc<Mutex<BTreeSet<String>>>,
     #[cfg(test)]
     pub(crate) fail_next_initial_state_send: Arc<AtomicBool>,
 }
@@ -159,6 +189,8 @@ impl AppState {
             fallback_companion_sprites: Arc::new(fallback_companion_sprites),
             image_job_queue: Arc::new(Semaphore::new(image_job_max_concurrency)),
             sessions: Arc::new(Mutex::new(BTreeMap::new())),
+            character_sprite_cache: Arc::new(Mutex::new(BTreeMap::new())),
+            character_sprite_load_locks: Arc::new(Mutex::new(BTreeMap::new())),
             session_cache_load_locks: Arc::new(Mutex::new(BTreeMap::new())),
             session_write_locks: Arc::new(Mutex::new(BTreeMap::new())),
             create_limiter: Arc::new(Mutex::new(FixedWindowRateLimiter::new(
@@ -191,9 +223,11 @@ impl AppState {
             ))),
             realtime: Arc::new(Mutex::new(SessionRegistry::new())),
             realtime_senders: Arc::new(Mutex::new(BTreeMap::new())),
+            realtime_close_signals: Arc::new(Mutex::new(BTreeMap::new())),
             realtime_heartbeats: Arc::new(Mutex::new(BTreeMap::new())),
             retired_realtime_connections: Arc::new(Mutex::new(BTreeMap::new())),
             recent_session_notifications: Arc::new(Mutex::new(BTreeMap::new())),
+            dirty_sessions: Arc::new(Mutex::new(BTreeSet::new())),
             #[cfg(test)]
             fail_next_initial_state_send: Arc::new(AtomicBool::new(false)),
         }
@@ -237,7 +271,10 @@ pub(crate) fn build_app(state: AppState) -> Router {
         .route("/workshops", post(create_workshop))
         .route("/workshops/lobby", post(create_workshop_lobby))
         .route("/workshops/open", get(list_open_workshops))
-        .route("/workshops/{code}", delete(delete_workshop))
+        .route(
+            "/workshops/{code}",
+            delete(delete_workshop).patch(update_workshop),
+        )
         .route("/workshops/join", post(join_workshop))
         .route("/workshops/command", post(workshop_command))
         .route("/workshops/ws", get(workshop_ws))
@@ -316,7 +353,7 @@ pub(crate) fn load_config() -> Result<AppConfig, String> {
         "RECONNECT_TOKEN_TTL_SECONDS",
         60 * 60 * 12,
     )?);
-    let database_pool_size = load_rate_limit_env("DATABASE_POOL_SIZE", 10)?;
+    let database_pool_size = load_rate_limit_env("DATABASE_POOL_SIZE", 60)?;
     let origin_policy = create_origin_policy(OriginPolicyOptions {
         allowed_origins: env::var("ALLOWED_ORIGINS").ok().as_deref(),
         app_origin: env::var("VITE_APP_URL").ok().as_deref(),

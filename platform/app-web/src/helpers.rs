@@ -2,6 +2,7 @@ use protocol::{
     ClientDragon, ClientGameState, DragonAction, DragonEmotion, JudgeBundle, Phase, Player,
     SessionCommand, SpriteSet,
 };
+use std::collections::BTreeSet;
 
 use crate::state::{ConnectionStatus, NoticeTone, ShellScreen};
 
@@ -298,6 +299,14 @@ pub fn format_remaining_duration(total_seconds: i32) -> String {
     format!("{minutes:02}:{seconds:02}")
 }
 
+pub fn clock_display_hour(time: i32) -> i32 {
+    time.rem_euclid(48) / 2
+}
+
+pub fn clock_is_daytime(time: i32) -> bool {
+    (12..36).contains(&time.rem_euclid(48))
+}
+
 pub fn current_player(state: &ClientGameState) -> Option<&Player> {
     let player_id = state.current_player_id.as_ref()?;
     state.players.get(player_id)
@@ -364,26 +373,80 @@ pub const ACHIEVEMENT_DEFS: &[(&str, &str, &str, &str)] = &[
     (
         "master_chef",
         "Master Chef",
-        "Found favorite food on 1st try!",
+        "Found favorite food on a cycle's first try.",
         "meat",
     ),
     (
         "playful_spirit",
         "Playful Spirit",
-        "Found favorite game on 1st try!",
+        "Found favorite game on a cycle's first try.",
         "fetch",
     ),
     (
-        "dragon_whisperer",
-        "Dragon Whisperer",
-        "Happiness > 90% for 15s.",
+        "speed_learner",
+        "Speed Learner",
+        "Found favorite food and game within 3 actions.",
+        "clock",
+    ),
+    (
+        "steady_hand",
+        "Steady Hand",
+        "Kept happiness at 60+ for 20 Phase 2 ticks without dropping below 60.",
         "heart",
     ),
     (
-        "smooth_transition",
-        "Smooth Transition",
-        "Perfect handover in Phase 2.",
+        "no_mistakes",
+        "No Mistakes",
+        "Finished Phase 2 with 5+ actions, a correct food or play, and no wrong food, play, or sleep.",
         "sparkle",
+    ),
+    (
+        "zen_master",
+        "Zen Master",
+        "Ended Phase 2 with 8+ actions and no penalty stacks.",
+        "moon",
+    ),
+    (
+        "button_masher",
+        "Button Masher",
+        "Pressed through cooldown 5+ times.",
+        "angry",
+    ),
+    (
+        "restful_rhythm",
+        "Restful Rhythm",
+        "Used 2+ correct-time sleeps, no successful wrong-time sleeps, and 5+ care actions.",
+        "sleep",
+    ),
+    (
+        "rock_bottom",
+        "Rock Bottom",
+        "Happiness hit zero. Nowhere to go but up.",
+        "alert",
+    ),
+    (
+        "helicopter_parent",
+        "Helicopter Parent",
+        "Took 20+ care actions in Phase 2.",
+        "clock",
+    ),
+    (
+        "comeback_kid",
+        "Comeback Kid",
+        "Recovered from 15 or less happiness to a 70+ finish.",
+        "trophy",
+    ),
+    (
+        "chaos_gremlin",
+        "Chaos Gremlin",
+        "Reached 4+ peak penalty stacks through maximum chaos.",
+        "angry",
+    ),
+    (
+        "perfectionist",
+        "Perfectionist",
+        "Kept at least 80% action accuracy over 10+ actions.",
+        "crown",
     ),
 ];
 
@@ -392,6 +455,30 @@ pub fn achievement_def(id: &str) -> Option<(&'static str, &'static str, &'static
         .iter()
         .find(|(aid, _, _, _)| *aid == id)
         .map(|(_, name, desc, icon)| (*name, *desc, *icon))
+}
+
+pub fn unique_achievement_ids<'a>(achievements: &'a [String]) -> Vec<&'a str> {
+    let mut seen = BTreeSet::new();
+    achievements
+        .iter()
+        .filter_map(|achievement| {
+            let achievement = achievement.as_str();
+            (achievement_def(achievement).is_some() && seen.insert(achievement))
+                .then_some(achievement)
+        })
+        .collect()
+}
+
+fn achievement_count(achievements: &[String]) -> usize {
+    unique_achievement_ids(achievements).len()
+}
+
+fn achievement_count_label(count: usize) -> String {
+    match count {
+        0 => "No achievements yet".to_string(),
+        1 => "1 achievement".to_string(),
+        count => format!("{count} achievements"),
+    }
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -827,7 +914,9 @@ pub fn end_player_score_rows(state: &ClientGameState) -> Vec<EndPlayerScoreRow> 
         right
             .score
             .cmp(&left.score)
-            .then_with(|| right.achievements.len().cmp(&left.achievements.len()))
+            .then_with(|| {
+                achievement_count(&right.achievements).cmp(&achievement_count(&left.achievements))
+            })
             .then_with(|| {
                 left.name
                     .to_ascii_lowercase()
@@ -841,19 +930,14 @@ pub fn end_player_score_rows(state: &ClientGameState) -> Vec<EndPlayerScoreRow> 
         .enumerate()
         .map(|(index, player)| {
             let (obs, care, issues) = player_phase_scores(state, &player.id);
-            let is_good = issues.is_empty();
             EndPlayerScoreRow {
                 placement_label: format!("#{}", index + 1),
                 player_name: player.name.clone(),
                 phase1_score_label: format!("{}", obs),
                 phase2_score_label: format!("{}", care),
                 total_score_label: format!("{} pts", player.score),
-                judge_status: if is_good { "Good" } else { "Bad" },
-                judge_status_tooltip: if is_good {
-                    String::new()
-                } else {
-                    issues.join(" | ")
-                },
+                judge_status: if issues.is_empty() { "Scored" } else { "Notes" },
+                judge_status_tooltip: issues.join(" | "),
                 is_winner: index == 0,
             }
         })
@@ -870,7 +954,9 @@ pub fn game_over_player_rows(state: &ClientGameState) -> Vec<GameOverPlayerRow> 
         right
             .score
             .cmp(&left.score)
-            .then_with(|| right.achievements.len().cmp(&left.achievements.len()))
+            .then_with(|| {
+                achievement_count(&right.achievements).cmp(&achievement_count(&left.achievements))
+            })
             .then_with(|| {
                 left.name
                     .to_ascii_lowercase()
@@ -884,9 +970,8 @@ pub fn game_over_player_rows(state: &ClientGameState) -> Vec<GameOverPlayerRow> 
         .take(3)
         .enumerate()
         .map(|(index, player)| {
-            let badges: Vec<(&str, &str)> = player
-                .achievements
-                .iter()
+            let badges: Vec<(&str, &str)> = unique_achievement_ids(&player.achievements)
+                .into_iter()
                 .filter_map(|id| achievement_def(id).map(|(name, _desc, icon)| (name, icon)))
                 .collect();
             GameOverPlayerRow {
@@ -974,7 +1059,9 @@ pub fn judge_bundle_player_rows(bundle: &JudgeBundle) -> Vec<JudgeBundlePlayerRo
         right
             .score
             .cmp(&left.score)
-            .then_with(|| right.achievements.len().cmp(&left.achievements.len()))
+            .then_with(|| {
+                achievement_count(&right.achievements).cmp(&achievement_count(&left.achievements))
+            })
             .then_with(|| {
                 left.name
                     .to_ascii_lowercase()
@@ -989,11 +1076,7 @@ pub fn judge_bundle_player_rows(bundle: &JudgeBundle) -> Vec<JudgeBundlePlayerRo
         .map(|(index, player)| JudgeBundlePlayerRow {
             player_name: player.name.clone(),
             score_label: format!("{} pts", player.score),
-            achievements_label: if player.achievements.is_empty() {
-                "No achievements yet".to_string()
-            } else {
-                format!("{} achievement(s)", player.achievements.len())
-            },
+            achievements_label: achievement_count_label(achievement_count(&player.achievements)),
             is_top_score: index == 0,
         })
         .collect()
@@ -1078,6 +1161,7 @@ pub mod tests {
                     code: "123456".to_string(),
                     created_at: "2026-01-01T00:00:00Z".to_string(),
                     updated_at: "2026-01-01T00:00:00Z".to_string(),
+                    state_revision: 0,
                     phase_started_at: "2026-01-01T00:00:00Z".to_string(),
                     host_player_id: Some("player-1".to_string()),
                     settings: create_default_session_settings(),
@@ -1231,13 +1315,13 @@ pub mod tests {
             .players
             .get_mut("player-1")
             .expect("player-1")
-            .achievements = vec!["careful_observer".to_string()];
+            .achievements = vec!["master_chef".to_string()];
         state.players.get_mut("player-2").expect("player-2").score = 18;
         state
             .players
             .get_mut("player-2")
             .expect("player-2")
-            .achievements = vec!["creative_pick".to_string(), "steady_hands".to_string()];
+            .achievements = vec!["playful_spirit".to_string(), "steady_hand".to_string()];
         state
             .dragons
             .get_mut("dragon-1")
@@ -1319,13 +1403,13 @@ pub mod tests {
                     player_id: "player-1".to_string(),
                     name: "Alice".to_string(),
                     score: 12,
-                    achievements: vec!["careful_observer".to_string()],
+                    achievements: vec!["master_chef".to_string()],
                 },
                 protocol::JudgePlayerSummary {
                     player_id: "player-2".to_string(),
                     name: "Bob".to_string(),
                     score: 18,
-                    achievements: vec!["creative_pick".to_string(), "steady_hands".to_string()],
+                    achievements: vec!["playful_spirit".to_string(), "steady_hand".to_string()],
                 },
             ],
             dragons: vec![
@@ -1367,6 +1451,8 @@ pub mod tests {
                     correct_actions: 3,
                     wrong_food_count: 1,
                     wrong_play_count: 1,
+                    wrong_sleep_count: 0,
+                    correct_sleep_count: 0,
                     cooldown_violations: 0,
                     penalty_stacks_at_end: 0,
                     phase2_lowest_happiness: 60,
@@ -1402,6 +1488,8 @@ pub mod tests {
                     correct_actions: 2,
                     wrong_food_count: 0,
                     wrong_play_count: 1,
+                    wrong_sleep_count: 0,
+                    correct_sleep_count: 0,
                     cooldown_violations: 0,
                     penalty_stacks_at_end: 0,
                     phase2_lowest_happiness: 70,
@@ -1809,6 +1897,7 @@ pub mod tests {
         assert_eq!(vote_rows[0].votes_label, "2 votes");
         assert_eq!(score_rows[0].player_name, "Bob");
         assert_eq!(score_rows[0].total_score_label, "18 pts");
+        assert_eq!(score_rows[0].judge_status, "Notes");
         assert!(score_rows[0].is_winner);
         assert!(
             score_rows[0]
@@ -1877,10 +1966,130 @@ pub mod tests {
         );
         assert_eq!(players[0].player_name, "Bob");
         assert_eq!(players[0].score_label, "18 pts");
+        assert_eq!(players[0].achievements_label, "2 achievements");
         assert!(players[0].is_top_score);
         assert_eq!(dragons[0].dragon_name, "Nova");
         assert_eq!(dragons[0].votes_label, "2 creative vote(s)");
         assert_eq!(dragons[0].actions_label, "1 phase 2 action(s) captured");
+    }
+
+    #[test]
+    fn end_helpers_deduplicate_achievements_for_ranking_and_badges() {
+        let mut state = mock_end_state();
+        state.players.get_mut("player-1").expect("player-1").score = 18;
+        state
+            .players
+            .get_mut("player-1")
+            .expect("player-1")
+            .achievements = vec![
+            "master_chef".to_string(),
+            "master_chef".to_string(),
+            "playful_spirit".to_string(),
+        ];
+        state
+            .players
+            .get_mut("player-2")
+            .expect("player-2")
+            .achievements = vec!["playful_spirit".to_string(), "playful_spirit".to_string()];
+
+        let score_rows = end_player_score_rows(&state);
+        let game_over_rows = game_over_player_rows(&state);
+
+        assert_eq!(score_rows[0].player_name, "Alice");
+        assert_eq!(game_over_rows[0].player_name, "Alice");
+        assert_eq!(game_over_rows[0].achievement_badges.len(), 2);
+    }
+
+    #[test]
+    fn judge_bundle_helpers_deduplicate_achievement_counts() {
+        let mut bundle = mock_judge_bundle();
+        bundle.players[0].score = 18;
+        bundle.players[0].achievements = vec![
+            "master_chef".to_string(),
+            "master_chef".to_string(),
+            "playful_spirit".to_string(),
+        ];
+        bundle.players[1].achievements = vec!["playful_spirit".to_string()];
+
+        let rows = judge_bundle_player_rows(&bundle);
+
+        assert_eq!(rows[0].player_name, "Alice");
+        assert_eq!(rows[0].achievements_label, "2 achievements");
+        assert_eq!(rows[1].achievements_label, "1 achievement");
+    }
+
+    #[test]
+    fn unknown_achievements_do_not_affect_visible_counts_or_ranking() {
+        let mut state = mock_end_state();
+        state.players.get_mut("player-1").expect("player-1").score = 18;
+        state.players.get_mut("player-2").expect("player-2").score = 18;
+        state
+            .players
+            .get_mut("player-1")
+            .expect("player-1")
+            .achievements = vec!["master_chef".to_string()];
+        state
+            .players
+            .get_mut("player-2")
+            .expect("player-2")
+            .achievements = vec!["unknown_legacy".to_string(), "also_unknown".to_string()];
+
+        let score_rows = end_player_score_rows(&state);
+        let game_over_rows = game_over_player_rows(&state);
+
+        assert_eq!(score_rows[0].player_name, "Alice");
+        assert_eq!(game_over_rows[0].player_name, "Alice");
+        assert_eq!(game_over_rows[0].achievement_badges.len(), 1);
+        assert!(game_over_rows[1].achievement_badges.is_empty());
+    }
+
+    #[test]
+    fn judge_bundle_ignores_unknown_achievements_for_counts() {
+        let mut bundle = mock_judge_bundle();
+        bundle.players[0].achievements = vec!["unknown_legacy".to_string()];
+        bundle.players[1].achievements = vec!["playful_spirit".to_string()];
+
+        let rows = judge_bundle_player_rows(&bundle);
+
+        let alice = rows
+            .iter()
+            .find(|row| row.player_name == "Alice")
+            .expect("Alice row");
+        assert_eq!(alice.achievements_label, "No achievements yet");
+        let bob = rows
+            .iter()
+            .find(|row| row.player_name == "Bob")
+            .expect("Bob row");
+        assert_eq!(bob.achievements_label, "1 achievement");
+    }
+
+    #[test]
+    fn achievement_defs_cover_domain_awarded_ids() {
+        let expected = [
+            "master_chef",
+            "playful_spirit",
+            "speed_learner",
+            "steady_hand",
+            "no_mistakes",
+            "zen_master",
+            "button_masher",
+            "restful_rhythm",
+            "rock_bottom",
+            "helicopter_parent",
+            "comeback_kid",
+            "chaos_gremlin",
+            "perfectionist",
+        ];
+
+        assert_eq!(ACHIEVEMENT_DEFS.len(), expected.len());
+        for id in expected {
+            assert!(
+                achievement_def(id).is_some(),
+                "missing achievement def for {id}"
+            );
+        }
+        assert_eq!(achievement_def("dragon_whisperer"), None);
+        assert_eq!(achievement_def("smooth_transition"), None);
     }
 
     // -----------------------------------------------------------------------
@@ -2019,6 +2228,8 @@ pub mod tests {
                 correct_actions: 3,
                 wrong_food_count: 0,
                 wrong_play_count: 1,
+                wrong_sleep_count: 0,
+                correct_sleep_count: 0,
                 cooldown_violations: 0,
                 penalty_stacks_at_end: 0,
                 phase2_lowest_happiness: 50,
@@ -2123,5 +2334,21 @@ pub mod tests {
             parse_rfc3339_epoch_seconds(&state.session.phase_started_at).expect("fractional");
 
         assert_eq!(phase_remaining_seconds(&state, started_at + 1), Some(479));
+    }
+
+    #[test]
+    fn clock_display_uses_domain_48_tick_cycle() {
+        assert_eq!(clock_display_hour(16), 8);
+        assert_eq!(clock_display_hour(24), 12);
+        assert_eq!(clock_display_hour(47), 23);
+        assert_eq!(clock_display_hour(48), 0);
+    }
+
+    #[test]
+    fn clock_daytime_uses_domain_day_ticks() {
+        assert!(!clock_is_daytime(11));
+        assert!(clock_is_daytime(12));
+        assert!(clock_is_daytime(35));
+        assert!(!clock_is_daytime(36));
     }
 }

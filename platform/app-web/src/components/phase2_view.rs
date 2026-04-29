@@ -64,9 +64,10 @@ pub fn Phase2View(
         .unwrap_or_default();
     let session_code = state.session.code.clone();
 
-    let achievements: Vec<String> = current_player(state)
+    let achievements = current_player(state)
         .map(|p| p.achievements.clone())
         .unwrap_or_default();
+    let achievements = unique_achievement_ids(&achievements);
 
     let is_host = current_player(state).map(|p| p.is_host).unwrap_or(false);
     let connection_status = identity.read().connection_status;
@@ -337,6 +338,7 @@ pub fn Phase2View(
                         }
                         // Rest section
                         p { class: "action-section-label", style: "margin-top:16px;", "Rest" }
+                        p { class: "meta", "Sleep works best when the dragon is tired during its off-cycle; avoid successful sleep during its active time." }
                         div { class: "action-grid",
                             button {
                                 class: "action-btn action-btn--sleep",

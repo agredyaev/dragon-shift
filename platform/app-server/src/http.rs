@@ -1,6 +1,6 @@
 use axum::{
     Json,
-    body::Body,
+    body::{Body, Bytes},
     extract::{ConnectInfo, FromRequestParts, Path, Query, State},
     http::{HeaderMap, HeaderValue, StatusCode, header, request::Parts},
     response::{IntoResponse, Response},
@@ -26,10 +26,11 @@ use protocol::{
     SPRITE_ATELIER_FALLBACK_NOTICE_MESSAGE, SPRITE_ATELIER_NOTICE_TITLE,
     SPRITE_ATELIER_QUEUED_NOTICE_MESSAGE, SelectCharacterRequest, SessionArtifactKind,
     SessionArtifactRecord, SessionCommand, SessionNoticeCode, SpriteSheetRequest,
-    SpriteSheetResult, SpriteSheetSuccess, UpdateCharacterRequest, VotePayload,
-    WorkshopCommandRequest, WorkshopCommandResult, WorkshopCommandSuccess, WorkshopCreateResult,
-    WorkshopCreateSuccess, WorkshopError, WorkshopJoinResult, WorkshopJoinSuccess,
-    WorkshopJudgeBundleRequest, WorkshopJudgeBundleResult, WorkshopJudgeBundleSuccess,
+    SpriteSheetResult, SpriteSheetSuccess, UpdateCharacterRequest, UpdateWorkshopRequest,
+    VotePayload, WorkshopCommandRequest, WorkshopCommandResult, WorkshopCommandSuccess,
+    WorkshopCreateResult, WorkshopCreateSuccess, WorkshopError, WorkshopJoinResult,
+    WorkshopJoinSuccess, WorkshopJudgeBundleRequest, WorkshopJudgeBundleResult,
+    WorkshopJudgeBundleSuccess,
 };
 use security::{FixedWindowRateLimiter, OriginPolicy};
 use serde_json::json;
@@ -40,6 +41,7 @@ use std::{
     sync::Arc,
 };
 use tokio::sync::{Mutex, OwnedSemaphorePermit, TryAcquireError};
+use tokio::time::{Duration, timeout};
 use uuid::Uuid;
 
 use crate::app::AppState;
@@ -50,8 +52,22 @@ use crate::helpers::{
     random_prefixed_id, sprite_set_uses_references, to_client_game_state,
 };
 use crate::ws::{
-    broadcast_session_state, close_local_workshop_connections, send_player_notice_with_code,
+    broadcast_dragon_patch, broadcast_player_and_dragon_patch, broadcast_player_upsert,
+    close_local_workshop_connections, mark_session_dirty, send_player_notice_with_code,
 };
+
+enum WorkshopBroadcastDelta {
+    PlayerUpsert {
+        player_id: String,
+    },
+    DragonPatch {
+        dragon_id: String,
+    },
+    PlayerAndDragonPatch {
+        player_id: String,
+        dragon_id: String,
+    },
+}
 
 enum ImageJobAdmissionError {
     TimedOut,
@@ -95,17 +111,88 @@ fn character_profile_with_sprite_references(record: &CharacterRecord) -> Charact
     }
 }
 
-fn sprite_base64_for_emotion<'a>(
-    sprites: &'a protocol::SpriteSet,
+fn decode_sprite_bytes(base64: &str, character_id: &str, emotion: &str) -> Result<Bytes, Response> {
+    base64::engine::general_purpose::STANDARD
+        .decode(base64)
+        .map(Bytes::from)
+        .map_err(|error| {
+            tracing::warn!(%error, character_id = %character_id, emotion = %emotion, "sprite base64 decode failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        })
+}
+
+fn build_character_sprite_cache_entry(
+    record: &CharacterRecord,
+) -> Result<crate::app::CharacterSpriteCacheEntry, Response> {
+    Ok(crate::app::CharacterSpriteCacheEntry {
+        neutral: decode_sprite_bytes(&record.sprites.neutral, &record.id, "neutral")?,
+        happy: decode_sprite_bytes(&record.sprites.happy, &record.id, "happy")?,
+        angry: decode_sprite_bytes(&record.sprites.angry, &record.id, "angry")?,
+        sleepy: decode_sprite_bytes(&record.sprites.sleepy, &record.id, "sleepy")?,
+    })
+}
+
+async fn character_sprite_load_lock(state: &AppState, character_id: &str) -> Arc<Mutex<()>> {
+    let mut locks = state.character_sprite_load_locks.lock().await;
+    locks
+        .entry(character_id.to_string())
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone()
+}
+
+async fn evict_character_sprite_cache(state: &AppState, character_id: &str) {
+    state
+        .character_sprite_cache
+        .lock()
+        .await
+        .remove(character_id);
+}
+
+async fn load_cached_character_sprite(
+    state: &AppState,
+    character_id: &str,
     emotion: &str,
-) -> Option<&'a str> {
-    match emotion {
-        "neutral" => Some(&sprites.neutral),
-        "happy" => Some(&sprites.happy),
-        "angry" => Some(&sprites.angry),
-        "sleepy" => Some(&sprites.sleepy),
-        _ => None,
+) -> Result<Option<Bytes>, Response> {
+    if let Some(bytes) = state
+        .character_sprite_cache
+        .lock()
+        .await
+        .get(character_id)
+        .and_then(|entry| entry.for_emotion(emotion))
+    {
+        return Ok(Some(bytes));
     }
+
+    let load_lock = character_sprite_load_lock(state, character_id).await;
+    let _load_guard = load_lock.lock().await;
+
+    if let Some(bytes) = state
+        .character_sprite_cache
+        .lock()
+        .await
+        .get(character_id)
+        .and_then(|entry| entry.for_emotion(emotion))
+    {
+        return Ok(Some(bytes));
+    }
+
+    let record = match state.store.load_character(character_id).await {
+        Ok(Some(record)) => record,
+        Ok(None) => return Ok(None),
+        Err(error) => {
+            tracing::error!(%error, character_id = %character_id, "load_character failed");
+            return Err(StatusCode::INTERNAL_SERVER_ERROR.into_response());
+        }
+    };
+
+    let entry = build_character_sprite_cache_entry(&record)?;
+    let bytes = entry.for_emotion(emotion);
+    state
+        .character_sprite_cache
+        .lock()
+        .await
+        .insert(character_id.to_string(), entry);
+    Ok(bytes)
 }
 
 fn sprite_preview_busy_response() -> Response {
@@ -527,6 +614,7 @@ fn deterministic_local_judge_dragon_evaluation(dragon: &JudgeDragonBundle) -> Ll
             + (15
                 - dragon.wrong_food_count.max(0) * 4
                 - dragon.wrong_play_count.max(0) * 4
+                - dragon.wrong_sleep_count.max(0) * 4
                 - dragon.penalty_stacks_at_end.max(0) * 2)
                 .clamp(0, 15)
             + (10 - dragon.cooldown_violations.max(0) * 2).clamp(0, 10)
@@ -537,7 +625,9 @@ fn deterministic_local_judge_dragon_evaluation(dragon: &JudgeDragonBundle) -> Ll
     let creativity_score =
         clamp_score(20 + (word_count / 2).min(45) + observation_count * 5 + tags_count * 5);
 
-    let mistake_count = dragon.wrong_food_count.max(0) + dragon.wrong_play_count.max(0);
+    let mistake_count = dragon.wrong_food_count.max(0)
+        + dragon.wrong_play_count.max(0)
+        + dragon.wrong_sleep_count.max(0);
     let observation_feedback = format!(
         "Phase 1 handover matched {mechanic_clue_hits}/3 hidden habits with {observation_count} observation(s) and {tags_count} handover tag(s). Character design text was ignored for care scoring."
     );
@@ -554,7 +644,7 @@ fn deterministic_local_judge_dragon_evaluation(dragon: &JudgeDragonBundle) -> Ll
         )
     } else if mistake_count > 0 || dragon.cooldown_violations > 0 {
         format!(
-            "Phase 2 followed {correct_actions}/{total_actions} actions correctly; {handover_relevance}, with {mistake_count} wrong food/play actions, {} cooldown violations, and {stat_average}/100 final average stats.",
+            "Phase 2 followed {correct_actions}/{total_actions} actions correctly; {handover_relevance}, with {mistake_count} wrong food/play/sleep actions, {} cooldown violations, and {stat_average}/100 final average stats.",
             dragon.cooldown_violations.max(0),
         )
     } else {
@@ -605,7 +695,7 @@ fn deterministic_local_judge_evaluation(bundle: &JudgeBundle) -> LlmJudgeEvaluat
     }
 }
 
-async fn run_judge_for_session(
+pub(crate) async fn run_judge_for_session(
     state: &AppState,
     session_code: &str,
     actor_player_id: &str,
@@ -725,7 +815,7 @@ async fn run_judge_for_session(
         return Err(format!("failed to persist judge scores: {error}"));
     }
 
-    broadcast_session_state(state, session_code, None).await;
+    mark_session_dirty(state, session_code).await;
     Ok(evaluation)
 }
 
@@ -803,24 +893,11 @@ pub(crate) async fn get_character_sprite(
     State(state): State<AppState>,
     Path((character_id, emotion)): Path<(String, String)>,
 ) -> Response {
-    let record = match state.store.load_character(&character_id).await {
-        Ok(Some(record)) => record,
-        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
-        Err(error) => {
-            tracing::error!(%error, character_id = %character_id, "load_character failed");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-        }
-    };
-
-    let Some(base64) = sprite_base64_for_emotion(&record.sprites, emotion.as_str()) else {
-        return StatusCode::NOT_FOUND.into_response();
-    };
-    let bytes = match base64::engine::general_purpose::STANDARD.decode(base64) {
+    let Some(bytes) = (match load_cached_character_sprite(&state, &character_id, &emotion).await {
         Ok(bytes) => bytes,
-        Err(error) => {
-            tracing::warn!(%error, character_id = %character_id, emotion = %emotion, "sprite base64 decode failed");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-        }
+        Err(response) => return response,
+    }) else {
+        return StatusCode::NOT_FOUND.into_response();
     };
 
     let mut response = Body::from(bytes).into_response();
@@ -1109,7 +1186,7 @@ pub(crate) async fn join_workshop(
             };
             player.is_connected = true;
             session.ensure_host_assigned(true);
-            session.updated_at = timestamp;
+            session.touch();
             (session_before, session.clone())
         };
 
@@ -1165,7 +1242,7 @@ pub(crate) async fn join_workshop(
         };
 
         let response = (StatusCode::OK, Json(WorkshopJoinResult::Success(response)));
-        broadcast_session_state(&state, session_code, None).await;
+        mark_session_dirty(&state, session_code).await;
         return response;
     }
 
@@ -1275,7 +1352,7 @@ pub(crate) async fn join_workshop(
                 player.is_ready = true;
             }
             session.ensure_host_assigned(true);
-            session.updated_at = timestamp;
+            session.touch();
             (session_before, session.clone(), reconnect_token, timestamp)
         };
 
@@ -1323,7 +1400,7 @@ pub(crate) async fn join_workshop(
         };
 
         let response = (StatusCode::OK, Json(WorkshopJoinResult::Success(response)));
-        broadcast_session_state(&state, session_code, None).await;
+        mark_session_dirty(&state, session_code).await;
         return response;
     }
 
@@ -1479,7 +1556,7 @@ pub(crate) async fn join_workshop(
     };
 
     let response = (StatusCode::OK, Json(WorkshopJoinResult::Success(response)));
-    broadcast_session_state(&state, session_code, None).await;
+    mark_session_dirty(&state, session_code).await;
     response
 }
 
@@ -1568,7 +1645,7 @@ pub(crate) async fn workshop_command(
         return internal_command_error(format!("lost session lease before command load: {error}"));
     }
 
-    match reload_cached_session(&state, session_code).await {
+    match ensure_session_cached(&state, session_code).await {
         Ok(true) => {}
         Ok(false) => return bad_command_request("Workshop not found."),
         Err(error) => return internal_command_error(format!("failed to load session: {error}")),
@@ -1579,12 +1656,46 @@ pub(crate) async fn workshop_command(
         ));
     }
 
-    let (response, should_broadcast, session_before, session_to_persist, artifact_to_append) = {
+    let preloaded_select_character: Option<(SelectCharacterRequest, Option<CharacterRecord>)> =
+        if matches!(request.command, SessionCommand::SelectCharacter) {
+            let payload = match request.payload.clone() {
+                Some(value) => serde_json::from_value::<SelectCharacterRequest>(value).ok(),
+                None => None,
+            };
+            let Some(payload) = payload else {
+                return bad_command_request("Character selection payload is invalid.");
+            };
+            let character_id = payload.character_id.trim();
+            if character_id.is_empty() {
+                return bad_command_request("Selected character was not found.");
+            }
+            let record = match state.store.load_character(character_id).await {
+                Ok(record) => record,
+                Err(error) => {
+                    return internal_command_error(format!("failed to load character: {error}"));
+                }
+            };
+            Some((payload, record))
+        } else {
+            None
+        };
+
+    let (
+        response,
+        should_broadcast,
+        should_run_judge,
+        broadcast_delta,
+        session_before,
+        session_to_persist,
+        artifact_to_append,
+    ) = {
         let mut sessions = state.sessions.lock().await;
         let Some(session) = sessions.get_mut(session_code) else {
             return bad_command_request("Workshop not found.");
         };
         let mut should_broadcast = false;
+        let mut should_run_judge = false;
+        let mut broadcast_delta = None;
         let session_before = session.clone();
         let mut session_to_persist = None;
         let mut artifact_to_append = None;
@@ -1634,13 +1745,8 @@ pub(crate) async fn workshop_command(
                 successful_workshop_command(&mut should_broadcast)
             }
             SessionCommand::SelectCharacter => {
-                let payload = match request.payload.clone() {
-                    Some(value) => serde_json::from_value::<SelectCharacterRequest>(value).ok(),
-                    None => None,
-                };
-                let Some(payload) = payload else {
-                    return bad_command_request("Character selection payload is invalid.");
-                };
+                let (payload, preloaded_record) = preloaded_select_character
+                    .expect("preloaded_select_character set for SelectCharacter command");
 
                 let character_id = payload.character_id.trim();
                 if character_id.starts_with("starter_")
@@ -1651,14 +1757,9 @@ pub(crate) async fn workshop_command(
                 {
                     return bad_command_request("That starter is already taken in this workshop.");
                 }
-                let record = match state.store.load_character(character_id).await {
-                    Ok(Some(r)) => r,
-                    Ok(None) => return bad_command_request("Selected character was not found."),
-                    Err(error) => {
-                        return internal_command_error(format!(
-                            "failed to load character: {error}"
-                        ));
-                    }
+                let record = match preloaded_record {
+                    Some(r) => r,
+                    None => return bad_command_request("Selected character was not found."),
                 };
 
                 // Ownership check: must be owned by the requesting player's
@@ -1703,6 +1804,11 @@ pub(crate) async fn workshop_command(
                     }),
                 });
 
+                if session.phase == protocol::Phase::Lobby {
+                    broadcast_delta = Some(WorkshopBroadcastDelta::PlayerUpsert {
+                        player_id: identity.player_id.clone(),
+                    });
+                }
                 successful_workshop_command(&mut should_broadcast)
             }
             SessionCommand::SubmitObservation => {
@@ -1746,6 +1852,7 @@ pub(crate) async fn workshop_command(
                     payload: json!({ "dragonId": dragon_id, "text": text }),
                 });
 
+                broadcast_delta = Some(WorkshopBroadcastDelta::DragonPatch { dragon_id });
                 successful_workshop_command(&mut should_broadcast)
             }
             SessionCommand::Action => {
@@ -1794,16 +1901,6 @@ pub(crate) async fn workshop_command(
                     "actionType": action_type,
                     "actionValue": action_value,
                 });
-                // Persist achievement before borrowing dragon immutably
-                if let domain::ActionOutcome::Applied {
-                    awarded_achievement: Some(achievement),
-                    ..
-                } = &outcome
-                {
-                    if let Some(player) = session.players.get_mut(&identity.player_id) {
-                        player.achievements.push(achievement.to_string());
-                    }
-                }
                 if let Some(dragon) = session.dragons.get(&dragon_id)
                     && let Some(payload_map) = artifact_payload.as_object_mut()
                 {
@@ -1842,6 +1939,10 @@ pub(crate) async fn workshop_command(
                     payload: artifact_payload,
                 });
 
+                broadcast_delta = Some(WorkshopBroadcastDelta::PlayerAndDragonPatch {
+                    player_id: identity.player_id.clone(),
+                    dragon_id,
+                });
                 successful_workshop_command(&mut should_broadcast)
             }
             SessionCommand::StartHandover => {
@@ -1921,6 +2022,13 @@ pub(crate) async fn workshop_command(
                     payload: json!({ "tagCount": saved_tags.len(), "tags": saved_tags }),
                 });
 
+                if let Some(dragon_id) = session
+                    .players
+                    .get(&identity.player_id)
+                    .and_then(|player| player.current_dragon_id.clone())
+                {
+                    broadcast_delta = Some(WorkshopBroadcastDelta::DragonPatch { dragon_id });
+                }
                 successful_workshop_command(&mut should_broadcast)
             }
             SessionCommand::StartPhase2 => {
@@ -1930,7 +2038,12 @@ pub(crate) async fn workshop_command(
                 if session.phase != protocol::Phase::Handover {
                     return conflict_command_request("Phase 2 can only begin from handover.");
                 }
-                if let Err(error) = session.enter_phase2() {
+                let phase2_result = if session.remaining_phase_seconds(Utc::now()) == Some(0) {
+                    session.enter_phase2_after_deadline()
+                } else {
+                    session.enter_phase2()
+                };
+                if let Err(error) = phase2_result {
                     return match error {
                         DomainError::MissingHandoverTags { players } => conflict_command_request(
                             &format!("Still waiting on: {}.", players.join(", ")),
@@ -1956,16 +2069,14 @@ pub(crate) async fn workshop_command(
                 if session.host_player_id.as_deref() != Some(identity.player_id.as_str()) {
                     return bad_command_request("Only the host can end the workshop.");
                 }
-                if !matches!(
-                    session.phase,
-                    protocol::Phase::Phase2 | protocol::Phase::Judge
-                ) {
+                if session.phase != protocol::Phase::Phase2 {
                     return conflict_command_request("Design voting can only begin from Phase 2.");
                 }
                 session.award_phase_end_achievements();
                 if let Err(error) = session.enter_voting() {
                     return conflict_command_request(&error.to_string());
                 }
+                should_run_judge = true;
                 session_to_persist = Some(session.clone());
                 artifact_to_append = Some(SessionArtifactRecord {
                     id: random_prefixed_id("artifact"),
@@ -1988,12 +2099,22 @@ pub(crate) async fn workshop_command(
                 if session.host_player_id.as_deref() != Some(identity.player_id.as_str()) {
                     return bad_command_request("Only the host can open the design vote.");
                 }
-                if session.phase != protocol::Phase::Phase2 {
-                    return conflict_command_request("Design voting can only begin from Phase 2.");
-                }
+                let queue_judge = match session.phase {
+                    protocol::Phase::Phase2 => {
+                        session.award_phase_end_achievements();
+                        true
+                    }
+                    protocol::Phase::Judge => false,
+                    _ => {
+                        return conflict_command_request(
+                            "Design voting can only begin from Phase 2 or judge review.",
+                        );
+                    }
+                };
                 if let Err(error) = session.enter_voting() {
                     return conflict_command_request(&error.to_string());
                 }
+                should_run_judge = queue_judge;
                 session_to_persist = Some(session.clone());
                 artifact_to_append = Some(SessionArtifactRecord {
                     id: random_prefixed_id("artifact"),
@@ -2156,6 +2277,8 @@ pub(crate) async fn workshop_command(
         (
             response,
             should_broadcast,
+            should_run_judge,
+            broadcast_delta,
             session_before,
             session_to_persist,
             artifact_to_append,
@@ -2203,13 +2326,26 @@ pub(crate) async fn workshop_command(
         _ => unreachable!("checked command persistence invariants above"),
     }
 
-    let should_run_judge = request.command == SessionCommand::EndGame;
-
     drop(_write_guard);
     drop(write_lease);
 
     if should_broadcast {
-        broadcast_session_state(&state, session_code, None).await;
+        match broadcast_delta {
+            Some(WorkshopBroadcastDelta::PlayerUpsert { player_id }) => {
+                broadcast_player_upsert(&state, session_code, &player_id).await;
+            }
+            Some(WorkshopBroadcastDelta::DragonPatch { dragon_id }) => {
+                broadcast_dragon_patch(&state, session_code, &dragon_id).await;
+            }
+            Some(WorkshopBroadcastDelta::PlayerAndDragonPatch {
+                player_id,
+                dragon_id,
+            }) => {
+                broadcast_player_and_dragon_patch(&state, session_code, &player_id, &dragon_id)
+                    .await;
+            }
+            None => mark_session_dirty(&state, session_code).await,
+        }
     }
 
     if should_run_judge {
@@ -2375,7 +2511,11 @@ pub(crate) async fn workshop_judge_bundle(
 }
 
 pub(crate) async fn ready(State(state): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
-    let store_healthy = state.store.health_check().await.unwrap_or(false);
+    let store_healthy = timeout(Duration::from_secs(1), state.store.health_check())
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or(false);
     let status = if store_healthy {
         StatusCode::OK
     } else {
@@ -3067,6 +3207,35 @@ async fn generate_or_update_character_sprite_sheet(
 
     let fallback_used = fallback_used;
 
+    let (_, _write_guard, write_lease) =
+        match SessionWriteLease::acquire(&state, session_code).await {
+            Ok(guard) => guard,
+            Err(error) => {
+                return internal_character_sprite_sheet_error(format!(
+                    "failed to acquire session lease: {error}"
+                ));
+            }
+        };
+    if let Err(error) = write_lease.ensure_active() {
+        return internal_character_sprite_sheet_error(format!(
+            "lost session lease before character mutation: {error}"
+        ));
+    }
+    match reload_cached_session(&state, session_code).await {
+        Ok(true) => {}
+        Ok(false) => return bad_character_sprite_sheet_request("Workshop not found."),
+        Err(error) => {
+            return internal_character_sprite_sheet_error(format!(
+                "failed to reload session before character mutation: {error}"
+            ));
+        }
+    }
+    if let Err(error) = write_lease.ensure_active() {
+        return internal_character_sprite_sheet_error(format!(
+            "lost session lease before character persist: {error}"
+        ));
+    }
+
     let (session_before, session_to_persist, artifact_to_append, next_character_record) = {
         let mut sessions = state.sessions.lock().await;
         let Some(session) = sessions.get_mut(session_code) else {
@@ -3138,6 +3307,15 @@ async fn generate_or_update_character_sprite_sheet(
             "failed to persist character: {error}"
         ));
     }
+    evict_character_sprite_cache(&state, &next_character_record.id).await;
+
+    if let Err(error) = write_lease.ensure_active() {
+        let mut sessions = state.sessions.lock().await;
+        sessions.insert(session_code.to_string(), session_before);
+        return internal_character_sprite_sheet_error(format!(
+            "lost session lease before character session persist: {error}"
+        ));
+    }
 
     if let Err(error) = state
         .store
@@ -3150,7 +3328,7 @@ async fn generate_or_update_character_sprite_sheet(
             "failed to persist character selection: {error}"
         ));
     }
-    broadcast_session_state(&state, session_code, None).await;
+    mark_session_dirty(&state, session_code).await;
 
     (
         StatusCode::OK,
@@ -3435,7 +3613,10 @@ pub(crate) async fn create_character(
         .save_character_enforcing_cap(&record, MAX_CHARACTERS_PER_ACCOUNT as u32)
         .await
     {
-        Ok(()) => (StatusCode::CREATED, Json(record.profile())).into_response(),
+        Ok(()) => {
+            evict_character_sprite_cache(&state, &record.id).await;
+            (StatusCode::CREATED, Json(record.profile())).into_response()
+        }
         Err(persistence::PersistenceError::CharacterLimitReached { max }) => (
             StatusCode::BAD_REQUEST,
             Json(json!({ "error": format!("character limit reached ({max} per account)") })),
@@ -3569,7 +3750,10 @@ pub(crate) async fn delete_character(
         .delete_character_by_owner(&character_id, &session.account.id)
         .await
     {
-        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(true) => {
+            evict_character_sprite_cache(&state, &character_id).await;
+            StatusCode::NO_CONTENT.into_response()
+        }
         Ok(false) => (
             StatusCode::NOT_FOUND,
             Json(json!({ "error": "character not found or not owned by you" })),
@@ -3625,6 +3809,8 @@ pub(crate) async fn update_character(
         )
             .into_response();
     }
+
+    evict_character_sprite_cache(&state, &character_id).await;
 
     match state.store.load_character(&character_id).await {
         Ok(Some(record))
@@ -3741,6 +3927,134 @@ pub(crate) async fn delete_workshop(
                 .into_response()
         }
     }
+}
+
+/// `PATCH /api/workshops/:code` — update phase settings for an owned empty lobby workshop.
+pub(crate) async fn update_workshop(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    session: AccountSession,
+    Path(session_code): Path<String>,
+    Json(request): Json<UpdateWorkshopRequest>,
+) -> Response {
+    if let Some((status, payload)) = reject_disallowed_origin(&headers, &state.config.origin_policy)
+    {
+        let error = match payload.0 {
+            WorkshopJoinResult::Success(_) => "Origin is not allowed.".to_string(),
+            WorkshopJoinResult::Error(error) => error.error,
+        };
+        return (status, Json(json!({ "error": error }))).into_response();
+    }
+
+    let defaults = protocol::WorkshopCreateConfig::default();
+    let phase1_minutes = request.phase1_minutes.unwrap_or(defaults.phase1_minutes);
+    let phase2_minutes = request.phase2_minutes.unwrap_or(defaults.phase2_minutes);
+    if phase1_minutes == 0 || phase2_minutes == 0 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "phase lengths must be at least 1 minute" })),
+        )
+            .into_response();
+    }
+
+    let (_, _write_guard, write_lease) =
+        match SessionWriteLease::acquire(&state, &session_code).await {
+            Ok(guard) => guard,
+            Err(error) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "error": format!("failed to acquire session lease: {error}") })),
+                )
+                    .into_response();
+            }
+        };
+    if let Err(error) = write_lease.ensure_active() {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("lost session lease before update: {error}") })),
+        )
+            .into_response();
+    }
+
+    match reload_cached_session(&state, &session_code).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": "Workshop not found, already started, not empty, or not owned by your account." })),
+            )
+                .into_response();
+        }
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(
+                    json!({ "error": format!("failed to reload session before update: {error}") }),
+                ),
+            )
+                .into_response();
+        }
+    }
+    if let Err(error) = write_lease.ensure_active() {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("lost session lease before update mutate: {error}") })),
+        )
+            .into_response();
+    }
+
+    let (session_before, session_clone) = {
+        let mut sessions = state.sessions.lock().await;
+        let Some(workshop) = sessions.get_mut(&session_code) else {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": "Workshop not found, already started, not empty, or not owned by your account." })),
+            )
+                .into_response();
+        };
+        let owner_matches = workshop.owner_account_id.as_deref()
+            == Some(session.account.id.as_str())
+            || workshop.reserved_host_account_id.as_deref() == Some(session.account.id.as_str());
+        let can_update = workshop.phase == protocol::Phase::Lobby
+            && workshop.players.is_empty()
+            && owner_matches;
+        if !can_update {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": "Workshop not found, already started, not empty, or not owned by your account." })),
+            )
+                .into_response();
+        }
+
+        let session_before = workshop.clone();
+        workshop.config.phase1_minutes = phase1_minutes;
+        workshop.config.phase2_minutes = phase2_minutes;
+        workshop.touch();
+        (session_before, workshop.clone())
+    };
+
+    if let Err(error) = write_lease.ensure_active() {
+        let mut sessions = state.sessions.lock().await;
+        sessions.insert(session_code.clone(), session_before);
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("lost session lease before update persist: {error}") })),
+        )
+            .into_response();
+    }
+
+    if let Err(error) = state.store.save_session(&session_clone).await {
+        let mut sessions = state.sessions.lock().await;
+        sessions.insert(session_code.clone(), session_before);
+        tracing::error!(%error, %session_code, "save_session failed during workshop update");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "internal error" })),
+        )
+            .into_response();
+    }
+
+    (StatusCode::OK, Json(json!({ "ok": true }))).into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -3895,6 +4209,8 @@ pub(crate) async fn list_open_workshops(
             host_name: r.host_name,
             player_count: r.player_count,
             created_at: r.created_at,
+            phase1_minutes: r.phase1_minutes,
+            phase2_minutes: r.phase2_minutes,
             archived: r.archived,
             can_delete: !r.archived
                 && !r.resumable

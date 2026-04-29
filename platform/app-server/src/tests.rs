@@ -2,13 +2,13 @@
 
 use crate::{
     app::{AppConfig, AppState, build_app},
-    cache::ensure_session_cached,
+    cache::{ensure_session_cached, session_lease_enabled_from_value},
     handle_session_update_notification,
     helpers::{build_judge_action_traces, to_client_game_state},
     http::allocate_session_code,
     llm::{LlmClient, LlmPoolConfig, ResolvedProvider},
     parse_session_update_notification,
-    ws::{advance_game_ticks, emit_phase_warning_notices},
+    ws::{advance_game_ticks, advance_overdue_phases, emit_phase_warning_notices},
 };
 use axum::{
     Router,
@@ -26,8 +26,9 @@ use persistence::{
 use protocol::{
     ClientWsMessage, CoordinatorType, DragonStats, JoinWorkshopRequest, LlmJudgeResult,
     LlmProviderKind, NoticeLevel, ServerWsMessage, SessionArtifactKind, SessionArtifactRecord,
-    SessionCommand, SessionEnvelope, SpriteSheetResult, WorkshopCommandRequest,
-    WorkshopCommandResult, WorkshopCreateResult, WorkshopJoinResult, WorkshopJudgeBundleResult,
+    SessionCommand, SessionEnvelope, SpriteSheetResult, UpdateWorkshopRequest,
+    WorkshopCommandRequest, WorkshopCommandResult, WorkshopCreateResult, WorkshopJoinResult,
+    WorkshopJoinSuccess, WorkshopJudgeBundleResult,
 };
 use security::{DEFAULT_RUST_SESSION_CODE_PREFIX, OriginPolicyOptions, create_origin_policy};
 use sqlx::PgPool;
@@ -330,6 +331,7 @@ struct FaultyStore {
     fail_renew_session_lease: AtomicBool,
     fail_claim_realtime_connection: AtomicBool,
     load_session_by_code_calls: AtomicUsize,
+    load_character_calls: AtomicUsize,
     save_session_calls: AtomicUsize,
 }
 
@@ -388,6 +390,10 @@ impl FaultyStore {
 
     fn save_session_calls(&self) -> usize {
         self.save_session_calls.load(Ordering::SeqCst)
+    }
+
+    fn load_character_calls(&self) -> usize {
+        self.load_character_calls.load(Ordering::SeqCst)
     }
 }
 
@@ -663,6 +669,7 @@ impl SessionStore for FaultyStore {
                 + '_,
         >,
     > {
+        self.load_character_calls.fetch_add(1, Ordering::SeqCst);
         self.inner.load_character(character_id)
     }
 
@@ -864,6 +871,39 @@ async fn test_auth_cookie(app: &Router, name: &str) -> String {
     signin_and_get_cookie(app, "knight", name, "testpassword123").await
 }
 
+async fn attach_workshop_ws(
+    app: Router,
+    cookie: &str,
+    session: &WorkshopJoinSuccess,
+) -> (
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+    tokio::task::JoinHandle<()>,
+) {
+    let (addr, server_handle) = spawn_test_server(app).await;
+    let (mut socket, _) = connect_async(ws_request_with_cookie(addr, Some(cookie)))
+        .await
+        .expect("connect ws");
+    let attach_message = ClientWsMessage::AttachSession(SessionEnvelope {
+        session_code: session.session_code.clone(),
+        player_id: session.player_id.clone(),
+        reconnect_token: session.reconnect_token.clone(),
+        coordinator_type: Some(CoordinatorType::Rust),
+    });
+    socket
+        .send(WsMessage::Text(
+            serde_json::to_string(&attach_message)
+                .expect("encode attach")
+                .into(),
+        ))
+        .await
+        .expect("send attach");
+    match next_server_ws_message(&mut socket).await {
+        ServerWsMessage::StateUpdate(_) => {}
+        other => panic!("expected initial state update, got {other:?}"),
+    }
+    (socket, server_handle)
+}
+
 fn create_workshop_body(name: &str) -> String {
     serde_json::json!({
         "name": name,
@@ -1019,6 +1059,28 @@ async fn send_command_ok(app: &Router, request_body: String) {
         .await
         .expect("call command endpoint");
     assert_eq!(response.status(), StatusCode::OK);
+}
+
+async fn seed_starter_character(state: &AppState, id: &str) {
+    state
+        .store
+        .save_character(&persistence::CharacterRecord {
+            id: id.to_string(),
+            name: None,
+            description: "Shared starter dragon".to_string(),
+            sprites: protocol::SpriteSet {
+                neutral: "starter-neutral".to_string(),
+                happy: "starter-happy".to_string(),
+                angry: "starter-angry".to_string(),
+                sleepy: "starter-sleepy".to_string(),
+            },
+            remaining_sprite_regenerations: 0,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+            owner_account_id: None,
+        })
+        .await
+        .expect("seed starter");
 }
 
 async fn progress_workshop_to_end(
@@ -1345,6 +1407,37 @@ fn load_config_parses_database_pool_size() {
     let config = crate::app::load_config().expect("load config");
 
     assert_eq!(config.database_pool_size, 17);
+}
+
+#[test]
+fn load_config_defaults_database_pool_size_for_workshop_bursts() {
+    let _env_lock = lock_env();
+    let _bind = ScopedEnvVar::set("APP_SERVER_BIND_ADDR", "127.0.0.1:4100");
+    let _app_url = ScopedEnvVar::set("VITE_APP_URL", "http://127.0.0.1:4100");
+    let _origins = ScopedEnvVar::set("ALLOWED_ORIGINS", "http://127.0.0.1:4100");
+    let _node_env = ScopedEnvVar::set("NODE_ENV", "development");
+    let _database = ScopedEnvVar::set("DATABASE_URL", "postgres://user:pass@localhost:5432/db");
+    let _pool = ScopedEnvVar::unset("DATABASE_POOL_SIZE");
+
+    let config = crate::app::load_config().expect("load config");
+
+    assert_eq!(config.database_pool_size, 60);
+}
+
+#[test]
+fn session_lease_enabled_parser_defaults_safe() {
+    assert!(session_lease_enabled_from_value(None));
+    assert!(session_lease_enabled_from_value(Some("")));
+    assert!(session_lease_enabled_from_value(Some("true")));
+    assert!(session_lease_enabled_from_value(Some("1")));
+    assert!(session_lease_enabled_from_value(Some("invalid")));
+}
+
+#[test]
+fn session_lease_enabled_parser_disables_explicit_false_values() {
+    for value in ["false", "0", "no", "off", " FALSE ", "No", "Off"] {
+        assert!(!session_lease_enabled_from_value(Some(value)));
+    }
 }
 
 #[test]
@@ -2295,6 +2388,242 @@ async fn workshop_command_pushes_state_update_to_attached_websocket() {
 }
 
 #[tokio::test]
+async fn workshop_command_select_character_pushes_player_upsert_delta_to_attached_websocket() {
+    let state = test_state();
+    seed_starter_character(&state, "starter_delta_001").await;
+    let app = build_app(state.clone());
+    let cookie = test_auth_cookie(&app, "Alice").await;
+    let create_success = create_workshop_success(&app, &cookie, "Alice").await;
+    let (mut socket, server_handle) =
+        attach_workshop_ws(app.clone(), &cookie, &create_success).await;
+
+    let command_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops/command")
+                .header("origin", "http://localhost:5173")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&WorkshopCommandRequest {
+                        session_code: create_success.session_code.clone(),
+                        reconnect_token: create_success.reconnect_token.clone(),
+                        coordinator_type: Some(CoordinatorType::Rust),
+                        command: SessionCommand::SelectCharacter,
+                        payload: Some(serde_json::json!({ "characterId": "starter_delta_001" })),
+                    })
+                    .expect("encode command request"),
+                ))
+                .expect("build command request"),
+        )
+        .await
+        .expect("call command endpoint");
+    assert_eq!(command_response.status(), StatusCode::OK);
+
+    match next_server_ws_message(&mut socket).await {
+        ServerWsMessage::PlayerUpsert {
+            state_revision,
+            player,
+        } => {
+            assert!(state_revision > create_success.state.session.state_revision);
+            assert_eq!(player.id, create_success.player_id);
+            assert_eq!(player.character_id.as_deref(), Some("starter_delta_001"));
+        }
+        other => panic!("expected player upsert delta, got {other:?}"),
+    }
+
+    let _ = socket.close(None).await;
+    server_handle.abort();
+}
+
+#[tokio::test]
+async fn workshop_command_submit_observation_pushes_dragon_patch_delta_to_attached_websocket() {
+    let state = test_state();
+    let app = build_app(state.clone());
+    let cookie = test_auth_cookie(&app, "Alice").await;
+    let create_success = create_workshop_success(&app, &cookie, "Alice").await;
+    let (mut socket, server_handle) =
+        attach_workshop_ws(app.clone(), &cookie, &create_success).await;
+
+    seed_selected_characters(&state, &create_success.session_code).await;
+    send_command_ok(
+        &app,
+        setup_phase1_body(
+            &create_success.session_code,
+            &create_success.reconnect_token,
+        ),
+    )
+    .await;
+    match next_server_ws_message(&mut socket).await {
+        ServerWsMessage::StateUpdate(client_state) => {
+            assert_eq!(client_state.phase, protocol::Phase::Phase1);
+        }
+        other => panic!("expected phase state update, got {other:?}"),
+    }
+
+    let command_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops/command")
+                .header("origin", "http://localhost:5173")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&WorkshopCommandRequest {
+                        session_code: create_success.session_code.clone(),
+                        reconnect_token: create_success.reconnect_token.clone(),
+                        coordinator_type: Some(CoordinatorType::Rust),
+                        command: SessionCommand::SubmitObservation,
+                        payload: Some(serde_json::json!({ "text": "Notices glowing scales" })),
+                    })
+                    .expect("encode command request"),
+                ))
+                .expect("build command request"),
+        )
+        .await
+        .expect("call command endpoint");
+    assert_eq!(command_response.status(), StatusCode::OK);
+
+    match next_server_ws_message(&mut socket).await {
+        ServerWsMessage::DragonPatch {
+            state_revision,
+            dragon,
+        } => {
+            assert!(state_revision > create_success.state.session.state_revision);
+            assert_eq!(dragon.id, format!("dragon_{}", create_success.player_id));
+            assert_eq!(dragon.discovery_observations.len(), 1);
+            assert_eq!(dragon.discovery_observations[0], "Notices glowing scales");
+        }
+        other => panic!("expected dragon patch delta, got {other:?}"),
+    }
+
+    let _ = socket.close(None).await;
+    server_handle.abort();
+}
+
+#[tokio::test]
+async fn workshop_command_action_pushes_player_and_dragon_deltas_to_attached_websocket() {
+    let state = test_state();
+    let app = build_app(state.clone());
+    let cookie = test_auth_cookie(&app, "Alice").await;
+    let create_success = create_workshop_success(&app, &cookie, "Alice").await;
+    let (mut socket, server_handle) =
+        attach_workshop_ws(app.clone(), &cookie, &create_success).await;
+
+    seed_selected_characters(&state, &create_success.session_code).await;
+    send_command_ok(
+        &app,
+        setup_phase1_body(
+            &create_success.session_code,
+            &create_success.reconnect_token,
+        ),
+    )
+    .await;
+    match next_server_ws_message(&mut socket).await {
+        ServerWsMessage::StateUpdate(client_state) => {
+            assert_eq!(client_state.phase, protocol::Phase::Phase1);
+        }
+        other => panic!("expected phase state update, got {other:?}"),
+    }
+
+    send_command_ok(
+        &app,
+        serde_json::json!({
+            "sessionCode": create_success.session_code.clone(),
+            "reconnectToken": create_success.reconnect_token.clone(),
+            "command": "action",
+            "payload": { "type": "feed", "value": "meat" }
+        })
+        .to_string(),
+    )
+    .await;
+
+    match next_server_ws_message(&mut socket).await {
+        ServerWsMessage::PlayerUpsert { player, .. } => {
+            assert_eq!(player.id, create_success.player_id);
+        }
+        other => panic!("expected player upsert delta, got {other:?}"),
+    }
+    match next_server_ws_message(&mut socket).await {
+        ServerWsMessage::DragonPatch { dragon, .. } => {
+            assert_eq!(dragon.id, format!("dragon_{}", create_success.player_id));
+            assert!(dragon.last_action != protocol::DragonAction::Idle);
+        }
+        other => panic!("expected dragon patch delta, got {other:?}"),
+    }
+
+    let _ = socket.close(None).await;
+    server_handle.abort();
+}
+
+#[tokio::test]
+async fn workshop_command_submit_tags_pushes_dragon_patch_delta_to_attached_websocket() {
+    let state = test_state();
+    let app = build_app(state.clone());
+    let cookie = test_auth_cookie(&app, "Alice").await;
+    let create_success = create_workshop_success(&app, &cookie, "Alice").await;
+    let (mut socket, server_handle) =
+        attach_workshop_ws(app.clone(), &cookie, &create_success).await;
+
+    seed_selected_characters(&state, &create_success.session_code).await;
+    send_command_ok(
+        &app,
+        setup_phase1_body(
+            &create_success.session_code,
+            &create_success.reconnect_token,
+        ),
+    )
+    .await;
+    match next_server_ws_message(&mut socket).await {
+        ServerWsMessage::StateUpdate(client_state) => {
+            assert_eq!(client_state.phase, protocol::Phase::Phase1);
+        }
+        other => panic!("expected phase1 state update, got {other:?}"),
+    }
+    send_command_ok(
+        &app,
+        serde_json::json!({
+            "sessionCode": create_success.session_code.clone(),
+            "reconnectToken": create_success.reconnect_token.clone(),
+            "command": "startHandover"
+        })
+        .to_string(),
+    )
+    .await;
+    match next_server_ws_message(&mut socket).await {
+        ServerWsMessage::StateUpdate(client_state) => {
+            assert_eq!(client_state.phase, protocol::Phase::Handover);
+        }
+        other => panic!("expected handover state update, got {other:?}"),
+    }
+
+    send_command_ok(
+        &app,
+        serde_json::json!({
+            "sessionCode": create_success.session_code.clone(),
+            "reconnectToken": create_success.reconnect_token.clone(),
+            "command": "submitTags",
+            "payload": ["bright", "hungry", "gentle"]
+        })
+        .to_string(),
+    )
+    .await;
+
+    match next_server_ws_message(&mut socket).await {
+        ServerWsMessage::DragonPatch { dragon, .. } => {
+            assert_eq!(dragon.id, format!("dragon_{}", create_success.player_id));
+            assert_eq!(dragon.handover_tags, vec!["bright", "hungry", "gentle"]);
+        }
+        other => panic!("expected dragon patch delta, got {other:?}"),
+    }
+
+    let _ = socket.close(None).await;
+    server_handle.abort();
+}
+
+#[tokio::test]
 async fn session_update_notification_skip_does_not_evict_cache_or_broadcast() {
     let state = test_state();
     let timestamp = Utc::now();
@@ -2314,7 +2643,7 @@ async fn session_update_notification_skip_does_not_evict_cache_or_broadcast() {
         .await
         .insert(session.code.0.clone(), session.clone());
 
-    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+    let (sender, mut receiver) = tokio::sync::mpsc::channel(64);
     state
         .realtime
         .lock()
@@ -2342,6 +2671,84 @@ async fn session_update_notification_skip_does_not_evict_cache_or_broadcast() {
     assert!(
         receiver.try_recv().is_err(),
         "skip path should not broadcast"
+    );
+}
+
+#[tokio::test]
+async fn broadcast_overflow_forces_local_connection_cleanup() {
+    let state = test_state();
+    let timestamp = Utc::now();
+    let mut session = WorkshopSession::new(
+        Uuid::new_v4(),
+        SessionCode("123456".into()),
+        timestamp,
+        protocol::WorkshopCreateConfig::default(),
+    );
+    session.add_player(session_player_with_state(
+        "player-1", "Alice", timestamp, true, true,
+    ));
+    state
+        .store
+        .save_session(&session)
+        .await
+        .expect("seed persisted session");
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(session.code.0.clone(), session.clone());
+
+    let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+    sender
+        .try_send(crate::ws::WsOutbound::Close)
+        .expect("fill outbound channel");
+    let (close_signal, close_rx) = tokio::sync::oneshot::channel();
+    state
+        .realtime
+        .lock()
+        .await
+        .attach(&session.code.0, "player-1", "conn-1");
+    state
+        .realtime_senders
+        .lock()
+        .await
+        .insert("conn-1".to_string(), sender);
+    state
+        .realtime_close_signals
+        .lock()
+        .await
+        .insert("conn-1".to_string(), close_signal);
+
+    super::ws::broadcast_session_state(&state, &session.code.0, None).await;
+
+    tokio::time::timeout(std::time::Duration::from_secs(1), close_rx)
+        .await
+        .expect("overflow should force-close reader")
+        .expect("overflow close signal should be delivered");
+    assert!(
+        !state.realtime_senders.lock().await.contains_key("conn-1"),
+        "overflowed sender should be removed"
+    );
+    assert!(
+        !state
+            .realtime_close_signals
+            .lock()
+            .await
+            .contains_key("conn-1"),
+        "force-close signal should be consumed"
+    );
+    assert!(
+        state
+            .realtime
+            .lock()
+            .await
+            .session_registrations(&session.code.0)
+            .is_empty(),
+        "overflowed connection should leave the local registry"
+    );
+    assert!(
+        matches!(receiver.try_recv(), Ok(crate::ws::WsOutbound::Close)),
+        "pre-filled channel should remain otherwise untouched"
     );
 }
 
@@ -2491,7 +2898,7 @@ async fn typed_notification_followed_by_legacy_notification_does_not_rebroadcast
         .await
         .insert(session.code.0.clone(), session.clone());
 
-    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+    let (sender, mut receiver) = tokio::sync::mpsc::channel(64);
     state
         .realtime
         .lock()
@@ -2595,7 +3002,7 @@ async fn realtime_replaced_notification_clears_local_registration_without_persis
         .await
         .insert(session.code.0.clone(), session.clone());
 
-    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+    let (sender, mut receiver) = tokio::sync::mpsc::channel(64);
     state
         .realtime
         .lock()
@@ -2705,7 +3112,7 @@ async fn workshop_deleted_notification_closes_local_session_connections() {
         .await
         .insert(session.code.0.clone(), session.clone());
 
-    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+    let (sender, mut receiver) = tokio::sync::mpsc::channel(64);
     state
         .realtime
         .lock()
@@ -2770,7 +3177,7 @@ async fn clearing_local_realtime_before_close_prevents_false_disconnect_fallback
         .await
         .insert(session.code.0.clone(), session.clone());
 
-    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+    let (sender, mut receiver) = tokio::sync::mpsc::channel(64);
     state
         .realtime
         .lock()
@@ -3656,6 +4063,58 @@ async fn create_workshop_lobby_endpoint_creates_empty_reserved_lobby() {
 }
 
 #[tokio::test]
+async fn create_workshop_lobby_endpoint_applies_custom_phase_config() {
+    let state = test_state();
+    let app = build_app(state.clone());
+    let cookie = test_auth_cookie(&app, "Alice").await;
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops/lobby")
+                .header("content-type", "application/json")
+                .header(axum::http::header::COOKIE, &cookie)
+                .body(Body::from(
+                    serde_json::json!({
+                        "config": {
+                            "phase1Minutes": 2,
+                            "phase2Minutes": 3
+                        }
+                    })
+                    .to_string(),
+                ))
+                .expect("build create lobby request"),
+        )
+        .await
+        .expect("call create workshop lobby");
+
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read create lobby body");
+    let result: WorkshopCreateResult =
+        serde_json::from_slice(&body).expect("parse create lobby result");
+    let success = match result {
+        WorkshopCreateResult::Success(success) => success,
+        WorkshopCreateResult::Error(error) => {
+            panic!("expected create lobby success, got error: {}", error.error)
+        }
+    };
+
+    let session = state
+        .store
+        .load_session_by_code(&success.session_code)
+        .await
+        .expect("load created lobby")
+        .expect("created lobby exists");
+    assert_eq!(session.config.phase0_minutes, 8);
+    assert_eq!(session.config.phase1_minutes, 2);
+    assert_eq!(session.config.phase2_minutes, 3);
+}
+
+#[tokio::test]
 async fn create_workshop_lobby_appears_in_open_workshops_with_zero_players() {
     let state = test_state();
     let app = build_app(state.clone());
@@ -3695,7 +4154,111 @@ async fn create_workshop_lobby_appears_in_open_workshops_with_zero_players() {
         .expect("created lobby appears in open workshops");
     assert_eq!(created["hostName"].as_str(), Some("Alice"));
     assert_eq!(created["playerCount"].as_u64(), Some(0));
+    assert_eq!(created["phase1Minutes"].as_u64(), Some(10));
+    assert_eq!(created["phase2Minutes"].as_u64(), Some(10));
     assert_eq!(created["canDelete"].as_bool(), Some(true));
+}
+
+#[tokio::test]
+async fn update_workshop_updates_owned_empty_reserved_lobby_config() {
+    let state = test_state();
+    let app = build_app(state.clone());
+    let cookie = test_auth_cookie(&app, "Alice").await;
+
+    let session_code = create_test_workshop_lobby(&app, &cookie).await;
+
+    let update_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri(format!("/api/workshops/{session_code}"))
+                .header("content-type", "application/json")
+                .header(axum::http::header::COOKIE, &cookie)
+                .body(Body::from(
+                    serde_json::to_string(&UpdateWorkshopRequest {
+                        phase1_minutes: Some(2),
+                        phase2_minutes: Some(3),
+                    })
+                    .expect("encode update workshop request"),
+                ))
+                .expect("build update workshop request"),
+        )
+        .await
+        .expect("update workshop response");
+    assert_eq!(update_response.status(), StatusCode::OK);
+
+    let session = state
+        .store
+        .load_session_by_code(&session_code)
+        .await
+        .expect("load updated session")
+        .expect("updated session exists");
+    assert_eq!(session.config.phase1_minutes, 2);
+    assert_eq!(session.config.phase2_minutes, 3);
+
+    let (status, value) = get_open_workshops_json(&app, &cookie, "").await;
+    assert_eq!(status, StatusCode::OK);
+    let created = value["workshops"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["sessionCode"].as_str() == Some(session_code.as_str()))
+        .expect("updated lobby appears in open workshops");
+    assert_eq!(created["phase1Minutes"].as_u64(), Some(2));
+    assert_eq!(created["phase2Minutes"].as_u64(), Some(3));
+}
+
+#[tokio::test]
+async fn update_workshop_rejects_owner_after_owner_joins_lobby() {
+    let state = test_state();
+    let app = build_app(state.clone());
+    let cookie = test_auth_cookie(&app, "Alice").await;
+
+    let session_code = create_test_workshop_lobby(&app, &cookie).await;
+
+    let join_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops/join")
+                .header("content-type", "application/json")
+                .header(axum::http::header::COOKIE, &cookie)
+                .body(Body::from(
+                    serde_json::json!({
+                        "sessionCode": session_code,
+                        "characterId": null,
+                        "reconnectToken": null
+                    })
+                    .to_string(),
+                ))
+                .expect("build join request"),
+        )
+        .await
+        .expect("join workshop response");
+    assert_eq!(join_response.status(), StatusCode::OK);
+
+    let update_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri(format!("/api/workshops/{session_code}"))
+                .header("content-type", "application/json")
+                .header(axum::http::header::COOKIE, &cookie)
+                .body(Body::from(
+                    serde_json::to_string(&UpdateWorkshopRequest {
+                        phase1_minutes: Some(2),
+                        phase2_minutes: Some(3),
+                    })
+                    .expect("encode update workshop request"),
+                ))
+                .expect("build update workshop request"),
+        )
+        .await
+        .expect("update workshop response");
+    assert_eq!(update_response.status(), StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
@@ -3960,8 +4523,8 @@ async fn create_workshop_endpoint_applies_default_config_when_omitted() {
             .get(&protocol::Phase::Phase2)
             .expect("phase2 settings")
             .duration_seconds,
-        8 * 60,
-        "phase2 should default to 8 minutes",
+        5 * 60,
+        "phase2 should default to 5 minutes",
     );
 }
 
@@ -4775,26 +5338,7 @@ async fn generate_character_sprite_sheet_preserves_owned_character_owner_account
 async fn workshop_command_rejects_duplicate_starter_selection_in_lobby() {
     let state = test_state();
 
-    let starter = persistence::CharacterRecord {
-        id: "starter_shared_001".to_string(),
-        name: None,
-        description: "Shared starter dragon".to_string(),
-        sprites: protocol::SpriteSet {
-            neutral: "starter-neutral".to_string(),
-            happy: "starter-happy".to_string(),
-            angry: "starter-angry".to_string(),
-            sleepy: "starter-sleepy".to_string(),
-        },
-        remaining_sprite_regenerations: 0,
-        created_at: chrono::Utc::now().to_rfc3339(),
-        updated_at: chrono::Utc::now().to_rfc3339(),
-        owner_account_id: None,
-    };
-    state
-        .store
-        .save_character(&starter)
-        .await
-        .expect("seed starter");
+    seed_starter_character(&state, "starter_shared_001").await;
 
     let app = build_app(state.clone());
     let alice_cookie = test_auth_cookie(&app, "Alice").await;
@@ -6623,6 +7167,152 @@ async fn workshop_command_records_action_artifact_during_phase2() {
 }
 
 #[tokio::test]
+async fn workshop_command_does_not_duplicate_inline_achievement_on_repeated_correct_first_try_patterns()
+ {
+    let state = test_state();
+    let app = build_app(state.clone());
+    let cookie = test_auth_cookie(&app, "Alice").await;
+    let create_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops")
+                .header("content-type", "application/json")
+                .header(axum::http::header::COOKIE, &cookie)
+                .body(Body::from(create_workshop_body("Alice")))
+                .expect("build create request"),
+        )
+        .await
+        .expect("call create workshop");
+    let create_body = to_bytes(create_response.into_body(), usize::MAX)
+        .await
+        .expect("read create body");
+    let create_result: WorkshopJoinResult =
+        serde_json::from_slice(&create_body).expect("parse create result");
+    let create_success = match create_result {
+        WorkshopJoinResult::Success(success) => success,
+        WorkshopJoinResult::Error(error) => {
+            panic!("expected create success, got error: {}", error.error)
+        }
+    };
+
+    seed_selected_characters(&state, &create_success.session_code).await;
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops/command")
+                .header("content-type", "application/json")
+                .body(Body::from(setup_phase1_body(
+                    &create_success.session_code,
+                    &create_success.reconnect_token,
+                )))
+                .expect("build setup request"),
+        )
+        .await
+        .expect("call setup command");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    {
+        let mut sessions = state.sessions.lock().await;
+        let session = sessions
+            .get_mut(&create_success.session_code)
+            .expect("session exists in cache");
+        let dragon_id = session
+            .players
+            .get(&create_success.player_id)
+            .and_then(|player| player.current_dragon_id.clone())
+            .expect("current dragon id");
+        let dragon = session.dragons.get_mut(&dragon_id).expect("dragon exists");
+        dragon.favorite_food = protocol::FoodType::Meat;
+        dragon.hunger = 50;
+    }
+
+    let first_action = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops/command")
+                .header("content-type", "application/json")
+                .body(Body::from(format!(
+                    r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"action","payload":{{"type":"feed","value":"meat"}}}}"#,
+                    create_success.session_code, create_success.reconnect_token
+                )))
+                .expect("build action request"),
+        )
+        .await
+        .expect("call first action command");
+    assert_eq!(first_action.status(), StatusCode::OK);
+
+    {
+        let sessions = state.sessions.lock().await;
+        let session = sessions
+            .get(&create_success.session_code)
+            .expect("session exists after first action");
+        let player = session
+            .players
+            .get(&create_success.player_id)
+            .expect("player exists");
+        let master_chef_count = player
+            .achievements
+            .iter()
+            .filter(|achievement| *achievement == "master_chef")
+            .count();
+        assert_eq!(master_chef_count, 1);
+    }
+
+    {
+        let mut sessions = state.sessions.lock().await;
+        let session = sessions
+            .get_mut(&create_success.session_code)
+            .expect("session exists for reset");
+        let dragon_id = session
+            .players
+            .get(&create_success.player_id)
+            .and_then(|player| player.current_dragon_id.clone())
+            .expect("current dragon id");
+        let dragon = session.dragons.get_mut(&dragon_id).expect("dragon exists");
+        dragon.action_cooldown = 0;
+        dragon.food_tries = 0;
+        dragon.hunger = 50;
+    }
+
+    let second_action = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops/command")
+                .header("content-type", "application/json")
+                .body(Body::from(format!(
+                    r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"action","payload":{{"type":"feed","value":"meat"}}}}"#,
+                    create_success.session_code, create_success.reconnect_token
+                )))
+                .expect("build second action request"),
+        )
+        .await
+        .expect("call second action command");
+    assert_eq!(second_action.status(), StatusCode::OK);
+
+    let sessions = state.sessions.lock().await;
+    let session = sessions
+        .get(&create_success.session_code)
+        .expect("session exists after second action");
+    let player = session
+        .players
+        .get(&create_success.player_id)
+        .expect("player exists after second action");
+    let master_chef_count = player
+        .achievements
+        .iter()
+        .filter(|achievement| *achievement == "master_chef")
+        .count();
+    assert_eq!(master_chef_count, 1);
+}
+
+#[tokio::test]
 async fn workshop_command_rejects_invalid_credentials() {
     let app = build_app(test_state());
 
@@ -7723,6 +8413,82 @@ async fn workshop_command_rejects_start_phase2_when_tags_are_missing() {
 }
 
 #[tokio::test]
+async fn workshop_command_starts_phase2_after_handover_deadline_with_missing_tags() {
+    let state = test_state();
+    let app = build_app(state.clone());
+    let cookie = test_auth_cookie(&app, "Alice").await;
+    let create_success = create_workshop_success(&app, &cookie, "Alice").await;
+
+    state
+        .store
+        .claim_realtime_connection(&RealtimeConnectionRegistration {
+            session_code: create_success.session_code.clone(),
+            player_id: create_success.player_id.clone(),
+            connection_id: "conn-host-deadline".to_string(),
+            replica_id: state.replica_id.clone(),
+        })
+        .await
+        .expect("seed host realtime registration");
+
+    send_command_ok(
+        &app,
+        setup_phase1_body(
+            &create_success.session_code,
+            &create_success.reconnect_token,
+        ),
+    )
+    .await;
+    send_command_ok(
+        &app,
+        format!(
+            r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"startHandover"}}"#,
+            create_success.session_code, create_success.reconnect_token
+        ),
+    )
+    .await;
+
+    let expired_session = {
+        let mut sessions = state.sessions.lock().await;
+        let session = sessions
+            .get_mut(&create_success.session_code)
+            .expect("cached session");
+        session.phase_started_at =
+            Utc::now() - ChronoDuration::seconds(i64::from(session.config.phase2_minutes) * 60);
+        session.updated_at = Utc::now();
+        session.clone()
+    };
+    state
+        .store
+        .save_session(&expired_session)
+        .await
+        .expect("persist expired handover session");
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops/command")
+                .header("content-type", "application/json")
+                .body(Body::from(format!(
+                    r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"startPhase2"}}"#,
+                    create_success.session_code, create_success.reconnect_token
+                )))
+                .expect("build command request"),
+        )
+        .await
+        .expect("call command endpoint");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let sessions = state.sessions.lock().await;
+    let session = sessions
+        .get(&create_success.session_code)
+        .expect("session exists");
+    assert_eq!(session.phase, protocol::Phase::Phase2);
+    let dragon = session.dragons.values().next().expect("dragon exists");
+    assert_eq!(dragon.handover_tags.len(), domain::HANDOVER_TAG_COUNT);
+}
+
+#[tokio::test]
 async fn workshop_command_starts_phase2_when_handover_is_complete() {
     let state = test_state();
     let app = build_app(state.clone());
@@ -8210,6 +8976,212 @@ async fn workshop_command_enters_voting_and_runs_judge_in_background_when_host_e
         .and_then(|value| value.as_str())
         .expect("judge artifact summary");
     assert!(!summary.trim().is_empty());
+}
+
+#[tokio::test]
+async fn workshop_command_start_voting_awards_phase_end_achievements() {
+    let state = test_state();
+    let app = build_app(state.clone());
+    let cookie = test_auth_cookie(&app, "Alice").await;
+    let create_success = create_workshop_success(&app, &cookie, "Alice").await;
+    let session_code = create_success.session_code.clone();
+
+    seed_selected_characters(&state, &session_code).await;
+    for request_body in [
+        setup_phase1_body(&session_code, &create_success.reconnect_token),
+        format!(
+            r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"startHandover"}}"#,
+            session_code, create_success.reconnect_token
+        ),
+        format!(
+            r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"submitTags","payload":["one","two","three"]}}"#,
+            session_code, create_success.reconnect_token
+        ),
+        format!(
+            r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"startPhase2"}}"#,
+            session_code, create_success.reconnect_token
+        ),
+    ] {
+        send_command_ok(&app, request_body).await;
+    }
+
+    {
+        let mut sessions = state.sessions.lock().await;
+        let session = sessions
+            .get_mut(&session_code)
+            .expect("cached session after phase2 start");
+        let dragon_id = session
+            .players
+            .get(&create_success.player_id)
+            .and_then(|player| player.current_dragon_id.clone())
+            .expect("host current dragon id");
+        let dragon = session.dragons.get_mut(&dragon_id).expect("current dragon");
+        dragon.wrong_food_count = 0;
+        dragon.wrong_play_count = 0;
+        dragon.wrong_sleep_count = 0;
+        dragon.correct_sleep_count = 2;
+        dragon.total_actions = 10;
+        dragon.correct_actions = 10;
+        dragon.found_correct_food = true;
+        dragon.penalty_stacks = 0;
+        dragon.phase2_lowest_happiness = 80;
+        dragon.happiness = 90;
+    }
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops/command")
+                .header("content-type", "application/json")
+                .body(Body::from(format!(
+                    r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"startVoting"}}"#,
+                    session_code, create_success.reconnect_token
+                )))
+                .expect("build startVoting command"),
+        )
+        .await
+        .expect("call startVoting command");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let sessions = state.sessions.lock().await;
+    let session = sessions
+        .get(&session_code)
+        .expect("cached session after startVoting");
+    assert_eq!(session.phase, protocol::Phase::Voting);
+    let player = session
+        .players
+        .get(&create_success.player_id)
+        .expect("host player");
+    for expected in [
+        "no_mistakes",
+        "zen_master",
+        "restful_rhythm",
+        "perfectionist",
+    ] {
+        let count = player
+            .achievements
+            .iter()
+            .filter(|achievement| achievement.as_str() == expected)
+            .count();
+        assert_eq!(count, 1, "cached achievement count for {expected}");
+    }
+    drop(sessions);
+
+    let persisted = state
+        .store
+        .load_session_by_code(&session_code)
+        .await
+        .expect("load persisted session")
+        .expect("persisted session exists");
+    let persisted_player = persisted
+        .players
+        .get(&create_success.player_id)
+        .expect("persisted host player");
+    for expected in [
+        "no_mistakes",
+        "zen_master",
+        "restful_rhythm",
+        "perfectionist",
+    ] {
+        let count = persisted_player
+            .achievements
+            .iter()
+            .filter(|achievement| achievement.as_str() == expected)
+            .count();
+        assert_eq!(count, 1, "persisted achievement count for {expected}");
+    }
+}
+
+#[tokio::test]
+async fn workshop_command_start_voting_from_judge_does_not_rerun_judge() {
+    let state = test_state();
+    let app = build_app(state.clone());
+    let cookie = test_auth_cookie(&app, "Alice").await;
+    let create_success = create_workshop_success(&app, &cookie, "Alice").await;
+    let session_code = create_success.session_code.clone();
+
+    {
+        let mut sessions = state.sessions.lock().await;
+        let session = sessions
+            .get_mut(&session_code)
+            .expect("cached session after create");
+        session.host_player_id = Some(create_success.player_id.clone());
+        session.phase = protocol::Phase::Judge;
+    }
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops/command")
+                .header("content-type", "application/json")
+                .body(Body::from(format!(
+                    r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"startVoting"}}"#,
+                    session_code, create_success.reconnect_token
+                )))
+                .expect("build startVoting command"),
+        )
+        .await
+        .expect("call startVoting command");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let sessions = state.sessions.lock().await;
+    let session = sessions
+        .get(&session_code)
+        .expect("cached session after startVoting");
+    assert_eq!(session.phase, protocol::Phase::Voting);
+    let session_id = session.id.to_string();
+    drop(sessions);
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let artifacts = state
+        .store
+        .list_session_artifacts(&session_id)
+        .await
+        .expect("list session artifacts after startVoting");
+    assert_eq!(
+        artifacts
+            .iter()
+            .filter(|artifact| artifact.kind == SessionArtifactKind::JudgeBundleGenerated)
+            .count(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn workshop_command_end_game_rejects_judge_phase() {
+    let state = test_state();
+    let app = build_app(state.clone());
+    let cookie = test_auth_cookie(&app, "Alice").await;
+    let create_success = create_workshop_success(&app, &cookie, "Alice").await;
+    let session_code = create_success.session_code.clone();
+
+    {
+        let mut sessions = state.sessions.lock().await;
+        let session = sessions
+            .get_mut(&session_code)
+            .expect("cached session after create");
+        session.host_player_id = Some(create_success.player_id.clone());
+        session.phase = protocol::Phase::Judge;
+    }
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops/command")
+                .header("content-type", "application/json")
+                .body(Body::from(format!(
+                    r#"{{"sessionCode":"{}","reconnectToken":"{}","command":"endGame"}}"#,
+                    session_code, create_success.reconnect_token
+                )))
+                .expect("build endGame command"),
+        )
+        .await
+        .expect("call endGame command");
+
+    assert_eq!(response.status(), StatusCode::CONFLICT);
 }
 
 #[tokio::test]
@@ -9424,6 +10396,7 @@ async fn advance_game_ticks_updates_cached_session_without_persisting_each_tick(
         .unwrap();
 
     let original_time = session.time;
+    let original_revision = session.state_revision;
     state
         .store
         .save_session(&session)
@@ -9444,6 +10417,13 @@ async fn advance_game_ticks_updates_cached_session_without_persisting_each_tick(
     let updated = cached.get("955555").expect("cached session after tick");
     assert_eq!(updated.phase, protocol::Phase::Phase1);
     assert_eq!(updated.time, (original_time + 1) % 48);
+    assert_eq!(updated.state_revision, original_revision + 1);
+    assert_eq!(
+        to_client_game_state(updated, "player-1")
+            .session
+            .state_revision,
+        updated.state_revision
+    );
     assert_eq!(
         store.save_session_calls(),
         baseline_save_calls,
@@ -9468,6 +10448,386 @@ async fn advance_game_ticks_updates_cached_session_without_persisting_each_tick(
         before_persist + 1,
         "multiple-of-5 ticks must persist so command-handler reloads pick up decayed stats"
     );
+}
+
+#[tokio::test]
+async fn advance_game_ticks_persists_tick_awarded_achievements_immediately() {
+    let store = Arc::new(FaultyStore::new());
+    let state = test_state_with_store(store.clone());
+
+    let mut session = WorkshopSession::new(
+        Uuid::new_v4(),
+        SessionCode("955559".into()),
+        Utc::now(),
+        protocol::WorkshopCreateConfig::default(),
+    );
+    let mut host = session_player("player-1", "Alice", 1);
+    host.is_host = true;
+    host.character_id = Some("character-1".into());
+    host.selected_character = Some(test_character_profile(
+        "character-1",
+        "Coral dragon",
+        protocol::SpriteSet {
+            neutral: "neutral_b64".into(),
+            happy: "happy_b64".into(),
+            angry: "angry_b64".into(),
+            sleepy: "sleepy_b64".into(),
+        },
+        1,
+    ));
+    host.is_ready = true;
+    session.add_player(host);
+    session
+        .begin_phase1(&[domain::Phase1Assignment {
+            player_id: "player-1".into(),
+            dragon_id: "dragon-1".into(),
+        }])
+        .expect("begin phase1");
+    session.time = 16;
+    {
+        let dragon = session.dragons.get_mut("dragon-1").expect("dragon-1");
+        dragon.active_time = protocol::ActiveTime::Day;
+        dragon.sleep_rate = 1;
+        dragon.hunger = 100;
+        dragon.energy = 100;
+        dragon.happiness = 1;
+    }
+
+    state
+        .store
+        .save_session(&session)
+        .await
+        .expect("persist initial session");
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(session.code.0.clone(), session);
+    let before_tick = store.save_session_calls();
+
+    // time 16 -> 17 is not a multiple of 5, so only the achievement award should force persistence.
+    advance_game_ticks(&state).await;
+
+    assert_eq!(
+        store.save_session_calls(),
+        before_tick + 1,
+        "tick-awarded achievements must be persisted immediately even between throttled tick saves"
+    );
+    let cached = state.sessions.lock().await;
+    let cached_player = cached
+        .get("955559")
+        .and_then(|session| session.players.get("player-1"))
+        .expect("cached player after tick");
+    assert_eq!(
+        cached_player
+            .achievements
+            .iter()
+            .filter(|achievement| achievement.as_str() == "rock_bottom")
+            .count(),
+        1
+    );
+    drop(cached);
+
+    let persisted = state
+        .store
+        .load_session_by_code("955559")
+        .await
+        .expect("load persisted tick session")
+        .expect("persisted tick session exists");
+    let persisted_player = persisted
+        .players
+        .get("player-1")
+        .expect("persisted player after tick");
+    assert_eq!(
+        persisted_player
+            .achievements
+            .iter()
+            .filter(|achievement| achievement.as_str() == "rock_bottom")
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn workshop_command_preserves_cached_tick_state_before_tick_persist() {
+    let store = Arc::new(FaultyStore::new());
+    let state = test_state_with_store(store.clone());
+    let session_code = "955557";
+    let player_id = "player-1".to_string();
+    let reconnect_token = "token-1".to_string();
+    let timestamp = Utc::now();
+
+    let mut session = WorkshopSession::new(
+        Uuid::new_v4(),
+        SessionCode(session_code.into()),
+        timestamp,
+        protocol::WorkshopCreateConfig::default(),
+    );
+    let mut host = session_player_with_state(&player_id, "Alice", timestamp, true, true);
+    host.character_id = Some("character-1".into());
+    host.selected_character = Some(test_character_profile(
+        "character-1",
+        "Coral dragon",
+        protocol::SpriteSet {
+            neutral: "neutral_b64".into(),
+            happy: "happy_b64".into(),
+            angry: "angry_b64".into(),
+            sleepy: "sleepy_b64".into(),
+        },
+        1,
+    ));
+    host.is_ready = true;
+    session.add_player(host);
+    session
+        .begin_phase1(&[domain::Phase1Assignment {
+            player_id: player_id.clone(),
+            dragon_id: "dragon-1".into(),
+        }])
+        .expect("begin phase1");
+    {
+        let dragon = session.dragons.get_mut("dragon-1").expect("dragon-1");
+        dragon.active_time = protocol::ActiveTime::Day;
+        dragon.favorite_food = protocol::FoodType::Meat;
+        dragon.sleep_rate = 1;
+        dragon.hunger = 80;
+        dragon.energy = 80;
+        dragon.happiness = 80;
+    }
+
+    store
+        .inner
+        .save_session(&session)
+        .await
+        .expect("persist initial session");
+    store
+        .inner
+        .create_player_identity(&persistence::PlayerIdentity {
+            session_id: session.id.to_string(),
+            player_id: player_id.clone(),
+            reconnect_token: reconnect_token.clone(),
+            created_at: timestamp.to_rfc3339(),
+            last_seen_at: timestamp.to_rfc3339(),
+        })
+        .await
+        .expect("seed identity");
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(session_code.to_string(), session);
+
+    advance_game_ticks(&state).await;
+    {
+        let sessions = state.sessions.lock().await;
+        let cached = sessions
+            .get(session_code)
+            .expect("cached session after tick");
+        let dragon = cached.dragons.get("dragon-1").expect("dragon-1");
+        assert_eq!(cached.time, 17);
+        assert_eq!(dragon.hunger, 79);
+        assert_eq!(dragon.happiness, 79);
+    }
+
+    let app = build_app(state.clone());
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workshops/command")
+                .header("origin", "http://localhost:5173")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&WorkshopCommandRequest {
+                        session_code: session_code.to_string(),
+                        reconnect_token,
+                        coordinator_type: Some(CoordinatorType::Rust),
+                        command: SessionCommand::Action,
+                        payload: Some(serde_json::json!({"type": "feed", "value": "meat"})),
+                    })
+                    .expect("encode command request"),
+                ))
+                .expect("build command request"),
+        )
+        .await
+        .expect("call command endpoint");
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let sessions = state.sessions.lock().await;
+    let cached = sessions
+        .get(session_code)
+        .expect("cached session after command");
+    let dragon = cached.dragons.get("dragon-1").expect("dragon-1");
+    assert_eq!(cached.time, 17, "command must not reload stale DB time");
+    assert_eq!(dragon.hunger, 100);
+    assert_eq!(
+        dragon.happiness, 99,
+        "action must apply on tick-decayed stats"
+    );
+}
+
+#[tokio::test]
+async fn advance_overdue_phases_moves_handover_to_phase2_with_fallback_tags() {
+    let state = test_state();
+    let mut session = WorkshopSession::new(
+        Uuid::new_v4(),
+        SessionCode("955556".into()),
+        Utc::now(),
+        protocol::WorkshopCreateConfig {
+            phase0_minutes: 1,
+            phase1_minutes: 1,
+            phase2_minutes: 1,
+        },
+    );
+    session.add_player(session_player("player-1", "Alice", 1));
+    seed_selected_characters_on_session(&mut session);
+    session
+        .begin_phase1(&[domain::Phase1Assignment {
+            player_id: "player-1".into(),
+            dragon_id: "dragon-1".into(),
+        }])
+        .expect("start phase1");
+    session
+        .transition_to(protocol::Phase::Handover)
+        .expect("to handover");
+    session.phase_started_at = Utc::now() - ChronoDuration::seconds(60);
+    session.updated_at = Utc::now();
+
+    state
+        .store
+        .save_session(&session)
+        .await
+        .expect("persist session");
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(session.code.0.clone(), session);
+
+    advance_overdue_phases(&state).await;
+
+    let sessions = state.sessions.lock().await;
+    let session = sessions.get("955556").expect("cached session");
+    assert_eq!(session.phase, protocol::Phase::Phase2);
+    let dragon = session.dragons.get("dragon-1").expect("dragon-1");
+    assert_eq!(dragon.handover_tags.len(), domain::HANDOVER_TAG_COUNT);
+}
+
+#[tokio::test]
+async fn advance_overdue_phases_preserves_cached_phase1_revision_before_tick_persist() {
+    let store = Arc::new(FaultyStore::new());
+    let state = test_state_with_store(store.clone());
+    let mut session = WorkshopSession::new(
+        Uuid::new_v4(),
+        SessionCode("955558".into()),
+        Utc::now(),
+        protocol::WorkshopCreateConfig {
+            phase0_minutes: 1,
+            phase1_minutes: 1,
+            phase2_minutes: 1,
+        },
+    );
+    session.add_player(session_player("player-1", "Alice", 1));
+    seed_selected_characters_on_session(&mut session);
+    session
+        .begin_phase1(&[domain::Phase1Assignment {
+            player_id: "player-1".into(),
+            dragon_id: "dragon-1".into(),
+        }])
+        .expect("start phase1");
+
+    state
+        .store
+        .save_session(&session)
+        .await
+        .expect("persist initial phase1 session");
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(session.code.0.clone(), session);
+
+    advance_game_ticks(&state).await;
+    let (cached_time, cached_revision) = {
+        let mut sessions = state.sessions.lock().await;
+        let cached = sessions.get_mut("955558").expect("cached session");
+        cached.phase_started_at = Utc::now() - ChronoDuration::seconds(60);
+        (cached.time, cached.state_revision)
+    };
+
+    assert_eq!(
+        store.load_calls(),
+        0,
+        "test setup should not load from store"
+    );
+    advance_overdue_phases(&state).await;
+
+    let sessions = state.sessions.lock().await;
+    let session = sessions.get("955558").expect("cached session");
+    assert_eq!(session.phase, protocol::Phase::Handover);
+    assert_eq!(
+        session.time, cached_time,
+        "auto-advance must not reload stale DB time"
+    );
+    assert_eq!(
+        store.load_calls(),
+        0,
+        "auto-advance must use cached active state"
+    );
+    assert!(
+        session.state_revision > cached_revision,
+        "auto-advance must keep revision monotonic after unpersisted ticks"
+    );
+}
+
+#[tokio::test]
+async fn advance_overdue_phases_moves_phase2_to_voting() {
+    let state = test_state();
+    let mut session = WorkshopSession::new(
+        Uuid::new_v4(),
+        SessionCode("955557".into()),
+        Utc::now(),
+        protocol::WorkshopCreateConfig {
+            phase0_minutes: 1,
+            phase1_minutes: 1,
+            phase2_minutes: 1,
+        },
+    );
+    session.add_player(session_player("player-1", "Alice", 1));
+    seed_selected_characters_on_session(&mut session);
+    session
+        .begin_phase1(&[domain::Phase1Assignment {
+            player_id: "player-1".into(),
+            dragon_id: "dragon-1".into(),
+        }])
+        .expect("start phase1");
+    session
+        .transition_to(protocol::Phase::Handover)
+        .expect("to handover");
+    session
+        .save_handover_tags("player-1", vec!["a".into(), "b".into(), "c".into()])
+        .expect("save tags");
+    session.enter_phase2().expect("enter phase2");
+    session.phase_started_at = Utc::now() - ChronoDuration::seconds(60);
+    session.updated_at = Utc::now();
+
+    state
+        .store
+        .save_session(&session)
+        .await
+        .expect("persist session");
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(session.code.0.clone(), session);
+
+    advance_overdue_phases(&state).await;
+
+    let sessions = state.sessions.lock().await;
+    let session = sessions.get("955557").expect("cached session");
+    assert_eq!(session.phase, protocol::Phase::Voting);
+    assert!(session.voting.is_some());
 }
 
 #[tokio::test]
@@ -10568,6 +11928,56 @@ async fn workshop_ws_failed_reattach_restores_replaced_registration() {
 
     let _ = second_socket.close(None).await;
     server_handle.abort();
+}
+
+#[tokio::test]
+async fn restore_replaced_registration_ignores_dead_local_connection() {
+    let state = test_state();
+    let timestamp = Utc::now();
+    let mut session = WorkshopSession::new(
+        Uuid::new_v4(),
+        SessionCode("123456".into()),
+        timestamp,
+        protocol::WorkshopCreateConfig::default(),
+    );
+    session.add_player(session_player_with_state(
+        "player-1", "Alice", timestamp, true, true,
+    ));
+    state
+        .store
+        .save_session(&session)
+        .await
+        .expect("seed persisted session");
+
+    let replaced = RealtimeConnectionRegistration {
+        session_code: session.code.0.clone(),
+        player_id: "player-1".to_string(),
+        connection_id: "conn-dead".to_string(),
+        replica_id: state.replica_id.clone(),
+    };
+
+    super::ws::restore_replaced_registration(&state, &replaced)
+        .await
+        .expect("dead local restore should not fail");
+
+    assert!(
+        state
+            .realtime
+            .lock()
+            .await
+            .session_registrations(&session.code.0)
+            .is_empty(),
+        "dead local connection should not be restored into the in-memory registry"
+    );
+    assert!(
+        state
+            .store
+            .list_realtime_connections(&session.code.0)
+            .await
+            .expect("list realtime registrations")
+            .is_empty(),
+        "dead local connection should not be restored into persistent realtime ownership"
+    );
 }
 
 #[tokio::test]
@@ -14568,6 +15978,130 @@ async fn character_sprite_endpoint_serves_referenced_character_sprite() {
         .await
         .expect("read sprite body");
     assert_eq!(&bytes[..], b"png-happy");
+}
+
+#[tokio::test]
+async fn character_sprite_endpoint_uses_cached_character_bytes_after_first_load() {
+    use base64::Engine as _;
+
+    let store = Arc::new(FaultyStore::new());
+    store
+        .save_character(&persistence::CharacterRecord {
+            id: "character_sprite_cache_hit_001".to_string(),
+            name: None,
+            description: "A cached sprite dragon".to_string(),
+            sprites: protocol::SpriteSet {
+                neutral: base64::engine::general_purpose::STANDARD.encode(b"png-neutral"),
+                happy: base64::engine::general_purpose::STANDARD.encode(b"png-happy"),
+                angry: base64::engine::general_purpose::STANDARD.encode(b"png-angry"),
+                sleepy: base64::engine::general_purpose::STANDARD.encode(b"png-sleepy"),
+            },
+            remaining_sprite_regenerations: 0,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+            owner_account_id: None,
+        })
+        .await
+        .expect("seed cached character");
+
+    let app = build_app(test_state_with_store(store.clone()));
+    for _ in 0..2 {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/characters/character_sprite_cache_hit_001/sprites/happy")
+                    .body(Body::empty())
+                    .expect("build cached sprite request"),
+            )
+            .await
+            .expect("cached sprite response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read cached sprite body");
+        assert_eq!(&bytes[..], b"png-happy");
+    }
+
+    assert_eq!(store.load_character_calls(), 1);
+}
+
+#[tokio::test]
+async fn delete_character_evicts_cached_sprite_bytes() {
+    use base64::Engine as _;
+
+    let store = Arc::new(FaultyStore::new());
+    let state = test_state_with_store(store.clone());
+    let app = build_app(state);
+    let cookie =
+        signin_and_get_cookie(&app, "dragon", "SpriteOwner", "sprite-owner-password").await;
+    let owner_account_id = store
+        .find_account_by_name_lower("spriteowner")
+        .await
+        .expect("lookup sprite owner")
+        .expect("sprite owner account exists")
+        .id;
+
+    store
+        .save_character(&persistence::CharacterRecord {
+            id: "character_sprite_delete_001".to_string(),
+            name: None,
+            description: "A deletable sprite dragon".to_string(),
+            sprites: protocol::SpriteSet {
+                neutral: base64::engine::general_purpose::STANDARD.encode(b"png-neutral"),
+                happy: base64::engine::general_purpose::STANDARD.encode(b"png-happy"),
+                angry: base64::engine::general_purpose::STANDARD.encode(b"png-angry"),
+                sleepy: base64::engine::general_purpose::STANDARD.encode(b"png-sleepy"),
+            },
+            remaining_sprite_regenerations: 0,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+            owner_account_id: Some(owner_account_id),
+        })
+        .await
+        .expect("seed deletable character");
+
+    let first = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/characters/character_sprite_delete_001/sprites/happy")
+                .body(Body::empty())
+                .expect("build first sprite request"),
+        )
+        .await
+        .expect("first sprite response");
+    assert_eq!(first.status(), StatusCode::OK);
+
+    let delete = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/api/characters/character_sprite_delete_001")
+                .header(axum::http::header::COOKIE, &cookie)
+                .body(Body::empty())
+                .expect("build delete character request"),
+        )
+        .await
+        .expect("delete character response");
+    assert_eq!(delete.status(), StatusCode::NO_CONTENT);
+
+    let second = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/characters/character_sprite_delete_001/sprites/happy")
+                .body(Body::empty())
+                .expect("build second sprite request"),
+        )
+        .await
+        .expect("second sprite response");
+    assert_eq!(second.status(), StatusCode::NOT_FOUND);
+    assert_eq!(store.load_character_calls(), 2);
 }
 
 #[tokio::test]

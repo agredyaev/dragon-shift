@@ -1516,7 +1516,7 @@ Scoring rubric:
   - 15 points: clarity and lack of contradiction between discovery_observations and handover_tags
 - careScore (0-100)
   - 45 points: how well phase2_actions follow the handover recommendations and actual hidden habits
-  - 20 points: correct_actions ratio and low wrong_food_count / wrong_play_count
+  - 20 points: correctActions ratio and low wrongFoodCount / wrongPlayCount / wrongSleepCount
   - 15 points: finalStats quality, especially hunger, energy, and happiness after care
   - 10 points: cooldown discipline
   - 10 points: reasonable adaptation when the handover was incomplete, vague, or contradictory
@@ -1777,6 +1777,8 @@ mod tests {
                     correct_actions: 3,
                     wrong_food_count: 1,
                     wrong_play_count: 0,
+                    wrong_sleep_count: 0,
+                    correct_sleep_count: 0,
                     cooldown_violations: 0,
                     penalty_stacks_at_end: 0,
                     phase2_lowest_happiness: 66,
@@ -1809,6 +1811,8 @@ mod tests {
                     correct_actions: 4,
                     wrong_food_count: 0,
                     wrong_play_count: 1,
+                    wrong_sleep_count: 0,
+                    correct_sleep_count: 0,
                     cooldown_violations: 1,
                     penalty_stacks_at_end: 1,
                     phase2_lowest_happiness: 61,

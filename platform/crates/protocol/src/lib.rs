@@ -247,6 +247,10 @@ pub struct Dragon {
     pub phase2_lowest_happiness: i32,
     pub wrong_food_count: i32,
     pub wrong_play_count: i32,
+    #[serde(default)]
+    pub wrong_sleep_count: i32,
+    #[serde(default)]
+    pub correct_sleep_count: i32,
     pub cooldown_violations: i32,
     pub total_actions: i32,
     pub correct_actions: i32,
@@ -322,6 +326,8 @@ pub struct SessionMeta {
     pub code: String,
     pub created_at: String,
     pub updated_at: String,
+    #[serde(default)]
+    pub state_revision: u64,
     pub phase_started_at: String,
     pub host_player_id: Option<String>,
     pub settings: SessionSettings,
@@ -421,17 +427,32 @@ pub struct ClientSessionSnapshot {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkshopCreateConfig {
+    #[serde(default = "default_phase0_minutes")]
     pub phase0_minutes: u32,
+    #[serde(default = "default_phase1_minutes")]
     pub phase1_minutes: u32,
+    #[serde(default = "default_phase2_minutes")]
     pub phase2_minutes: u32,
+}
+
+fn default_phase0_minutes() -> u32 {
+    8
+}
+
+fn default_phase1_minutes() -> u32 {
+    8
+}
+
+fn default_phase2_minutes() -> u32 {
+    5
 }
 
 impl Default for WorkshopCreateConfig {
     fn default() -> Self {
         Self {
-            phase0_minutes: 8,
-            phase1_minutes: 8,
-            phase2_minutes: 8,
+            phase0_minutes: default_phase0_minutes(),
+            phase1_minutes: default_phase1_minutes(),
+            phase2_minutes: default_phase2_minutes(),
         }
     }
 }
@@ -521,7 +542,7 @@ pub struct JudgeActionTrace {
     pub created_at: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resulting_stats: Option<DragonStats>,
-    /// Whether the action matched the dragon's preference (None = blocked/sleep).
+    /// Whether the action matched the dragon's preference (None = blocked).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub was_correct: Option<bool>,
     /// If the action was blocked, the reason (e.g. "already_full", "cooldown_violation").
@@ -570,6 +591,10 @@ pub struct JudgeDragonBundle {
     pub correct_actions: i32,
     pub wrong_food_count: i32,
     pub wrong_play_count: i32,
+    #[serde(default)]
+    pub wrong_sleep_count: i32,
+    #[serde(default)]
+    pub correct_sleep_count: i32,
     pub cooldown_violations: i32,
     pub penalty_stacks_at_end: i32,
     pub phase2_lowest_happiness: i32,
@@ -815,8 +840,30 @@ pub enum ClientWsMessage {
 #[allow(clippy::large_enum_variant)]
 pub enum ServerWsMessage {
     StateUpdate(ClientGameState),
+    PlayerUpsert {
+        #[serde(rename = "stateRevision")]
+        state_revision: u64,
+        player: Player,
+    },
+    DragonPatch {
+        #[serde(rename = "stateRevision")]
+        state_revision: u64,
+        dragon: ClientDragon,
+    },
+    PhaseChanged {
+        phase: Phase,
+        time: i32,
+        session: SessionMeta,
+    },
+    TimeTick {
+        #[serde(rename = "stateRevision")]
+        state_revision: u64,
+        time: i32,
+    },
     Notice(SessionNotice),
-    Error { message: String },
+    Error {
+        message: String,
+    },
     Pong,
 }
 
@@ -935,6 +982,7 @@ pub fn create_session_settings(config: &WorkshopCreateConfig) -> SessionSettings
             allowed_commands: vec![
                 SessionCommand::Action,
                 SessionCommand::EndGame,
+                SessionCommand::StartVoting,
                 SessionCommand::ResetGame,
             ],
         },
@@ -1028,6 +1076,15 @@ pub struct UpdateCharacterRequest {
     pub name: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateWorkshopRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase1_minutes: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase2_minutes: Option<u32>,
+}
+
 /// Request body for `POST /api/characters/preview-sprites`.
 ///
 /// Account-scoped sprite-sheet preview. Unlike the workshop-scoped
@@ -1071,6 +1128,10 @@ pub struct OpenWorkshopSummary {
     pub host_name: String,
     pub player_count: u32,
     pub created_at: String,
+    #[serde(default = "default_phase1_minutes")]
+    pub phase1_minutes: u32,
+    #[serde(default = "default_phase2_minutes")]
+    pub phase2_minutes: u32,
     #[serde(default)]
     pub archived: bool,
     #[serde(default)]
@@ -1197,6 +1258,112 @@ mod tests {
     }
 
     #[test]
+    fn server_ws_delta_variants_use_camel_case_tags() {
+        let player = Player {
+            id: "player-1".to_string(),
+            name: "Alice".to_string(),
+            is_host: true,
+            score: 0,
+            current_dragon_id: None,
+            achievements: Vec::new(),
+            is_ready: true,
+            is_connected: true,
+            character_id: None,
+            pet_description: None,
+            custom_sprites: None,
+            remaining_sprite_regenerations: 0,
+        };
+        let player_upsert = serde_json::to_value(ServerWsMessage::PlayerUpsert {
+            state_revision: 3,
+            player: player.clone(),
+        })
+        .expect("serialize player upsert");
+        assert_eq!(
+            player_upsert["playerUpsert"]["stateRevision"],
+            serde_json::json!(3)
+        );
+        let player_message: ServerWsMessage =
+            serde_json::from_value(player_upsert).expect("deserialize player upsert");
+        assert_eq!(
+            player_message,
+            ServerWsMessage::PlayerUpsert {
+                state_revision: 3,
+                player,
+            }
+        );
+
+        let dragon = ClientDragon {
+            id: "dragon-1".to_string(),
+            name: "Pebble".to_string(),
+            visuals: DragonVisuals {
+                base: 1,
+                color_p: "#112233".to_string(),
+                color_s: "#445566".to_string(),
+                color_a: "#778899".to_string(),
+            },
+            original_owner_id: Some("player-1".to_string()),
+            design_creator_name: None,
+            current_owner_id: Some("player-1".to_string()),
+            stats: DragonStats {
+                hunger: 50,
+                energy: 60,
+                happiness: 70,
+            },
+            condition_hint: None,
+            discovery_observations: Vec::new(),
+            handover_tags: Vec::new(),
+            last_action: DragonAction::Idle,
+            last_emotion: DragonEmotion::Neutral,
+            speech: None,
+            speech_timer: 0,
+            action_cooldown: 0,
+            custom_sprites: None,
+            judge_observation_score: None,
+            judge_care_score: None,
+            judge_feedback: None,
+            judge_observation_feedback: None,
+            judge_care_feedback: None,
+        };
+        let dragon_patch = serde_json::to_value(ServerWsMessage::DragonPatch {
+            state_revision: 4,
+            dragon: dragon.clone(),
+        })
+        .expect("serialize dragon patch");
+        assert_eq!(
+            dragon_patch["dragonPatch"]["stateRevision"],
+            serde_json::json!(4)
+        );
+        let dragon_message: ServerWsMessage =
+            serde_json::from_value(dragon_patch).expect("deserialize dragon patch");
+        assert_eq!(
+            dragon_message,
+            ServerWsMessage::DragonPatch {
+                state_revision: 4,
+                dragon,
+            }
+        );
+
+        let tick = serde_json::to_value(ServerWsMessage::TimeTick {
+            state_revision: 4,
+            time: 12,
+        })
+        .expect("serialize tick");
+        assert_eq!(
+            tick,
+            serde_json::json!({ "timeTick": { "stateRevision": 4, "time": 12 } })
+        );
+
+        let message: ServerWsMessage = serde_json::from_value(tick).expect("deserialize tick");
+        assert_eq!(
+            message,
+            ServerWsMessage::TimeTick {
+                state_revision: 4,
+                time: 12
+            }
+        );
+    }
+
+    #[test]
     fn default_session_settings_cover_all_phases() {
         let settings = create_default_session_settings();
 
@@ -1240,6 +1407,22 @@ mod tests {
                 .expect("voting phase")
                 .allowed_commands
                 .contains(&SessionCommand::SubmitVote)
+        );
+        assert_eq!(
+            settings
+                .phases
+                .get(&Phase::Phase2)
+                .expect("phase2 phase")
+                .duration_seconds,
+            5 * 60
+        );
+        assert!(
+            settings
+                .phases
+                .get(&Phase::Phase2)
+                .expect("phase2 phase")
+                .allowed_commands
+                .contains(&SessionCommand::StartVoting)
         );
     }
 

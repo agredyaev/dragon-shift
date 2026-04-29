@@ -9,6 +9,18 @@ use protocol::{
 use crate::api::build_client_session_snapshot;
 use crate::realtime::disconnect_realtime;
 
+#[cfg(target_arch = "wasm32")]
+use std::cell::RefCell;
+
+#[cfg(target_arch = "wasm32")]
+std::thread_local! {
+    static PENDING_SESSION_GAME_STATE_PERSIST: RefCell<Option<ClientGameState>> = const { RefCell::new(None) };
+    static SESSION_GAME_STATE_PERSIST_TIMER: RefCell<Option<gloo_timers::callback::Timeout>> = const { RefCell::new(None) };
+}
+
+#[cfg(target_arch = "wasm32")]
+const SESSION_GAME_STATE_PERSIST_DEBOUNCE_MS: u32 = 500;
+
 // ---------------------------------------------------------------------------
 // Enums
 // ---------------------------------------------------------------------------
@@ -39,6 +51,7 @@ pub enum PendingFlow {
     Reconnect,
     DeleteCharacter,
     RenameCharacter,
+    UpdateWorkshop,
     DeleteWorkshop,
     Logout,
 }
@@ -740,6 +753,12 @@ pub fn persist_browser_session_snapshot(snapshot: &ClientSessionSnapshot) -> Res
 
 #[cfg(target_arch = "wasm32")]
 pub fn persist_browser_session_game_state(state: &ClientGameState) -> Result<(), String> {
+    cancel_pending_browser_session_game_state_persist();
+    persist_browser_session_game_state_now(state)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn persist_browser_session_game_state_now(state: &ClientGameState) -> Result<(), String> {
     let Some(window) = web_sys::window() else {
         return Err("window is unavailable".to_string());
     };
@@ -753,8 +772,49 @@ pub fn persist_browser_session_game_state(state: &ClientGameState) -> Result<(),
         .map_err(|_| "failed to persist browser session state".to_string())
 }
 
+#[cfg(target_arch = "wasm32")]
+pub fn persist_browser_session_game_state_debounced(state: &ClientGameState) -> Result<(), String> {
+    PENDING_SESSION_GAME_STATE_PERSIST.with(|pending| {
+        pending.borrow_mut().replace(state.clone());
+    });
+    SESSION_GAME_STATE_PERSIST_TIMER.with(|timer| {
+        timer.borrow_mut().take();
+        let timeout = gloo_timers::callback::Timeout::new(
+            SESSION_GAME_STATE_PERSIST_DEBOUNCE_MS,
+            move || {
+                let pending_state =
+                    PENDING_SESSION_GAME_STATE_PERSIST.with(|pending| pending.borrow_mut().take());
+                SESSION_GAME_STATE_PERSIST_TIMER.with(|timer| {
+                    timer.borrow_mut().take();
+                });
+                if let Some(state) = pending_state {
+                    let _ = persist_browser_session_game_state_now(&state);
+                }
+            },
+        );
+        timer.borrow_mut().replace(timeout);
+        Ok(())
+    })
+}
+
+#[cfg(target_arch = "wasm32")]
+fn cancel_pending_browser_session_game_state_persist() {
+    PENDING_SESSION_GAME_STATE_PERSIST.with(|pending| {
+        pending.borrow_mut().take();
+    });
+    SESSION_GAME_STATE_PERSIST_TIMER.with(|timer| {
+        timer.borrow_mut().take();
+    });
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 pub fn persist_browser_session_game_state(state: &ClientGameState) -> Result<(), String> {
+    let _ = state;
+    Ok(())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn persist_browser_session_game_state_debounced(state: &ClientGameState) -> Result<(), String> {
     let _ = state;
     Ok(())
 }
@@ -780,6 +840,7 @@ pub fn clear_browser_session_snapshot() -> Result<(), String> {
 
 #[cfg(target_arch = "wasm32")]
 pub fn clear_browser_session_game_state() -> Result<(), String> {
+    cancel_pending_browser_session_game_state_persist();
     let Some(window) = web_sys::window() else {
         return Err("window is unavailable".to_string());
     };
@@ -932,6 +993,7 @@ pub fn apply_join_success(
         PendingFlow::DeleteCharacter => "Character deleted.",
         PendingFlow::RenameCharacter => "Character renamed.",
         PendingFlow::DeleteWorkshop => "Workshop deleted.",
+        PendingFlow::UpdateWorkshop => "Workshop updated.",
         PendingFlow::SignIn => "Workshop created.",
         PendingFlow::Logout => "Signed out.",
     };
@@ -1018,6 +1080,32 @@ fn command_completed_by_state_update(command: SessionCommand, state: &ClientGame
         SessionCommand::ResetGame => state.phase == Phase::Lobby,
         _ => false,
     }
+}
+
+fn should_apply_state_update(
+    identity: &IdentityState,
+    current_state: Option<&ClientGameState>,
+    next_state: &ClientGameState,
+) -> bool {
+    let Some(snapshot) = identity.session_snapshot.as_ref() else {
+        return false;
+    };
+    if next_state.session.code != snapshot.session_code
+        || next_state.current_player_id.as_deref() != Some(snapshot.player_id.as_str())
+    {
+        return false;
+    }
+
+    if let Some(current_state) = current_state {
+        if current_state.session.code == next_state.session.code
+            && current_state.current_player_id == next_state.current_player_id
+            && next_state.session.state_revision < current_state.session.state_revision
+        {
+            return false;
+        }
+    }
+
+    true
 }
 
 pub fn apply_successful_command(
@@ -1196,6 +1284,9 @@ pub fn apply_server_ws_message(
 ) {
     match message {
         ServerWsMessage::StateUpdate(client_state) => {
+            if !should_apply_state_update(identity, game_state.as_ref(), &client_state) {
+                return;
+            }
             let first_attach = identity.connection_status != ConnectionStatus::Connected;
             let phase = client_state.phase;
             let completed_pending_command = ops
@@ -1204,7 +1295,7 @@ pub fn apply_server_ws_message(
             identity.screen = ShellScreen::Session;
             *game_state = Some(client_state);
             if let Some(state) = game_state.as_ref() {
-                let _ = persist_browser_session_game_state(state);
+                let _ = persist_browser_session_game_state_debounced(state);
             }
             identity.connection_status = ConnectionStatus::Connected;
             identity.restored_session_needs_realtime = false;
@@ -1246,6 +1337,60 @@ pub fn apply_server_ws_message(
                     success_notice(command_success_message(command)),
                 ));
             }
+        }
+        ServerWsMessage::PlayerUpsert {
+            state_revision,
+            player,
+        } => {
+            let Some(state) = game_state.as_mut() else {
+                return;
+            };
+            if state_revision < state.session.state_revision {
+                return;
+            }
+            state.players.insert(player.id.clone(), player);
+            state.session.state_revision = state.session.state_revision.max(state_revision);
+        }
+        ServerWsMessage::DragonPatch {
+            state_revision,
+            dragon,
+        } => {
+            let Some(state) = game_state.as_mut() else {
+                return;
+            };
+            if state_revision < state.session.state_revision {
+                return;
+            }
+            state.dragons.insert(dragon.id.clone(), dragon);
+            state.session.state_revision = state.session.state_revision.max(state_revision);
+        }
+        ServerWsMessage::PhaseChanged {
+            phase,
+            time,
+            session,
+        } => {
+            let Some(state) = game_state.as_mut() else {
+                return;
+            };
+            if session.state_revision < state.session.state_revision {
+                return;
+            }
+            state.phase = phase;
+            state.time = time;
+            state.session = session;
+        }
+        ServerWsMessage::TimeTick {
+            state_revision,
+            time,
+        } => {
+            let Some(state) = game_state.as_mut() else {
+                return;
+            };
+            if state_revision < state.session.state_revision {
+                return;
+            }
+            state.time = time;
+            state.session.state_revision = state.session.state_revision.max(state_revision);
         }
         ServerWsMessage::Notice(ProtocolSessionNotice {
             level,
@@ -1296,8 +1441,9 @@ pub fn apply_server_ws_message(
 mod tests {
     use super::*;
     use protocol::{
-        ClientGameState, ClientVotingState, CoordinatorType, Phase, Player, SessionMeta,
-        SessionNoticeCode, WorkshopJoinSuccess, create_default_session_settings,
+        ClientDragon, ClientGameState, ClientVotingState, CoordinatorType, DragonAction,
+        DragonEmotion, DragonStats, DragonVisuals, Phase, Player, SessionMeta, SessionNoticeCode,
+        WorkshopJoinSuccess, create_default_session_settings,
     };
     use std::collections::BTreeMap;
 
@@ -1333,6 +1479,7 @@ mod tests {
                     code: "123456".to_string(),
                     created_at: "2026-01-01T00:00:00Z".to_string(),
                     updated_at: "2026-01-01T00:00:00Z".to_string(),
+                    state_revision: 0,
                     phase_started_at: "2026-01-01T00:00:00Z".to_string(),
                     host_player_id: Some("player-1".to_string()),
                     settings: create_default_session_settings(),
@@ -1344,6 +1491,41 @@ mod tests {
                 current_player_id: Some("player-1".to_string()),
                 voting: None,
             },
+        }
+    }
+
+    fn mock_client_dragon(id: &str) -> ClientDragon {
+        ClientDragon {
+            id: id.to_string(),
+            name: "Pebble".to_string(),
+            visuals: DragonVisuals {
+                base: 1,
+                color_p: "#112233".to_string(),
+                color_s: "#445566".to_string(),
+                color_a: "#778899".to_string(),
+            },
+            original_owner_id: Some("player-1".to_string()),
+            design_creator_name: None,
+            current_owner_id: Some("player-1".to_string()),
+            stats: DragonStats {
+                hunger: 50,
+                energy: 60,
+                happiness: 70,
+            },
+            condition_hint: None,
+            discovery_observations: Vec::new(),
+            handover_tags: Vec::new(),
+            last_action: DragonAction::Idle,
+            last_emotion: DragonEmotion::Neutral,
+            speech: None,
+            speech_timer: 0,
+            action_cooldown: 0,
+            custom_sprites: None,
+            judge_observation_score: None,
+            judge_care_score: None,
+            judge_feedback: None,
+            judge_observation_feedback: None,
+            judge_care_feedback: None,
         }
     }
 
@@ -1918,6 +2100,322 @@ mod tests {
     }
 
     #[test]
+    fn server_ws_state_update_rejects_wrong_session_or_player() {
+        let mut identity = default_identity_state();
+        let mut game_state = None;
+        let mut ops = default_operation_state();
+        let mut reconnect_session_code = String::new();
+        let mut reconnect_token = String::new();
+        let mut judge_bundle = None;
+
+        apply_join_success(
+            &mut identity,
+            &mut game_state,
+            &mut ops,
+            &mut reconnect_session_code,
+            &mut reconnect_token,
+            &mut judge_bundle,
+            mock_join_success(),
+            PendingFlow::Join,
+        );
+
+        let mut wrong_session = mock_join_success().state;
+        wrong_session.session.code = "654321".to_string();
+        apply_server_ws_message(
+            &mut identity,
+            &mut game_state,
+            &mut ops,
+            &mut judge_bundle,
+            ServerWsMessage::StateUpdate(wrong_session),
+        );
+        assert_eq!(
+            game_state.as_ref().map(|state| state.session.code.as_str()),
+            Some("123456")
+        );
+
+        let mut wrong_player = mock_join_success().state;
+        wrong_player.current_player_id = Some("player-2".to_string());
+        apply_server_ws_message(
+            &mut identity,
+            &mut game_state,
+            &mut ops,
+            &mut judge_bundle,
+            ServerWsMessage::StateUpdate(wrong_player),
+        );
+        assert_eq!(
+            game_state
+                .as_ref()
+                .and_then(|state| state.current_player_id.as_deref()),
+            Some("player-1")
+        );
+    }
+
+    #[test]
+    fn server_ws_state_update_orders_by_revision_not_updated_at() {
+        let mut identity = default_identity_state();
+        let mut game_state = None;
+        let mut ops = default_operation_state();
+        let mut reconnect_session_code = String::new();
+        let mut reconnect_token = String::new();
+        let mut judge_bundle = None;
+
+        apply_join_success(
+            &mut identity,
+            &mut game_state,
+            &mut ops,
+            &mut reconnect_session_code,
+            &mut reconnect_token,
+            &mut judge_bundle,
+            mock_join_success(),
+            PendingFlow::Join,
+        );
+
+        let mut newer = mock_join_success().state;
+        newer.session.updated_at = "2026-01-01T00:00:00Z".to_string();
+        newer.session.state_revision = 10;
+        newer.time = 18;
+        apply_server_ws_message(
+            &mut identity,
+            &mut game_state,
+            &mut ops,
+            &mut judge_bundle,
+            ServerWsMessage::StateUpdate(newer),
+        );
+
+        let mut older = mock_join_success().state;
+        older.session.updated_at = "2026-01-01T00:00:10Z".to_string();
+        older.session.state_revision = 9;
+        older.time = 16;
+        apply_server_ws_message(
+            &mut identity,
+            &mut game_state,
+            &mut ops,
+            &mut judge_bundle,
+            ServerWsMessage::StateUpdate(older),
+        );
+
+        assert_eq!(game_state.as_ref().map(|state| state.time), Some(18));
+
+        let mut later_revision_with_older_timestamp = mock_join_success().state;
+        later_revision_with_older_timestamp.session.updated_at = "2026-01-01T00:00:01Z".to_string();
+        later_revision_with_older_timestamp.session.state_revision = 11;
+        later_revision_with_older_timestamp.time = 19;
+        apply_server_ws_message(
+            &mut identity,
+            &mut game_state,
+            &mut ops,
+            &mut judge_bundle,
+            ServerWsMessage::StateUpdate(later_revision_with_older_timestamp),
+        );
+
+        assert_eq!(game_state.as_ref().map(|state| state.time), Some(19));
+    }
+
+    #[test]
+    fn server_ws_deltas_update_existing_game_state() {
+        let mut identity = default_identity_state();
+        let mut game_state = Some(mock_join_success().state);
+        let mut ops = default_operation_state();
+        let mut judge_bundle = None;
+
+        let mut player = game_state
+            .as_ref()
+            .and_then(|state| state.players.get("player-1"))
+            .cloned()
+            .expect("player");
+        player.score = 25;
+        apply_server_ws_message(
+            &mut identity,
+            &mut game_state,
+            &mut ops,
+            &mut judge_bundle,
+            ServerWsMessage::PlayerUpsert {
+                state_revision: 0,
+                player,
+            },
+        );
+        assert_eq!(
+            game_state
+                .as_ref()
+                .and_then(|state| state.players.get("player-1"))
+                .map(|player| player.score),
+            Some(25)
+        );
+
+        let dragon = mock_client_dragon("dragon-1");
+        apply_server_ws_message(
+            &mut identity,
+            &mut game_state,
+            &mut ops,
+            &mut judge_bundle,
+            ServerWsMessage::DragonPatch {
+                state_revision: 1,
+                dragon: dragon.clone(),
+            },
+        );
+        assert_eq!(
+            game_state
+                .as_ref()
+                .and_then(|state| state.dragons.get("dragon-1")),
+            Some(&dragon)
+        );
+
+        let mut session = game_state.as_ref().expect("state").session.clone();
+        session.state_revision = 7;
+        apply_server_ws_message(
+            &mut identity,
+            &mut game_state,
+            &mut ops,
+            &mut judge_bundle,
+            ServerWsMessage::PhaseChanged {
+                phase: Phase::Phase1,
+                time: 14,
+                session,
+            },
+        );
+        assert_eq!(
+            game_state.as_ref().map(|state| state.phase),
+            Some(Phase::Phase1)
+        );
+        assert_eq!(game_state.as_ref().map(|state| state.time), Some(14));
+        assert_eq!(
+            game_state
+                .as_ref()
+                .map(|state| state.session.state_revision),
+            Some(7)
+        );
+
+        apply_server_ws_message(
+            &mut identity,
+            &mut game_state,
+            &mut ops,
+            &mut judge_bundle,
+            ServerWsMessage::TimeTick {
+                state_revision: 7,
+                time: 15,
+            },
+        );
+        assert_eq!(game_state.as_ref().map(|state| state.time), Some(15));
+    }
+
+    #[test]
+    fn server_ws_stale_deltas_are_ignored() {
+        let mut identity = default_identity_state();
+        let mut game_state = Some(mock_join_success().state);
+        let mut ops = default_operation_state();
+        let mut judge_bundle = None;
+        game_state.as_mut().expect("state").session.state_revision = 5;
+
+        let mut player = game_state
+            .as_ref()
+            .and_then(|state| state.players.get("player-1"))
+            .cloned()
+            .expect("player");
+        player.score = 25;
+        apply_server_ws_message(
+            &mut identity,
+            &mut game_state,
+            &mut ops,
+            &mut judge_bundle,
+            ServerWsMessage::PlayerUpsert {
+                state_revision: 4,
+                player,
+            },
+        );
+        assert_eq!(
+            game_state
+                .as_ref()
+                .and_then(|state| state.players.get("player-1"))
+                .map(|player| player.score),
+            Some(0)
+        );
+
+        apply_server_ws_message(
+            &mut identity,
+            &mut game_state,
+            &mut ops,
+            &mut judge_bundle,
+            ServerWsMessage::TimeTick {
+                state_revision: 4,
+                time: 15,
+            },
+        );
+        assert_eq!(game_state.as_ref().map(|state| state.time), Some(8));
+    }
+
+    #[test]
+    fn server_ws_equal_and_newer_deltas_are_applied() {
+        let mut identity = default_identity_state();
+        let mut game_state = Some(mock_join_success().state);
+        let mut ops = default_operation_state();
+        let mut judge_bundle = None;
+        game_state.as_mut().expect("state").session.state_revision = 5;
+
+        let dragon = mock_client_dragon("dragon-1");
+        apply_server_ws_message(
+            &mut identity,
+            &mut game_state,
+            &mut ops,
+            &mut judge_bundle,
+            ServerWsMessage::DragonPatch {
+                state_revision: 5,
+                dragon: dragon.clone(),
+            },
+        );
+        assert_eq!(
+            game_state
+                .as_ref()
+                .and_then(|state| state.dragons.get("dragon-1")),
+            Some(&dragon)
+        );
+        assert_eq!(
+            game_state
+                .as_ref()
+                .map(|state| state.session.state_revision),
+            Some(5)
+        );
+
+        apply_server_ws_message(
+            &mut identity,
+            &mut game_state,
+            &mut ops,
+            &mut judge_bundle,
+            ServerWsMessage::TimeTick {
+                state_revision: 6,
+                time: 15,
+            },
+        );
+        assert_eq!(game_state.as_ref().map(|state| state.time), Some(15));
+        assert_eq!(
+            game_state
+                .as_ref()
+                .map(|state| state.session.state_revision),
+            Some(6)
+        );
+    }
+
+    #[test]
+    fn server_ws_deltas_are_ignored_without_game_state() {
+        let mut identity = default_identity_state();
+        let mut game_state = None;
+        let mut ops = default_operation_state();
+        let mut judge_bundle = None;
+
+        apply_server_ws_message(
+            &mut identity,
+            &mut game_state,
+            &mut ops,
+            &mut judge_bundle,
+            ServerWsMessage::TimeTick {
+                state_revision: 1,
+                time: 15,
+            },
+        );
+
+        assert!(game_state.is_none());
+    }
+
+    #[test]
     fn first_attach_phase_update_confirms_matching_pending_command() {
         let mut identity = default_identity_state();
         let mut game_state = None;
@@ -2324,6 +2822,43 @@ mod tests {
             ops.sprite_generation_stage,
             Some(SpriteGenerationStage::Completed)
         );
+    }
+
+    #[test]
+    fn server_ws_state_update_ignores_cleared_session_identity() {
+        let mut identity = default_identity_state();
+        let mut game_state = None;
+        let mut ops = default_operation_state();
+        let mut reconnect_session_code = String::new();
+        let mut reconnect_token = String::new();
+        let mut judge_bundle = None;
+
+        apply_join_success(
+            &mut identity,
+            &mut game_state,
+            &mut ops,
+            &mut reconnect_session_code,
+            &mut reconnect_token,
+            &mut judge_bundle,
+            mock_join_success(),
+            PendingFlow::Join,
+        );
+        clear_session_identity(&mut identity);
+        let previous_state = game_state.clone();
+        let mut stale_update = mock_join_success().state;
+        stale_update.session.state_revision = stale_update.session.state_revision.saturating_add(1);
+
+        apply_server_ws_message(
+            &mut identity,
+            &mut game_state,
+            &mut ops,
+            &mut judge_bundle,
+            ServerWsMessage::StateUpdate(stale_update),
+        );
+
+        assert_eq!(identity.session_snapshot, None);
+        assert_eq!(identity.connection_status, ConnectionStatus::Offline);
+        assert_eq!(game_state, previous_state);
     }
 
     #[test]
