@@ -353,7 +353,7 @@ pub(crate) fn load_config() -> Result<AppConfig, String> {
         "RECONNECT_TOKEN_TTL_SECONDS",
         60 * 60 * 12,
     )?);
-    let database_pool_size = load_rate_limit_env("DATABASE_POOL_SIZE", 10)?;
+    let database_pool_size = load_rate_limit_env("DATABASE_POOL_SIZE", 60)?;
     let origin_policy = create_origin_policy(OriginPolicyOptions {
         allowed_origins: env::var("ALLOWED_ORIGINS").ok().as_deref(),
         app_origin: env::var("VITE_APP_URL").ok().as_deref(),

@@ -1410,6 +1410,21 @@ fn load_config_parses_database_pool_size() {
 }
 
 #[test]
+fn load_config_defaults_database_pool_size_for_workshop_bursts() {
+    let _env_lock = lock_env();
+    let _bind = ScopedEnvVar::set("APP_SERVER_BIND_ADDR", "127.0.0.1:4100");
+    let _app_url = ScopedEnvVar::set("VITE_APP_URL", "http://127.0.0.1:4100");
+    let _origins = ScopedEnvVar::set("ALLOWED_ORIGINS", "http://127.0.0.1:4100");
+    let _node_env = ScopedEnvVar::set("NODE_ENV", "development");
+    let _database = ScopedEnvVar::set("DATABASE_URL", "postgres://user:pass@localhost:5432/db");
+    let _pool = ScopedEnvVar::unset("DATABASE_POOL_SIZE");
+
+    let config = crate::app::load_config().expect("load config");
+
+    assert_eq!(config.database_pool_size, 60);
+}
+
+#[test]
 fn session_lease_enabled_parser_defaults_safe() {
     assert!(session_lease_enabled_from_value(None));
     assert!(session_lease_enabled_from_value(Some("")));

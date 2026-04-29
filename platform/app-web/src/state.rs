@@ -9,6 +9,18 @@ use protocol::{
 use crate::api::build_client_session_snapshot;
 use crate::realtime::disconnect_realtime;
 
+#[cfg(target_arch = "wasm32")]
+use std::cell::RefCell;
+
+#[cfg(target_arch = "wasm32")]
+std::thread_local! {
+    static PENDING_SESSION_GAME_STATE_PERSIST: RefCell<Option<ClientGameState>> = const { RefCell::new(None) };
+    static SESSION_GAME_STATE_PERSIST_TIMER: RefCell<Option<gloo_timers::callback::Timeout>> = const { RefCell::new(None) };
+}
+
+#[cfg(target_arch = "wasm32")]
+const SESSION_GAME_STATE_PERSIST_DEBOUNCE_MS: u32 = 500;
+
 // ---------------------------------------------------------------------------
 // Enums
 // ---------------------------------------------------------------------------
@@ -741,6 +753,12 @@ pub fn persist_browser_session_snapshot(snapshot: &ClientSessionSnapshot) -> Res
 
 #[cfg(target_arch = "wasm32")]
 pub fn persist_browser_session_game_state(state: &ClientGameState) -> Result<(), String> {
+    cancel_pending_browser_session_game_state_persist();
+    persist_browser_session_game_state_now(state)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn persist_browser_session_game_state_now(state: &ClientGameState) -> Result<(), String> {
     let Some(window) = web_sys::window() else {
         return Err("window is unavailable".to_string());
     };
@@ -754,8 +772,49 @@ pub fn persist_browser_session_game_state(state: &ClientGameState) -> Result<(),
         .map_err(|_| "failed to persist browser session state".to_string())
 }
 
+#[cfg(target_arch = "wasm32")]
+pub fn persist_browser_session_game_state_debounced(state: &ClientGameState) -> Result<(), String> {
+    PENDING_SESSION_GAME_STATE_PERSIST.with(|pending| {
+        pending.borrow_mut().replace(state.clone());
+    });
+    SESSION_GAME_STATE_PERSIST_TIMER.with(|timer| {
+        timer.borrow_mut().take();
+        let timeout = gloo_timers::callback::Timeout::new(
+            SESSION_GAME_STATE_PERSIST_DEBOUNCE_MS,
+            move || {
+                let pending_state =
+                    PENDING_SESSION_GAME_STATE_PERSIST.with(|pending| pending.borrow_mut().take());
+                SESSION_GAME_STATE_PERSIST_TIMER.with(|timer| {
+                    timer.borrow_mut().take();
+                });
+                if let Some(state) = pending_state {
+                    let _ = persist_browser_session_game_state_now(&state);
+                }
+            },
+        );
+        timer.borrow_mut().replace(timeout);
+        Ok(())
+    })
+}
+
+#[cfg(target_arch = "wasm32")]
+fn cancel_pending_browser_session_game_state_persist() {
+    PENDING_SESSION_GAME_STATE_PERSIST.with(|pending| {
+        pending.borrow_mut().take();
+    });
+    SESSION_GAME_STATE_PERSIST_TIMER.with(|timer| {
+        timer.borrow_mut().take();
+    });
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 pub fn persist_browser_session_game_state(state: &ClientGameState) -> Result<(), String> {
+    let _ = state;
+    Ok(())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn persist_browser_session_game_state_debounced(state: &ClientGameState) -> Result<(), String> {
     let _ = state;
     Ok(())
 }
@@ -781,6 +840,7 @@ pub fn clear_browser_session_snapshot() -> Result<(), String> {
 
 #[cfg(target_arch = "wasm32")]
 pub fn clear_browser_session_game_state() -> Result<(), String> {
+    cancel_pending_browser_session_game_state_persist();
     let Some(window) = web_sys::window() else {
         return Err("window is unavailable".to_string());
     };
@@ -1027,12 +1087,13 @@ fn should_apply_state_update(
     current_state: Option<&ClientGameState>,
     next_state: &ClientGameState,
 ) -> bool {
-    if let Some(snapshot) = identity.session_snapshot.as_ref() {
-        if next_state.session.code != snapshot.session_code
-            || next_state.current_player_id.as_deref() != Some(snapshot.player_id.as_str())
-        {
-            return false;
-        }
+    let Some(snapshot) = identity.session_snapshot.as_ref() else {
+        return false;
+    };
+    if next_state.session.code != snapshot.session_code
+        || next_state.current_player_id.as_deref() != Some(snapshot.player_id.as_str())
+    {
+        return false;
     }
 
     if let Some(current_state) = current_state {
@@ -1234,7 +1295,7 @@ pub fn apply_server_ws_message(
             identity.screen = ShellScreen::Session;
             *game_state = Some(client_state);
             if let Some(state) = game_state.as_ref() {
-                let _ = persist_browser_session_game_state(state);
+                let _ = persist_browser_session_game_state_debounced(state);
             }
             identity.connection_status = ConnectionStatus::Connected;
             identity.restored_session_needs_realtime = false;
@@ -2761,6 +2822,43 @@ mod tests {
             ops.sprite_generation_stage,
             Some(SpriteGenerationStage::Completed)
         );
+    }
+
+    #[test]
+    fn server_ws_state_update_ignores_cleared_session_identity() {
+        let mut identity = default_identity_state();
+        let mut game_state = None;
+        let mut ops = default_operation_state();
+        let mut reconnect_session_code = String::new();
+        let mut reconnect_token = String::new();
+        let mut judge_bundle = None;
+
+        apply_join_success(
+            &mut identity,
+            &mut game_state,
+            &mut ops,
+            &mut reconnect_session_code,
+            &mut reconnect_token,
+            &mut judge_bundle,
+            mock_join_success(),
+            PendingFlow::Join,
+        );
+        clear_session_identity(&mut identity);
+        let previous_state = game_state.clone();
+        let mut stale_update = mock_join_success().state;
+        stale_update.session.state_revision = stale_update.session.state_revision.saturating_add(1);
+
+        apply_server_ws_message(
+            &mut identity,
+            &mut game_state,
+            &mut ops,
+            &mut judge_bundle,
+            ServerWsMessage::StateUpdate(stale_update),
+        );
+
+        assert_eq!(identity.session_snapshot, None);
+        assert_eq!(identity.connection_status, ConnectionStatus::Offline);
+        assert_eq!(game_state, previous_state);
     }
 
     #[test]
