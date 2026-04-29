@@ -190,7 +190,7 @@ async fn advance_overdue_phase(
 
     drop(_write_guard);
     drop(write_lease);
-    broadcast_session_state(state, session_code, None).await;
+    mark_session_dirty(state, session_code).await;
     if from_phase == protocol::Phase::Phase2 {
         let background_state = state.clone();
         let background_session_code = session_code.to_string();
@@ -222,13 +222,6 @@ async fn broadcast_notice(
     title: &str,
     message: &str,
 ) {
-    // perf: read registrations from in-memory `SessionRegistry` instead of
-    // `state.store.list_realtime_connections(...)`, which on every broadcast
-    // ran `DELETE FROM realtime_connections WHERE updated_at <= ...` and
-    // serialized 30 concurrent broadcasts on a single Postgres row.
-    // TODO(perf-step-2): if the WS task panics without calling `detach`, the
-    // in-memory entry leaks (the previous Postgres-driven path swept stale
-    // rows after 5 minutes). Add a periodic registry sweep in the janitor.
     let registrations = state
         .realtime
         .lock()
@@ -685,6 +678,37 @@ pub(crate) async fn close_local_workshop_connections(
     }
 }
 
+/// Mark a session as needing a client state broadcast. The actual broadcast
+/// is delayed by ~150ms and collapsed with other pending marks for the same
+/// session. Use this for post-mutation broadcasts where `excluded_connection_id`
+/// is `None`.
+pub(crate) async fn mark_session_dirty(state: &AppState, session_code: &str) {
+    let should_schedule_drain = {
+        let mut dirty = state.dirty_sessions.lock().await;
+        let should_schedule_drain = dirty.is_empty();
+        dirty.insert(session_code.to_string());
+        should_schedule_drain
+    };
+
+    if should_schedule_drain {
+        let drain_state = state.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            drain_dirty_sessions_once(&drain_state).await;
+        });
+    }
+}
+
+pub(crate) async fn drain_dirty_sessions_once(state: &AppState) {
+    let codes: Vec<String> = {
+        let mut dirty = state.dirty_sessions.lock().await;
+        std::mem::take(&mut *dirty).into_iter().collect()
+    };
+    for code in codes {
+        broadcast_session_state(state, &code, None).await;
+    }
+}
+
 pub(crate) async fn broadcast_session_state(
     state: &AppState,
     session_code: &str,
@@ -895,7 +919,7 @@ pub(crate) async fn sync_ws_disconnect(state: &AppState, connection_id: &str) {
         return;
     }
 
-    broadcast_session_state(state, &session.code.0, None).await;
+    mark_session_dirty(state, &session.code.0).await;
 }
 
 async fn attach_ws_session(
@@ -1278,6 +1302,6 @@ pub(crate) async fn advance_game_ticks(state: &AppState) {
         drop(_write_guard);
 
         // Broadcast updated state to all connected players
-        broadcast_session_state(state, &session_code, None).await;
+        mark_session_dirty(state, &session_code).await;
     }
 }

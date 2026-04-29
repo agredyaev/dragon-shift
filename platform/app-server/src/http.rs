@@ -52,7 +52,7 @@ use crate::helpers::{
     random_prefixed_id, sprite_set_uses_references, to_client_game_state,
 };
 use crate::ws::{
-    broadcast_session_state, close_local_workshop_connections, send_player_notice_with_code,
+    close_local_workshop_connections, mark_session_dirty, send_player_notice_with_code,
 };
 
 enum ImageJobAdmissionError {
@@ -796,7 +796,7 @@ pub(crate) async fn run_judge_for_session(
         return Err(format!("failed to persist judge scores: {error}"));
     }
 
-    broadcast_session_state(state, session_code, None).await;
+    mark_session_dirty(state, session_code).await;
     Ok(evaluation)
 }
 
@@ -1223,7 +1223,7 @@ pub(crate) async fn join_workshop(
         };
 
         let response = (StatusCode::OK, Json(WorkshopJoinResult::Success(response)));
-        broadcast_session_state(&state, session_code, None).await;
+        mark_session_dirty(&state, session_code).await;
         return response;
     }
 
@@ -1381,7 +1381,7 @@ pub(crate) async fn join_workshop(
         };
 
         let response = (StatusCode::OK, Json(WorkshopJoinResult::Success(response)));
-        broadcast_session_state(&state, session_code, None).await;
+        mark_session_dirty(&state, session_code).await;
         return response;
     }
 
@@ -1537,7 +1537,7 @@ pub(crate) async fn join_workshop(
     };
 
     let response = (StatusCode::OK, Json(WorkshopJoinResult::Success(response)));
-    broadcast_session_state(&state, session_code, None).await;
+    mark_session_dirty(&state, session_code).await;
     response
 }
 
@@ -2299,7 +2299,7 @@ pub(crate) async fn workshop_command(
     drop(write_lease);
 
     if should_broadcast {
-        broadcast_session_state(&state, session_code, None).await;
+        mark_session_dirty(&state, session_code).await;
     }
 
     if should_run_judge {
@@ -3245,7 +3245,7 @@ async fn generate_or_update_character_sprite_sheet(
             "failed to persist character selection: {error}"
         ));
     }
-    broadcast_session_state(&state, session_code, None).await;
+    mark_session_dirty(&state, session_code).await;
 
     (
         StatusCode::OK,

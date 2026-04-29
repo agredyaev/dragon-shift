@@ -23,7 +23,12 @@ use security::{
 #[cfg(test)]
 use std::sync::atomic::AtomicBool;
 use std::{
-    collections::BTreeMap, env, net::SocketAddr, path::PathBuf, str::FromStr, sync::Arc,
+    collections::{BTreeMap, BTreeSet},
+    env,
+    net::SocketAddr,
+    path::PathBuf,
+    str::FromStr,
+    sync::Arc,
     time::Duration,
 };
 use tokio::{
@@ -155,6 +160,7 @@ pub(crate) struct AppState {
     pub(crate) realtime_heartbeats: Arc<Mutex<BTreeMap<String, JoinHandle<()>>>>,
     pub(crate) retired_realtime_connections: Arc<Mutex<BTreeMap<String, ()>>>,
     pub(crate) recent_session_notifications: Arc<Mutex<BTreeMap<String, String>>>,
+    pub(crate) dirty_sessions: Arc<Mutex<BTreeSet<String>>>,
     #[cfg(test)]
     pub(crate) fail_next_initial_state_send: Arc<AtomicBool>,
 }
@@ -219,6 +225,7 @@ impl AppState {
             realtime_heartbeats: Arc::new(Mutex::new(BTreeMap::new())),
             retired_realtime_connections: Arc::new(Mutex::new(BTreeMap::new())),
             recent_session_notifications: Arc::new(Mutex::new(BTreeMap::new())),
+            dirty_sessions: Arc::new(Mutex::new(BTreeSet::new())),
             #[cfg(test)]
             fail_next_initial_state_send: Arc::new(AtomicBool::new(false)),
         }
