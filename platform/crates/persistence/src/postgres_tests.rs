@@ -296,7 +296,7 @@ mod postgres_tests {
 
         assert_eq!(
             versions,
-            vec![(1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,)]
+            vec![(1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,), (9,)]
         );
         store.cleanup().await;
     }
