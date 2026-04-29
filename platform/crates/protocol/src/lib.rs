@@ -840,14 +840,24 @@ pub enum ClientWsMessage {
 #[allow(clippy::large_enum_variant)]
 pub enum ServerWsMessage {
     StateUpdate(ClientGameState),
-    PlayerUpsert(Player),
-    DragonPatch(ClientDragon),
+    PlayerUpsert {
+        #[serde(rename = "stateRevision")]
+        state_revision: u64,
+        player: Player,
+    },
+    DragonPatch {
+        #[serde(rename = "stateRevision")]
+        state_revision: u64,
+        dragon: ClientDragon,
+    },
     PhaseChanged {
         phase: Phase,
         time: i32,
         session: SessionMeta,
     },
     TimeTick {
+        #[serde(rename = "stateRevision")]
+        state_revision: u64,
         time: i32,
     },
     Notice(SessionNotice),
@@ -1249,12 +1259,108 @@ mod tests {
 
     #[test]
     fn server_ws_delta_variants_use_camel_case_tags() {
-        let tick =
-            serde_json::to_value(ServerWsMessage::TimeTick { time: 12 }).expect("serialize tick");
-        assert_eq!(tick, serde_json::json!({ "timeTick": { "time": 12 } }));
+        let player = Player {
+            id: "player-1".to_string(),
+            name: "Alice".to_string(),
+            is_host: true,
+            score: 0,
+            current_dragon_id: None,
+            achievements: Vec::new(),
+            is_ready: true,
+            is_connected: true,
+            character_id: None,
+            pet_description: None,
+            custom_sprites: None,
+            remaining_sprite_regenerations: 0,
+        };
+        let player_upsert = serde_json::to_value(ServerWsMessage::PlayerUpsert {
+            state_revision: 3,
+            player: player.clone(),
+        })
+        .expect("serialize player upsert");
+        assert_eq!(
+            player_upsert["playerUpsert"]["stateRevision"],
+            serde_json::json!(3)
+        );
+        let player_message: ServerWsMessage =
+            serde_json::from_value(player_upsert).expect("deserialize player upsert");
+        assert_eq!(
+            player_message,
+            ServerWsMessage::PlayerUpsert {
+                state_revision: 3,
+                player,
+            }
+        );
+
+        let dragon = ClientDragon {
+            id: "dragon-1".to_string(),
+            name: "Pebble".to_string(),
+            visuals: DragonVisuals {
+                base: 1,
+                color_p: "#112233".to_string(),
+                color_s: "#445566".to_string(),
+                color_a: "#778899".to_string(),
+            },
+            original_owner_id: Some("player-1".to_string()),
+            design_creator_name: None,
+            current_owner_id: Some("player-1".to_string()),
+            stats: DragonStats {
+                hunger: 50,
+                energy: 60,
+                happiness: 70,
+            },
+            condition_hint: None,
+            discovery_observations: Vec::new(),
+            handover_tags: Vec::new(),
+            last_action: DragonAction::Idle,
+            last_emotion: DragonEmotion::Neutral,
+            speech: None,
+            speech_timer: 0,
+            action_cooldown: 0,
+            custom_sprites: None,
+            judge_observation_score: None,
+            judge_care_score: None,
+            judge_feedback: None,
+            judge_observation_feedback: None,
+            judge_care_feedback: None,
+        };
+        let dragon_patch = serde_json::to_value(ServerWsMessage::DragonPatch {
+            state_revision: 4,
+            dragon: dragon.clone(),
+        })
+        .expect("serialize dragon patch");
+        assert_eq!(
+            dragon_patch["dragonPatch"]["stateRevision"],
+            serde_json::json!(4)
+        );
+        let dragon_message: ServerWsMessage =
+            serde_json::from_value(dragon_patch).expect("deserialize dragon patch");
+        assert_eq!(
+            dragon_message,
+            ServerWsMessage::DragonPatch {
+                state_revision: 4,
+                dragon,
+            }
+        );
+
+        let tick = serde_json::to_value(ServerWsMessage::TimeTick {
+            state_revision: 4,
+            time: 12,
+        })
+        .expect("serialize tick");
+        assert_eq!(
+            tick,
+            serde_json::json!({ "timeTick": { "stateRevision": 4, "time": 12 } })
+        );
 
         let message: ServerWsMessage = serde_json::from_value(tick).expect("deserialize tick");
-        assert_eq!(message, ServerWsMessage::TimeTick { time: 12 });
+        assert_eq!(
+            message,
+            ServerWsMessage::TimeTick {
+                state_revision: 4,
+                time: 12
+            }
+        );
     }
 
     #[test]

@@ -291,9 +291,7 @@ pub(crate) async fn send_player_notice_with_code(
         let senders = state.realtime_senders.lock().await;
         registrations
             .into_iter()
-            .filter(|registration| {
-                registration.player_id == player_id
-            })
+            .filter(|registration| registration.player_id == player_id)
             .filter_map(|registration| {
                 senders.get(&registration.connection_id).and_then(|sender| {
                     sender
@@ -769,6 +767,134 @@ pub(crate) async fn broadcast_session_state(
                 |(connection_id, encoded)| match senders.get(&connection_id) {
                     Some(sender) => sender
                         .send(WsOutbound::EncodedMessage(encoded))
+                        .err()
+                        .map(|_| connection_id),
+                    None => None,
+                },
+            )
+            .collect::<Vec<_>>()
+    };
+
+    if !failed_connection_ids.is_empty() {
+        let mut senders = state.realtime_senders.lock().await;
+        for connection_id in failed_connection_ids {
+            senders.remove(&connection_id);
+        }
+    }
+}
+
+pub(crate) async fn broadcast_player_upsert(state: &AppState, session_code: &str, player_id: &str) {
+    broadcast_session_delta(state, session_code, |session, registration| {
+        let client_state = to_client_game_state(session, &registration.player_id);
+        client_state
+            .players
+            .get(player_id)
+            .cloned()
+            .map(|player| ServerWsMessage::PlayerUpsert {
+                state_revision: client_state.session.state_revision,
+                player,
+            })
+            .into_iter()
+            .collect()
+    })
+    .await;
+}
+
+pub(crate) async fn broadcast_dragon_patch(state: &AppState, session_code: &str, dragon_id: &str) {
+    broadcast_session_delta(state, session_code, |session, registration| {
+        let client_state = to_client_game_state(session, &registration.player_id);
+        client_state
+            .dragons
+            .get(dragon_id)
+            .cloned()
+            .map(|dragon| ServerWsMessage::DragonPatch {
+                state_revision: client_state.session.state_revision,
+                dragon,
+            })
+            .into_iter()
+            .collect()
+    })
+    .await;
+}
+
+pub(crate) async fn broadcast_player_and_dragon_patch(
+    state: &AppState,
+    session_code: &str,
+    player_id: &str,
+    dragon_id: &str,
+) {
+    broadcast_session_delta(state, session_code, |session, registration| {
+        let client_state = to_client_game_state(session, &registration.player_id);
+        let mut messages = Vec::new();
+        if let Some(player) = client_state.players.get(player_id).cloned() {
+            messages.push(ServerWsMessage::PlayerUpsert {
+                state_revision: client_state.session.state_revision,
+                player,
+            });
+        }
+        if let Some(dragon) = client_state.dragons.get(dragon_id).cloned() {
+            messages.push(ServerWsMessage::DragonPatch {
+                state_revision: client_state.session.state_revision,
+                dragon,
+            });
+        }
+        messages
+    })
+    .await;
+}
+
+async fn broadcast_session_delta(
+    state: &AppState,
+    session_code: &str,
+    message_for: impl Fn(
+        &domain::WorkshopSession,
+        &realtime::ConnectionRegistration,
+    ) -> Vec<ServerWsMessage>,
+) {
+    let Ok(is_cached) = ensure_session_cached(state, session_code).await else {
+        return;
+    };
+    if !is_cached {
+        return;
+    }
+
+    let registrations = state
+        .realtime
+        .lock()
+        .await
+        .session_registrations(session_code);
+    if registrations.is_empty() {
+        return;
+    }
+
+    let Some(session) = ({
+        let sessions = state.sessions.lock().await;
+        sessions.get(session_code).cloned()
+    }) else {
+        return;
+    };
+
+    let messages = registrations
+        .into_iter()
+        .flat_map(|registration| {
+            let connection_id = registration.connection_id.clone();
+            message_for(&session, &registration)
+                .into_iter()
+                .map(move |message| (connection_id.clone(), message))
+        })
+        .collect::<Vec<_>>();
+    if messages.is_empty() {
+        return;
+    }
+
+    let failed_connection_ids = {
+        let senders = state.realtime_senders.lock().await;
+        messages
+            .into_iter()
+            .filter_map(
+                |(connection_id, message)| match senders.get(&connection_id) {
+                    Some(sender) => sender
+                        .send(WsOutbound::Message(message))
                         .err()
                         .map(|_| connection_id),
                     None => None,

@@ -52,8 +52,22 @@ use crate::helpers::{
     random_prefixed_id, sprite_set_uses_references, to_client_game_state,
 };
 use crate::ws::{
+    broadcast_dragon_patch, broadcast_player_and_dragon_patch, broadcast_player_upsert,
     close_local_workshop_connections, mark_session_dirty, send_player_notice_with_code,
 };
+
+enum WorkshopBroadcastDelta {
+    PlayerUpsert {
+        player_id: String,
+    },
+    DragonPatch {
+        dragon_id: String,
+    },
+    PlayerAndDragonPatch {
+        player_id: String,
+        dragon_id: String,
+    },
+}
 
 enum ImageJobAdmissionError {
     TimedOut,
@@ -120,13 +134,18 @@ fn build_character_sprite_cache_entry(
 
 async fn character_sprite_load_lock(state: &AppState, character_id: &str) -> Arc<Mutex<()>> {
     let mut locks = state.character_sprite_load_locks.lock().await;
-    locks.entry(character_id.to_string())
+    locks
+        .entry(character_id.to_string())
         .or_insert_with(|| Arc::new(Mutex::new(())))
         .clone()
 }
 
 async fn evict_character_sprite_cache(state: &AppState, character_id: &str) {
-    state.character_sprite_cache.lock().await.remove(character_id);
+    state
+        .character_sprite_cache
+        .lock()
+        .await
+        .remove(character_id);
 }
 
 async fn load_cached_character_sprite(
@@ -1637,10 +1656,6 @@ pub(crate) async fn workshop_command(
         ));
     }
 
-    // Perf step 1: For SelectCharacter, preload the character record from the
-    // store BEFORE acquiring the global `state.sessions` mutex so we don't hold
-    // that lock across a DB round-trip. Per-workshop ordering is still
-    // preserved by the write lease acquired above.
     let preloaded_select_character: Option<(SelectCharacterRequest, Option<CharacterRecord>)> =
         if matches!(request.command, SessionCommand::SelectCharacter) {
             let payload = match request.payload.clone() {
@@ -1669,6 +1684,7 @@ pub(crate) async fn workshop_command(
         response,
         should_broadcast,
         should_run_judge,
+        broadcast_delta,
         session_before,
         session_to_persist,
         artifact_to_append,
@@ -1679,6 +1695,7 @@ pub(crate) async fn workshop_command(
         };
         let mut should_broadcast = false;
         let mut should_run_judge = false;
+        let mut broadcast_delta = None;
         let session_before = session.clone();
         let mut session_to_persist = None;
         let mut artifact_to_append = None;
@@ -1728,10 +1745,6 @@ pub(crate) async fn workshop_command(
                 successful_workshop_command(&mut should_broadcast)
             }
             SessionCommand::SelectCharacter => {
-                // Perf step 1: payload + character record were preloaded above
-                // (before the sessions lock) to avoid holding the global mutex
-                // across DB I/O. `expect` is sound because we set this Some
-                // iff `request.command` is `SelectCharacter`.
                 let (payload, preloaded_record) = preloaded_select_character
                     .expect("preloaded_select_character set for SelectCharacter command");
 
@@ -1791,6 +1804,11 @@ pub(crate) async fn workshop_command(
                     }),
                 });
 
+                if session.phase == protocol::Phase::Lobby {
+                    broadcast_delta = Some(WorkshopBroadcastDelta::PlayerUpsert {
+                        player_id: identity.player_id.clone(),
+                    });
+                }
                 successful_workshop_command(&mut should_broadcast)
             }
             SessionCommand::SubmitObservation => {
@@ -1834,6 +1852,7 @@ pub(crate) async fn workshop_command(
                     payload: json!({ "dragonId": dragon_id, "text": text }),
                 });
 
+                broadcast_delta = Some(WorkshopBroadcastDelta::DragonPatch { dragon_id });
                 successful_workshop_command(&mut should_broadcast)
             }
             SessionCommand::Action => {
@@ -1920,6 +1939,10 @@ pub(crate) async fn workshop_command(
                     payload: artifact_payload,
                 });
 
+                broadcast_delta = Some(WorkshopBroadcastDelta::PlayerAndDragonPatch {
+                    player_id: identity.player_id.clone(),
+                    dragon_id,
+                });
                 successful_workshop_command(&mut should_broadcast)
             }
             SessionCommand::StartHandover => {
@@ -1999,6 +2022,13 @@ pub(crate) async fn workshop_command(
                     payload: json!({ "tagCount": saved_tags.len(), "tags": saved_tags }),
                 });
 
+                if let Some(dragon_id) = session
+                    .players
+                    .get(&identity.player_id)
+                    .and_then(|player| player.current_dragon_id.clone())
+                {
+                    broadcast_delta = Some(WorkshopBroadcastDelta::DragonPatch { dragon_id });
+                }
                 successful_workshop_command(&mut should_broadcast)
             }
             SessionCommand::StartPhase2 => {
@@ -2248,6 +2278,7 @@ pub(crate) async fn workshop_command(
             response,
             should_broadcast,
             should_run_judge,
+            broadcast_delta,
             session_before,
             session_to_persist,
             artifact_to_append,
@@ -2299,7 +2330,22 @@ pub(crate) async fn workshop_command(
     drop(write_lease);
 
     if should_broadcast {
-        mark_session_dirty(&state, session_code).await;
+        match broadcast_delta {
+            Some(WorkshopBroadcastDelta::PlayerUpsert { player_id }) => {
+                broadcast_player_upsert(&state, session_code, &player_id).await;
+            }
+            Some(WorkshopBroadcastDelta::DragonPatch { dragon_id }) => {
+                broadcast_dragon_patch(&state, session_code, &dragon_id).await;
+            }
+            Some(WorkshopBroadcastDelta::PlayerAndDragonPatch {
+                player_id,
+                dragon_id,
+            }) => {
+                broadcast_player_and_dragon_patch(&state, session_code, &player_id, &dragon_id)
+                    .await;
+            }
+            None => mark_session_dirty(&state, session_code).await,
+        }
     }
 
     if should_run_judge {

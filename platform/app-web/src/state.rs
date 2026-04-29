@@ -1277,31 +1277,59 @@ pub fn apply_server_ws_message(
                 ));
             }
         }
-        ServerWsMessage::PlayerUpsert(player) => {
-            if let Some(state) = game_state.as_mut() {
-                state.players.insert(player.id.clone(), player);
+        ServerWsMessage::PlayerUpsert {
+            state_revision,
+            player,
+        } => {
+            let Some(state) = game_state.as_mut() else {
+                return;
+            };
+            if state_revision < state.session.state_revision {
+                return;
             }
+            state.players.insert(player.id.clone(), player);
+            state.session.state_revision = state.session.state_revision.max(state_revision);
         }
-        ServerWsMessage::DragonPatch(dragon) => {
-            if let Some(state) = game_state.as_mut() {
-                state.dragons.insert(dragon.id.clone(), dragon);
+        ServerWsMessage::DragonPatch {
+            state_revision,
+            dragon,
+        } => {
+            let Some(state) = game_state.as_mut() else {
+                return;
+            };
+            if state_revision < state.session.state_revision {
+                return;
             }
+            state.dragons.insert(dragon.id.clone(), dragon);
+            state.session.state_revision = state.session.state_revision.max(state_revision);
         }
         ServerWsMessage::PhaseChanged {
             phase,
             time,
             session,
         } => {
-            if let Some(state) = game_state.as_mut() {
-                state.phase = phase;
-                state.time = time;
-                state.session = session;
+            let Some(state) = game_state.as_mut() else {
+                return;
+            };
+            if session.state_revision < state.session.state_revision {
+                return;
             }
+            state.phase = phase;
+            state.time = time;
+            state.session = session;
         }
-        ServerWsMessage::TimeTick { time } => {
-            if let Some(state) = game_state.as_mut() {
-                state.time = time;
+        ServerWsMessage::TimeTick {
+            state_revision,
+            time,
+        } => {
+            let Some(state) = game_state.as_mut() else {
+                return;
+            };
+            if state_revision < state.session.state_revision {
+                return;
             }
+            state.time = time;
+            state.session.state_revision = state.session.state_revision.max(state_revision);
         }
         ServerWsMessage::Notice(ProtocolSessionNotice {
             level,
@@ -2140,7 +2168,10 @@ mod tests {
             &mut game_state,
             &mut ops,
             &mut judge_bundle,
-            ServerWsMessage::PlayerUpsert(player),
+            ServerWsMessage::PlayerUpsert {
+                state_revision: 0,
+                player,
+            },
         );
         assert_eq!(
             game_state
@@ -2156,7 +2187,10 @@ mod tests {
             &mut game_state,
             &mut ops,
             &mut judge_bundle,
-            ServerWsMessage::DragonPatch(dragon.clone()),
+            ServerWsMessage::DragonPatch {
+                state_revision: 1,
+                dragon: dragon.clone(),
+            },
         );
         assert_eq!(
             game_state
@@ -2195,9 +2229,108 @@ mod tests {
             &mut game_state,
             &mut ops,
             &mut judge_bundle,
-            ServerWsMessage::TimeTick { time: 15 },
+            ServerWsMessage::TimeTick {
+                state_revision: 7,
+                time: 15,
+            },
         );
         assert_eq!(game_state.as_ref().map(|state| state.time), Some(15));
+    }
+
+    #[test]
+    fn server_ws_stale_deltas_are_ignored() {
+        let mut identity = default_identity_state();
+        let mut game_state = Some(mock_join_success().state);
+        let mut ops = default_operation_state();
+        let mut judge_bundle = None;
+        game_state.as_mut().expect("state").session.state_revision = 5;
+
+        let mut player = game_state
+            .as_ref()
+            .and_then(|state| state.players.get("player-1"))
+            .cloned()
+            .expect("player");
+        player.score = 25;
+        apply_server_ws_message(
+            &mut identity,
+            &mut game_state,
+            &mut ops,
+            &mut judge_bundle,
+            ServerWsMessage::PlayerUpsert {
+                state_revision: 4,
+                player,
+            },
+        );
+        assert_eq!(
+            game_state
+                .as_ref()
+                .and_then(|state| state.players.get("player-1"))
+                .map(|player| player.score),
+            Some(0)
+        );
+
+        apply_server_ws_message(
+            &mut identity,
+            &mut game_state,
+            &mut ops,
+            &mut judge_bundle,
+            ServerWsMessage::TimeTick {
+                state_revision: 4,
+                time: 15,
+            },
+        );
+        assert_eq!(game_state.as_ref().map(|state| state.time), Some(8));
+    }
+
+    #[test]
+    fn server_ws_equal_and_newer_deltas_are_applied() {
+        let mut identity = default_identity_state();
+        let mut game_state = Some(mock_join_success().state);
+        let mut ops = default_operation_state();
+        let mut judge_bundle = None;
+        game_state.as_mut().expect("state").session.state_revision = 5;
+
+        let dragon = mock_client_dragon("dragon-1");
+        apply_server_ws_message(
+            &mut identity,
+            &mut game_state,
+            &mut ops,
+            &mut judge_bundle,
+            ServerWsMessage::DragonPatch {
+                state_revision: 5,
+                dragon: dragon.clone(),
+            },
+        );
+        assert_eq!(
+            game_state
+                .as_ref()
+                .and_then(|state| state.dragons.get("dragon-1")),
+            Some(&dragon)
+        );
+        assert_eq!(
+            game_state
+                .as_ref()
+                .map(|state| state.session.state_revision),
+            Some(5)
+        );
+
+        apply_server_ws_message(
+            &mut identity,
+            &mut game_state,
+            &mut ops,
+            &mut judge_bundle,
+            ServerWsMessage::TimeTick {
+                state_revision: 6,
+                time: 15,
+            },
+        );
+        assert_eq!(game_state.as_ref().map(|state| state.time), Some(15));
+        assert_eq!(
+            game_state
+                .as_ref()
+                .map(|state| state.session.state_revision),
+            Some(6)
+        );
     }
 
     #[test]
@@ -2212,7 +2345,10 @@ mod tests {
             &mut game_state,
             &mut ops,
             &mut judge_bundle,
-            ServerWsMessage::TimeTick { time: 15 },
+            ServerWsMessage::TimeTick {
+                state_revision: 1,
+                time: 15,
+            },
         );
 
         assert!(game_state.is_none());
