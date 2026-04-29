@@ -840,8 +840,20 @@ pub enum ClientWsMessage {
 #[allow(clippy::large_enum_variant)]
 pub enum ServerWsMessage {
     StateUpdate(ClientGameState),
+    PlayerUpsert(Player),
+    DragonPatch(ClientDragon),
+    PhaseChanged {
+        phase: Phase,
+        time: i32,
+        session: SessionMeta,
+    },
+    TimeTick {
+        time: i32,
+    },
     Notice(SessionNotice),
-    Error { message: String },
+    Error {
+        message: String,
+    },
     Pong,
 }
 
@@ -1233,6 +1245,16 @@ mod tests {
         let json = serde_json::to_string(&SessionArtifactKind::JudgeBundleGenerated)
             .expect("serialize artifact kind");
         assert_eq!(json, "\"judge_bundle_generated\"");
+    }
+
+    #[test]
+    fn server_ws_delta_variants_use_camel_case_tags() {
+        let tick =
+            serde_json::to_value(ServerWsMessage::TimeTick { time: 12 }).expect("serialize tick");
+        assert_eq!(tick, serde_json::json!({ "timeTick": { "time": 12 } }));
+
+        let message: ServerWsMessage = serde_json::from_value(tick).expect("deserialize tick");
+        assert_eq!(message, ServerWsMessage::TimeTick { time: 12 });
     }
 
     #[test]

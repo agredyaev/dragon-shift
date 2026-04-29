@@ -1277,6 +1277,32 @@ pub fn apply_server_ws_message(
                 ));
             }
         }
+        ServerWsMessage::PlayerUpsert(player) => {
+            if let Some(state) = game_state.as_mut() {
+                state.players.insert(player.id.clone(), player);
+            }
+        }
+        ServerWsMessage::DragonPatch(dragon) => {
+            if let Some(state) = game_state.as_mut() {
+                state.dragons.insert(dragon.id.clone(), dragon);
+            }
+        }
+        ServerWsMessage::PhaseChanged {
+            phase,
+            time,
+            session,
+        } => {
+            if let Some(state) = game_state.as_mut() {
+                state.phase = phase;
+                state.time = time;
+                state.session = session;
+            }
+        }
+        ServerWsMessage::TimeTick { time } => {
+            if let Some(state) = game_state.as_mut() {
+                state.time = time;
+            }
+        }
         ServerWsMessage::Notice(ProtocolSessionNotice {
             level,
             title,
@@ -1326,8 +1352,9 @@ pub fn apply_server_ws_message(
 mod tests {
     use super::*;
     use protocol::{
-        ClientGameState, ClientVotingState, CoordinatorType, Phase, Player, SessionMeta,
-        SessionNoticeCode, WorkshopJoinSuccess, create_default_session_settings,
+        ClientDragon, ClientGameState, ClientVotingState, CoordinatorType, DragonAction,
+        DragonEmotion, DragonStats, DragonVisuals, Phase, Player, SessionMeta, SessionNoticeCode,
+        WorkshopJoinSuccess, create_default_session_settings,
     };
     use std::collections::BTreeMap;
 
@@ -1375,6 +1402,41 @@ mod tests {
                 current_player_id: Some("player-1".to_string()),
                 voting: None,
             },
+        }
+    }
+
+    fn mock_client_dragon(id: &str) -> ClientDragon {
+        ClientDragon {
+            id: id.to_string(),
+            name: "Pebble".to_string(),
+            visuals: DragonVisuals {
+                base: 1,
+                color_p: "#112233".to_string(),
+                color_s: "#445566".to_string(),
+                color_a: "#778899".to_string(),
+            },
+            original_owner_id: Some("player-1".to_string()),
+            design_creator_name: None,
+            current_owner_id: Some("player-1".to_string()),
+            stats: DragonStats {
+                hunger: 50,
+                energy: 60,
+                happiness: 70,
+            },
+            condition_hint: None,
+            discovery_observations: Vec::new(),
+            handover_tags: Vec::new(),
+            last_action: DragonAction::Idle,
+            last_emotion: DragonEmotion::Neutral,
+            speech: None,
+            speech_timer: 0,
+            action_cooldown: 0,
+            custom_sprites: None,
+            judge_observation_score: None,
+            judge_care_score: None,
+            judge_feedback: None,
+            judge_observation_feedback: None,
+            judge_care_feedback: None,
         }
     }
 
@@ -2058,6 +2120,102 @@ mod tests {
         );
 
         assert_eq!(game_state.as_ref().map(|state| state.time), Some(19));
+    }
+
+    #[test]
+    fn server_ws_deltas_update_existing_game_state() {
+        let mut identity = default_identity_state();
+        let mut game_state = Some(mock_join_success().state);
+        let mut ops = default_operation_state();
+        let mut judge_bundle = None;
+
+        let mut player = game_state
+            .as_ref()
+            .and_then(|state| state.players.get("player-1"))
+            .cloned()
+            .expect("player");
+        player.score = 25;
+        apply_server_ws_message(
+            &mut identity,
+            &mut game_state,
+            &mut ops,
+            &mut judge_bundle,
+            ServerWsMessage::PlayerUpsert(player),
+        );
+        assert_eq!(
+            game_state
+                .as_ref()
+                .and_then(|state| state.players.get("player-1"))
+                .map(|player| player.score),
+            Some(25)
+        );
+
+        let dragon = mock_client_dragon("dragon-1");
+        apply_server_ws_message(
+            &mut identity,
+            &mut game_state,
+            &mut ops,
+            &mut judge_bundle,
+            ServerWsMessage::DragonPatch(dragon.clone()),
+        );
+        assert_eq!(
+            game_state
+                .as_ref()
+                .and_then(|state| state.dragons.get("dragon-1")),
+            Some(&dragon)
+        );
+
+        let mut session = game_state.as_ref().expect("state").session.clone();
+        session.state_revision = 7;
+        apply_server_ws_message(
+            &mut identity,
+            &mut game_state,
+            &mut ops,
+            &mut judge_bundle,
+            ServerWsMessage::PhaseChanged {
+                phase: Phase::Phase1,
+                time: 14,
+                session,
+            },
+        );
+        assert_eq!(
+            game_state.as_ref().map(|state| state.phase),
+            Some(Phase::Phase1)
+        );
+        assert_eq!(game_state.as_ref().map(|state| state.time), Some(14));
+        assert_eq!(
+            game_state
+                .as_ref()
+                .map(|state| state.session.state_revision),
+            Some(7)
+        );
+
+        apply_server_ws_message(
+            &mut identity,
+            &mut game_state,
+            &mut ops,
+            &mut judge_bundle,
+            ServerWsMessage::TimeTick { time: 15 },
+        );
+        assert_eq!(game_state.as_ref().map(|state| state.time), Some(15));
+    }
+
+    #[test]
+    fn server_ws_deltas_are_ignored_without_game_state() {
+        let mut identity = default_identity_state();
+        let mut game_state = None;
+        let mut ops = default_operation_state();
+        let mut judge_bundle = None;
+
+        apply_server_ws_message(
+            &mut identity,
+            &mut game_state,
+            &mut ops,
+            &mut judge_bundle,
+            ServerWsMessage::TimeTick { time: 15 },
+        );
+
+        assert!(game_state.is_none());
     }
 
     #[test]
