@@ -2628,7 +2628,7 @@ async fn session_update_notification_skip_does_not_evict_cache_or_broadcast() {
         .await
         .insert(session.code.0.clone(), session.clone());
 
-    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+    let (sender, mut receiver) = tokio::sync::mpsc::channel(64);
     state
         .realtime
         .lock()
@@ -2656,6 +2656,84 @@ async fn session_update_notification_skip_does_not_evict_cache_or_broadcast() {
     assert!(
         receiver.try_recv().is_err(),
         "skip path should not broadcast"
+    );
+}
+
+#[tokio::test]
+async fn broadcast_overflow_forces_local_connection_cleanup() {
+    let state = test_state();
+    let timestamp = Utc::now();
+    let mut session = WorkshopSession::new(
+        Uuid::new_v4(),
+        SessionCode("123456".into()),
+        timestamp,
+        protocol::WorkshopCreateConfig::default(),
+    );
+    session.add_player(session_player_with_state(
+        "player-1", "Alice", timestamp, true, true,
+    ));
+    state
+        .store
+        .save_session(&session)
+        .await
+        .expect("seed persisted session");
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(session.code.0.clone(), session.clone());
+
+    let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+    sender
+        .try_send(crate::ws::WsOutbound::Close)
+        .expect("fill outbound channel");
+    let (close_signal, close_rx) = tokio::sync::oneshot::channel();
+    state
+        .realtime
+        .lock()
+        .await
+        .attach(&session.code.0, "player-1", "conn-1");
+    state
+        .realtime_senders
+        .lock()
+        .await
+        .insert("conn-1".to_string(), sender);
+    state
+        .realtime_close_signals
+        .lock()
+        .await
+        .insert("conn-1".to_string(), close_signal);
+
+    super::ws::broadcast_session_state(&state, &session.code.0, None).await;
+
+    tokio::time::timeout(std::time::Duration::from_secs(1), close_rx)
+        .await
+        .expect("overflow should force-close reader")
+        .expect("overflow close signal should be delivered");
+    assert!(
+        !state.realtime_senders.lock().await.contains_key("conn-1"),
+        "overflowed sender should be removed"
+    );
+    assert!(
+        !state
+            .realtime_close_signals
+            .lock()
+            .await
+            .contains_key("conn-1"),
+        "force-close signal should be consumed"
+    );
+    assert!(
+        state
+            .realtime
+            .lock()
+            .await
+            .session_registrations(&session.code.0)
+            .is_empty(),
+        "overflowed connection should leave the local registry"
+    );
+    assert!(
+        matches!(receiver.try_recv(), Ok(crate::ws::WsOutbound::Close)),
+        "pre-filled channel should remain otherwise untouched"
     );
 }
 
@@ -2805,7 +2883,7 @@ async fn typed_notification_followed_by_legacy_notification_does_not_rebroadcast
         .await
         .insert(session.code.0.clone(), session.clone());
 
-    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+    let (sender, mut receiver) = tokio::sync::mpsc::channel(64);
     state
         .realtime
         .lock()
@@ -2909,7 +2987,7 @@ async fn realtime_replaced_notification_clears_local_registration_without_persis
         .await
         .insert(session.code.0.clone(), session.clone());
 
-    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+    let (sender, mut receiver) = tokio::sync::mpsc::channel(64);
     state
         .realtime
         .lock()
@@ -3019,7 +3097,7 @@ async fn workshop_deleted_notification_closes_local_session_connections() {
         .await
         .insert(session.code.0.clone(), session.clone());
 
-    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+    let (sender, mut receiver) = tokio::sync::mpsc::channel(64);
     state
         .realtime
         .lock()
@@ -3084,7 +3162,7 @@ async fn clearing_local_realtime_before_close_prevents_false_disconnect_fallback
         .await
         .insert(session.code.0.clone(), session.clone());
 
-    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+    let (sender, mut receiver) = tokio::sync::mpsc::channel(64);
     state
         .realtime
         .lock()
@@ -11835,6 +11913,56 @@ async fn workshop_ws_failed_reattach_restores_replaced_registration() {
 
     let _ = second_socket.close(None).await;
     server_handle.abort();
+}
+
+#[tokio::test]
+async fn restore_replaced_registration_ignores_dead_local_connection() {
+    let state = test_state();
+    let timestamp = Utc::now();
+    let mut session = WorkshopSession::new(
+        Uuid::new_v4(),
+        SessionCode("123456".into()),
+        timestamp,
+        protocol::WorkshopCreateConfig::default(),
+    );
+    session.add_player(session_player_with_state(
+        "player-1", "Alice", timestamp, true, true,
+    ));
+    state
+        .store
+        .save_session(&session)
+        .await
+        .expect("seed persisted session");
+
+    let replaced = RealtimeConnectionRegistration {
+        session_code: session.code.0.clone(),
+        player_id: "player-1".to_string(),
+        connection_id: "conn-dead".to_string(),
+        replica_id: state.replica_id.clone(),
+    };
+
+    super::ws::restore_replaced_registration(&state, &replaced)
+        .await
+        .expect("dead local restore should not fail");
+
+    assert!(
+        state
+            .realtime
+            .lock()
+            .await
+            .session_registrations(&session.code.0)
+            .is_empty(),
+        "dead local connection should not be restored into the in-memory registry"
+    );
+    assert!(
+        state
+            .store
+            .list_realtime_connections(&session.code.0)
+            .await
+            .expect("list realtime registrations")
+            .is_empty(),
+        "dead local connection should not be restored into persistent realtime ownership"
+    );
 }
 
 #[tokio::test]

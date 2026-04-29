@@ -1,6 +1,6 @@
 use axum::{
-    body::Bytes,
     Router,
+    body::Bytes,
     extract::FromRef,
     http::HeaderValue,
     http::header::CACHE_CONTROL,
@@ -32,7 +32,7 @@ use std::{
     time::Duration,
 };
 use tokio::{
-    sync::{Mutex, Semaphore, mpsc},
+    sync::{Mutex, Semaphore, mpsc, oneshot},
     task::JoinHandle,
 };
 use tower_http::{
@@ -156,7 +156,8 @@ pub(crate) struct AppState {
     pub(crate) login_limiter: Arc<Mutex<FixedWindowRateLimiter>>,
     pub(crate) character_create_limiter: Arc<Mutex<FixedWindowRateLimiter>>,
     pub(crate) realtime: Arc<Mutex<SessionRegistry>>,
-    pub(crate) realtime_senders: Arc<Mutex<BTreeMap<String, mpsc::UnboundedSender<WsOutbound>>>>,
+    pub(crate) realtime_senders: Arc<Mutex<BTreeMap<String, mpsc::Sender<WsOutbound>>>>,
+    pub(crate) realtime_close_signals: Arc<Mutex<BTreeMap<String, oneshot::Sender<()>>>>,
     pub(crate) realtime_heartbeats: Arc<Mutex<BTreeMap<String, JoinHandle<()>>>>,
     pub(crate) retired_realtime_connections: Arc<Mutex<BTreeMap<String, ()>>>,
     pub(crate) recent_session_notifications: Arc<Mutex<BTreeMap<String, String>>>,
@@ -222,6 +223,7 @@ impl AppState {
             ))),
             realtime: Arc::new(Mutex::new(SessionRegistry::new())),
             realtime_senders: Arc::new(Mutex::new(BTreeMap::new())),
+            realtime_close_signals: Arc::new(Mutex::new(BTreeMap::new())),
             realtime_heartbeats: Arc::new(Mutex::new(BTreeMap::new())),
             retired_realtime_connections: Arc::new(Mutex::new(BTreeMap::new())),
             recent_session_notifications: Arc::new(Mutex::new(BTreeMap::new())),
