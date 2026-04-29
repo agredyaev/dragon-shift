@@ -3207,6 +3207,35 @@ async fn generate_or_update_character_sprite_sheet(
 
     let fallback_used = fallback_used;
 
+    let (_, _write_guard, write_lease) =
+        match SessionWriteLease::acquire(&state, session_code).await {
+            Ok(guard) => guard,
+            Err(error) => {
+                return internal_character_sprite_sheet_error(format!(
+                    "failed to acquire session lease: {error}"
+                ));
+            }
+        };
+    if let Err(error) = write_lease.ensure_active() {
+        return internal_character_sprite_sheet_error(format!(
+            "lost session lease before character mutation: {error}"
+        ));
+    }
+    match reload_cached_session(&state, session_code).await {
+        Ok(true) => {}
+        Ok(false) => return bad_character_sprite_sheet_request("Workshop not found."),
+        Err(error) => {
+            return internal_character_sprite_sheet_error(format!(
+                "failed to reload session before character mutation: {error}"
+            ));
+        }
+    }
+    if let Err(error) = write_lease.ensure_active() {
+        return internal_character_sprite_sheet_error(format!(
+            "lost session lease before character persist: {error}"
+        ));
+    }
+
     let (session_before, session_to_persist, artifact_to_append, next_character_record) = {
         let mut sessions = state.sessions.lock().await;
         let Some(session) = sessions.get_mut(session_code) else {
@@ -3279,6 +3308,14 @@ async fn generate_or_update_character_sprite_sheet(
         ));
     }
     evict_character_sprite_cache(&state, &next_character_record.id).await;
+
+    if let Err(error) = write_lease.ensure_active() {
+        let mut sessions = state.sessions.lock().await;
+        sessions.insert(session_code.to_string(), session_before);
+        return internal_character_sprite_sheet_error(format!(
+            "lost session lease before character session persist: {error}"
+        ));
+    }
 
     if let Err(error) = state
         .store

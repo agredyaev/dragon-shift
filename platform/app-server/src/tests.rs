@@ -2,7 +2,7 @@
 
 use crate::{
     app::{AppConfig, AppState, build_app},
-    cache::ensure_session_cached,
+    cache::{ensure_session_cached, session_lease_enabled_from_value},
     handle_session_update_notification,
     helpers::{build_judge_action_traces, to_client_game_state},
     http::allocate_session_code,
@@ -1407,6 +1407,22 @@ fn load_config_parses_database_pool_size() {
     let config = crate::app::load_config().expect("load config");
 
     assert_eq!(config.database_pool_size, 17);
+}
+
+#[test]
+fn session_lease_enabled_parser_defaults_safe() {
+    assert!(session_lease_enabled_from_value(None));
+    assert!(session_lease_enabled_from_value(Some("")));
+    assert!(session_lease_enabled_from_value(Some("true")));
+    assert!(session_lease_enabled_from_value(Some("1")));
+    assert!(session_lease_enabled_from_value(Some("invalid")));
+}
+
+#[test]
+fn session_lease_enabled_parser_disables_explicit_false_values() {
+    for value in ["false", "0", "no", "off", " FALSE ", "No", "Off"] {
+        assert!(!session_lease_enabled_from_value(Some(value)));
+    }
 }
 
 #[test]

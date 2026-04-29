@@ -12,6 +12,9 @@ spec:
   {{- if ne (int .Values.replicaCount) 1 }}
   {{- fail "replicaCount must remain 1 for the current singleton runtime" }}
   {{- end }}
+  {{- if and (not .Values.app.sessionLeaseEnabled) (ne (int .Values.replicaCount) 1) }}
+  {{- fail "app.sessionLeaseEnabled=false is only safe with replicaCount=1" }}
+  {{- end }}
   {{- if .Values.autoscaling.enabled }}
   {{- fail "autoscaling.enabled must remain false for the current singleton runtime" }}
   {{- end }}
@@ -101,6 +104,8 @@ spec:
               value: {{ .Values.app.imageJobMaxConcurrency | quote }}
             - name: DATABASE_POOL_SIZE
               value: {{ .Values.app.databasePoolSize | quote }}
+            - name: SESSION_LEASE_ENABLED
+              value: {{ ternary "true" "false" .Values.app.sessionLeaseEnabled | quote }}
             {{- with .Values.app.googleCloudProject }}
             - name: GOOGLE_CLOUD_PROJECT
               value: {{ . | quote }}

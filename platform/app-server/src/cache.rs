@@ -127,9 +127,23 @@ pub(crate) async fn session_write_lock(state: &AppState, session_code: &str) -> 
 pub(crate) struct SessionWriteLease {
     store: Arc<dyn persistence::SessionStore>,
     session_code: String,
-    lease_id: String,
+    lease_id: Option<String>,
     is_active: Arc<AtomicBool>,
     renewal_task: Option<JoinHandle<()>>,
+}
+
+pub(crate) fn session_lease_enabled_from_value(value: Option<&str>) -> bool {
+    !matches!(
+        value.map(str::trim),
+        Some(value) if value.eq_ignore_ascii_case("false")
+            || value == "0"
+            || value.eq_ignore_ascii_case("no")
+            || value.eq_ignore_ascii_case("off")
+    )
+}
+
+fn session_lease_enabled_from_env() -> bool {
+    session_lease_enabled_from_value(std::env::var("SESSION_LEASE_ENABLED").ok().as_deref())
 }
 
 impl SessionWriteLease {
@@ -139,6 +153,21 @@ impl SessionWriteLease {
     ) -> Result<(Arc<Mutex<()>>, tokio::sync::OwnedMutexGuard<()>, Self), PersistenceError> {
         let local_lock = session_write_lock(state, session_code).await;
         let local_guard = local_lock.clone().lock_owned().await;
+
+        if !session_lease_enabled_from_env() {
+            return Ok((
+                local_lock,
+                local_guard,
+                Self {
+                    store: state.store.clone(),
+                    session_code: session_code.to_string(),
+                    lease_id: None,
+                    is_active: Arc::new(AtomicBool::new(true)),
+                    renewal_task: None,
+                },
+            ));
+        }
+
         let lease_id = format!("{}:{}", state.replica_id, Uuid::new_v4());
         let deadline = Instant::now() + SESSION_LEASE_TIMEOUT;
 
@@ -164,7 +193,7 @@ impl SessionWriteLease {
                     Self {
                         store: state.store.clone(),
                         session_code: session_code.to_string(),
-                        lease_id,
+                        lease_id: Some(lease_id),
                         is_active,
                         renewal_task: Some(renewal_task),
                     },
@@ -197,12 +226,13 @@ impl Drop for SessionWriteLease {
         if let Some(renewal_task) = self.renewal_task.take() {
             renewal_task.abort();
         }
-        let store = self.store.clone();
-        let session_code = self.session_code.clone();
-        let lease_id = self.lease_id.clone();
-        tokio::spawn(async move {
-            let _ = store.release_session_lease(&session_code, &lease_id).await;
-        });
+        if let Some(lease_id) = self.lease_id.take() {
+            let store = self.store.clone();
+            let session_code = self.session_code.clone();
+            tokio::spawn(async move {
+                let _ = store.release_session_lease(&session_code, &lease_id).await;
+            });
+        }
     }
 }
 

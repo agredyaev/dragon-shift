@@ -24,6 +24,7 @@ app:
   rustLog: "info,tower_http=debug,app_server=debug"
   rustSessionCodePrefix: "9"
   databasePoolSize: 30
+  sessionLeaseEnabled: false
   createRateLimitMax: 80
   joinRateLimitMax: 80
   signupRateLimitMax: 80

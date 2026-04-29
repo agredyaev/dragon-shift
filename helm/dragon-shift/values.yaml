@@ -41,6 +41,7 @@ app:
   rustSessionCodePrefix: "9"
   trustForwardedFor: true
   databasePoolSize: 10
+  sessionLeaseEnabled: true
   createRateLimitMax: 20
   joinRateLimitMax: 100
   signupRateLimitMax: 80
