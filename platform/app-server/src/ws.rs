@@ -38,6 +38,7 @@ struct WsAttachOutcome {
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum WsOutbound {
     Message(ServerWsMessage),
+    EncodedMessage(std::sync::Arc<str>),
     Close,
 }
 
@@ -390,6 +391,11 @@ async fn handle_workshop_ws(
                             break;
                         }
                     }
+                    WsOutbound::EncodedMessage(encoded) => {
+                        if send_encoded_ws_message(&mut socket, encoded).await.is_err() {
+                            break;
+                        }
+                    }
                     WsOutbound::Close => break,
                 }
             }
@@ -730,28 +736,26 @@ pub(crate) async fn broadcast_session_state(
         return;
     }
 
-    let messages = {
+    let Some(session) = ({
         let sessions = state.sessions.lock().await;
-        let Some(session) = sessions.get(session_code) else {
-            return;
-        };
-
-        registrations
-            .into_iter()
-            .filter(|registration| {
-                Some(registration.connection_id.as_str()) != excluded_connection_id
-            })
-            .map(|registration| {
-                (
-                    registration.connection_id,
-                    ServerWsMessage::StateUpdate(to_client_game_state(
-                        session,
-                        &registration.player_id,
-                    )),
-                )
-            })
-            .collect::<Vec<_>>()
+        sessions.get(session_code).cloned()
+    }) else {
+        return;
     };
+
+    let messages = registrations
+        .into_iter()
+        .filter(|registration| Some(registration.connection_id.as_str()) != excluded_connection_id)
+        .filter_map(|registration| {
+            let message = ServerWsMessage::StateUpdate(to_client_game_state(
+                &session,
+                &registration.player_id,
+            ));
+            encode_ws_message(&message)
+                .ok()
+                .map(|encoded| (registration.connection_id, encoded))
+        })
+        .collect::<Vec<_>>();
 
     if messages.is_empty() {
         return;
@@ -762,9 +766,9 @@ pub(crate) async fn broadcast_session_state(
         messages
             .into_iter()
             .filter_map(
-                |(connection_id, message)| match senders.get(&connection_id) {
+                |(connection_id, encoded)| match senders.get(&connection_id) {
                     Some(sender) => sender
-                        .send(WsOutbound::Message(message))
+                        .send(WsOutbound::EncodedMessage(encoded))
                         .err()
                         .map(|_| connection_id),
                     None => None,
@@ -1253,9 +1257,22 @@ async fn send_ws_message(
         return Err(());
     }
 
-    let encoded = serde_json::to_string(message).map_err(|_| ())?;
+    let encoded = encode_ws_message(message)?;
+    send_encoded_ws_message(socket, encoded).await
+}
+
+fn encode_ws_message(message: &ServerWsMessage) -> Result<std::sync::Arc<str>, ()> {
+    serde_json::to_string(message)
+        .map(std::sync::Arc::<str>::from)
+        .map_err(|_| ())
+}
+
+async fn send_encoded_ws_message(
+    socket: &mut WebSocket,
+    encoded: std::sync::Arc<str>,
+) -> Result<(), ()> {
     socket
-        .send(Message::Text(encoded.into()))
+        .send(Message::Text(encoded.to_string().into()))
         .await
         .map_err(|_| ())
 }
